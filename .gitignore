@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Backups
+*.bak
+
+# imgui state
+imgui.ini
+
+# Recordings (large media files)
+recordings/
+
+# Discoveries backup
+discoveries_backup.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 1D CA exploration scripts (not part of the 3D simulator)
+ca_lab.py
+continuous_ca.py
+phase_diagram.py
+rule_space.py
+adaptive_neighborhood.py
+async_ca.py
+causal_ca.py
+chemical_ca.py
+coevolution.py
+number_ca.py
+temporal_ca.py
+explorer.html
+validator.html
+
+# Batch scripts
+batch_*.sh
