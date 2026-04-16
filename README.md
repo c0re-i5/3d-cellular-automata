@@ -99,6 +99,162 @@ Each rule is a GLSL compute shader dispatched over an 8×8×8 workgroup grid. A 
 
 Shaders that use large neighborhood radii (SmoothLife, Lenia) have an optimized shared memory tiling path with automatic fallback for drivers that don't support it.
 
+## Mathematical Reference
+
+Every rule below runs as a GLSL compute shader on a 3D grid. All spatial derivatives use the 7-point stencil Laplacian $\nabla^2 f = \sum_{\text{nn}} f - 6f$, scaled by $h^2 = (128/N)^2$ for resolution independence. Gradients use central differences scaled by $h^{-1} = N/128$.
+
+---
+
+### Classical Automata
+
+**Game of Life 3D** — Discrete totalistic rule on the 26-cell Moore neighborhood:
+
+$$s^{t+1} = \begin{cases} 1 & \text{if } s^t = 0 \;\wedge\; b_1 \le N_{26} \le b_2 \\\ 1 & \text{if } s^t > 0 \;\wedge\; s_1 \le N_{26} \le s_2 \\\ 0 & \text{otherwise} \end{cases}$$
+
+**SmoothLife 3D** (Rafler) — Continuous generalization with concentric spherical shells at radii $r_i = 1.5 h^{-1}$, $r_o = 2.5 h^{-1}$. Inner mean $m$ and outer mean $n$ drive a smooth sigmoid transition:
+
+$$s^{t+1} = s^t + \Delta t \left(2\,\sigma\!\left(n,\; \ell(m),\; h(m),\; 0.03\right) - 1\right)$$
+
+where $\sigma(x, a, b, w) = S(x,a,w)(1 - S(x,b,w))$ with $S(x,c,w) = (1 + e^{-(x-c)/w})^{-1}$, and $\ell, h$ interpolate between birth and survival intervals based on $m$.
+
+---
+
+### Reaction-Diffusion
+
+**Gray-Scott** — Two-species feed-kill system producing spots, worms, and mitotic patterns:
+
+$$\partial_t U = D_U \nabla^2 U - UV^2 + F(1-U)$$
+$$\partial_t V = D_V \nabla^2 V + UV^2 - (F+k)V$$
+
+**BZ (Complex Ginzburg-Landau)** — Normal form of the Belousov-Zhabotinsky oscillating reaction, writing $A = u + iv$:
+
+$$\partial_t A = \mu A + (1 + i\alpha)D\nabla^2 A - (1 + i\beta)|A|^2 A$$
+
+**Barkley** — Fast-slow excitable medium with stochastic nucleation:
+
+$$\partial_t u = \varepsilon^{-1}\,\xi(v)\,u(1-u)\!\left(u - \tfrac{v+b}{a}\right) + D_u \nabla^2 u, \qquad \partial_t v = u - v$$
+
+**Morphogen (Gierer-Meinhardt)** — Turing instability with activator saturation:
+
+$$\partial_t a = D_a \nabla^2 a + \rho\!\left(\frac{a^2}{h(1 + \kappa a^2)} - a\right) + \sigma_a, \qquad \partial_t h = D_h \nabla^2 h + \rho(a^2 - h)$$
+
+---
+
+### Continuous CA (Lenia Family)
+
+**Lenia 3D** — Gaussian ring kernel convolution with Gaussian growth function:
+
+$$K(r) = \exp\!\left(-\tfrac{1}{2}\left(\tfrac{r/R - \beta}{0.15}\right)^2\right), \qquad U = \frac{\sum_j s_j K(|\mathbf{x}_j - \mathbf{x}|)}{\sum_j K(|\mathbf{x}_j - \mathbf{x}|)}$$
+
+$$s^{t+1} = \text{clamp}\!\left(s^t + \Delta t\left(2e^{-\frac{(U-\mu)^2}{2\sigma^2}} - 1\right),\; 0,\; 1\right)$$
+
+**Multi-Channel Lenia** — Three species with cyclic cross-coupling. Two kernels at ring positions $0.3$ (inner) and $0.7$ (outer) with cross-channel potentials:
+
+$$P_a = \bar{S}^{\text{inner}}_a + \chi\,\tfrac{1}{2}(\bar{S}^{\text{outer}}_b + \bar{S}^{\text{outer}}_c)$$
+
+Each channel has a Gaussian growth function with slightly shifted $\mu$ for symmetry breaking.
+
+---
+
+### Wave / Field Equations
+
+**Wave 3D** — Symplectic Euler integration of the damped wave equation with an optional sinusoidal source:
+
+$$\partial_t v = c^2 \nabla^2 u - \gamma v + A_d \sin(\omega_d t)\,\mathbf{1}_{|\mathbf{x}-\mathbf{x}_0| < r_s}, \qquad \partial_t u = v$$
+
+**EM Wave** — TE-like Maxwell FDTD: $E_z$ driven by curl of $(B_x, B_y)$, magnetic fields updated by curl of $E_z$, with conductor absorption.
+
+---
+
+### Quantum Mechanics
+
+**Schrödinger 3D** — Time-dependent Schrödinger equation via Yee leapfrog (symplectic, norm-conserving):
+
+$$i\hbar\,\partial_t \Psi = -\frac{\hbar^2}{2m}\nabla^2\Psi + V(\mathbf{r})\Psi$$
+
+Split into real/imaginary parts with staggered updates. 6 presets: hydrogen atom, orbital, wavepacket, harmonic oscillator, tunneling, double-slit.
+
+**Schrödinger-Poisson** — Adds self-consistent Hartree mean-field: $\nabla^2 V = -\alpha|\Psi|^2$, solved via SOR Jacobi relaxation each frame.
+
+**Molecular Schrödinger** — Two-center softened Coulomb potential for bonding/antibonding orbitals:
+
+$$V(\mathbf{r}) = -\frac{Z}{\sqrt{|\mathbf{r}-\mathbf{R}_1|^2 + r_s^2}} - \frac{Z}{\sqrt{|\mathbf{r}-\mathbf{R}_2|^2 + r_s^2}}$$
+
+---
+
+### Ecology / Population Dynamics
+
+**Predator-Prey (Rosenzweig-MacArthur)** — Holling type II functional response with prey logistic growth:
+
+$$\partial_t u = ru(1 - u) - \frac{auv}{1+ahu} + D_u\nabla^2 u, \qquad \partial_t v = \frac{eauv}{1+ahu} - dv + D_v\nabla^2 v$$
+
+**Lichen** — Three-species Lotka-Volterra competition for space and a shared resource, with asymmetric growth rates and competition coefficients.
+
+**Flocking (Vicsek)** — Active matter with velocity alignment, pressure repulsion, and semi-Lagrangian density advection:
+
+$$\mathbf{v}^{t+1} = (1-\alpha\Delta t)\mathbf{v}^t + \alpha\Delta t\,v_0(1+2\bar\rho)\hat{\mathbf{v}}_{\text{avg}} - \kappa(\bar\rho - 0.3)\nabla\rho\;\Delta t$$
+
+**Physarum** — Slime mold chemotaxis: agents follow trail gradients via semi-Lagrangian advection, depositing and evaporating pheromone.
+
+**Mycelium** — Agent-based fungal network: tip extension with nutrient-gradient-biased branching, anastomosis, and starvation death.
+
+---
+
+### Oscillator / Synchronization
+
+**Kuramoto 3D** — Coupled phase oscillators on a 3D lattice with Hebbian frequency adaptation:
+
+$$\dot\theta_i = \omega_i\Omega + \frac{K}{26}\sum_{j\in\mathcal{N}_{26}}\sin(\theta_j - \theta_i) + \eta_i, \qquad \dot\omega_i = \lambda R_i(\langle\omega\rangle_\mathcal{N} - \omega_i)$$
+
+---
+
+### Phase-Field / Materials
+
+**Crystal Growth (Kobayashi)** — Anisotropic phase-field with cubic harmonics on the interface normal:
+
+$$\partial_t \phi = \beta(\hat{n})^2\nabla^2\phi + 30\beta^2\phi(1-\phi)\!\left(\phi - \tfrac{1}{2} + \Delta + \tfrac{u}{2}\right)$$
+$$\partial_t u = D\nabla^2 u - \tfrac{1}{2}\partial_t\phi$$
+
+where $\beta(\hat{n}) = 1 + \varepsilon(n_x^4 + n_y^4 + n_z^4 - 3/5)$.
+
+**Cahn-Hilliard** — Spinodal decomposition via fourth-order diffusion of the chemical potential:
+
+$$\mu = c^3 - c + \alpha_{\text{asym}} - \varepsilon^2\nabla^2 c, \qquad \partial_t c = M\nabla^2\mu$$
+
+**Fracture** — Elastic wave propagation with irreversible integrity loss when $|\sigma| > \sigma_c(1 - 0.03 N_{\text{broken}})$.
+
+**Erosion** — Hydraulic erosion with gravity-driven fluid, shear-rate erosion, and velocity-dependent deposition.
+
+---
+
+### Fluid / Transport
+
+**Viscous Fingers (Saffman-Taylor)** — Pressure-driven invasion with viscosity-dependent mobility:
+
+$$p_{ijk} \leftarrow (1-\omega)p_{ijk} + \omega\frac{\sum_{\text{nn}}\bar\lambda\,p_{\text{nn}}}{\sum_{\text{nn}}\bar\lambda}$$
+
+$$\partial_t S = \lambda\xi\sum_{\text{nn}}\max(0, p_{\text{nn}} - p)(S_{\text{nn}} - S) + \gamma\nabla^2 S$$
+
+**Fire** — Combustion front with temperature diffusion, fuel consumption, oxygen transport, and rising embers.
+
+---
+
+### Astrophysics
+
+**Galaxy Formation** — Multi-scale self-gravity with semi-Lagrangian advection:
+
+$$\mathbf{F}_g = G\rho\!\left(\nabla\rho\big|_1 + \tfrac{1}{2}\nabla\rho\big|_2 + \tfrac{1}{4}\nabla\rho\big|_4\right)$$
+
+$$\partial_t\mathbf{v} = \mathbf{F}_g - P\nabla\rho/\rho + \tfrac{\nu}{2}\nabla^2\mathbf{v} + \Lambda\hat{\mathbf{r}}\cdot 0.01$$
+
+---
+
+### Chemistry
+
+**Element CA** — Particle-based system with all 118 elements, reaction rules, phase transitions, and electronegativity-driven bonding (separate shader and data file).
+
+---
+
 ## Screenshots
 
 *Coming soon — contributions welcome!*
@@ -106,107 +262,3 @@ Shaders that use large neighborhood radii (SmoothLife, Lenia) have an optimized 
 ## License
 
 MIT
-
-## Tools
-
-- `explorer.html` — interactive multi-state 1D CA explorer (zero dependencies)
-- `validator.html` — extended PRNG validation battery (15+ statistical tests)
-- `ca_lab.py` — shared continuous CA engine: 7 rule families, simulation, 10+ measurements, Wolfram classification, interestingness scoring
-- `phase_diagram.py` — 2D parameter sweeps, phase boundary detection, sweet spot finding, class/metric heatmaps
-- `continuous_ca.py` — bifurcation diagrams, attractor type analysis (fixed/periodic/quasiperiodic/chaotic), cell trajectories
-- `rule_space.py` — PCA of behavioral fingerprints, clustering, cross-family comparison, outlier detection
-- `coevolution.py` — open-ended evolution: cells carry state + genome defining local rule, fitness-driven competition, speciation tracking
-- `temporal_ca.py` — temporal-derivative CAs: each cell has state + velocity, 5 physics modes (spring/resonant/damped/threshold/wave)
-- `adaptive_neighborhood.py` — adaptive neighborhoods: radius = f(cell state), 4 radius modes, emergent domain formation
-- `causal_ca.py` — self-referential CAs: run CA → extract perturbation-based influence graph → run CA on graph → iterate
-- `chemical_ca.py` — multi-species chemistry: concentration vectors with Brusselator, Gray-Scott, autocatalytic RPS, random chemistry search
-- `async_ca.py` — asynchronous deterministic CAs: variable clock speed from energy, 4 energy modes, relativistic effects
-- `number_ca.py` — number-theoretic lattices: neighborhoods from divisors, prime offsets, shared factors, modular arithmetic, Collatz
-
-## Rule Families
-
-| Family | Parameters | Description |
-|--------|-----------|-------------|
-| `weighted_threshold` | weight, theta | Weighted neighbor average + hard threshold |
-| `logistic_coupling` | r, w | Logistic map with spatial coupling (chaos at r≈3.57) |
-| `gaussian_kernel` | mu, sigma | Gaussian response peaked at target neighbor average |
-| `reaction_diffusion` | D, R | Bistable reaction-diffusion with cubic reaction term |
-| `asymmetric_wave` | a, decay | Left-biased signal propagation with decay |
-| `fuzzy_totalistic` | birth, survive | Continuous analog of birth/survival rules |
-| `sin_interference` | freq, phase | Sinusoidal interference patterns |
-
-## Discoveries
-
-### Phase transitions in reaction-diffusion CAs
-The `reaction_diffusion` family has the richest phase structure of all 7 families:
-- **491 phase boundary points** at 30×30 resolution (900 parameter combinations)
-- All 4 Wolfram classes present: Fixed 40.9%, Periodic 23.3%, Chaotic 19.4%, **Complex 16.3%**
-- Clear diagonal boundary in (D, R) space — low diffusion + low reaction = chaotic, high diffusion = periodic/fixed, the complex class (edge of chaos) lives at the hinge
-- Top sweet spot: D≈0.48, R=5.0 — Complex class with entropy=0.422, Lyapunov=-0.070
-
-### Period-doubling cascade in logistic coupling
-The `logistic_coupling` family reproduces the classic period-doubling route to chaos:
-- Bifurcation diagram shows fixed → period-2 → period-4 → chaos as r increases
-- Edge of chaos confirmed at r≈3.57 (Lyapunov crosses zero)
-- 41 distinct behavioral clusters in PCA space
-
-### Families are genuinely different
-Cross-family PCA scatter shows each rule family occupies a distinct region of behavioral space:
-- `asymmetric_wave`: highest average entropy (0.903), consistently high structure
-- `logistic_coupling`: highest interestingness (0.634), richest bifurcation behavior
-- `weighted_threshold`: lowest activity (0.016), mostly dead/fixed
-- Gaps between family clusters indicate **unexplored behavioral regimes** — potential targets for novel rule design
-
-### Most unique rules discovered
-Behaviorally isolated rules (far from everything else in measurement space):
-- `gaussian_kernel(mu=0.00, sigma=0.21)` — nn_dist=0.756, Complex class
-- `logistic_coupling(r=2.50, w=1.00)` — nn_dist=0.548, Periodic
-- `logistic_coupling(r=3.40, w=1.00)` — nn_dist=0.541, Complex
-- `sin_interference(freq=0.50, phase=0.40)` — nn_dist=0.511, Complex
-
-### Coevolutionary rule ecology
-Open-ended evolution with cells carrying both state and a 4-parameter genome (weight, threshold, steepness, asymmetry):
-- `edge` fitness mode produces the richest ecologies (43 species at equilibrium)
-- Long runs show **423 speciation events** in 1000 steps, species count oscillating 34–106
-- Clear diversity-stability tradeoff: mutation rate 0.01→15 species, 0.50→88 species
-- Species count fluctuations suggest the system operates at self-organized criticality
-
-### Temporal-derivative CAs — wave physics from rate dependence
-Rules that depend on velocity (rate of change) rather than just current state:
-- **Spring physics** produces expanding pulse rings at ~0.38 cells/step with memory=6
-- **Threshold mode** shows energy AMPLIFICATION (9.4× initial energy) — counter-intuitive
-- **Damped mode** has longest temporal memory (41 steps autocorrelation)
-- **Wave mode** preserves ~25% of energy with ballistic propagation
-
-### Adaptive neighborhoods — emergent geometry
-Neighborhood radius determined by cell state creates self-reinforcing spatial structure:
-- **Bistable rule** creates strong domain formation: cells snap to 0 or 1 with clear gap boundaries
-- High-state cells have large radius (more influence) → domains self-reinforce
-- Domain formation completes in ~3 steps — extremely fast phase separation
-
-### Self-referential causal CAs
-Run CA → extract who-influences-whom → run CA on that influence graph → repeat:
-- Rule 30 influence graph: avg_degree=7.5, clustering=0.346, **71.8% long-range connections**
-- Graph structure measurably changes across iterations (clustering drifts 0.346→0.321)
-- Activity drops sharply on first graph iteration (0.491→0.063) — the causal structure acts as a filter
-
-### Multi-species chemical CAs
-Concentration vectors with explicit reaction kinetics:
-- **Brusselator**: settles to steady state (X=0.388, Y=4.056) in 1D
-- **Gray-Scott**: forms localized activator spot (U=0.891, V=0.045)
-- **Autocatalytic RPS**: all 3 species coexist with spatial concentration waves, near-perfect symmetry (A=0.307, B=0.319, C=0.323)
-
-### Asynchronous deterministic CAs
-Variable clock speed with no randomness — purely deterministic timing:
-- **Activity-driven energy** creates self-reinforcing fast zones: active regions gain energy, update more, stay active
-- **Conservative energy** produces energy waves — computation "sloshes" between regions
-- Critical recharge rate threshold: below it, system freezes; above it, synchronous behavior returns
-- At recharge=1.0, activity=0.473 (synchronous regime); at recharge=0.1, activity=0.001 (frozen)
-
-### Number-theoretic lattice CAs — CAs that discover primes
-Neighborhoods defined by number theory rather than spatial proximity:
-- **Factor neighborhoods achieve 0.4355 prime-composite separation** — the CA genuinely distinguishes primes from composites
-- Primes are isolated (few divisor-neighbors), highly composite numbers are hubs
-- Divisor correlation of −0.67 shows final state strongly anti-correlates with divisor count
-- Modular neighborhoods (mod 3): 0.088 separation; separation decreases with larger moduli
-- Collatz neighborhoods create unique tree-like topology encoding trajectory structure
