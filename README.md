@@ -257,7 +257,11 @@ $$\partial_t\mathbf{v} = \mathbf{F}_g - P\nabla\rho/\rho + \tfrac{\nu}{2}\nabla^
 
 ## Screenshots
 
-*Coming soon — contributions welcome!*
+| 64³ grid | 512³ grid |
+|----------|-----------|
+| ![3D Game of Life at 64³](screenshots/3d-ca-sim-voxel-3dgol-01.png) | ![3D Game of Life at 512³](screenshots/3d-ca-sim-voxel-3dgol-02.png) |
+
+*3D Game of Life (B6-7/S5-7) — voxel renderer with surface neighbor count coloring. 11.5M visible voxels at 512³.*
 
 ## License
 
