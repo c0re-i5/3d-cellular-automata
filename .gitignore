@@ -22,6 +22,9 @@ discoveries_backup.json
 .DS_Store
 Thumbs.db
 
+# Sandbox saves
+sandbox_save.npz
+
 # 1D CA exploration scripts (not part of the 3D simulator)
 ca_lab.py
 continuous_ca.py
@@ -36,6 +39,3 @@ number_ca.py
 temporal_ca.py
 explorer.html
 validator.html
-
-# Batch scripts
-batch_*.sh
