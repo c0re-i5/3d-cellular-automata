@@ -1511,8 +1511,60 @@ void main() {
 // u_param1 = epsilon² (interface energy / width control)
 // u_param2 = noise strength (thermal fluctuations)
 // u_param3 = asymmetry (shifts the double-well: favors one phase)
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec2 tile (c, μ); both Laplacians are
+// read from on-chip memory.
+
+#if USE_SHARED_MEM
+#define CHTILE 10
+#define CHTILE3 (CHTILE * CHTILE * CHTILE)
+shared vec2 s_ch[CHTILE3];
+int ch_idx(int x, int y, int z) {
+    return z * CHTILE * CHTILE + y * CHTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < CHTILE3; i += 512) {
+        int tz = i / (CHTILE * CHTILE);
+        int ty = (i / CHTILE) % CHTILE;
+        int tx = i % CHTILE;
+        s_ch[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 sc = s_ch[ch_idx(tp.x, tp.y, tp.z)];
+    float c = sc.r;
+    float mu = sc.g;
+
+    vec2 nxp = s_ch[ch_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec2 nxm = s_ch[ch_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec2 nyp = s_ch[ch_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec2 nym = s_ch[ch_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec2 nzp = s_ch[ch_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec2 nzm = s_ch[ch_idx(tp.x,     tp.y,     tp.z - 1)];
+
+    // Preserve exact FP-associativity grouping of the direct-fetch path
+    float lap_c = 0.0;
+    lap_c += nxp.r + nxm.r;
+    lap_c += nyp.r + nym.r;
+    lap_c += nzp.r + nzm.r;
+    lap_c = (lap_c - 6.0 * c) * h_sq;
+
+    float lap_mu = 0.0;
+    lap_mu += nxp.g + nxm.g;
+    lap_mu += nyp.g + nym.g;
+    lap_mu += nzp.g + nzm.g;
+    lap_mu = (lap_mu - 6.0 * mu) * h_sq;
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
@@ -1532,6 +1584,7 @@ void main() {
     lap_mu += fetch(pos + ivec3(0,1,0)).g + fetch(pos + ivec3(0,-1,0)).g;
     lap_mu += fetch(pos + ivec3(0,0,1)).g + fetch(pos + ivec3(0,0,-1)).g;
     lap_mu = (lap_mu - 6.0 * mu) * h_sq;
+#endif
 
     float mobility = u_param0;
     float eps2 = u_param1;
@@ -1567,11 +1620,57 @@ void main() {
 // u_param1 = deposition rate
 // u_param2 = fluid diffusion
 // u_param3 = gravity strength
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile — all 6 face neighbours are
+// read twice (once for fluid/sediment Laplacian, once for the gravity
+// flow + lateral-pressure pass) so the tile saves many imageLoads.
+
+#if USE_SHARED_MEM
+#define ERTILE 10
+#define ERTILE3 (ERTILE * ERTILE * ERTILE)
+shared vec4 s_er[ERTILE3];
+int er_idx(int x, int y, int z) {
+    return z * ERTILE * ERTILE + y * ERTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < ERTILE3; i += 512) {
+        int tz = i / (ERTILE * ERTILE);
+        int ty = (i / ERTILE) % ERTILE;
+        int tx = i % ERTILE;
+        s_er[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_er[er_idx(tp.x, tp.y, tp.z)];
+
+    vec4 nxp = s_er[er_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec4 nxm = s_er[er_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec4 nyp = s_er[er_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec4 nym = s_er[er_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec4 nzp = s_er[er_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec4 nzm = s_er[er_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+    // Fetch all 6 face neighbors
+    vec4 nxp = fetch(pos + ivec3( 1,0,0));
+    vec4 nxm = fetch(pos + ivec3(-1,0,0));
+    vec4 nyp = fetch(pos + ivec3(0, 1,0));
+    vec4 nym = fetch(pos + ivec3(0,-1,0));
+    vec4 nzp = fetch(pos + ivec3(0,0, 1));
+    vec4 nzm = fetch(pos + ivec3(0,0,-1));
+#endif
     float solid = self_data.r;
     float fluid = self_data.g;
     float sediment = self_data.b;
@@ -1580,14 +1679,6 @@ void main() {
     float deposition_rate = u_param1;
     float diffusion = u_param2;
     float gravity = u_param3;
-
-    // Fetch all 6 face neighbors
-    vec4 nxp = fetch(pos + ivec3( 1,0,0));
-    vec4 nxm = fetch(pos + ivec3(-1,0,0));
-    vec4 nyp = fetch(pos + ivec3(0, 1,0));
-    vec4 nym = fetch(pos + ivec3(0,-1,0));
-    vec4 nzp = fetch(pos + ivec3(0,0, 1));
-    vec4 nzm = fetch(pos + ivec3(0,0,-1));
 
     // Fluid Laplacian (lateral diffusion/spreading, resolution-independent)
     float lap_fluid = (nxp.g + nxm.g + nyp.g + nym.g + nzp.g + nzm.g - 6.0 * fluid) * h_sq;
@@ -1663,11 +1754,41 @@ void main() {
 // u_param1 = branch probability factor
 // u_param2 = nutrient consumption rate
 // u_param3 = nutrient diffusion
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile for the 26-neighbor Moore scan.
+
+#if USE_SHARED_MEM
+#define MYTILE 10
+#define MYTILE3 (MYTILE * MYTILE * MYTILE)
+shared vec4 s_my[MYTILE3];
+int my_idx(int x, int y, int z) {
+    return z * MYTILE * MYTILE + y * MYTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < MYTILE3; i += 512) {
+        int tz = i / (MYTILE * MYTILE);
+        int ty = (i / MYTILE) % MYTILE;
+        int tx = i % MYTILE;
+        s_my[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_my[my_idx(tp.x, tp.y, tp.z)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+#endif
     float biomass = self_data.r;
     float nutrient = self_data.g;
     float signal = self_data.b;
@@ -1686,7 +1807,11 @@ void main() {
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0 && dz == 0) continue;
+#if USE_SHARED_MEM
+        vec4 nb = s_my[my_idx(tp.x + dx, tp.y + dy, tp.z + dz)];
+#else
         vec4 nb = fetch(pos + ivec3(dx, dy, dz));
+#endif
         sum_bio += nb.r;
         sum_nut += nb.g;
         sum_sig += nb.b;
@@ -1761,11 +1886,55 @@ void main() {
 // u_param1 = damping in conductors
 // u_param2 = source frequency
 // u_param3 = source amplitude
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile; all six axial derivatives of
+// Ez, Bx, By come from on-chip memory.
+
+#if USE_SHARED_MEM
+#define EMTILE 10
+#define EMTILE3 (EMTILE * EMTILE * EMTILE)
+shared vec4 s_em[EMTILE3];
+int em_idx(int x, int y, int z) {
+    return z * EMTILE * EMTILE + y * EMTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < EMTILE3; i += 512) {
+        int tz = i / (EMTILE * EMTILE);
+        int ty = (i / EMTILE) % EMTILE;
+        int tx = i % EMTILE;
+        s_em[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_em[em_idx(tp.x, tp.y, tp.z)];
+
+    vec4 nxp = s_em[em_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec4 nxm = s_em[em_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec4 nyp = s_em[em_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec4 nym = s_em[em_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec4 nzp = s_em[em_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec4 nzm = s_em[em_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+#endif
     float Ez = self_data.r;
     float Bx = self_data.g;
     float By = self_data.b;
@@ -1778,18 +1947,18 @@ void main() {
 
     // Curl of B → updates E: dEz/dt = c²(dBy/dx - dBx/dy + dBy/dz - dBx/dz)
     // Scale derivatives by h_inv for resolution-independence
-    float dBy_dx = (fetch(pos + ivec3(1,0,0)).b - fetch(pos + ivec3(-1,0,0)).b) * 0.5 * h_inv;
-    float dBx_dy = (fetch(pos + ivec3(0,1,0)).g - fetch(pos + ivec3(0,-1,0)).g) * 0.5 * h_inv;
-    float dBy_dz = (fetch(pos + ivec3(0,0,1)).b - fetch(pos + ivec3(0,0,-1)).b) * 0.5 * h_inv;
-    float dBx_dz = (fetch(pos + ivec3(0,0,1)).g - fetch(pos + ivec3(0,0,-1)).g) * 0.5 * h_inv;
+    float dBy_dx = (nxp.b - nxm.b) * 0.5 * h_inv;
+    float dBx_dy = (nyp.g - nym.g) * 0.5 * h_inv;
+    float dBy_dz = (nzp.b - nzm.b) * 0.5 * h_inv;
+    float dBx_dz = (nzp.g - nzm.g) * 0.5 * h_inv;
 
     float new_Ez = Ez + c * c * (dBy_dx - dBx_dy + dBy_dz - dBx_dz) * u_dt;
 
     // Curl of E → updates B: dBx/dt = -dEz/dy + dEz/dz, dBy/dt = dEz/dx - dEz/dz
     // Scale derivatives by h_inv for resolution-independence
-    float dEz_dx = (fetch(pos + ivec3(1,0,0)).r - fetch(pos + ivec3(-1,0,0)).r) * 0.5 * h_inv;
-    float dEz_dy = (fetch(pos + ivec3(0,1,0)).r - fetch(pos + ivec3(0,-1,0)).r) * 0.5 * h_inv;
-    float dEz_dz = (fetch(pos + ivec3(0,0,1)).r - fetch(pos + ivec3(0,0,-1)).r) * 0.5 * h_inv;
+    float dEz_dx = (nxp.r - nxm.r) * 0.5 * h_inv;
+    float dEz_dy = (nyp.r - nym.r) * 0.5 * h_inv;
+    float dEz_dz = (nzp.r - nzm.r) * 0.5 * h_inv;
 
     float new_Bx = Bx - dEz_dy * u_dt + dEz_dz * u_dt;
     float new_By = By + dEz_dx * u_dt - dEz_dz * u_dt;
@@ -1830,11 +1999,43 @@ void main() {
 // u_param1 = viscosity ratio (M = μ_defending / μ_invading)
 // u_param2 = noise (porous medium heterogeneity)
 // u_param3 = surface tension (stabilizes/smooths fingers)
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile — two separate 6-face passes
+// (pressure-mobility relaxation and saturation advection) both pull
+// the same neighbours, so the tile is reused heavily.
+
+#if USE_SHARED_MEM
+#define VFTILE 10
+#define VFTILE3 (VFTILE * VFTILE * VFTILE)
+shared vec4 s_vf[VFTILE3];
+int vf_idx(int x, int y, int z) {
+    return z * VFTILE * VFTILE + y * VFTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < VFTILE3; i += 512) {
+        int tz = i / (VFTILE * VFTILE);
+        int ty = (i / VFTILE) % VFTILE;
+        int tx = i % VFTILE;
+        s_vf[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_vf[vf_idx(tp.x, tp.y, tp.z)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+#endif
     float sat = self_data.r;       // invader saturation
     float pressure = self_data.g;
     float perm = self_data.b;      // local permeability [0,1]
@@ -1859,7 +2060,11 @@ void main() {
         ivec3 off = ivec3(0);
         int axis = i / 2; int dir = (i % 2) * 2 - 1;
         off[axis] = dir;
+#if USE_SHARED_MEM
+        vec4 nb = s_vf[vf_idx(tp.x + off.x, tp.y + off.y, tp.z + off.z)];
+#else
         vec4 nb = fetch(pos + off);
+#endif
         float nb_sat = nb.r;
         float nb_perm = nb.b;
         float nb_mob = nb_perm / max(mix(visc_ratio, 1.0, nb_sat), 0.01);
@@ -1881,7 +2086,11 @@ void main() {
         ivec3 off = ivec3(0);
         int axis = i / 2; int dir = (i % 2) * 2 - 1;
         off[axis] = dir;
+#if USE_SHARED_MEM
+        vec4 nb = s_vf[vf_idx(tp.x + off.x, tp.y + off.y, tp.z + off.z)];
+#else
         vec4 nb = fetch(pos + off);
+#endif
         lap_sat += nb.r;
         // Upwind: fluid moves from high to low pressure
         float dp = nb.g - pressure;
@@ -1945,11 +2154,57 @@ void main() {
 // u_param1 = heat output (combustion energy)
 // u_param2 = heat diffusion
 // u_param3 = wind strength (upward bias + some lateral)
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile: temp and oxygen Laplacians
+// plus the wind-advection read (y±1) all come from the tile. The ember
+// +Y neighbour read is also on the tile.
+
+#if USE_SHARED_MEM
+#define FRTILE 10
+#define FRTILE3 (FRTILE * FRTILE * FRTILE)
+shared vec4 s_fr[FRTILE3];
+int fr_idx(int x, int y, int z) {
+    return z * FRTILE * FRTILE + y * FRTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < FRTILE3; i += 512) {
+        int tz = i / (FRTILE * FRTILE);
+        int ty = (i / FRTILE) % FRTILE;
+        int tx = i % FRTILE;
+        s_fr[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_fr[fr_idx(tp.x, tp.y, tp.z)];
+
+    // Pre-fetch the 6 face neighbours from the tile
+    vec4 nxp = s_fr[fr_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec4 nxm = s_fr[fr_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec4 nyp = s_fr[fr_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec4 nym = s_fr[fr_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec4 nzp = s_fr[fr_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec4 nzm = s_fr[fr_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+#endif
     float fuel = self_data.r;
     float temp = self_data.g;
     float oxygen = self_data.b;
@@ -1961,24 +2216,14 @@ void main() {
     float wind = u_param3;
 
     // Temperature Laplacian (heat diffusion)
-    float lap_temp = 0.0;
-    lap_temp += fetch(pos + ivec3(1,0,0)).g + fetch(pos + ivec3(-1,0,0)).g;
-    lap_temp += fetch(pos + ivec3(0,1,0)).g + fetch(pos + ivec3(0,-1,0)).g;
-    lap_temp += fetch(pos + ivec3(0,0,1)).g + fetch(pos + ivec3(0,0,-1)).g;
-    lap_temp -= 6.0 * temp;
-    lap_temp *= h_sq;  // resolution-independent
+    float lap_temp = (nxp.g + nxm.g + nyp.g + nym.g + nzp.g + nzm.g - 6.0 * temp) * h_sq;
 
     // Oxygen Laplacian
-    float lap_oxy = 0.0;
-    lap_oxy += fetch(pos + ivec3(1,0,0)).b + fetch(pos + ivec3(-1,0,0)).b;
-    lap_oxy += fetch(pos + ivec3(0,1,0)).b + fetch(pos + ivec3(0,-1,0)).b;
-    lap_oxy += fetch(pos + ivec3(0,0,1)).b + fetch(pos + ivec3(0,0,-1)).b;
-    lap_oxy -= 6.0 * oxygen;
-    lap_oxy *= h_sq;  // resolution-independent
+    float lap_oxy = (nxp.b + nxm.b + nyp.b + nym.b + nzp.b + nzm.b - 6.0 * oxygen) * h_sq;
 
     // Wind: bias heat transport upward (+Y) and slight lateral
-    float heat_below = fetch(pos + ivec3(0,-1,0)).g;
-    float heat_above = fetch(pos + ivec3(0, 1,0)).g;
+    float heat_below = nym.g;
+    float heat_above = nyp.g;
     float wind_advect = wind * (heat_below - heat_above) * 0.5;
 
     float new_fuel = fuel;
@@ -1999,7 +2244,7 @@ void main() {
     }
 
     // Ember transport (rises and cools)
-    float ember_below = fetch(pos + ivec3(0,-1,0)).a;
+    float ember_below = nym.a;
     new_ember = max(new_ember, ember_below * 0.8);  // embers rise
     new_ember -= 0.05 * u_dt;  // cool/fade
     // Embers can ignite fuel
@@ -2037,11 +2282,56 @@ void main() {
 // u_param1 = turn strength (chemotaxis response)
 // u_param2 = trail decay rate
 // u_param3 = trail diffusion
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile for the 6 axial reads used by
+// trail/agent Laplacians and trail+food gradients. fetch_interp for the
+// semi-Lagrangian back-trace stays off-tile (stepsize > 1 voxel).
+
+#if USE_SHARED_MEM
+#define PHTILE 10
+#define PHTILE3 (PHTILE * PHTILE * PHTILE)
+shared vec4 s_ph[PHTILE3];
+int ph_idx(int x, int y, int z) {
+    return z * PHTILE * PHTILE + y * PHTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < PHTILE3; i += 512) {
+        int tz = i / (PHTILE * PHTILE);
+        int ty = (i / PHTILE) % PHTILE;
+        int tx = i % PHTILE;
+        s_ph[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_ph[ph_idx(tp.x, tp.y, tp.z)];
+
+    vec4 nxp = s_ph[ph_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec4 nxm = s_ph[ph_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec4 nyp = s_ph[ph_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec4 nym = s_ph[ph_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec4 nzp = s_ph[ph_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec4 nzm = s_ph[ph_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+#endif
     float trail = self_data.r;
     float agents = self_data.g;
     float food = self_data.b;
@@ -2051,31 +2341,31 @@ void main() {
     float decay = u_param2;
     float diffusion = u_param3;
 
-    // Trail Laplacian (diffusion)
+    // Trail Laplacian (diffusion) — preserve pairwise grouping for FP assoc.
     float lap_trail = 0.0;
-    lap_trail += fetch(pos + ivec3(1,0,0)).r + fetch(pos + ivec3(-1,0,0)).r;
-    lap_trail += fetch(pos + ivec3(0,1,0)).r + fetch(pos + ivec3(0,-1,0)).r;
-    lap_trail += fetch(pos + ivec3(0,0,1)).r + fetch(pos + ivec3(0,0,-1)).r;
+    lap_trail += nxp.r + nxm.r;
+    lap_trail += nyp.r + nym.r;
+    lap_trail += nzp.r + nzm.r;
     lap_trail -= 6.0 * trail;
     lap_trail *= h_sq;  // resolution-independent
 
     // Agent density Laplacian (agents diffuse/move)
     float lap_agents = 0.0;
-    lap_agents += fetch(pos + ivec3(1,0,0)).g + fetch(pos + ivec3(-1,0,0)).g;
-    lap_agents += fetch(pos + ivec3(0,1,0)).g + fetch(pos + ivec3(0,-1,0)).g;
-    lap_agents += fetch(pos + ivec3(0,0,1)).g + fetch(pos + ivec3(0,0,-1)).g;
+    lap_agents += nxp.g + nxm.g;
+    lap_agents += nyp.g + nym.g;
+    lap_agents += nzp.g + nzm.g;
     lap_agents -= 6.0 * agents;
     lap_agents *= h_sq;  // resolution-independent
 
     // Trail gradient (agents move toward strongest trail, scaled by h_inv)
-    float gx = (fetch(pos + ivec3(1,0,0)).r - fetch(pos + ivec3(-1,0,0)).r) * 0.5 * h_inv;
-    float gy = (fetch(pos + ivec3(0,1,0)).r - fetch(pos + ivec3(0,-1,0)).r) * 0.5 * h_inv;
-    float gz = (fetch(pos + ivec3(0,0,1)).r - fetch(pos + ivec3(0,0,-1)).r) * 0.5 * h_inv;
+    float gx = (nxp.r - nxm.r) * 0.5 * h_inv;
+    float gy = (nyp.r - nym.r) * 0.5 * h_inv;
+    float gz = (nzp.r - nzm.r) * 0.5 * h_inv;
 
     // Also sense food
-    float fx = (fetch(pos + ivec3(1,0,0)).b - fetch(pos + ivec3(-1,0,0)).b) * 0.5 * h_inv;
-    float fy = (fetch(pos + ivec3(0,1,0)).b - fetch(pos + ivec3(0,-1,0)).b) * 0.5 * h_inv;
-    float fz = (fetch(pos + ivec3(0,0,1)).b - fetch(pos + ivec3(0,0,-1)).b) * 0.5 * h_inv;
+    float fx = (nxp.b - nxm.b) * 0.5 * h_inv;
+    float fy = (nyp.b - nym.b) * 0.5 * h_inv;
+    float fz = (nzp.b - nzm.b) * 0.5 * h_inv;
 
     // Combined chemotactic gradient (trail + food attraction)
     float tot_gx = gx + fx * 2.0;
@@ -2126,11 +2416,42 @@ void main() {
 // u_param1 = fracture threshold
 // u_param2 = stress diffusion
 // u_param3 = initial stress intensity
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile for both the face Laplacians
+// (disp, stress) and the 26-neighbor broken-neighbor count.
+
+#if USE_SHARED_MEM
+#define FCTILE 10
+#define FCTILE3 (FCTILE * FCTILE * FCTILE)
+shared vec4 s_fc[FCTILE3];
+int fc_idx(int x, int y, int z) {
+    return z * FCTILE * FCTILE + y * FCTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < FCTILE3; i += 512) {
+        int tz = i / (FCTILE * FCTILE);
+        int ty = (i / FCTILE) % FCTILE;
+        int tx = i % FCTILE;
+        s_fc[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_fc[fc_idx(tp.x, tp.y, tp.z)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+#endif
     float disp = self_data.r;
     float stress = self_data.g;
     float integrity = self_data.b;
@@ -2141,19 +2462,31 @@ void main() {
     float diffusion = u_param2;
     float intensity = u_param3;
 
-    // Displacement Laplacian (elastic wave equation)
+    // Displacement Laplacian (elastic wave equation) — preserve pairwise grouping
     float lap_disp = 0.0;
+#if USE_SHARED_MEM
+    lap_disp += s_fc[fc_idx(tp.x+1, tp.y,   tp.z  )].r + s_fc[fc_idx(tp.x-1, tp.y,   tp.z  )].r;
+    lap_disp += s_fc[fc_idx(tp.x,   tp.y+1, tp.z  )].r + s_fc[fc_idx(tp.x,   tp.y-1, tp.z  )].r;
+    lap_disp += s_fc[fc_idx(tp.x,   tp.y,   tp.z+1)].r + s_fc[fc_idx(tp.x,   tp.y,   tp.z-1)].r;
+#else
     lap_disp += fetch(pos + ivec3(1,0,0)).r + fetch(pos + ivec3(-1,0,0)).r;
     lap_disp += fetch(pos + ivec3(0,1,0)).r + fetch(pos + ivec3(0,-1,0)).r;
     lap_disp += fetch(pos + ivec3(0,0,1)).r + fetch(pos + ivec3(0,0,-1)).r;
+#endif
     lap_disp -= 6.0 * disp;
     lap_disp *= h_sq;  // resolution-independent
 
     // Stress Laplacian (stress diffusion / redistribution)
     float lap_stress = 0.0;
+#if USE_SHARED_MEM
+    lap_stress += s_fc[fc_idx(tp.x+1, tp.y,   tp.z  )].g + s_fc[fc_idx(tp.x-1, tp.y,   tp.z  )].g;
+    lap_stress += s_fc[fc_idx(tp.x,   tp.y+1, tp.z  )].g + s_fc[fc_idx(tp.x,   tp.y-1, tp.z  )].g;
+    lap_stress += s_fc[fc_idx(tp.x,   tp.y,   tp.z+1)].g + s_fc[fc_idx(tp.x,   tp.y,   tp.z-1)].g;
+#else
     lap_stress += fetch(pos + ivec3(1,0,0)).g + fetch(pos + ivec3(-1,0,0)).g;
     lap_stress += fetch(pos + ivec3(0,1,0)).g + fetch(pos + ivec3(0,-1,0)).g;
     lap_stress += fetch(pos + ivec3(0,0,1)).g + fetch(pos + ivec3(0,0,-1)).g;
+#endif
     lap_stress -= 6.0 * stress;
     lap_stress *= h_sq;  // resolution-independent
 
@@ -2163,7 +2496,11 @@ void main() {
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0 && dz == 0) continue;
+#if USE_SHARED_MEM
+        float nb_int = s_fc[fc_idx(tp.x + dx, tp.y + dy, tp.z + dz)].b;
+#else
         float nb_int = fetch(pos + ivec3(dx, dy, dz)).b;
+#endif
         if (nb_int < 0.5) broken_neighbors += 1.0;
     }
 
@@ -2317,11 +2654,42 @@ void main() {
 // u_param1 = competition strength
 // u_param2 = resource regeneration rate
 // u_param3 = diffusion (spread rate)
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile — all four channels are
+// Laplacian-averaged so the full vec4 is the natural unit.
+
+#if USE_SHARED_MEM
+#define LCTILE 10
+#define LCTILE3 (LCTILE * LCTILE * LCTILE)
+shared vec4 s_lc[LCTILE3];
+int lc_idx(int x, int y, int z) {
+    return z * LCTILE * LCTILE + y * LCTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < LCTILE3; i += 512) {
+        int tz = i / (LCTILE * LCTILE);
+        int ty = (i / LCTILE) % LCTILE;
+        int tx = i % LCTILE;
+        s_lc[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_data = s_lc[lc_idx(tp.x, tp.y, tp.z)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
+#endif
     float a = self_data.r;  // species A (pioneer)
     float b = self_data.g;  // species B (competitor)
     float res = self_data.b;
@@ -2338,7 +2706,11 @@ void main() {
         ivec3 off = ivec3(0);
         int axis = i / 2; int dir = (i % 2) * 2 - 1;
         off[axis] = dir;
+#if USE_SHARED_MEM
+        vec4 nb = s_lc[lc_idx(tp.x + off.x, tp.y + off.y, tp.z + off.z)];
+#else
         vec4 nb = fetch(pos + off);
+#endif
         lap_a += nb.r; lap_b += nb.g; lap_r += nb.b; lap_c += nb.a;
     }
     lap_a -= 6.0 * a; lap_b -= 6.0 * b; lap_r -= 6.0 * res; lap_c -= 6.0 * c;
