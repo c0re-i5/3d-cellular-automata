@@ -373,6 +373,11 @@ void main() {
 //   du/dt = v
 // Integration: symplectic Euler (update v first, then u with new v)
 //
+// Stability (CFL): explicit 3D wave eq. requires  c * u_dt * h_inv <= 1/sqrt(3).
+// With the default h_inv = size/REF_SIZE (REF_SIZE=128) and u_dt ≈ 0.5, the
+// rule is stable for c <~ 0.58 / h_inv. The preset uses c=0.5 which is safely
+// inside this bound at all supported grid sizes; higher c values will ring.
+//
 // Two code paths: USE_SHARED_MEM=1 cooperatively loads a 10^3 tile
 // (8^3 core + 1-voxel halo) into shared memory so the 7 stencil reads
 // per cell come from on-chip memory instead of 7 imageLoad ops.
@@ -870,8 +875,12 @@ void main() {
     float new_phase = fract(phase + d_phase);  // wrap to [0, 1)
 
     // Frequency adaptation: when neighbors are coherent, pull ω toward <ω_j>
-    // Creates chimera states — some clusters synchronize, others drift freely
+    // Creates chimera states — some clusters synchronize, others drift freely.
+    // Clamp natural frequency to a bounded range: the adaptation law is linear
+    // and coherence-gated but parameter extremes + long runs can drift nat_freq
+    // far outside the texture’s usable range, producing aliased phase updates.
     float new_freq = nat_freq + adaptation * coherence * (mean_freq - nat_freq) * u_dt;
+    new_freq = clamp(new_freq, -2.0, 2.0);
 
     imageStore(u_dst, pos, vec4(new_phase, new_freq, coherence, 0.0));
 }
