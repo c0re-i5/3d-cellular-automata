@@ -2948,72 +2948,49 @@ void main() {
 }
 """
 
-# ── Occupancy bitmap compute shader ──────────────────────────────────
-# Generates a coarse 3D grid where each texel = 1 if ANY voxel in its
-# BLOCK_SIZE³ region is above threshold, 0 otherwise.
-# Dispatched once per sim step (after compute, before render).
-OCCUPANCY_BUILD_SHADER = """
+# (The previous OCCUPANCY_BUILD_SHADER and MINMAX_BUILD_SHADER were
+# replaced by the fused ACCEL_FUSED_SHADER below — they performed two
+# separate full passes over the source texture for what is now a
+# single-pass dispatch.)
+
+# ── Fused occupancy + min/max compute shader ─────────────────────────
+# A single pass over each BLOCK_SIZE³ region that writes BOTH the
+# occupancy bitmap (R8UI) and the min/max mipmap (RG16F).
+#
+# The two prior shaders had identical traversal (4³ scan, same channel,
+# same abs flag) and read every voxel of the source texture. Fusing
+# them halves the texture-fetch traffic for the acceleration build,
+# eliminates one compute dispatch + memory barrier per frame, and
+# keeps a single threshold uniform path. Logic is unchanged — the
+# occupancy bit is still `any(v > threshold)` over the block and the
+# mipmap is still `(min, max)` of the same value.
+ACCEL_FUSED_SHADER = """
 #version 430
 layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
 
 uniform sampler3D u_volume;
 uniform int u_size;          // full grid dimension
-uniform int u_block_size;    // block edge length (e.g. 4 or 8)
-uniform int u_channel;       // which channel to test
+uniform int u_block_size;    // block edge length (e.g. 4)
+uniform int u_channel;       // which channel to sample
 uniform int u_use_abs;       // 1 = abs(value)
-uniform float u_threshold;   // alive threshold
+uniform float u_threshold;   // alive threshold for occupancy
 
 layout(r8ui, binding=0) writeonly uniform uimage3D u_occupancy;
+layout(rg16f, binding=1) writeonly uniform image3D u_minmax;
 
 void main() {
     ivec3 block = ivec3(gl_GlobalInvocationID);
     int occ_size = (u_size + u_block_size - 1) / u_block_size;
     if (any(greaterThanEqual(block, ivec3(occ_size)))) return;
 
-    // Scan all voxels in this block for any alive cell
     ivec3 base = block * u_block_size;
     bool found = false;
+    float lo =  1e10;
+    float hi = -1e10;
 
-    for (int dz = 0; dz < u_block_size && !found; dz++) {
-        for (int dy = 0; dy < u_block_size && !found; dy++) {
-            for (int dx = 0; dx < u_block_size && !found; dx++) {
-                ivec3 pos = base + ivec3(dx, dy, dz);
-                if (any(greaterThanEqual(pos, ivec3(u_size)))) continue;
-                vec4 c = texelFetch(u_volume, pos, 0);
-                float v = c[u_channel];
-                if (u_use_abs == 1) v = abs(v);
-                if (v > u_threshold) found = true;
-            }
-        }
-    }
-
-    imageStore(u_occupancy, block, uvec4(found ? 1u : 0u, 0u, 0u, 0u));
-}
-"""
-
-# ── Min/Max mipmap compute shader ────────────────────────────────────
-# Generates a coarse 3D grid where each texel stores (min, max) of the
-# visualization channel over a 4³ block. Used for adaptive ray stepping.
-MINMAX_BUILD_SHADER = """
-#version 430
-layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
-
-uniform sampler3D u_volume;
-uniform int u_size;          // full grid dimension
-uniform int u_block_size;    // block edge length (typically 4)
-uniform int u_channel;
-uniform int u_use_abs;
-
-layout(rg16f, binding=0) writeonly uniform image3D u_minmax;
-
-void main() {
-    ivec3 block = ivec3(gl_GlobalInvocationID);
-    int mm_size = (u_size + u_block_size - 1) / u_block_size;
-    if (any(greaterThanEqual(block, ivec3(mm_size)))) return;
-
-    ivec3 base = block * u_block_size;
-    float lo = 1e10, hi = -1e10;
-
+    // Single read pass — accumulate min/max AND test occupancy threshold.
+    // Loop bounds are constant per dispatch so the unroll is friendly to
+    // every driver we target (NVK/Mesa, NVIDIA proprietary, AMDVLK).
     for (int dz = 0; dz < u_block_size; dz++) {
         for (int dy = 0; dy < u_block_size; dy++) {
             for (int dx = 0; dx < u_block_size; dx++) {
@@ -3022,13 +2999,15 @@ void main() {
                 vec4 c = texelFetch(u_volume, pos, 0);
                 float v = c[u_channel];
                 if (u_use_abs == 1) v = abs(v);
+                if (v > u_threshold) found = true;
                 lo = min(lo, v);
                 hi = max(hi, v);
             }
         }
     }
 
-    imageStore(u_minmax, block, vec4(lo, hi, 0.0, 0.0));
+    imageStore(u_occupancy, block, uvec4(found ? 1u : 0u, 0u, 0u, 0u));
+    imageStore(u_minmax,    block, vec4(lo, hi, 0.0, 0.0));
 }
 """
 
@@ -6417,9 +6396,11 @@ class Simulator:
         self._compute_ray_prog = self.ctx.compute_shader(COMPUTE_RAYMARCH_SHADER)
         self._init_compute_ray_uniforms()
 
-        # Compile occupancy + minmax build shaders
-        self._occ_prog = self.ctx.compute_shader(OCCUPANCY_BUILD_SHADER)
-        self._mm_prog = self.ctx.compute_shader(MINMAX_BUILD_SHADER)
+        # Compile fused occupancy + minmax build shader.
+        # The two used to be separate dispatches that each did a full pass
+        # over the source texture; they're now a single shader that writes
+        # both outputs from one read pass.
+        self._accel_prog = self.ctx.compute_shader(ACCEL_FUSED_SHADER)
 
         # Acceleration texture state
         self._occ_block_size = 4  # each occupancy block = 4³ voxels
@@ -6623,25 +6604,19 @@ class Simulator:
 
         src_tex.use(location=0)
 
-        # ── Occupancy ──
+        # ── Fused occupancy + min/max ──
+        # Both output images are bound; the shader writes them in a single
+        # pass over the source texture (one fetch per voxel instead of two).
         self._occ_tex.bind_to_image(0, read=False, write=True)
-        self._occ_prog['u_volume'].value = 0
-        self._occ_prog['u_size'].value = size
-        self._occ_prog['u_block_size'].value = bs
-        self._occ_prog['u_channel'].value = channel
-        self._occ_prog['u_use_abs'].value = use_abs
-        self._occ_prog['u_threshold'].value = threshold
+        self._mm_tex.bind_to_image(1, read=False, write=True)
+        self._accel_prog['u_volume'].value = 0
+        self._accel_prog['u_size'].value = size
+        self._accel_prog['u_block_size'].value = bs
+        self._accel_prog['u_channel'].value = channel
+        self._accel_prog['u_use_abs'].value = use_abs
+        self._accel_prog['u_threshold'].value = threshold
         groups = (occ_dim + 3) // 4
-        self._occ_prog.run(groups, groups, groups)
-
-        # ── Min/Max mipmap ──
-        self._mm_tex.bind_to_image(0, read=False, write=True)
-        self._mm_prog['u_volume'].value = 0
-        self._mm_prog['u_size'].value = size
-        self._mm_prog['u_block_size'].value = bs
-        self._mm_prog['u_channel'].value = channel
-        self._mm_prog['u_use_abs'].value = use_abs
-        self._mm_prog.run(groups, groups, groups)
+        self._accel_prog.run(groups, groups, groups)
 
         GL.glMemoryBarrier(GL.GL_TEXTURE_FETCH_BARRIER_BIT |
                            GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
@@ -9121,8 +9096,7 @@ class Simulator:
             '_metrics_prog',         # GPU metrics reduction
             '_indirect_reset_prog',  # indirect-draw counter reset
             '_compute_ray_prog',     # compute-shader raymarcher
-            '_occ_prog',             # occupancy bitmap builder
-            '_mm_prog',              # min/max mipmap builder
+            '_accel_prog',           # fused occupancy + min/max builder
             '_upsample_prog',        # half-res upsample fragment program
 
             # ── Buffers (SSBOs, VBOs, indirect, staging) ──
