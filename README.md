@@ -28,7 +28,10 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 - **6 colormaps** — Fire, Cool, Grayscale, Neon, Discrete, Spectral — with semantic legends per rule
 - **Multi-channel visualization** — select which field to display (e.g., prey vs predator, real vs imaginary)
 - **Half-resolution mode** — 2–4× faster volumetric rendering with catmull-rom upsampling
-- **Compute raymarcher** — optional shared memory cached ray marching shader
+- **Compute raymarcher** — optional shared-memory cached ray-marching shader with occupancy-grid brick DDA (matches fragment path)
+- **Adaptive brick DDA** — occupancy grid block edge is 4³ (small grids) or 8³ (≥192³) for fewer DDA steps and lower cache pressure
+- **R16F view texture** — channel-select and abs are baked into a single half-precision texture; ray-marcher reads 2 B/voxel instead of 16 B, halving ray-march bandwidth at large grid sizes
+- **Idle-frame blit cache** — when camera, simulation state, and render knobs are all unchanged, the previous frame is re-displayed via a GPU framebuffer blit (~0.3 ms) instead of re-marching rays (5–30 ms at 512³)
 
 ### Recording
 - **MP4 video capture** at 2560×1440 60fps via ffmpeg (H.264)
@@ -36,6 +39,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 - **JSON metadata sidecar** — full parameter snapshot alongside each recording
 - **Background writer thread** — 30-frame queue to avoid blocking the main loop
 - **Blinking REC indicator** in the UI during capture
+- **Opt-in only** — recording requires `CA_RECORDING_ENABLED=1` in the environment; F5 is a no-op without it
 
 ### Discovery System
 - **Save discoveries** — store interesting parameter sets with interestingness score and metrics
@@ -47,11 +51,6 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 ### Automated Search
 - **Headless test harness** (`test_harness.py`) — GPU parameter sweeps without a visible window
 - **Interestingness scoring** — composite metric from alive ratio, activity, surface complexity
-- **Batch search scripts** — parallel multi-rule discovery with configurable trials, steps, and GPU concurrency:
-  - `batch_search.sh` — basic parallel search across rules
-  - `batch_elegance.sh` — targets oscillators, gliders, and symmetric structures
-  - `batch_mega.sh` — diversity-aware search with novelty bonus and quality filtering
-  - `batch_ordered.sh` — grouped discovery generation ordered by rule
 
 ### Interactive UI
 - **ImGui control panel** — rule selector, parameter sliders, time step, playback controls
@@ -132,9 +131,13 @@ python simulator.py                          # default (64³ Game of Life)
 python simulator.py --size 128               # custom grid size
 python simulator.py --rule gray_scott        # specific rule preset
 python simulator.py --discovery discoveries.json --discovery-index 5  # load saved discovery
+
+# Enable video recording (opt-in; requires ffmpeg on PATH)
+export CA_RECORDING_ENABLED=1
+python simulator.py
 ```
 
-### Headless Testing & Batch Search
+### Headless Testing
 
 The test harness runs GPU parameter sweeps without a window, scoring each trial by interestingness:
 
@@ -142,29 +145,15 @@ The test harness runs GPU parameter sweeps without a window, scoring each trial 
 python test_harness.py                       # single headless run
 ```
 
-For large-scale discovery searches, use the batch scripts:
-
-```bash
-bash batch_search.sh       # parallel search across all rules
-bash batch_ordered.sh      # grouped results ordered by rule
-bash batch_mega.sh         # diversity-aware search with novelty bonus
-bash batch_elegance.sh     # targets oscillators, gliders, symmetry
-```
-
-Each script runs multiple GPU processes in parallel, sweeps random parameters per rule, and merges results into `discoveries.json`. Tune `MAX_JOBS` for your GPU memory.
-
 ## Architecture
 
 ```
-simulator.py         — Main simulator: GLSL shaders, rendering, UI (~8800 lines)
+simulator.py         — Main simulator: GLSL shaders, rendering, UI (~10 300 lines)
 element_data.py      — Periodic table data for the Element Chemistry rule
 test_harness.py      — Headless parameter sweep and discovery engine
-discoveries.json     — Saved interesting parameter configurations
-batch_search.sh      — Parallel multi-rule discovery search
-batch_elegance.sh    — Elegance-targeted search (oscillators, symmetry)
-batch_mega.sh        — Diversity-aware search with novelty bonus
-batch_ordered.sh     — Ordered discovery generation grouped by rule
 ```
+
+> `discoveries.json` and the batch search scripts are personal workflow tooling and are gitignored; they are not part of the repository.
 
 All 26 compute shaders are embedded in `simulator.py` as GLSL source strings, compiled at runtime via moderngl. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
 

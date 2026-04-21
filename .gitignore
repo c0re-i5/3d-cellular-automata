@@ -15,8 +15,18 @@ imgui.ini
 # Recordings (large media files)
 recordings/
 
-# Discoveries backup
+# Discoveries — generated at runtime, not committed
+discoveries.json
+discoveries.json.lock
 discoveries_backup.json
+
+# Batch search / discovery scripts (personal workflow tooling)
+batch_ordered.sh
+batch_mega.sh
+batch_merge.py
+batch_search.sh
+batch_elegance.sh
+logs/
 
 # OS
 .DS_Store

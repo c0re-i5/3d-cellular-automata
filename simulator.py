@@ -3822,22 +3822,20 @@ void main() {
 # A single pass over each BLOCK_SIZE³ region that writes BOTH the
 # occupancy bitmap (R8UI) and the min/max mipmap (RG16F).
 #
-# The two prior shaders had identical traversal (4³ scan, same channel,
-# same abs flag) and read every voxel of the source texture. Fusing
-# them halves the texture-fetch traffic for the acceleration build,
-# eliminates one compute dispatch + memory barrier per frame, and
-# keeps a single threshold uniform path. Logic is unchanged — the
-# occupancy bit is still `any(v > threshold)` over the block and the
-# mipmap is still `(min, max)` of the same value.
+# Source is the R16F view texture (channel-select + abs already baked
+# in by VIEW_TEX_BUILD_SHADER). This reads 1/8th the bytes of the
+# previous RGBA32F direct-read formulation:
+#   512³ voxels × 2 B  =  256 MB   (vs 2 GB for RGBA32F)
+# so the full accel rebuild (view + occupancy + minmax) costs
+# 2 GB + 256 MB instead of the prior 2 × 2 GB. Roughly halves the
+# per-sim-step accel bandwidth at large grids.
 ACCEL_FUSED_SHADER = """
 #version 430
 layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
 
-uniform sampler3D u_volume;
+uniform sampler3D u_view;    // R16F (channel/abs already applied)
 uniform int u_size;          // full grid dimension
-uniform int u_block_size;    // block edge length (e.g. 4)
-uniform int u_channel;       // which channel to sample
-uniform int u_use_abs;       // 1 = abs(value)
+uniform int u_block_size;    // block edge length (e.g. 4 or 8)
 uniform float u_threshold;   // alive threshold for occupancy
 
 layout(r8ui, binding=0) writeonly uniform uimage3D u_occupancy;
@@ -3853,17 +3851,12 @@ void main() {
     float lo =  1e10;
     float hi = -1e10;
 
-    // Single read pass — accumulate min/max AND test occupancy threshold.
-    // Loop bounds are constant per dispatch so the unroll is friendly to
-    // every driver we target (NVK/Mesa, NVIDIA proprietary, AMDVLK).
     for (int dz = 0; dz < u_block_size; dz++) {
         for (int dy = 0; dy < u_block_size; dy++) {
             for (int dx = 0; dx < u_block_size; dx++) {
                 ivec3 pos = base + ivec3(dx, dy, dz);
                 if (any(greaterThanEqual(pos, ivec3(u_size)))) continue;
-                vec4 c = texelFetch(u_volume, pos, 0);
-                float v = c[u_channel];
-                if (u_use_abs == 1) v = abs(v);
+                float v = texelFetch(u_view, pos, 0).r;
                 if (v > u_threshold) found = true;
                 lo = min(lo, v);
                 hi = max(hi, v);
@@ -3873,6 +3866,34 @@ void main() {
 
     imageStore(u_occupancy, block, uvec4(found ? 1u : 0u, 0u, 0u, 0u));
     imageStore(u_minmax,    block, vec4(lo, hi, 0.0, 0.0));
+}
+"""
+
+# ── Reduced-precision view texture builder ──────────────────────────
+# Bakes the per-voxel visualization scalar (channel select + abs / signed
+# remap) into a single-channel R16F texture. The ray-marcher samples THIS
+# texture instead of the RGBA32F simulation texture, giving 8× less
+# bandwidth per sample and a 4× smaller footprint in the texture cache.
+# For a 512³ grid: 256 MB R16F vs 2 × 512 MB RGBA32F ping-pong.
+# R16F (vs R8) keeps values outside [0,1] intact with ~3-decimal precision,
+# which is plenty for colormaps and iso thresholds.
+VIEW_TEX_BUILD_SHADER = """
+#version 430
+layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
+
+layout(r16f, binding=0) writeonly uniform image3D u_view;
+uniform sampler3D u_volume;
+uniform int u_size;
+uniform int u_channel;
+uniform int u_use_abs;   // 0=raw, 1=abs, 2=signed→[0,1]
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, ivec3(u_size)))) return;
+    float v = texelFetch(u_volume, p, 0)[u_channel];
+    if (u_use_abs == 1)      v = abs(v);
+    else if (u_use_abs == 2) v = v * 0.5 + 0.5;
+    imageStore(u_view, p, vec4(v, 0.0, 0.0, 0.0));
 }
 """
 
@@ -3981,18 +4002,11 @@ uniform sampler3D u_minmax_mip;
 uniform int u_minmax_size;
 uniform int u_use_minmax;
 
-// ── Shared occupancy cache: 32 threads share DDA results ────────────
-// Each workgroup (8x8 = 64 threads) processes a tile of the screen.
-// Adjacent rays have similar traversal paths → cache occupancy locally.
-shared uint s_occ_cache[6][6][6]; // small occupancy neighbourhood
-shared bool s_occ_loaded;
+// Reduced-precision view texture (see FRAGMENT_SHADER for docs)
+uniform sampler3D u_view_tex;
 
 float sample_vol(vec3 p) {
-    vec4 s = texture(u_volume, p);
-    float raw = s[u_vis_channel];
-    if (u_vis_abs == 1) return abs(raw);
-    if (u_vis_abs == 2) return raw * 0.5 + 0.5;
-    return raw;
+    return texture(u_view_tex, p).r;
 }
 
 // Same colormaps as fragment shader (duplicated for compute path)
@@ -4068,6 +4082,46 @@ float adaptive_step(vec3 p) {
     return 1.0;
 }
 
+// ── Occupancy DDA (mirrors FRAGMENT_SHADER::skip_empty_blocks) ─────
+// Advances t to the next occupied brick along the ray, or t_end if none.
+float skip_empty_blocks(vec3 ro, vec3 rd, float t_start, float t_end) {
+    if (u_use_occupancy == 0) return t_start;
+    float block_size = 1.0 / float(u_occ_size);
+    float t = t_start;
+    vec3 p = ro + rd * t;
+    ivec3 cell = ivec3(clamp(p * float(u_occ_size),
+                             vec3(0.0), vec3(float(u_occ_size) - 1.0)));
+    if (texelFetch(u_occupancy, cell, 0).r > 0u) return t;
+
+    vec3 inv_rd = 1.0 / rd;
+    vec3 step_dir = sign(rd);
+    vec3 next_boundary = vec3(cell) + max(step_dir, vec3(0.0));
+    vec3 t_max_v = (next_boundary / float(u_occ_size) - ro) * inv_rd;
+    vec3 t_delta = abs(block_size * inv_rd);
+
+    int max_occ_steps = u_occ_size * 3;
+    for (int i = 0; i < max_occ_steps && t < t_end; i++) {
+        if (t_max_v.x < t_max_v.y) {
+            if (t_max_v.x < t_max_v.z) {
+                t = t_max_v.x; cell.x += int(step_dir.x); t_max_v.x += t_delta.x;
+            } else {
+                t = t_max_v.z; cell.z += int(step_dir.z); t_max_v.z += t_delta.z;
+            }
+        } else {
+            if (t_max_v.y < t_max_v.z) {
+                t = t_max_v.y; cell.y += int(step_dir.y); t_max_v.y += t_delta.y;
+            } else {
+                t = t_max_v.z; cell.z += int(step_dir.z); t_max_v.z += t_delta.z;
+            }
+        }
+        if (any(lessThan(cell, ivec3(0))) ||
+            any(greaterThanEqual(cell, ivec3(u_occ_size)))) return t_end;
+        if (texelFetch(u_occupancy, cell, 0).r > 0u)
+            return max(t - block_size * 0.5, t_start);
+    }
+    return t_end;
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= u_resolution.x || pixel.y >= u_resolution.y) return;
@@ -4092,17 +4146,26 @@ void main() {
     // Jitter
     t_start += ign_hash(vec2(pixel), u_frame_id) * base_step;
 
+    // Occupancy DDA: skip initial empty bricks
+    t_start = skip_empty_blocks(ro, rd, t_start, t_end);
+    if (t_start >= t_end) {
+        imageStore(u_output, pixel, vec4(0.02, 0.02, 0.04, 1.0));
+        return;
+    }
+
     if (u_render_mode == 0) {
         // Volume rendering
         vec3 accum_color = vec3(0.0);
         float accum_alpha = 0.0;
         float t = t_start;
+        float empty_run = 0.0;
 
         for (int i = 0; i < max_steps && t < t_end; i++) {
             vec3 p = ro + rd * t;
             float val = sample_vol(p);
 
             if (val > 0.01) {
+                empty_run = 0.0;
                 vec3 col = apply_colormap(val);
                 float alpha = val * u_density_scale * base_step;
                 alpha = min(alpha, 0.95);
@@ -4111,7 +4174,13 @@ void main() {
                 if (accum_alpha > 0.98) break;
                 t += base_step;
             } else {
-                t += base_step * adaptive_step(p);
+                float mult = adaptive_step(p);
+                t += base_step * mult;
+                empty_run += mult;
+                if (empty_run > 8.0 && u_use_occupancy != 0) {
+                    t = skip_empty_blocks(ro, rd, t, t_end);
+                    empty_run = 0.0;
+                }
             }
         }
 
@@ -4207,14 +4276,16 @@ uniform sampler3D u_minmax_mip;     // 3D texture: R=min, G=max per 4³ block
 uniform int u_minmax_size;          // mipmap grid dimension
 uniform int u_use_minmax;           // 0=disabled, 1=enabled
 
+// ── Reduced-precision view texture ──────────────────────────────────
+// R16F scalar baked from (u_volume[channel] -> optional abs/signed remap)
+// once per sim step. Sampling this is 8× less bandwidth than sampling
+// the RGBA32F simulation texture, and eliminates the per-sample branch.
+uniform sampler3D u_view_tex;
+
 // ────────────────────────────────────────────────────────────────────
 // Sample the selected visualization channel from the volume
 float sample_vol(vec3 p) {
-    vec4 s = texture(u_volume, p);
-    float raw = s[u_vis_channel];
-    if (u_vis_abs == 1) return abs(raw);
-    if (u_vis_abs == 2) return raw * 0.5 + 0.5;
-    return raw;
+    return texture(u_view_tex, p).r;
 }
 
 // ── Colormaps ───────────────────────────────────────────────────────
@@ -7067,6 +7138,15 @@ class Simulator:
         self.target_sps = 0  # target steps/sec (0 = unlimited, run every frame)
         self._last_step_time = 0.0
         self.seed = 42
+        # Idle-frame skip: when scene state (sim, camera, render knobs) is
+        # unchanged from the previous frame, we blit a cached copy of the
+        # last render instead of re-marching rays. Huge win when paused or
+        # stepping slower than the render rate, which is the common case
+        # at 384³/512³ where ray-march is 5–30 ms/frame.
+        self._last_scene_hash = None
+        self._scene_cache_fbo = None
+        self._scene_cache_tex = None
+        self._scene_cache_size = None
 
         # Camera
         self.cam_theta = 0.5      # horizontal angle
@@ -7224,8 +7304,12 @@ class Simulator:
         )
         # Cache volumetric program uniform references
         rp = self.render_prog
-        self._rp_u_volume = rp['u_volume']
-        self._rp_u_size = rp['u_size']
+        # Many of these are None-safe because the GLSL compiler strips any
+        # uniform not referenced in the active control flow (e.g. u_volume
+        # is no longer referenced by the fragment shader since sample_vol
+        # reads from u_view_tex).
+        self._rp_u_volume = rp.get('u_volume', None)
+        self._rp_u_size = rp.get('u_size', None)
         self._rp_u_camera_pos = rp['u_camera_pos']
         self._rp_u_camera_rot = rp['u_camera_rot']
         self._rp_u_fov = rp['u_fov']
@@ -7237,8 +7321,8 @@ class Simulator:
         self._rp_u_slice_pos = rp['u_slice_pos']
         self._rp_u_slice_axis = rp['u_slice_axis']
         self._rp_u_colormap = rp['u_colormap']
-        self._rp_u_vis_channel = rp['u_vis_channel']
-        self._rp_u_vis_abs = rp['u_vis_abs']
+        self._rp_u_vis_channel = rp.get('u_vis_channel', None)
+        self._rp_u_vis_abs = rp.get('u_vis_abs', None)
         # New acceleration uniforms (use .get() — GLSL compiler may strip unused ones)
         self._rp_u_frame_id = rp.get('u_frame_id', None)
         self._rp_u_occupancy = rp.get('u_occupancy', None)
@@ -7247,11 +7331,14 @@ class Simulator:
         self._rp_u_minmax_mip = rp.get('u_minmax_mip', None)
         self._rp_u_minmax_size = rp.get('u_minmax_size', None)
         self._rp_u_use_minmax = rp.get('u_use_minmax', None)
+        self._rp_u_view_tex = rp.get('u_view_tex', None)
         # Bind acceleration textures to fixed units
         if self._rp_u_occupancy is not None:
             self._rp_u_occupancy.value = 1   # texture unit 1
         if self._rp_u_minmax_mip is not None:
             self._rp_u_minmax_mip.value = 2  # texture unit 2
+        if self._rp_u_view_tex is not None:
+            self._rp_u_view_tex.value = 3    # texture unit 3
         self.vao = self.ctx.simple_vertex_array(self.render_prog, self.vbo, 'in_pos')
 
         # Compile upsample shader (for half-res rendering)
@@ -7274,8 +7361,11 @@ class Simulator:
         # both outputs from one read pass.
         self._accel_prog = self.ctx.compute_shader(ACCEL_FUSED_SHADER)
 
+        # Compile the view-texture baker (full-res R16F scalar).
+        self._view_build_prog = self.ctx.compute_shader(VIEW_TEX_BUILD_SHADER)
+
         # Acceleration texture state
-        self._occ_block_size = 4  # each occupancy block = 4³ voxels
+        self._occ_block_size = 4  # default; recomputed per-size in _alloc_accel_textures
         self._accel_textures_valid = False
         self._frame_counter = 0
         self._half_res_fbo = None
@@ -7418,6 +7508,7 @@ class Simulator:
         self._cr_u_minmax_mip = cr.get('u_minmax_mip', None)
         self._cr_u_minmax_size = cr.get('u_minmax_size', None)
         self._cr_u_use_minmax = cr.get('u_use_minmax', None)
+        self._cr_u_view_tex = cr.get('u_view_tex', None)
         # Bind to fixed texture units
         if self._cr_u_volume is not None:
             self._cr_u_volume.value = 0
@@ -7425,9 +7516,19 @@ class Simulator:
             self._cr_u_occupancy.value = 1
         if self._cr_u_minmax_mip is not None:
             self._cr_u_minmax_mip.value = 2
+        if self._cr_u_view_tex is not None:
+            self._cr_u_view_tex.value = 3
 
     def _alloc_accel_textures(self, size):
-        """Allocate or reallocate occupancy bitmap and min/max mipmap 3D textures."""
+        """Allocate or reallocate occupancy bitmap, min/max mipmap, and
+        reduced-precision view texture."""
+        # Adaptive brick size: coarser bricks at larger grids halve the DDA
+        # traversal cost. At 512³ with bs=8 the occupancy grid is 64³ (512k
+        # cells) instead of 128³ (2M cells) — ~2× faster empty-space skip,
+        # with negligible over-march from the larger bricks (a brick with a
+        # single active voxel is 512 voxels wide vs 64, which the per-voxel
+        # marching loop handles cheaply thanks to the R16F view tex).
+        self._occ_block_size = 8 if size >= 192 else 4
         bs = self._occ_block_size
         occ_dim = (size + bs - 1) // bs
 
@@ -7436,6 +7537,8 @@ class Simulator:
             self._occ_tex.release()
         if hasattr(self, '_mm_tex') and self._mm_tex is not None:
             self._mm_tex.release()
+        if hasattr(self, '_view_tex') and self._view_tex is not None:
+            self._view_tex.release()
 
         # Occupancy: R8UI (1 byte per block)
         occ_data = bytes(occ_dim ** 3)
@@ -7450,6 +7553,16 @@ class Simulator:
             (occ_dim, occ_dim, occ_dim), 2, mm_data, dtype='f2')
         self._mm_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._mm_dim = occ_dim
+
+        # Reduced-precision view tex: single-channel R16F, full voxel res.
+        # Trilinear filter so ray-march sampling interpolates smoothly.
+        view_data = bytes(size ** 3 * 2)  # 2 bytes per voxel
+        self._view_tex = self.ctx.texture3d(
+            (size, size, size), 1, view_data, dtype='f2')
+        self._view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._view_tex.repeat_x = False
+        self._view_tex.repeat_y = False
+        self._view_tex.repeat_z = False
 
         self._accel_textures_valid = False
 
@@ -7476,16 +7589,31 @@ class Simulator:
 
         src_tex.use(location=0)
 
-        # ── Fused occupancy + min/max ──
-        # Both output images are bound; the shader writes them in a single
-        # pass over the source texture (one fetch per voxel instead of two).
+        # ── Stage 1: Reduced-precision view tex ──
+        # Voxel-wise pass that reads the heavy RGBA32F source ONCE,
+        # writes a single R16F scalar per voxel. Downstream consumers
+        # (ray-march + occupancy build) read the cheaper R16F.
+        self._view_tex.bind_to_image(0, read=False, write=True)
+        self._view_build_prog['u_volume'].value = 0
+        self._view_build_prog['u_size'].value = size
+        self._view_build_prog['u_channel'].value = channel
+        self._view_build_prog['u_use_abs'].value = use_abs
+        vgroups = (size + 3) // 4
+        self._view_build_prog.run(vgroups, vgroups, vgroups)
+
+        # Ensure view-tex writes are visible to the next texture sample
+        GL.glMemoryBarrier(GL.GL_TEXTURE_FETCH_BARRIER_BIT |
+                           GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+
+        # ── Stage 2: Fused occupancy + min/max (reads from view tex) ──
+        # Reads 1/8 the bytes vs. the previous RGBA32F direct-read variant
+        # since channel-select + abs are already baked into the view tex.
+        self._view_tex.use(location=0)
         self._occ_tex.bind_to_image(0, read=False, write=True)
         self._mm_tex.bind_to_image(1, read=False, write=True)
-        self._accel_prog['u_volume'].value = 0
+        self._accel_prog['u_view'].value = 0
         self._accel_prog['u_size'].value = size
         self._accel_prog['u_block_size'].value = bs
-        self._accel_prog['u_channel'].value = channel
-        self._accel_prog['u_use_abs'].value = use_abs
         self._accel_prog['u_threshold'].value = threshold
         groups = (occ_dim + 3) // 4
         self._accel_prog.run(groups, groups, groups)
@@ -8608,10 +8736,14 @@ class Simulator:
             self._occ_tex.use(location=1)
         if hasattr(self, '_mm_tex') and self._mm_tex is not None:
             self._mm_tex.use(location=2)
+        if hasattr(self, '_view_tex') and self._view_tex is not None:
+            self._view_tex.use(location=3)
 
-        # Set uniforms
-        self._rp_u_volume.value = 0
-        self._rp_u_size.value = self.size
+        # Set uniforms (None-safe — unused uniforms may be stripped by GLSL)
+        if self._rp_u_volume is not None:
+            self._rp_u_volume.value = 0
+        if self._rp_u_size is not None:
+            self._rp_u_size.value = self.size
         self._rp_u_camera_pos.value = tuple(cam_pos)
         self._rp_u_camera_rot.value = tuple(cam_rot.T.flatten())
         self._rp_u_fov.value = fov
@@ -8623,8 +8755,10 @@ class Simulator:
         self._rp_u_slice_pos.value = self.slice_pos
         self._rp_u_slice_axis.value = self.slice_axis
         self._rp_u_colormap.value = self.colormap
-        self._rp_u_vis_channel.value = self.vis_channel
-        self._rp_u_vis_abs.value = 1 if self.vis_abs else 0
+        if self._rp_u_vis_channel is not None:
+            self._rp_u_vis_channel.value = self.vis_channel
+        if self._rp_u_vis_abs is not None:
+            self._rp_u_vis_abs.value = 1 if self.vis_abs else 0
 
         # Acceleration uniforms (None-safe — GLSL compiler may strip unused)
         if self._rp_u_frame_id is not None:
@@ -8888,6 +9022,62 @@ class Simulator:
         else:
             self._render_volume()
 
+    def _scene_hash(self):
+        """Tuple of every state bit that affects what a rendered frame shows.
+        If this is unchanged between frames we can skip the render and blit
+        the cached image instead. A miss just means one-frame staleness —
+        never corruption — so we keep the hash conservative but cheap.
+        """
+        return (
+            self.step_count,
+            self.size, self.rule_name, self.renderer_mode,
+            self.width, self.height,
+            # Camera (rounded to suppress sub-pixel jitter from trackpads)
+            round(self.cam_theta, 4), round(self.cam_phi, 4),
+            round(self.cam_dist, 4),
+            round(float(self.cam_target[0]), 4),
+            round(float(self.cam_target[1]), 4),
+            round(float(self.cam_target[2]), 4),
+            # Render knobs
+            round(self.density_scale, 4), round(self.brightness, 4),
+            self.render_mode, round(self.iso_threshold, 4), self.colormap,
+            round(self.slice_pos, 4), self.slice_axis,
+            self.vis_channel, bool(self.vis_abs),
+            # Recording disables caching (we need a fresh render each frame)
+            bool(getattr(self, '_recording', False)),
+        )
+
+    def _ensure_scene_cache(self):
+        """Allocate (or resize) the screen-sized scene cache FBO."""
+        need = (self.width, self.height)
+        if self._scene_cache_size == need and self._scene_cache_fbo is not None:
+            return
+        # Free previous
+        if self._scene_cache_fbo is not None:
+            try: self._scene_cache_fbo.release()
+            except Exception: pass
+        if self._scene_cache_tex is not None:
+            try: self._scene_cache_tex.release()
+            except Exception: pass
+        self._scene_cache_tex = self.ctx.texture(need, 4, dtype='f1')
+        self._scene_cache_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._scene_cache_fbo = self.ctx.framebuffer(
+            color_attachments=[self._scene_cache_tex])
+        self._scene_cache_size = need
+
+    def _snapshot_scene(self):
+        """Copy current backbuffer contents into the scene cache."""
+        self._ensure_scene_cache()
+        # moderngl's copy_framebuffer wraps glBlitFramebuffer — fast GPU copy.
+        self.ctx.copy_framebuffer(self._scene_cache_fbo, self.ctx.screen)
+
+    def _restore_scene_snapshot(self):
+        """Blit the cached scene onto the backbuffer (before UI overlay)."""
+        if self._scene_cache_fbo is None:
+            return False
+        self.ctx.copy_framebuffer(self.ctx.screen, self._scene_cache_fbo)
+        return True
+
     def _render_volume_compute(self):
         """Render volume using compute shader raymarcher."""
         if not self._accel_textures_valid:
@@ -8910,6 +9100,8 @@ class Simulator:
             self._occ_tex.use(location=1)
         if hasattr(self, '_mm_tex') and self._mm_tex is not None:
             self._mm_tex.use(location=2)
+        if hasattr(self, '_view_tex') and self._view_tex is not None:
+            self._view_tex.use(location=3)
 
         # Set uniforms (None-safe — GLSL compiler may strip unused)
         def _su(u, v):
@@ -9361,12 +9553,16 @@ class Simulator:
                 for i, name in enumerate(self.vis_channels):
                     is_sel = (i == self.vis_channel)
                     if imgui.selectable(name, is_sel)[0]:
-                        self.vis_channel = i
+                        if self.vis_channel != i:
+                            self.vis_channel = i
+                            self._accel_textures_valid = False
                     if is_sel:
                         imgui.set_item_default_focus()
                 imgui.end_combo()
 
-            _, self.vis_abs = imgui.checkbox("Absolute value", self.vis_abs)
+            changed, self.vis_abs = imgui.checkbox("Absolute value", self.vis_abs)
+            if changed:
+                self._accel_textures_valid = False
 
         imgui.separator()
 
@@ -9576,8 +9772,19 @@ class Simulator:
                 break
 
     def _start_recording(self):
-        """Start piping rendered frames to ffmpeg at 1440p60."""
+        """Start piping rendered frames to ffmpeg at 1440p60.
+
+        Recording is an opt-in feature gated behind the CA_RECORDING_ENABLED
+        environment variable so that clones of the repo don't expose the
+        feature to anonymous users by default.  Set it in your shell profile:
+
+            export CA_RECORDING_ENABLED=1
+        """
         if self._recording:
+            return
+        if not os.environ.get('CA_RECORDING_ENABLED'):
+            self._rec_msg = "Recording disabled — set CA_RECORDING_ENABLED=1 to enable"
+            self._rec_msg_time = time.time()
             return
         if not shutil.which('ffmpeg'):
             self._rec_msg = "ffmpeg not found on PATH"
@@ -9865,8 +10072,21 @@ class Simulator:
                             self._score_frame = 0
                             self._update_score()
 
-                # Render
-                self._render()
+                # Render — skip if scene state is identical to last frame
+                # (camera still, sim paused or between steps, UI knobs idle).
+                # Paying ~0.3 ms for a screen-size blit beats a full ray-march
+                # which at 512³ can be 10–30 ms. Recording forces a full render
+                # because the video pipeline reads the backbuffer each frame.
+                cur_hash = self._scene_hash()
+                if (cur_hash == self._last_scene_hash
+                        and self._scene_cache_fbo is not None
+                        and self._scene_cache_size == (self.width, self.height)
+                        and not self._recording):
+                    self._restore_scene_snapshot()
+                else:
+                    self._render()
+                    self._snapshot_scene()
+                    self._last_scene_hash = cur_hash
 
                 # Capture frame for video (scene only, before UI overlay)
                 if self._recording:
@@ -9969,6 +10189,7 @@ class Simulator:
             '_indirect_reset_prog',  # indirect-draw counter reset
             '_compute_ray_prog',     # compute-shader raymarcher
             '_accel_prog',           # fused occupancy + min/max builder
+            '_view_build_prog',      # reduced-precision view tex builder
             '_upsample_prog',        # half-res upsample fragment program
 
             # ── Buffers (SSBOs, VBOs, indirect, staging) ──
@@ -9983,8 +10204,11 @@ class Simulator:
             # ── 3-D simulation textures (largest allocations — safest last) ──
             'tex_a', 'tex_b',
 
-            # ── Acceleration textures (R8UI occupancy + RG16F min/max) ──
-            '_occ_tex', '_mm_tex',
+            # ── Acceleration textures (R8UI occupancy + RG16F min/max + R16F view) ──
+            '_occ_tex', '_mm_tex', '_view_tex',
+
+            # ── Scene cache (idle-frame blit target) ──
+            '_scene_cache_fbo', '_scene_cache_tex',
 
             # ── Recording FBO + renderbuffers ──
             '_rec_fbo', '_rec_rbo_color', '_rec_rbo_depth',
