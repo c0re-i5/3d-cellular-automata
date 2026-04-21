@@ -171,8 +171,48 @@ CA_RULES = {
     "game_of_life_3d": """
 // 3D Game of Life (Moore neighborhood, 26 neighbors)
 // Birth: b1-b2 neighbors alive, Survival: s1-s2 neighbors alive
+//
+// USE_SHARED_MEM=1 loads a 10^3 float tile (just the .r channel — the
+// other three are never read here) so the 26 stencil reads come from
+// on-chip shared memory. Biggest potential win among the Moore rules
+// because the kernel is almost pure counting.
+
+#if USE_SHARED_MEM
+#define GLTILE 10
+#define GLTILE3 (GLTILE * GLTILE * GLTILE)
+shared float s_gl[GLTILE3];
+int gl_idx(int x, int y, int z) {
+    return z * GLTILE * GLTILE + y * GLTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < GLTILE3; i += 512) {
+        int tz = i / (GLTILE * GLTILE);
+        int ty = (i / GLTILE) % GLTILE;
+        int tx = i % GLTILE;
+        s_gl[i] = fetch(tile_origin + ivec3(tx, ty, tz)).r;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    float self = s_gl[gl_idx(tp.x, tp.y, tp.z)];
+    int alive = 0;
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        if (s_gl[gl_idx(tp.x + dx, tp.y + dy, tp.z + dz)] > 0.5) alive++;
+    }
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     float self = fetch(pos).r;
@@ -184,6 +224,7 @@ void main() {
         if (dx == 0 && dy == 0 && dz == 0) continue;
         if (fetch(pos + ivec3(dx, dy, dz)).r > 0.5) alive++;
     }
+#endif
 
     float result;
     int b1 = int(u_param0), b2 = int(u_param1);
@@ -941,13 +982,47 @@ void main() {
 // G = natural frequency (adapts via Hebbian-like learning)
 // B = local order parameter (coherence magnitude)
 // Cells synchronize with neighbors; frequencies adapt toward synchronized clusters
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec2 tile of (phase, nat_freq) so the 26
+// Moore-neighbourhood stencil reads come from on-chip shared memory.
+// This is the biggest win of any tiled rule: 26 imageLoad → 26 shared reads.
+
+#if USE_SHARED_MEM
+#define KMTILE 10
+#define KMTILE3 (KMTILE * KMTILE * KMTILE)
+shared vec2 s_pn[KMTILE3];
+int km_idx(int x, int y, int z) {
+    return z * KMTILE * KMTILE + y * KMTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < KMTILE3; i += 512) {
+        int tz = i / (KMTILE * KMTILE);
+        int ty = (i / KMTILE) % KMTILE;
+        int tx = i % KMTILE;
+        s_pn[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 sc = s_pn[km_idx(tp.x, tp.y, tp.z)];
+    float phase    = sc.r;  // 0..1 representing 0..2*pi
+    float nat_freq = sc.g;  // natural frequency (adapts)
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
     float phase = self_val.r;         // 0..1 representing 0..2*pi
     float nat_freq = self_val.g;      // natural frequency (adapts)
+#endif
 
     float coupling = u_param0;        // coupling strength K
     float noise_amp = u_param1;       // phase noise amplitude
@@ -963,12 +1038,21 @@ void main() {
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0 && dz == 0) continue;
+#if USE_SHARED_MEM
+        vec2 nb = s_pn[km_idx(tp.x + dx, tp.y + dy, tp.z + dz)];
+        float nb_phase_2pi = nb.r * 6.283185;
+        float dphi = nb_phase_2pi - phase_2pi;
+        coupling_sum += sin(dphi);
+        cos_sum += cos(dphi);
+        mean_freq += nb.g;
+#else
         vec4 nb = fetch(pos + ivec3(dx, dy, dz));
         float nb_phase_2pi = nb.r * 6.283185;
         float dphi = nb_phase_2pi - phase_2pi;
         coupling_sum += sin(dphi);
         cos_sum += cos(dphi);
         mean_freq += nb.g;
+#endif
     }
     // 26 Moore neighbors
     coupling_sum /= 26.0;
@@ -1303,11 +1387,45 @@ void main() {
 // 3D Flocking / Active Matter (Vicsek-style model on continuous field)
 // R = density of agents, G = velocity_x, B = velocity_y, A = velocity_z
 // Agents align with neighbors (flocking), diffuse, and self-propel
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec4 tile of (rho, vx, vy, vz). Both
+// the 26-neighbour Moore sum and the 6-point density gradient read
+// from the tile; only the semi-Lagrangian back-trace (which can
+// wander off-tile) stays on the direct-fetch path.
+// Tile cost: 10^3 * 16 bytes = 16000 bytes shared per workgroup.
+
+#if USE_SHARED_MEM
+#define FKTILE 10
+#define FKTILE3 (FKTILE * FKTILE * FKTILE)
+shared vec4 s_rv[FKTILE3];
+int fk_idx(int x, int y, int z) {
+    return z * FKTILE * FKTILE + y * FKTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < FKTILE3; i += 512) {
+        int tz = i / (FKTILE * FKTILE);
+        int ty = (i / FKTILE) % FKTILE;
+        int tx = i % FKTILE;
+        s_rv[i] = fetch(tile_origin + ivec3(tx, ty, tz));
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec4 self_val = s_rv[fk_idx(tp.x, tp.y, tp.z)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
+#endif
     float rho = self_val.r;    // density
     vec3 vel = self_val.gba;   // velocity field (vx, vy, vz)
 
@@ -1318,7 +1436,11 @@ void main() {
     for (int dy = -1; dy <= 1; dy++)
     for (int dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0 && dz == 0) continue;
+#if USE_SHARED_MEM
+        vec4 nb = s_rv[fk_idx(tp.x + dx, tp.y + dy, tp.z + dz)];
+#else
         vec4 nb = fetch(pos + ivec3(dx, dy, dz));
+#endif
         float w = nb.r;  // weight by neighbor density
         sum_rho += nb.r;
         sum_vel += nb.gba * w;
@@ -1342,10 +1464,20 @@ void main() {
 
     // Repulsion from high density (prevents all agents piling up)
     float pressure = repulsion * (avg_rho - 0.3);
-    // Gradient of density (central differences, scaled by h_inv)
+    // Gradient of density (central differences, scaled by h_inv).
+    // Reuse the tile when present — these are among the 26 neighbours.
+#if USE_SHARED_MEM
+    float grad_x = (s_rv[fk_idx(tp.x + 1, tp.y,     tp.z    )].r -
+                    s_rv[fk_idx(tp.x - 1, tp.y,     tp.z    )].r) * 0.5 * h_inv;
+    float grad_y = (s_rv[fk_idx(tp.x,     tp.y + 1, tp.z    )].r -
+                    s_rv[fk_idx(tp.x,     tp.y - 1, tp.z    )].r) * 0.5 * h_inv;
+    float grad_z = (s_rv[fk_idx(tp.x,     tp.y,     tp.z + 1)].r -
+                    s_rv[fk_idx(tp.x,     tp.y,     tp.z - 1)].r) * 0.5 * h_inv;
+#else
     float grad_x = (fetch(pos + ivec3(1,0,0)).r - fetch(pos + ivec3(-1,0,0)).r) * 0.5 * h_inv;
     float grad_y = (fetch(pos + ivec3(0,1,0)).r - fetch(pos + ivec3(0,-1,0)).r) * 0.5 * h_inv;
     float grad_z = (fetch(pos + ivec3(0,0,1)).r - fetch(pos + ivec3(0,0,-1)).r) * 0.5 * h_inv;
+#endif
     new_vel -= pressure * vec3(grad_x, grad_y, grad_z) * u_dt;
 
     // Temporal noise — different every step for ongoing random exploration
