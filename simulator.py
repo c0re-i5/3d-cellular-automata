@@ -810,8 +810,48 @@ void main() {
 // u_param2 = predator mortality d (natural death rate)
 // u_param3 = conversion efficiency e (prey biomass → predator biomass)
 //            Controls Hopf bifurcation: e < a*h → oscillations, e > a*h → equilibrium
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec2 tile of (u, v) so the 6 stencil reads
+// come from on-chip shared memory instead of 6 imageLoad ops per cell.
+
+#if USE_SHARED_MEM
+#define PPTILE 10
+#define PPTILE3 (PPTILE * PPTILE * PPTILE)
+shared vec2 s_uv[PPTILE3];
+int pp_idx(int x, int y, int z) {
+    return z * PPTILE * PPTILE + y * PPTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < PPTILE3; i += 512) {
+        int tz = i / (PPTILE * PPTILE);
+        int ty = (i / PPTILE) % PPTILE;
+        int tx = i % PPTILE;
+        s_uv[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 c = s_uv[pp_idx(tp.x, tp.y, tp.z)];
+    float u = c.r;
+    float v = c.g;
+
+    vec2 sum_uv = vec2(0.0);
+    sum_uv += s_uv[pp_idx(tp.x + 1, tp.y,     tp.z    )];
+    sum_uv += s_uv[pp_idx(tp.x - 1, tp.y,     tp.z    )];
+    sum_uv += s_uv[pp_idx(tp.x,     tp.y + 1, tp.z    )];
+    sum_uv += s_uv[pp_idx(tp.x,     tp.y - 1, tp.z    )];
+    sum_uv += s_uv[pp_idx(tp.x,     tp.y,     tp.z + 1)];
+    sum_uv += s_uv[pp_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
@@ -826,6 +866,7 @@ void main() {
     sum_uv += fetch(pos + ivec3( 0,-1, 0)).rg;
     sum_uv += fetch(pos + ivec3( 0, 0, 1)).rg;
     sum_uv += fetch(pos + ivec3( 0, 0,-1)).rg;
+#endif
     float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
     float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
 
@@ -930,8 +971,48 @@ void main() {
 // The CGLE is the normal form of oscillating chemical reactions (like BZ)
 // near a Hopf bifurcation. R = Re(A), G = Im(A) where A is complex amplitude.
 // Produces spiral defect chaos and scroll wave turbulence in 3D.
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec2 tile of (u, v) so the 6 stencil reads
+// for the coupled Laplacian come from on-chip shared memory.
+
+#if USE_SHARED_MEM
+#define BZTILE 10
+#define BZTILE3 (BZTILE * BZTILE * BZTILE)
+shared vec2 s_uv[BZTILE3];
+int bz_idx(int x, int y, int z) {
+    return z * BZTILE * BZTILE + y * BZTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < BZTILE3; i += 512) {
+        int tz = i / (BZTILE * BZTILE);
+        int ty = (i / BZTILE) % BZTILE;
+        int tx = i % BZTILE;
+        s_uv[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 c = s_uv[bz_idx(tp.x, tp.y, tp.z)];
+    float u = c.r;  // Re(A)
+    float v = c.g;  // Im(A)
+
+    vec2 sum_uv = vec2(0.0);
+    sum_uv += s_uv[bz_idx(tp.x + 1, tp.y,     tp.z    )];
+    sum_uv += s_uv[bz_idx(tp.x - 1, tp.y,     tp.z    )];
+    sum_uv += s_uv[bz_idx(tp.x,     tp.y + 1, tp.z    )];
+    sum_uv += s_uv[bz_idx(tp.x,     tp.y - 1, tp.z    )];
+    sum_uv += s_uv[bz_idx(tp.x,     tp.y,     tp.z + 1)];
+    sum_uv += s_uv[bz_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
@@ -946,6 +1027,7 @@ void main() {
     sum_uv += fetch(pos + ivec3( 0,-1, 0)).rg;
     sum_uv += fetch(pos + ivec3( 0, 0, 1)).rg;
     sum_uv += fetch(pos + ivec3( 0, 0,-1)).rg;
+#endif
     float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
     float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
 
@@ -987,29 +1069,68 @@ void main() {
 // u_param1 = b (threshold shift: controls spiral tip meander)
 // u_param2 = epsilon (timescale ratio: smaller = sharper waves)
 // u_param3 = D_u (diffusion of activator)
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec2 tile of (u, v) so the 6 stencil reads
+// come from on-chip shared memory.
+
+#if USE_SHARED_MEM
+#define BKTILE 10
+#define BKTILE3 (BKTILE * BKTILE * BKTILE)
+shared vec2 s_uv[BKTILE3];
+int bk_idx(int x, int y, int z) {
+    return z * BKTILE * BKTILE + y * BKTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < BKTILE3; i += 512) {
+        int tz = i / (BKTILE * BKTILE);
+        int ty = (i / BKTILE) % BKTILE;
+        int tx = i % BKTILE;
+        s_uv[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 c = s_uv[bk_idx(tp.x, tp.y, tp.z)];
+    float u = c.r;  // activator
+    float v = c.g;  // inhibitor
+
+    vec2 sum_uv = vec2(0.0);
+    sum_uv += s_uv[bk_idx(tp.x + 1, tp.y,     tp.z    )];
+    sum_uv += s_uv[bk_idx(tp.x - 1, tp.y,     tp.z    )];
+    sum_uv += s_uv[bk_idx(tp.x,     tp.y + 1, tp.z    )];
+    sum_uv += s_uv[bk_idx(tp.x,     tp.y - 1, tp.z    )];
+    sum_uv += s_uv[bk_idx(tp.x,     tp.y,     tp.z + 1)];
+    sum_uv += s_uv[bk_idx(tp.x,     tp.y,     tp.z - 1)];
+    float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
+    float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
     float u = self_val.r;  // activator (excitation)
     float v = self_val.g;  // inhibitor (recovery)
 
-    // Laplacian of u and v
-    float lap_u = 0.0;
-    float lap_v = 0.0;
-    for (int i = 0; i < 6; i++) {
-        ivec3 off = ivec3(0);
-        int axis = i / 2; int dir = (i % 2) * 2 - 1;
-        off[axis] = dir;
-        vec4 nb = fetch(pos + off);
-        lap_u += nb.r;
-        lap_v += nb.g;
-    }
-    lap_u -= 6.0 * u;
-    lap_v -= 6.0 * v;
-    lap_u *= h_sq;  // resolution-independent
-    lap_v *= h_sq;
+    // 6-neighbor Laplacian of (u, v) — same additive grouping as tiled path
+    // so USE_SHARED_MEM=1 and =0 are byte-exact equivalent.
+    vec2 sum_uv = vec2(0.0);
+    sum_uv += fetch(pos + ivec3( 1, 0, 0)).rg;
+    sum_uv += fetch(pos + ivec3(-1, 0, 0)).rg;
+    sum_uv += fetch(pos + ivec3( 0, 1, 0)).rg;
+    sum_uv += fetch(pos + ivec3( 0,-1, 0)).rg;
+    sum_uv += fetch(pos + ivec3( 0, 0, 1)).rg;
+    sum_uv += fetch(pos + ivec3( 0, 0,-1)).rg;
+    float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
+    float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
+#endif
 
     float a = u_param0;       // excitability (0.6-1.0)
     float b = u_param1;       // threshold shift (0.01-0.1)
@@ -1051,8 +1172,50 @@ void main() {
 // R = activator a, G = inhibitor h, B = tissue density rho
 // Classic Gierer-Meinhardt with proper decay: inhibitor diffuses faster,
 // creating local activation + long-range inhibition → Turing patterns
+//
+// USE_SHARED_MEM=1 loads a 10^3 vec3 tile of (a, h, rho) so the 6 stencil
+// reads (for all three Laplacians) come from on-chip shared memory.
+// Tile cost: 10^3 * 12 bytes = 12000 bytes shared per workgroup.
+
+#if USE_SHARED_MEM
+#define MGTILE 10
+#define MGTILE3 (MGTILE * MGTILE * MGTILE)
+shared vec3 s_ahr[MGTILE3];
+int mg_idx(int x, int y, int z) {
+    return z * MGTILE * MGTILE + y * MGTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < MGTILE3; i += 512) {
+        int tz = i / (MGTILE * MGTILE);
+        int ty = (i / MGTILE) % MGTILE;
+        int tx = i % MGTILE;
+        s_ahr[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rgb;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec3 c = s_ahr[mg_idx(tp.x, tp.y, tp.z)];
+    float a   = c.r;  // activator
+    float h   = c.g;  // inhibitor
+    float rho = c.b;  // tissue density / growth
+
+    vec3 sum_f = vec3(0.0);
+    sum_f += s_ahr[mg_idx(tp.x + 1, tp.y,     tp.z    )];
+    sum_f += s_ahr[mg_idx(tp.x - 1, tp.y,     tp.z    )];
+    sum_f += s_ahr[mg_idx(tp.x,     tp.y + 1, tp.z    )];
+    sum_f += s_ahr[mg_idx(tp.x,     tp.y - 1, tp.z    )];
+    sum_f += s_ahr[mg_idx(tp.x,     tp.y,     tp.z + 1)];
+    sum_f += s_ahr[mg_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
@@ -1068,6 +1231,7 @@ void main() {
     sum_f += fetch(pos + ivec3( 0,-1, 0)).rgb;
     sum_f += fetch(pos + ivec3( 0, 0, 1)).rgb;
     sum_f += fetch(pos + ivec3( 0, 0,-1)).rgb;
+#endif
     float lap_a = (sum_f.r - 6.0 * a) * h_sq;
     float lap_h = (sum_f.g - 6.0 * h) * h_sq;
     float lap_rho = (sum_f.b - 6.0 * rho) * h_sq;
