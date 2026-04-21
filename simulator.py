@@ -247,9 +247,18 @@ void main() {
 // Two code paths: USE_SHARED_MEM=1 uses cooperative shared memory tiling
 // for ~100x fewer global memory ops; USE_SHARED_MEM=0 uses direct
 // imageLoad (compatible with nouveau and other limited drivers).
+//
+// Kernel radii are in *reference voxels* (1.5/2.5 at REF_SIZE=128) so the
+// physical feature size stays consistent across resolutions. This scales
+// with h_inv = size/REF_SIZE. At size 384+ the scan would exceed the
+// shared-mem tile; MAX_SCAN caps the scan AND shrinks outer_r/inner_r
+// proportionally in *both* code paths so dynamics remain identical
+// between paths (even though the effective kernel becomes smaller than
+// theoretical above size ~256). See commit log for details.
+
+#define MAX_SCAN 5
 
 #if USE_SHARED_MEM
-#define MAX_SCAN 5
 #define TILE (8 + 2 * MAX_SCAN)
 #define TILE3 (TILE * TILE * TILE)
 shared float s_tile[TILE3];
@@ -276,12 +285,18 @@ void main() {
     float inner_r = 1.5 * h_inv;
     float outer_r = 2.5 * h_inv;
     int scan = int(ceil(outer_r));
+    // Shared cap — applied identically in tiled and direct paths.
+    if (scan > MAX_SCAN) {
+        float shrink = float(MAX_SCAN) / outer_r;
+        outer_r *= shrink;
+        inner_r *= shrink;
+        scan = MAX_SCAN;
+    }
 
 #if USE_SHARED_MEM
     ivec3 local = ivec3(gl_LocalInvocationID);
     int local_flat = int(gl_LocalInvocationIndex);
     ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
-    scan = min(scan, MAX_SCAN);
 
     ivec3 tile_origin = group_origin - ivec3(scan);
     for (int i = local_flat; i < TILE3; i += 512) {
@@ -676,9 +691,14 @@ void main() {
 //
 // Two code paths: USE_SHARED_MEM=1 uses shared memory tiling,
 // USE_SHARED_MEM=0 uses direct imageLoad for driver compatibility.
+//
+// MAX_R caps both code paths identically so dynamics match regardless
+// of shared-mem availability; at size 512 (h_inv=4) a radius=2 preset
+// saturates at R=7 rather than 8.
+
+#define MAX_R 7
 
 #if USE_SHARED_MEM
-#define MAX_R 7
 #define TILE (8 + 2 * MAX_R)
 #define TILE3 (TILE * TILE * TILE)
 shared float s_tile[TILE3];
@@ -696,11 +716,15 @@ void main() {
     float ring_pos = clamp(u_param3, 0.1, 0.9);
     if (ring_pos < 0.05) ring_pos = 0.5;
 
+    // Shared cap — applied identically in both paths so dynamics match.
+    // At size ≥ 4x REF_SIZE (radius*h_inv > MAX_R) the kernel saturates
+    // at R = MAX_R voxels. See commit log.
+    int R = min(int(radius * h_inv), MAX_R);
+
 #if USE_SHARED_MEM
     ivec3 local = ivec3(gl_LocalInvocationID);
     int local_flat = int(gl_LocalInvocationIndex);
     ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
-    int R = min(int(radius * h_inv), MAX_R);
 
     ivec3 tile_origin = group_origin - ivec3(R);
     int tile_size = 8 + 2 * R;
@@ -720,7 +744,6 @@ void main() {
     ivec3 tile_pos = local + ivec3(MAX_R);
     float self = s_tile[tile_idx(tile_pos.x, tile_pos.y, tile_pos.z)];
 #else
-    int R = int(radius * h_inv);
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
     float self = fetch(pos).r;
 #endif
@@ -769,9 +792,12 @@ void main() {
 // Multi-channel Lenia — 3 channels with cross-channel kernel coupling
 // Two code paths: USE_SHARED_MEM=1 uses vec3 shared memory tiling,
 // USE_SHARED_MEM=0 uses direct imageLoad for driver compatibility.
+//
+// MAX_R caps both code paths identically so dynamics match.
+
+#define MAX_R 3
 
 #if USE_SHARED_MEM
-#define MAX_R 3
 #define TILE (8 + 2 * MAX_R)
 #define TILE3 (TILE * TILE * TILE)
 shared vec3 s_tile[TILE3];
@@ -788,11 +814,12 @@ void main() {
     float radius = u_param2;
     float cross = u_param3;
 
+    int R = min(int(radius * h_inv), MAX_R);
+
 #if USE_SHARED_MEM
     ivec3 local = ivec3(gl_LocalInvocationID);
     int local_flat = int(gl_LocalInvocationIndex);
     ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
-    int R = min(int(radius * h_inv), MAX_R);
 
     ivec3 tile_origin = group_origin - ivec3(R);
     int tile_size = 8 + 2 * R;
@@ -812,7 +839,6 @@ void main() {
     ivec3 tp = local + ivec3(MAX_R);
     vec3 self_rgb = s_tile[tile_idx(tp.x, tp.y, tp.z)];
 #else
-    int R = int(radius * h_inv);
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
     vec3 self_rgb = fetch(pos).rgb;
     ivec3 tp = pos;  // alias for sampling loop
