@@ -280,8 +280,55 @@ void main() {
 // Channel R = concentration U (substrate), Channel G = concentration V (catalyst)
 //   dU/dt = Du * lap(U) - U*V^2 + F*(1-U)
 //   dV/dt = Dv * lap(V) + U*V^2 - (F+k)*V
+//
+// USE_SHARED_MEM=1 cooperatively loads a 10^3 vec2 tile (RG only — the
+// A,B channels aren't used here) into shared memory so the 6 stencil
+// reads come from on-chip storage instead of 6 imageLoad ops per cell.
+// Tile cost: 10*10*10 * 8 bytes = 8000 bytes shared per workgroup.
+
+#if USE_SHARED_MEM
+#define RDTILE 10
+#define RDTILE3 (RDTILE * RDTILE * RDTILE)
+shared vec2 s_uv[RDTILE3];
+int rd_idx(int x, int y, int z) {
+    return z * RDTILE * RDTILE + y * RDTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    // Cooperative tile load — every thread participates BEFORE any
+    // early exit so the barrier doesn't deadlock and halo entries are
+    // populated even when the workgroup straddles the grid boundary.
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < RDTILE3; i += 512) {
+        int tz = i / (RDTILE * RDTILE);
+        int ty = (i / RDTILE) % RDTILE;
+        int tx = i % RDTILE;
+        s_uv[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 c = s_uv[rd_idx(tp.x, tp.y, tp.z)];
+    float U = c.r;
+    float V = c.g;
+
+    vec2 sum = vec2(0.0);
+    sum += s_uv[rd_idx(tp.x + 1, tp.y,     tp.z    )];
+    sum += s_uv[rd_idx(tp.x - 1, tp.y,     tp.z    )];
+    sum += s_uv[rd_idx(tp.x,     tp.y + 1, tp.z    )];
+    sum += s_uv[rd_idx(tp.x,     tp.y - 1, tp.z    )];
+    sum += s_uv[rd_idx(tp.x,     tp.y,     tp.z + 1)];
+    sum += s_uv[rd_idx(tp.x,     tp.y,     tp.z - 1)];
+    float sum_U = sum.x;
+    float sum_V = sum.y;
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_val = fetch(pos);
@@ -297,8 +344,9 @@ void main() {
     nb = fetch(pos + ivec3( 0,-1, 0)); sum_U += nb.r; sum_V += nb.g;
     nb = fetch(pos + ivec3( 0, 0, 1)); sum_U += nb.r; sum_V += nb.g;
     nb = fetch(pos + ivec3( 0, 0,-1)); sum_U += nb.r; sum_V += nb.g;
+#endif
 
-    // Standard 3D discrete Laplacian, scaled by h² for resolution-independence
+    // Standard 3D discrete Laplacian, scaled by h^2 for resolution-independence
     float lap_U = (sum_U - 6.0 * U) * h_sq;
     float lap_V = (sum_V - 6.0 * V) * h_sq;
 
@@ -324,15 +372,63 @@ void main() {
 //   dv/dt = c^2 * lap(u) - damping * v + source_driving
 //   du/dt = v
 // Integration: symplectic Euler (update v first, then u with new v)
+//
+// Two code paths: USE_SHARED_MEM=1 cooperatively loads a 10^3 tile
+// (8^3 core + 1-voxel halo) into shared memory so the 7 stencil reads
+// per cell come from on-chip memory instead of 7 imageLoad ops.
+// USE_SHARED_MEM=0 keeps the original direct-fetch path for nouveau.
+// Only the displacement channel (R) needs to be tiled — velocity is
+// per-cell and read from the self_val sample.
+
+#if USE_SHARED_MEM
+#define WTILE 10                  // 8 + 2*1 halo
+#define WTILE3 (WTILE * WTILE * WTILE)
+shared float s_u[WTILE3];
+int wtile_idx(int x, int y, int z) {
+    return z * WTILE * WTILE + y * WTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
+#if USE_SHARED_MEM
+    // Cooperative tile load. Threads outside the simulation domain still
+    // participate in the load (and contribute boundary values via fetch())
+    // before any early exit — otherwise the barrier would deadlock and
+    // the halo would have undefined entries.
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
+    ivec3 tile_origin = group_origin - ivec3(1);
+    for (int i = local_flat; i < WTILE3; i += 512) {
+        int tz = i / (WTILE * WTILE);
+        int ty = (i / WTILE) % WTILE;
+        int tx = i % WTILE;
+        s_u[i] = fetch(tile_origin + ivec3(tx, ty, tz)).r;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);  // shift past halo
+    vec4 self_val = fetch(pos);   // need both .r and .g; .g not in tile
+    float u = self_val.r;
+    float v = self_val.g;
+
+    float sum_u = 0.0;
+    sum_u += s_u[wtile_idx(tp.x + 1, tp.y,     tp.z    )];
+    sum_u += s_u[wtile_idx(tp.x - 1, tp.y,     tp.z    )];
+    sum_u += s_u[wtile_idx(tp.x,     tp.y + 1, tp.z    )];
+    sum_u += s_u[wtile_idx(tp.x,     tp.y - 1, tp.z    )];
+    sum_u += s_u[wtile_idx(tp.x,     tp.y,     tp.z + 1)];
+    sum_u += s_u[wtile_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
     vec4 self_val = fetch(pos);
     float u = self_val.r;  // displacement
     float v = self_val.g;  // velocity
 
-    // 3D discrete Laplacian, scaled by h² for resolution-independence
+    // 3D discrete Laplacian, scaled by h^2 for resolution-independence
     float sum_u = 0.0;
     sum_u += fetch(pos + ivec3( 1, 0, 0)).r;
     sum_u += fetch(pos + ivec3(-1, 0, 0)).r;
@@ -340,6 +436,7 @@ void main() {
     sum_u += fetch(pos + ivec3( 0,-1, 0)).r;
     sum_u += fetch(pos + ivec3( 0, 0, 1)).r;
     sum_u += fetch(pos + ivec3( 0, 0,-1)).r;
+#endif
     float lap = (sum_u - 6.0 * u) * h_sq;
 
     float c         = u_param0;  // wave speed
