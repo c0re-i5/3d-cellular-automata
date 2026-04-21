@@ -485,38 +485,77 @@ void main() {
 // u_param1 = diffusion rate (thermal diffusivity)
 // u_param2 = anisotropy strength ε (cubic harmonic amplitude)
 // u_param3 = mode: 0=compact crystal, 1=dendritic (noise-driven branching)
+//
+// USE_SHARED_MEM=1 cooperatively loads a 10^3 vec2 tile of (phi, u_field)
+// so the 6 stencil reads (for both lap_phi+lap_u and the phi-gradient)
+// come from on-chip shared memory instead of 6 imageLoad ops per cell.
+
+#if USE_SHARED_MEM
+#define CGTILE 10
+#define CGTILE3 (CGTILE * CGTILE * CGTILE)
+shared vec2 s_pu[CGTILE3];
+int cg_idx(int x, int y, int z) {
+    return z * CGTILE * CGTILE + y * CGTILE + x;
+}
+#endif
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+#if USE_SHARED_MEM
+    // Cooperative tile load. Every thread participates BEFORE any early
+    // exit so the barrier can't deadlock and halo entries are populated
+    // even when the workgroup straddles the grid boundary.
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+    for (int i = local_flat; i < CGTILE3; i += 512) {
+        int tz = i / (CGTILE * CGTILE);
+        int ty = (i / CGTILE) % CGTILE;
+        int tx = i % CGTILE;
+        s_pu[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(1);
+    vec2 c = s_pu[cg_idx(tp.x, tp.y, tp.z)];
+    float phi     = c.r;
+    float u_field = c.g;
+
+    vec2 nxp = s_pu[cg_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec2 nxm = s_pu[cg_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec2 nyp = s_pu[cg_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec2 nym = s_pu[cg_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec2 nzp = s_pu[cg_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec2 nzm = s_pu[cg_idx(tp.x,     tp.y,     tp.z - 1)];
+#else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
-    float phi = self_data.r;    // phase: 0=liquid, 1=solid
+    float phi = self_data.r;      // phase: 0=liquid, 1=solid
     float u_field = self_data.g;  // supersaturation
+
+    vec2 nxp = fetch(pos + ivec3( 1, 0, 0)).rg;
+    vec2 nxm = fetch(pos + ivec3(-1, 0, 0)).rg;
+    vec2 nyp = fetch(pos + ivec3( 0, 1, 0)).rg;
+    vec2 nym = fetch(pos + ivec3( 0,-1, 0)).rg;
+    vec2 nzp = fetch(pos + ivec3( 0, 0, 1)).rg;
+    vec2 nzm = fetch(pos + ivec3( 0, 0,-1)).rg;
+#endif
 
     float undercooling = u_param0;
     float D = u_param1;
     float eps_strength = u_param2;
     float mode = u_param3;
 
-    // 6-neighbor Laplacian + gradient (face neighbors)
-    vec4 nf[6];
-    nf[0] = fetch(pos + ivec3( 1,0,0)); nf[1] = fetch(pos + ivec3(-1,0,0));
-    nf[2] = fetch(pos + ivec3(0, 1,0)); nf[3] = fetch(pos + ivec3(0,-1,0));
-    nf[4] = fetch(pos + ivec3(0,0, 1)); nf[5] = fetch(pos + ivec3(0,0,-1));
-
-    float lap_phi = -6.0 * phi;
-    float lap_u = -6.0 * u_field;
-    for (int i = 0; i < 6; i++) {
-        lap_phi += nf[i].r;
-        lap_u += nf[i].g;
-    }
-    lap_phi *= h_sq;  // resolution-independent Laplacian
-    lap_u *= h_sq;
+    float lap_phi = (nxp.r + nxm.r + nyp.r + nym.r + nzp.r + nzm.r - 6.0 * phi)     * h_sq;
+    float lap_u   = (nxp.g + nxm.g + nyp.g + nym.g + nzp.g + nzm.g - 6.0 * u_field) * h_sq;
 
     // Interface normal from ∇φ (scale gradient by h_inv for correct magnitude)
-    float gx = (nf[0].r - nf[1].r) * 0.5 * h_inv;
-    float gy = (nf[2].r - nf[3].r) * 0.5 * h_inv;
-    float gz = (nf[4].r - nf[5].r) * 0.5 * h_inv;
+    float gx = (nxp.r - nxm.r) * 0.5 * h_inv;
+    float gy = (nyp.r - nym.r) * 0.5 * h_inv;
+    float gz = (nzp.r - nzm.r) * 0.5 * h_inv;
     float grad_mag = sqrt(gx*gx + gy*gy + gz*gz + 1e-8);
     vec3 n = vec3(gx, gy, gz) / grad_mag;
 
