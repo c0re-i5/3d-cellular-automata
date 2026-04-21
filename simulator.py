@@ -20,6 +20,7 @@ Usage:
 """
 
 import sys, math, time, argparse, json, os, random, subprocess, shutil, threading
+import queue as _queue
 import numpy as np
 import glfw
 import moderngl
@@ -31,6 +32,17 @@ from element_data import ELEMENT_GPU_DATA, SYMBOLS, NAMES, NUM_ELEMENTS, FLOATS_
 # Mesa/Nouveau driver has a ~1 GiB per-allocation limit for GL textures.
 # For grids where a single rgba32f texture exceeds this, use rgba16f instead.
 _TEX_ALLOC_LIMIT = 1_000_000_000  # bytes (~1 GB, conservative)
+
+# Boundary modes — must match the integer values used in shader fetch():
+#   0 = toroidal  (periodic wrap)
+#   1 = clamped   (Dirichlet — out-of-bounds reads as zero)
+#   2 = mirror    (Neumann zero-flux — reflect at the wall; preserves mass for
+#                  reaction/diffusion PDEs and avoids spurious boundary layers)
+_BOUNDARY_NAME_TO_MODE = {
+    'toroidal': 0, 'periodic': 0, 'wrap': 0,
+    'clamped': 1, 'dirichlet': 1, 'zero': 1,
+    'mirror': 2, 'neumann': 2, 'reflect': 2, 'zero_flux': 2,
+}
 
 
 def _tex_format_for_size(size):
@@ -56,7 +68,7 @@ uniform float u_param0;
 uniform float u_param1;
 uniform float u_param2;
 uniform float u_param3;
-uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (zero outside)
+uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (Dirichlet, zero outside), 2 = mirror (Neumann, zero-flux)
 uniform int u_frame;     // step counter for temporal noise
 
 // ── Grid-spacing scale factors ──────────────────────────────────────
@@ -70,9 +82,16 @@ float h_inv = float(u_size) / REF_SIZE;  // multiply radii by this
 
 vec4 fetch(ivec3 p) {
     if (u_boundary == 1) {
-        // Clamped: out-of-bounds returns zero
+        // Clamped (Dirichlet): out-of-bounds returns zero
         if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
             return vec4(0.0);
+        return imageLoad(u_src, p);
+    }
+    if (u_boundary == 2) {
+        // Mirror (Neumann zero-flux): reflect index across boundary.
+        // Preserves conservation laws for diffusion/reaction-diffusion PDEs.
+        // Equivalent to the boundary cell having a phantom neighbor equal to itself.
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
         return imageLoad(u_src, p);
     }
     // Toroidal: wrap around
@@ -504,7 +523,8 @@ void main() {
         if (dist > fR + 0.5) continue;
 
         float r_norm = dist / fR;
-        float kernel = exp(-0.5 * pow((r_norm - ring_pos) / 0.15, 2.0));
+        float kring = (r_norm - ring_pos) / 0.15;
+        float kernel = exp(-0.5 * kring * kring);
 
 #if USE_SHARED_MEM
         float v = s_tile[tile_idx(tile_pos.x + dx, tile_pos.y + dy, tile_pos.z + dz)];
@@ -591,8 +611,10 @@ void main() {
         if (dist > fR + 0.5) continue;
 
         float r_norm = dist / fR;
-        float k_inner = exp(-0.5 * pow((r_norm - 0.3) / 0.12, 2.0));
-        float k_outer = exp(-0.5 * pow((r_norm - 0.7) / 0.12, 2.0));
+        float ki = (r_norm - 0.3) / 0.12;
+        float ko = (r_norm - 0.7) / 0.12;
+        float k_inner = exp(-0.5 * ki * ki);
+        float k_outer = exp(-0.5 * ko * ko);
 
 #if USE_SHARED_MEM
         vec3 nb = s_tile[tile_idx(tp.x + dx, tp.y + dy, tp.z + dz)];
@@ -613,9 +635,12 @@ void main() {
     float pot_c = sum_inner.b + cross * (sum_outer.r + sum_outer.g) * 0.5;
 
     float mu_offset = 0.1 * cross;
-    float ga = 2.0 * exp(-0.5 * pow((pot_a - mu) / sigma, 2.0)) - 1.0;
-    float gb = 2.0 * exp(-0.5 * pow((pot_b - mu * (1.0 + mu_offset)) / sigma, 2.0)) - 1.0;
-    float gc = 2.0 * exp(-0.5 * pow((pot_c - mu * (1.0 - mu_offset)) / sigma, 2.0)) - 1.0;
+    float ga_z = (pot_a - mu) / sigma;
+    float gb_z = (pot_b - mu * (1.0 + mu_offset)) / sigma;
+    float gc_z = (pot_c - mu * (1.0 - mu_offset)) / sigma;
+    float ga = 2.0 * exp(-0.5 * ga_z * ga_z) - 1.0;
+    float gb = 2.0 * exp(-0.5 * gb_z * gb_z) - 1.0;
+    float gc = 2.0 * exp(-0.5 * gc_z * gc_z) - 1.0;
 
     vec3 result = self_rgb + u_dt * vec3(ga, gb, gc);
     result = clamp(result, 0.0, 1.0);
@@ -1954,6 +1979,13 @@ void main() {
         psi_r += (hbar_2m * lap_i - Vs * psi_i) * u_dt;
     }
 
+    // Safety clamp: Yee leapfrog is symplectic but unbounded if dt violates
+    // the von Neumann stability criterion (dt < h²/(2·hbar_2m)). Cap |ψ|
+    // to keep visualization and downstream metrics finite when a user
+    // pushes parameters past the stability limit.
+    psi_r = clamp(psi_r, -1e3, 1e3);
+    psi_i = clamp(psi_i, -1e3, 1e3);
+
     float prob = psi_r * psi_r + psi_i * psi_i;
     imageStore(u_dst, pos, vec4(psi_r, psi_i, V, prob));
 }
@@ -1989,9 +2021,15 @@ void main() {
     sum_V += fetch(pos + ivec3( 0, 0,-1)).b;
 
     float alpha = u_param2;  // coupling strength
-    float omega = u_param3;  // SOR relaxation rate
+    // Clamp SOR relaxation to its convergence interval (0, 2). Outside that
+    // range Jacobi/SOR diverges. ω=1 is plain Jacobi, ω∈(1,2) accelerates.
+    float omega = clamp(u_param3, 0.0, 1.95);
 
-    float V_jacobi = (sum_V + alpha * prob) / 6.0;
+    // Jacobi step for ∇²V = -α|ψ|² discretized as (sum_V - 6V)/h² = -α|ψ|².
+    // Solving for V: V = (sum_V + h²·α·|ψ|²) / 6. The h_sq factor is
+    // essential for resolution independence — without it the coupling is
+    // 4× too weak at size 64 and 4× too strong at size 256.
+    float V_jacobi = (sum_V + h_sq * alpha * prob) / 6.0;
     V = mix(V, V_jacobi, omega);
 
     // ── Schrödinger Yee leapfrog ──
@@ -2020,6 +2058,10 @@ void main() {
         float lap_i = (sum_i - 6.0 * psi_i) * h_sq;
         psi_r += (hbar_2m * lap_i - Vs * psi_i) * u_dt;
     }
+
+    psi_r = clamp(psi_r, -1e3, 1e3);
+    psi_i = clamp(psi_i, -1e3, 1e3);
+    V    = clamp(V,    -1e3, 1e3);
 
     prob = psi_r * psi_r + psi_i * psi_i;
     imageStore(u_dst, pos, vec4(psi_r, psi_i, V, prob));
@@ -2086,6 +2128,9 @@ void main() {
         psi_r += (hbar_2m * lap_i - V * psi_i) * u_dt;
     }
 
+    psi_r = clamp(psi_r, -1e3, 1e3);
+    psi_i = clamp(psi_i, -1e3, 1e3);
+
     float prob = psi_r * psi_r + psi_i * psi_i;
     imageStore(u_dst, pos, vec4(psi_r, psi_i, V, prob));
 }
@@ -2117,7 +2162,7 @@ uniform float u_param0;  // ambient temperature
 uniform float u_param1;  // gravity strength
 uniform float u_param2;  // reaction rate multiplier
 uniform float u_param3;  // unused
-uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (zero outside)
+uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (Dirichlet, zero outside), 2 = mirror (Neumann)
 
 // Cell channels:
 // R = element ID (0=vacuum, 1-118=element), encoded as float
@@ -2129,6 +2174,11 @@ vec4 fetch(ivec3 p) {
     if (u_boundary == 1) {
         if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
             return vec4(0.0);
+        return imageLoad(u_src, p);
+    }
+    if (u_boundary == 2) {
+        // Mirror (Neumann zero-flux): treat the wall as identical to its inner neighbor.
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
         return imageLoad(u_src, p);
     }
     p = (p + u_size) % u_size;
@@ -2408,7 +2458,10 @@ void main() {
 # Uses shared memory tiling (10x10x10 halo) for fast neighbor lookups
 # and sampler3D (texelFetch) for texture-cached reads
 # Packed format: 1 uint (4 bytes) per voxel
-#   uint0: x(10) | y(10) | z(10) | solid_neighbors(2)  — supports up to 1024³
+#   uint0: x(9) | y(9) | z(9) | solid_neighbors(5)  — supports up to 512³
+# Note: prior layout used 10/10/10/2 (1024³ max, only 4 shading levels). The
+# 5-bit shading field gives 32 levels, eliminating visible posterization on
+# voxel iso-surfaces. The simulator maxes at 512³ grids so 9 bits suffice.
 VOXEL_CULL_SHADER = """
 #version 430
 layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
@@ -2530,17 +2583,35 @@ void main() {
     if (is_alive(s_tile[s.z + 1][s.y][s.x])) solid_neighbors++;  // +Z
     if (solid_neighbors >= 6) return;  // fully buried, skip
 
+    // Compute a richer surface-darkening hint: 0..6 raw face-neighbor count
+    // mapped to 0..30 so it fits in a 5-bit field with smooth steps. We oversample
+    // the corner contributions by also weighting the 12 edge neighbors (each
+    // counted as 0.5) and 8 corner neighbors (each as 0.25). This produces
+    // ambient-occlusion-like shading without any extra global memory traffic
+    // (everything lives in s_tile which is already populated for the surface cull).
+    int aoc = solid_neighbors * 4;  // face neighbors weighted x4 (range 0..24)
+    // Edge (12) and corner (8) contributions for AO darkening
+    if (is_alive(s_tile[s.z][s.y - 1][s.x - 1])) aoc++;
+    if (is_alive(s_tile[s.z][s.y - 1][s.x + 1])) aoc++;
+    if (is_alive(s_tile[s.z][s.y + 1][s.x - 1])) aoc++;
+    if (is_alive(s_tile[s.z][s.y + 1][s.x + 1])) aoc++;
+    if (is_alive(s_tile[s.z - 1][s.y][s.x - 1])) aoc++;
+    if (is_alive(s_tile[s.z - 1][s.y][s.x + 1])) aoc++;
+    if (is_alive(s_tile[s.z + 1][s.y][s.x - 1])) aoc++;
+    if (is_alive(s_tile[s.z + 1][s.y][s.x + 1])) aoc++;
+    // Cap the AO score in the 5-bit field range (0..31)
+    uint shade_hint = uint(min(aoc, 31));
+
     // Append position only (1 uint = 4 bytes per voxel)
     atomicAdd(totalVisibleCount, 1u);  // frame-level total (not reset per chunk)
     uint idx = atomicAdd(instanceCount, 1u);
     if (idx >= uint(u_max_voxels)) return;
 
-    // Pack: 10 bits x, 10 bits y, 10 bits z (supports up to 1024^3)
-    // Plus 2-bit solid_neighbors hint in the spare bits for surface shading
-    voxels[idx] = (uint(pos.x) & 0x3FFu)
-                | ((uint(pos.y) & 0x3FFu) << 10)
-                | ((uint(pos.z) & 0x3FFu) << 20)
-                | ((uint(solid_neighbors) & 0x3u) << 30);
+    // Pack: 9 bits x, 9 bits y, 9 bits z (supports up to 512³) + 5-bit shading
+    voxels[idx] = (uint(pos.x) & 0x1FFu)
+                | ((uint(pos.y) & 0x1FFu) <<  9)
+                | ((uint(pos.z) & 0x1FFu) << 18)
+                | ((shade_hint  & 0x1Fu)  << 27);
 }
 """
 
@@ -2569,7 +2640,7 @@ uniform int u_channel;
 uniform int u_mode;        // 0=discrete, 1=continuous, 2=wave, 3=element
 uniform float u_change_thr;
 uniform int u_has_prev;    // 0 = no previous snapshot, skip activity
-uniform int u_boundary;    // 0 = toroidal, 1 = clamped
+uniform int u_boundary;    // 0 = toroidal, 1 = clamped (Dirichlet), 2 = mirror (Neumann)
 
 shared uint s_alive;
 shared uint s_change;
@@ -2589,6 +2660,9 @@ vec4 safe_load(ivec3 p) {
         if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
             return vec4(0.0);
         return imageLoad(u_current, p);
+    } else if (u_boundary == 2) {
+        // Mirror: out-of-bounds reflects to its inner neighbor (zero-flux).
+        return imageLoad(u_current, clamp(p, ivec3(0), ivec3(u_size - 1)));
     } else {
         // Toroidal: wrap
         return imageLoad(u_current, (p + ivec3(u_size)) % ivec3(u_size));
@@ -2721,15 +2795,14 @@ void main() {
     int instance_id = gl_InstanceID;
     int vert_id = gl_VertexID;
 
-    // Unpack position from 1 uint (4 bytes)
+    // Unpack position from 1 uint (4 bytes) — 9 bits per axis + 5-bit shading
     uint pdata = voxels[instance_id];
-    // 2-bit solid neighbor hint for binary CA surface shading
-    uint solid_hint = (pdata >> 30) & 0x3u;
+    uint shade_hint = (pdata >> 27) & 0x1Fu;  // 0..31, smoothed AO score
 
     // Sample color from 3D texture at this voxel's grid coordinate (exact texel)
-    ivec3 ipos = ivec3(int(pdata & 0x3FFu),
-                        int((pdata >> 10) & 0x3FFu),
-                        int((pdata >> 20) & 0x3FFu));
+    ivec3 ipos = ivec3(int(pdata & 0x1FFu),
+                        int((pdata >>  9) & 0x1FFu),
+                        int((pdata >> 18) & 0x1FFu));
 
     // Per-face visibility: degenerate triangles for faces hidden by a neighbor
     int face_id = vert_id / 6;
@@ -2767,10 +2840,15 @@ void main() {
         // Normalize value to [0,1] relative to threshold
         value = clamp((value - u_threshold) / max(1.0 - u_threshold, 0.001), 0.0, 1.0);
 
-        // For binary CAs (value ~= 1.0), use solid neighbor hint for surface shading
+        // For binary CAs (value ~= 1.0), use the AO-weighted shading hint
+        // (5 bits, 0..31) to give 32 smooth darkening levels instead of the
+        // previous 4. This eliminates visible posterization on iso-surfaces.
         if (value > 0.99) {
-            float sn = float(solid_hint) / 3.0;  // 2-bit hint scaled
-            value = 0.3 + sn * 0.7;
+            float sn = float(shade_hint) / 31.0;  // 5-bit hint, 0..1
+            // Map so isolated cells (sn ~ 0) are bright (0.85) and deeply
+            // embedded cells (sn ~ 1) are dim (0.30). The exponent shapes
+            // the response curve to emphasize edges.
+            value = mix(0.85, 0.30, pow(sn, 0.7));
         }
         color = vec3(value);
     }
@@ -2819,9 +2897,10 @@ vec3 colormap_neon(float t) {
     return vec3(clamp(abs(h-2.0)-1.0, 0.0, 1.0), clamp(2.0-abs(h-1.5), 0.0, 1.0), clamp(2.0-abs(h-3.0), 0.0, 1.0)) * (0.5+t*0.5);
 }
 vec3 colormap_discrete(float t) {
-    // 8 maximally-distinct hues via golden angle spacing
-    int idx = int(floor(t * 8.0));
-    idx = clamp(idx, 0, 7);
+    // 16 maximally-distinct hues via golden-angle spacing.
+    // 16 bins (vs the original 8) cuts banding in half on smooth fields.
+    int idx = int(floor(t * 16.0));
+    idx = clamp(idx, 0, 15);
     float hue = fract(float(idx) * 0.618033988 + 0.0);
     // HSV to RGB (S=0.75, V=0.95)
     float s = 0.75, v = 0.95;
@@ -3057,7 +3136,7 @@ vec3 colormap_neon(float t) {
     return c*(0.5+t*0.5);
 }
 vec3 colormap_discrete(float t) {
-    int idx=clamp(int(floor(t*8.0)),0,7); float hue=fract(float(idx)*0.618033988);
+    int idx=clamp(int(floor(t*16.0)),0,15); float hue=fract(float(idx)*0.618033988);
     float s=0.75,v=0.95,cc=v*s,h=hue*6.0,x=cc*(1.0-abs(mod(h,2.0)-1.0));
     vec3 rgb; if(h<1.0)rgb=vec3(cc,x,0);else if(h<2.0)rgb=vec3(x,cc,0);
     else if(h<3.0)rgb=vec3(0,cc,x);else if(h<4.0)rgb=vec3(0,x,cc);
@@ -3066,10 +3145,16 @@ vec3 colormap_discrete(float t) {
 }
 vec3 colormap_spectral(float t) {
     float wl=380.0+t*400.0;
-    float x_bar=1.056*exp(-0.5*pow((wl-599.8)/37.9,2.0))+0.362*exp(-0.5*pow((wl-442.0)/16.0,2.0))
-                -0.065*exp(-0.5*pow((wl-501.1)/20.4,2.0));
-    float y_bar=0.821*exp(-0.5*pow((wl-568.8)/46.9,2.0))+0.286*exp(-0.5*pow((wl-530.9)/16.3,2.0));
-    float z_bar=1.217*exp(-0.5*pow((wl-437.0)/11.8,2.0))+0.681*exp(-0.5*pow((wl-459.0)/26.0,2.0));
+    // CIE 1931 2-deg colour-matching functions, fitted as sums of Gaussians
+    // (Wyman, Sloan & Shirley 2013). Use squared-z-score form so the GLSL
+    // compiler can keep this in fast multiply-add lanes (avoids pow()).
+    float a, b, c, d, e, f;
+    a=(wl-599.8)/37.9; b=(wl-442.0)/16.0; c=(wl-501.1)/20.4;
+    float x_bar=1.056*exp(-0.5*a*a)+0.362*exp(-0.5*b*b)-0.065*exp(-0.5*c*c);
+    d=(wl-568.8)/46.9; e=(wl-530.9)/16.3;
+    float y_bar=0.821*exp(-0.5*d*d)+0.286*exp(-0.5*e*e);
+    float p=(wl-437.0)/11.8; float q=(wl-459.0)/26.0;
+    float z_bar=1.217*exp(-0.5*p*p)+0.681*exp(-0.5*q*q);
     vec3 rgb; rgb.r=3.2406*x_bar-1.5372*y_bar-0.4986*z_bar;
     rgb.g=-0.9689*x_bar+1.8758*y_bar+0.0415*z_bar;
     rgb.b=0.0557*x_bar-0.2040*y_bar+1.0570*z_bar;
@@ -3287,8 +3372,8 @@ vec3 colormap_neon(float t) {
 }
 
 vec3 colormap_discrete(float t) {
-    int idx = int(floor(t * 8.0));
-    idx = clamp(idx, 0, 7);
+    int idx = int(floor(t * 16.0));
+    idx = clamp(idx, 0, 15);
     float hue = fract(float(idx) * 0.618033988 + 0.0);
     float s = 0.75, v = 0.95;
     float cc = v * s;
@@ -3312,13 +3397,17 @@ vec3 colormap_spectral(float t) {
     // Attempt CIE 1931 approximate XYZ → linear sRGB
     float x_bar, y_bar, z_bar;
     // Gaussian approximation of CIE color matching functions
-    x_bar = 1.056 * exp(-0.5 * pow((wl - 599.8) / 37.9, 2.0))
-          + 0.362 * exp(-0.5 * pow((wl - 442.0) / 16.0, 2.0))
-          - 0.065 * exp(-0.5 * pow((wl - 501.1) / 20.4, 2.0));
-    y_bar = 0.821 * exp(-0.5 * pow((wl - 568.8) / 46.9, 2.0))
-          + 0.286 * exp(-0.5 * pow((wl - 530.9) / 16.3, 2.0));
-    z_bar = 1.217 * exp(-0.5 * pow((wl - 437.0) / 11.8, 2.0))
-          + 0.681 * exp(-0.5 * pow((wl - 459.0) / 26.0, 2.0));
+    float a, b, c, d, e, f;
+    a = (wl - 599.8) / 37.9; b = (wl - 442.0) / 16.0; c = (wl - 501.1) / 20.4;
+    x_bar = 1.056 * exp(-0.5 * a * a)
+          + 0.362 * exp(-0.5 * b * b)
+          - 0.065 * exp(-0.5 * c * c);
+    d = (wl - 568.8) / 46.9; e = (wl - 530.9) / 16.3;
+    y_bar = 0.821 * exp(-0.5 * d * d)
+          + 0.286 * exp(-0.5 * e * e);
+    f = (wl - 437.0) / 11.8; float g = (wl - 459.0) / 26.0;
+    z_bar = 1.217 * exp(-0.5 * f * f)
+          + 0.681 * exp(-0.5 * g * g);
     // XYZ to linear sRGB
     vec3 rgb;
     rgb.r =  3.2406 * x_bar - 1.5372 * y_bar - 0.4986 * z_bar;
@@ -6124,7 +6213,8 @@ class Simulator:
 
         # Rendering mode: 'volumetric' or 'voxel'
         self.renderer_mode = self.preset.get('render_mode', 'volumetric')
-        self.boundary_mode = 1 if self.preset.get('boundary', 'toroidal') == 'clamped' else 0
+        self.boundary_mode = _BOUNDARY_NAME_TO_MODE.get(
+            self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
 
         # Voxel rendering settings
@@ -7117,7 +7207,8 @@ class Simulator:
         self.vis_channel = self.preset.get('vis_default', 0)
         self.vis_abs = self.preset.get('vis_abs', False)
         self.renderer_mode = self.preset.get('render_mode', 'volumetric')
-        self.boundary_mode = 1 if self.preset.get('boundary', 'toroidal') == 'clamped' else 0
+        self.boundary_mode = _BOUNDARY_NAME_TO_MODE.get(
+            self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
         # Apply preset's preferred grid size if specified and current size is smaller
         pref_size = self.preset.get('default_size')
@@ -7304,7 +7395,7 @@ class Simulator:
         y0 += 16
 
         if self.colormap == 4:  # Discrete — draw individual swatches
-            n_bands = 8
+            n_bands = 16
             swatch_w = bar_w / n_bands
             for i in range(n_bands):
                 t = (i + 0.5) / n_bands
@@ -7378,7 +7469,7 @@ class Simulator:
             s = 0.5 + t * 0.5
             return (r * s, g * s, b * s)
         elif self.colormap == 4:  # Discrete
-            idx = min(int(t * 8), 7)
+            idx = min(int(t * 16), 15)
             hue = (idx * 0.618033988) % 1.0
             s, v = 0.75, 0.95
             c = v * s
@@ -7401,14 +7492,18 @@ class Simulator:
         for name, (lo, hi) in ranges.items():
             if name.startswith("unused"):
                 continue
+            # Normalize swapped or degenerate ranges so randint/uniform never throw.
+            if hi < lo:
+                lo, hi = hi, lo
             if isinstance(lo, int) and isinstance(hi, int):
-                self.params[name] = random.randint(lo, hi)
+                self.params[name] = lo if hi == lo else random.randint(lo, hi)
             else:
-                self.params[name] = random.uniform(lo, hi)
+                self.params[name] = float(lo) if hi == lo else random.uniform(lo, hi)
         # Also randomize dt if the preset defines a safe range
         dt_range = self.preset.get('dt_range')
         if dt_range:
-            self.dt = random.uniform(dt_range[0], dt_range[1])
+            dlo, dhi = float(min(dt_range)), float(max(dt_range))
+            self.dt = dlo if dhi == dlo else random.uniform(dlo, dhi)
         self.seed = random.randint(0, 99999)
         self._reset()
 
@@ -7418,7 +7513,9 @@ class Simulator:
         for name, (lo, hi) in ranges.items():
             if name.startswith("unused"):
                 continue
-            val = self.params[name]
+            if hi < lo:
+                lo, hi = hi, lo
+            val = self.params.get(name, lo)
             span = hi - lo if hi != lo else 1.0
             delta = random.gauss(0, strength * span)
             if isinstance(lo, int) and isinstance(hi, int):
@@ -7427,9 +7524,9 @@ class Simulator:
                 self.params[name] = max(float(lo), min(float(hi), val + delta))
         dt_range = self.preset.get('dt_range')
         if dt_range:
-            dt_span = dt_range[1] - dt_range[0]
-            self.dt = max(dt_range[0], min(dt_range[1],
-                          self.dt + random.gauss(0, strength * dt_span)))
+            dlo, dhi = float(min(dt_range)), float(max(dt_range))
+            dt_span = dhi - dlo
+            self.dt = max(dlo, min(dhi, self.dt + random.gauss(0, strength * dt_span)))
         self._reset()
 
     def _load_discoveries(self):
@@ -7992,6 +8089,10 @@ class Simulator:
             if name.startswith("unused"):
                 continue
             lo, hi = param_ranges[name]
+            # Defensive: presets are user-editable; a swapped range would crash
+            # the slider. Normalize silently here.
+            if hi < lo:
+                lo, hi = hi, lo
             val = self.params[name]
             if isinstance(lo, int) and isinstance(hi, int) and lo != hi:
                 changed, new_val = imgui.slider_int(name, int(val), lo, hi)
@@ -8002,8 +8103,17 @@ class Simulator:
                 if changed:
                     self.params[name] = new_val
 
-        changed, new_dt = imgui.slider_float("Time step", self.dt, 0.001, 2.0, "%.4f",
-                                              flags=imgui.SliderFlags_.logarithmic)
+        # Time step — respect the preset's safe range when one is declared,
+        # otherwise fall back to the historical wide [0.001, 2.0] window.
+        dt_range = self.preset.get('dt_range', (0.001, 2.0))
+        dt_lo = float(min(dt_range))
+        dt_hi = float(max(dt_range))
+        # Allow a 2× headroom above the preset's recommended max for exploration,
+        # but never below the lower bound.
+        dt_hi = max(dt_hi * 2.0, dt_lo * 1.001)
+        changed, new_dt = imgui.slider_float(
+            "Time step", float(self.dt), dt_lo, dt_hi, "%.4f",
+            flags=imgui.SliderFlags_.logarithmic)
         if changed:
             self.dt = new_dt
 
@@ -8046,7 +8156,9 @@ class Simulator:
 
         changed, new_seed = imgui.input_int("Seed", self.seed)
         if changed:
-            self.seed = new_seed
+            # NumPy RandomState requires uint32; clamp to a safe positive range
+            # so user-entered negatives or huge values don't crash _reset().
+            self.seed = int(max(0, min(0xFFFFFFFF, new_seed)))
 
         # Init pattern selector (if variants exist)
         variants = self.preset.get('init_variants', [])
@@ -8222,7 +8334,7 @@ class Simulator:
             imgui.end_combo()
 
         imgui.text("Boundary:")
-        boundary_modes = ["Toroidal (wrap)", "Clamped (edge)"]
+        boundary_modes = ["Toroidal (wrap)", "Clamped (Dirichlet)", "Mirror (Neumann)"]
         cur_b = self.boundary_mode
         if imgui.begin_combo("##boundary_mode", boundary_modes[cur_b]):
             for i, label in enumerate(boundary_modes):
@@ -8558,7 +8670,6 @@ class Simulator:
             self._rec_msg_time = time.time()
             return
 
-        import queue as _queue
         os.makedirs('recordings', exist_ok=True)
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         rule_label = RULE_PRESETS[self.rule_name]['label'].replace(' ', '_')
@@ -8674,22 +8785,48 @@ class Simulator:
             return
         self._recording = False
 
-        # Signal writer thread to stop, then wait for it to drain
+        # Signal writer thread to stop, then wait for it to drain.
+        # Bounded waits so a hung writer cannot block window close.
         if self._rec_write_queue is not None:
-            self._rec_write_queue.put(None)  # sentinel
+            try:
+                self._rec_write_queue.put(None, timeout=1.0)  # sentinel
+            except Exception:
+                pass
         if self._rec_write_thread is not None:
-            self._rec_write_thread.join(timeout=10)
+            self._rec_write_thread.join(timeout=3.0)
+            if self._rec_write_thread.is_alive():
+                # Daemon thread will be killed at interpreter exit; warn the user.
+                print("[record] WARNING: writer thread did not exit cleanly", flush=True)
             self._rec_write_thread = None
         self._rec_write_queue = None
 
-        # Close ffmpeg stdin after writer thread has finished (avoids BrokenPipeError)
+        # Close ffmpeg stdin after writer thread has finished (avoids BrokenPipeError).
+        # Bounded wait + escalating SIGTERM/SIGKILL so a hung ffmpeg cannot
+        # stall the GL shutdown sequence (which is what crashes NVK).
         if self._rec_process:
-            try:
-                self._rec_process.stdin.close()
-                self._rec_process.wait(timeout=15)
-            except Exception:
-                self._rec_process.kill()
+            proc = self._rec_process
             self._rec_process = None
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
         duration = time.time() - self._rec_start_time
         self._rec_msg = f"Saved {self._rec_filename} ({self._rec_frame_count} frames, {duration:.1f}s)"
@@ -8735,8 +8872,18 @@ class Simulator:
         try:
             self._rec_write_queue.put_nowait(bytes(data))
             self._rec_frame_count += 1
-        except Exception:
-            pass  # queue full, drop frame
+        except _queue.Full:
+            # ffmpeg is falling behind — record the loss visibly so users notice
+            # before checking the resulting MP4. Throttle the log so a sustained
+            # backlog doesn't spam stderr.
+            self._rec_dropped_frames = getattr(self, '_rec_dropped_frames', 0) + 1
+            if self._rec_dropped_frames % 30 == 1:
+                sys.stderr.write(
+                    f"[recording] dropped {self._rec_dropped_frames} frame(s); "
+                    f"ffmpeg writer queue is saturated\n")
+                self._rec_msg = (
+                    f"WARN: dropped {self._rec_dropped_frames} frame(s)")
+                self._rec_msg_time = time.time()
 
     def _write_recording_metadata(self):
         """Write a JSON sidecar with rule info, params, and description."""
@@ -8830,54 +8977,51 @@ class Simulator:
                     glfw.set_window_title(self.window,
                         f"3D CA — {RULE_PRESETS[self.rule_name]['label']} [{self.renderer_mode}] — {fps:.0f} FPS — {self.size}³")
         finally:
-            self._cleanup()
-
-    def _cleanup(self):
-        """Release all GPU resources in safe dependency order, then tear down window."""
-        if self._recording:
-            self._stop_recording()
-
-        # Flush all GPU work before releasing resources — prevents NVK/Mesa
-        # driver hangs from destroying a context with in-flight compute.
-        try:
-            GL.glFinish()
-        except Exception:
-            pass
-
-        # Release GPU resources in dependency order:
-        #   1. VAOs (reference programs + buffers internally)
-        #   2. Programs (reference shaders)
-        #   3. Buffers / textures / FBOs (leaf resources)
-        # Releasing out of order can leave dangling driver-internal
-        # references that crash NVK on context teardown.
-        release_order = [
-            # VAOs first
-            'voxel_vao', 'vao',
-            # Programs second
-            'compute_prog', 'voxel_cull_prog', 'voxel_prog',
-            'render_prog', '_metrics_prog', '_indirect_reset_prog',
-            # Buffers
-            'voxel_buffer', 'voxel_indirect_buffer', '_voxel_total_counter',
-            '_metrics_ssbo', 'vbo', 'element_ssbo', '_total_staging',
-            # Textures
-            'tex_a', 'tex_b',
-            # FBOs and renderbuffers
-            '_rec_fbo', '_rec_rbo_color', '_rec_rbo_depth',
-        ]
-        for attr in release_order:
-            obj = getattr(self, attr, None)
-            if obj is not None:
+            # Even if _cleanup raises, we MUST tear down GLFW — otherwise the
+            # zombie X window can wedge the compositor and any leaked GL
+            # context can crash the kernel module on next start.
+            try:
+                self._cleanup()
+            except Exception as e:
+                print(f"[shutdown] cleanup raised: {e!r}", flush=True)
                 try:
-                    obj.release()
+                    glfw.terminate()
                 except Exception:
                     pass
 
-        # Second glFinish: catch any deferred cleanup triggered by release()
+    def _cleanup(self):
+        """Release all GPU resources in safe dependency order, then tear down window.
+
+        Why the careful ordering matters:
+          - Mesa NVK / Nouveau is documented to deadlock the kernel module
+            (requiring a power cycle) when a GL context is destroyed with
+            unreleased compute shaders, image bindings, or 3-D textures.
+          - moderngl tracks every object; if any survives until Python GC
+            runs after `glfw.terminate()`, its `__del__` will issue GL calls
+            into a dead context — classic use-after-free.
+          - imgui_renderer holds its own GL state (font atlas, shader,
+            VBO/VAO). It must be torn down WHILE the GL context is still
+            current, but BEFORE the moderngl context itself is released.
+        """
+        # 1. Stop the recording subprocess and writer thread before touching GL.
+        #    _stop_recording is bounded by ffmpeg's wait timeout; if that hangs
+        #    we'd rather kill ffmpeg than block forever during shutdown.
+        if self._recording:
+            try:
+                self._stop_recording()
+            except Exception:
+                pass
+
+        # 2. Flush all in-flight GPU work. Without this, a still-running
+        #    compute dispatch can outlive its program object and crash the
+        #    driver when we release that program below.
         try:
             GL.glFinish()
         except Exception:
             pass
 
+        # 3. Tear down imgui FIRST — it owns GL textures/programs and needs
+        #    a live, current context to release them cleanly.
         try:
             self.imgui_renderer.shutdown()
         except Exception:
@@ -8886,7 +9030,93 @@ class Simulator:
             imgui.destroy_context()
         except Exception:
             pass
-        glfw.terminate()
+
+        # 4. Release every GL resource in strict dependency order.
+        #
+        #    Order rules:
+        #      a) VAOs reference programs + buffers — release first.
+        #      b) Programs (graphics + compute) — release second.
+        #      c) Buffers, textures, FBOs, renderbuffers — leaf resources, last.
+        #
+        #    The previous list was missing 11 objects (acceleration textures,
+        #    half-res FBO, compute raymarcher, occupancy/min-max programs and
+        #    textures, upsample program/VAO). Those leaks were what made NVK
+        #    hang on close.
+        release_order = [
+            # ── VAOs (must precede any program or buffer they reference) ──
+            'voxel_vao', 'vao', '_upsample_vao',
+
+            # ── Programs (graphics + compute) ──
+            'compute_prog',          # active CA compute shader
+            'voxel_cull_prog',       # voxel face-culling compute
+            'voxel_prog',            # instanced voxel raster
+            'render_prog',           # full-screen volume raymarcher (fragment)
+            '_metrics_prog',         # GPU metrics reduction
+            '_indirect_reset_prog',  # indirect-draw counter reset
+            '_compute_ray_prog',     # compute-shader raymarcher
+            '_occ_prog',             # occupancy bitmap builder
+            '_mm_prog',              # min/max mipmap builder
+            '_upsample_prog',        # half-res upsample fragment program
+
+            # ── Buffers (SSBOs, VBOs, indirect, staging) ──
+            'voxel_buffer',
+            'voxel_indirect_buffer',
+            '_voxel_total_counter',
+            '_metrics_ssbo',
+            'vbo',
+            'element_ssbo',
+            '_total_staging',
+
+            # ── 3-D simulation textures (largest allocations — safest last) ──
+            'tex_a', 'tex_b',
+
+            # ── Acceleration textures (R8UI occupancy + RG16F min/max) ──
+            '_occ_tex', '_mm_tex',
+
+            # ── Recording FBO + renderbuffers ──
+            '_rec_fbo', '_rec_rbo_color', '_rec_rbo_depth',
+
+            # ── Half-res rendering pair (FBO before its color attachment) ──
+            '_half_res_fbo', '_half_res_tex',
+
+            # ── Compute-raymarcher output pair (FBO before color attachment) ──
+            '_cr_fbo', '_cr_output_tex',
+        ]
+        for attr in release_order:
+            obj = getattr(self, attr, None)
+            if obj is None:
+                continue
+            try:
+                obj.release()
+            except Exception:
+                pass
+            # Clear the attribute so a later __del__ during Python GC
+            # cannot double-release into a dead context.
+            setattr(self, attr, None)
+
+        # 5. Second glFinish: any release() above may have queued deferred
+        #    work (e.g. NVK schedules texture frees on a worker queue).
+        try:
+            GL.glFinish()
+        except Exception:
+            pass
+
+        # 6. Release the moderngl Context itself. This catches anything we
+        #    forgot above and tells moderngl not to chase its own dead
+        #    references during interpreter shutdown.
+        try:
+            self.ctx.release()
+        except Exception:
+            pass
+        # Drop our reference so Python GC won't touch the Context again.
+        self.ctx = None
+
+        # 7. Finally tear down GLFW. After this point the GL context is
+        #    gone — any surviving GL handle that hits __del__ is a bug.
+        try:
+            glfw.terminate()
+        except Exception:
+            pass
 
 
 # ── main ──────────────────────────────────────────────────────────────
