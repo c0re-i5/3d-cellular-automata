@@ -29,9 +29,41 @@ from imgui_bundle import imgui
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 from element_data import ELEMENT_GPU_DATA, SYMBOLS, NAMES, NUM_ELEMENTS, FLOATS_PER_ELEMENT, WALL_ID
 
-# Mesa/Nouveau driver has a ~1 GiB per-allocation limit for GL textures.
-# For grids where a single rgba32f texture exceeds this, use rgba16f instead.
-_TEX_ALLOC_LIMIT = 1_000_000_000  # bytes (~1 GB, conservative)
+# Per-allocation size limit for a single rgba32f 3D texture, above which
+# the grid falls back to rgba16f. The default is conservative (1 GiB) so
+# the simulator runs on older drivers (Mesa/Nouveau historically capped
+# single allocations at ~1 GiB); `_probe_tex_alloc_limit()` below raises
+# it at GL-init time on drivers that support queryable VRAM (NVIDIA NVX),
+# since we ping-pong two simulation textures plus render targets and want
+# roughly a third of VRAM per texture.
+_TEX_ALLOC_LIMIT = 1_000_000_000  # bytes, default — see probe below
+
+
+def _probe_tex_alloc_limit(ctx):
+    """Return a per-texture byte budget for this GL context.
+
+    On NVIDIA we query GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX
+    (extension GL_NVX_gpu_memory_info). We reserve ~1 GB for render
+    targets / metrics buffers / driver overhead, divide the rest by 4
+    (two sim textures + headroom for resize operations + staging
+    buffers), and allow the remaining budget per allocation. On other
+    drivers we keep the conservative 1 GiB default.
+    """
+    try:
+        from OpenGL import GL as _GL
+        renderer = (ctx.info.get('GL_RENDERER', '') or '').lower()
+        vendor   = (ctx.info.get('GL_VENDOR',   '') or '').lower()
+        is_nvidia = 'nvidia' in vendor or 'nvidia' in renderer
+        if is_nvidia:
+            total_kb = _GL.glGetIntegerv(0x9048)          # NVX_gpu_memory_info
+            if total_kb and total_kb > 0:
+                total_bytes = int(total_kb) * 1024
+                # Reserve 1 GB for non-sim GL objects, then divide remainder by 4
+                budget = max(1_000_000_000, (total_bytes - 1_000_000_000) // 4)
+                return min(budget, 8_000_000_000)          # sanity cap at 8 GB
+    except Exception:
+        pass
+    return 1_000_000_000
 
 # Boundary modes — must match the integer values used in shader fetch():
 #   0 = toroidal  (periodic wrap)
@@ -6639,6 +6671,13 @@ class Simulator:
         renderer = self.ctx.info.get('GL_RENDERER', '').lower()
         vendor = self.ctx.info.get('GL_VENDOR', '').lower()
         self._use_shared_mem = 'nouveau' not in renderer and 'nouveau' not in vendor
+
+        # Probe the actual per-texture allocation budget for this driver and
+        # raise _TEX_ALLOC_LIMIT if we have a proper VRAM query. Keeps the
+        # rgba32f → rgba16f fallback honest without over-restricting NVIDIA
+        # cards that can comfortably hold 512³ rgba32f textures.
+        global _TEX_ALLOC_LIMIT
+        _TEX_ALLOC_LIMIT = _probe_tex_alloc_limit(self.ctx)
 
         # Determine texture format (rgba32f or rgba16f depending on grid size)
         self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
