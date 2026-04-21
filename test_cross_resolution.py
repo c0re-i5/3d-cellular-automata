@@ -211,29 +211,41 @@ def main():
     print()
 
     all_results = {}
+    n_presets = sum(1 for n in RULE_PRESETS if not only or n in only)
+    grand_t0 = time.perf_counter()
+    idx = 0
     for preset_name, preset in RULE_PRESETS.items():
         if only and preset_name not in only:
             continue
+        idx += 1
         per_size = {}
-        line = f"{preset_name:32s}"
+        line = f"[{idx:>2}/{n_presets}] {preset_name:32s}"
+        sys.stdout.write(line); sys.stdout.flush()
         for sz in sizes:
+            sys.stdout.write(f"  [{sz}…]"); sys.stdout.flush()
+            t_one = time.perf_counter()
             try:
                 r = run_once(ctx, preset_name, preset, sz, steps=args.steps)
             except Exception as e:
                 r = {"error": f"harness exc: {e}"}
             per_size[sz] = r
+            # Erase the "[sz…]" placeholder by overprinting
+            sys.stdout.write("\b" * (len(f"  [{sz}…]")))
             if "error" in r:
-                line += f"  [{sz:>3}] ERR"
+                cell = f"  [{sz:>3}] ERR"
             elif r.get("nan", 0) or r.get("inf", 0):
-                line += f"  [{sz:>3}] NAN({r['nan']})/INF({r['inf']})"
+                cell = f"  [{sz:>3}] NAN({r['nan']})/INF({r['inf']})"
             elif "skip" in r:
-                line += f"  [{sz:>3}] skip"
+                cell = f"  [{sz:>3}] skip"
             else:
-                line += f"  [{sz:>3}] {r['time_ms_per_step']:5.1f}ms"
+                cell = f"  [{sz:>3}] {r['time_ms_per_step']:5.1f}ms"
+            sys.stdout.write(cell); sys.stdout.flush()
         warns = compare_scaling(per_size)
+        wall = time.perf_counter() - grand_t0
+        sys.stdout.write(f"   ({wall:5.0f}s elapsed)\n")
         if warns:
-            line += "\n    " + "\n    ".join(warns)
-        print(line)
+            sys.stdout.write("    " + "\n    ".join(warns) + "\n")
+        sys.stdout.flush()
         all_results[preset_name] = per_size
 
     if args.json:
