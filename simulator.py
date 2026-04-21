@@ -520,9 +520,10 @@ void main() {
     float beta = 1.0 + eps_strength * (nx2*nx2 + ny2*ny2 + nz2*nz2 - 0.6);
 
     if (mode > 0.5) {
-        // Dendritic: add interface noise for Mullins-Sekerka tip-splitting
-        vec3 fp = vec3(pos) * 0.37;
-        float noise = fract(sin(dot(fp, vec3(12.9898, 78.233, 45.5432))) * 43758.5453);
+        // Dendritic: add interface noise for Mullins-Sekerka tip-splitting.
+        // Must be *temporal* — a static per-cell hash biases each interface
+        // cell in the same direction every step, suppressing tip-splitting.
+        float noise = hash_temporal(pos, 1);
         beta += eps_strength * 0.5 * (noise - 0.5) * smoothstep(0.01, 0.2, grad_mag);
     }
     beta = max(beta, 0.01);
@@ -971,7 +972,7 @@ void main() {
     //                   dv/dt = u - v + small v-diffusion
     // Self-excitation boost: when v is low (fresh/resting tissue), u excitation
     // is amplified → sharper wavefronts and more sustained propagation
-    float v_thresh = (v + b) / a;
+    float v_thresh = (v + b) / max(a, 1e-3);  // guard: u_param0 is user-settable
     float self_excite = 1.0 + 0.5 * max(0.0, 1.0 - 3.0 * v);  // up to 1.5× when v≈0
     float du = self_excite * u * (1.0 - u) * (u - v_thresh) / max(epsilon, 0.001);
     float dv = u - v;
@@ -1472,8 +1473,9 @@ void main() {
     float eff_visc = mix(visc_ratio, 1.0, sat);  // interpolate viscosity
     float mobility = perm / max(eff_visc, 0.01);
 
-    // Pressure Laplacian (Darcy flow: ∇·(k/μ ∇p) = 0, iterative relaxation)
-    float lap_p = 0.0;
+    // Pressure Laplacian (Darcy flow: ∇·(k/μ ∇p) = 0, iterative relaxation).
+    // Uses mobility-weighted averaging (sum_p_mob / sum_mob) rather than a
+    // plain Laplacian since mobility varies with saturation.
     float sum_p_mob = 0.0;
     float sum_mob = 0.0;
     float lap_perm = 0.0;
@@ -1703,14 +1705,6 @@ void main() {
     float tot_gx = gx + fx * 2.0;
     float tot_gy = gy + fy * 2.0;
     float tot_gz = gz + fz * 2.0;
-
-    // Advection: agents move along gradient
-    float agent_dx = (fetch(pos + ivec3(1,0,0)).g - fetch(pos + ivec3(-1,0,0)).g) * 0.5;
-    float agent_dy = (fetch(pos + ivec3(0,1,0)).g - fetch(pos + ivec3(0,-1,0)).g) * 0.5;
-    float agent_dz = (fetch(pos + ivec3(0,0,1)).g - fetch(pos + ivec3(0,0,-1)).g) * 0.5;
-
-    // Chemotactic flux: agents move up-gradient of trail+food
-    float advect = -(tot_gx * agent_dx + tot_gy * agent_dy + tot_gz * agent_dz) * turn;
 
     // Random noise for exploration
     float hash = hash_temporal(pos, 0);
