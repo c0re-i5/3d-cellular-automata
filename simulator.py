@@ -7221,8 +7221,20 @@ class Simulator:
         self._rec_start_time = 0.0
         self._rec_frame_count = 0
         self._rec_fps = 60
-        self._rec_width = 2560       # output resolution (1440p)
-        self._rec_height = 1440
+        # Output resolution presets. Lower resolutions cut bandwidth
+        # roughly proportionally to pixel count: 720p is ~1/4 the bytes
+        # of 1440p, 1080p is ~1/2. ffmpeg encodes whatever frame size we
+        # pipe in, so changing this just resizes the offscreen FBO.
+        self._rec_resolutions = [
+            ('4K (2160p)',   3840, 2160),
+            ('1440p',        2560, 1440),
+            ('1080p',        1920, 1080),
+            ('720p',         1280,  720),
+            ('Shorts 1080p', 1080, 1920),  # vertical 9:16
+        ]
+        self._rec_resolution_idx = 1   # 1440p default
+        self._rec_width  = self._rec_resolutions[self._rec_resolution_idx][1]
+        self._rec_height = self._rec_resolutions[self._rec_resolution_idx][2]
         self._rec_filename = ''
         self._rec_msg = ''
         self._rec_msg_time = 0.0
@@ -9307,6 +9319,15 @@ class Simulator:
                     "When enabled, the next recording is written to\n"
                     "recordings/upload_queue/ where the YouTube pipeline\n"
                     "will pick it up. Otherwise records to recordings/.")
+
+            # Resolution selector
+            res_labels = [r[0] for r in self._rec_resolutions]
+            imgui.set_next_item_width(180)
+            changed, self._rec_resolution_idx = imgui.combo(
+                "Resolution", self._rec_resolution_idx, res_labels)
+            if changed:
+                _, w, h = self._rec_resolutions[self._rec_resolution_idx]
+                self._rec_width, self._rec_height = w, h
         if self._rec_msg and time.time() - self._rec_msg_time < 5.0:
             imgui.same_line()
             imgui.text_colored(imgui.ImVec4(0.5, 1.0, 0.5, 1.0), self._rec_msg)
@@ -9807,7 +9828,11 @@ class Simulator:
         os.makedirs(rec_dir, exist_ok=True)
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         rule_label = RULE_PRESETS[self.rule_name]['label'].replace(' ', '_')
-        self._rec_filename = f'{rec_dir}/{timestamp}_{rule_label}.mp4'
+        # Tag filename with resolution so downstream tooling (e.g. the
+        # upload pipeline picking shorts vs landscape destinations) can
+        # route on shape without re-probing the file.
+        res_tag = f'{self._rec_width}x{self._rec_height}'
+        self._rec_filename = f'{rec_dir}/{timestamp}_{rule_label}_{res_tag}.mp4'
 
         w, h = self._rec_width, self._rec_height
         self._init_rec_fbo()
