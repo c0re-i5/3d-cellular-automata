@@ -7226,6 +7226,10 @@ class Simulator:
         self._rec_filename = ''
         self._rec_msg = ''
         self._rec_msg_time = 0.0
+        # Route the next recording into recordings/upload_queue/ instead
+        # of recordings/ — the YouTube upload pipeline watches that
+        # subdirectory. Toggle from the UI before pressing F5/Record.
+        self._rec_upload_queue = False
         self._rec_fbo = None         # offscreen framebuffer
         self._rec_rbo_color = None
         self._rec_rbo_depth = None
@@ -9295,6 +9299,14 @@ class Simulator:
         else:
             if imgui.button("Record Video [F5]"):
                 self._start_recording()
+            imgui.same_line()
+            changed, self._rec_upload_queue = imgui.checkbox(
+                "Queue for upload", self._rec_upload_queue)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "When enabled, the next recording is written to\n"
+                    "recordings/upload_queue/ where the YouTube pipeline\n"
+                    "will pick it up. Otherwise records to recordings/.")
         if self._rec_msg and time.time() - self._rec_msg_time < 5.0:
             imgui.same_line()
             imgui.text_colored(imgui.ImVec4(0.5, 1.0, 0.5, 1.0), self._rec_msg)
@@ -9791,10 +9803,11 @@ class Simulator:
             self._rec_msg_time = time.time()
             return
 
-        os.makedirs('recordings', exist_ok=True)
+        rec_dir = 'recordings/upload_queue' if self._rec_upload_queue else 'recordings'
+        os.makedirs(rec_dir, exist_ok=True)
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         rule_label = RULE_PRESETS[self.rule_name]['label'].replace(' ', '_')
-        self._rec_filename = f'recordings/{timestamp}_{rule_label}.mp4'
+        self._rec_filename = f'{rec_dir}/{timestamp}_{rule_label}.mp4'
 
         w, h = self._rec_width, self._rec_height
         self._init_rec_fbo()
