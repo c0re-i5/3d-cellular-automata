@@ -20,6 +20,11 @@ discoveries.json
 discoveries.json.lock
 discoveries_backup.json
 
+# OAuth credentials — NEVER commit (covers the youtube-pipeline branch too)
+**/credentials/
+*.client_secret*
+token.json
+
 # Batch search / discovery scripts (personal workflow tooling)
 batch_ordered.sh
 batch_mega.sh

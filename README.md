@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 26 compute shader rules, and 46 presets — from classic Game of Life to quantum mechanics.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 27 compute shader rules, and 45 presets — from classic Game of Life to quantum mechanics.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -10,7 +10,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 ## Features
 
 ### Simulation
-- **26 GPU compute shader rules** with 46 built-in presets
+- **27 GPU compute shader rules** with 45 built-in presets
 - **Grid sizes 32³ to 512³** with dynamic resizing (auto-switches rgba32f → rgba16f at large sizes)
 - **Resolution-independent physics** — h² Laplacian scaling and h⁻¹ gradient scaling keeps behavior consistent across grid sizes
 - **62 initialization patterns** — sparse/dense random, centered blobs, crystal seeds, orbital wavefunctions, terrain, and more
@@ -69,7 +69,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 | **Reaction-Diffusion** | Gray-Scott, BZ, Barkley, Morphogen | Chemical pattern formation — spots, spirals, waves |
 | **Continuous** | Lenia, Multi-channel Lenia | Kernel-based continuous CAs with lifelike organisms |
 | **Physics** | Wave, EM Wave, Schrödinger (×6) | Wave equations, quantum mechanics, tunneling, orbitals |
-| **Materials** | Crystal Growth, Cahn-Hilliard, Fracture, Erosion | Phase separation, nucleation, elastic fracture |
+| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Cahn-Hilliard, Fracture, Erosion | Phase separation, nucleation, elastic fracture |
 | **Biology** | Predator-Prey, Flocking, Physarum, Mycelium, Lichen | Population dynamics, swarm behavior, fungal networks |
 | **Astrophysics** | Galaxy Formation | N-body gravity with gas dynamics |
 | **Chemistry** | Element CA, Viscous Fingers, Fire | 118-element particle chemistry, fluid instabilities, combustion |
@@ -155,7 +155,7 @@ test_harness.py      — Headless parameter sweep and discovery engine
 
 > `discoveries.json` and the batch search scripts are personal workflow tooling and are gitignored; they are not part of the repository.
 
-All 26 compute shaders are embedded in `simulator.py` as GLSL source strings, compiled at runtime via moderngl. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
+All 27 compute shaders are embedded in `simulator.py` as GLSL source strings, compiled at runtime via moderngl. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
 
 ### Compute Shader Design
 
@@ -284,7 +284,11 @@ $$\dot\theta_i = \omega_i\Omega + \frac{K}{26}\sum_{j\in\mathcal{N}_{26}}\sin(\t
 $$\partial_t \phi = \beta(\hat{n})^2\nabla^2\phi + 30\beta^2\phi(1-\phi)\!\left(\phi - \tfrac{1}{2} + \Delta + \tfrac{u}{2}\right)$$
 $$\partial_t u = D\nabla^2 u - \tfrac{1}{2}\partial_t\phi$$
 
-where $\beta(\hat{n}) = 1 + \varepsilon(n_x^4 + n_y^4 + n_z^4 - 3/5)$.
+The shape mode parameter selects the anisotropy form via the cubic harmonic $K_4 = n_x^4 + n_y^4 + n_z^4$:
+
+$$\beta(\hat{n}) = 1 + \varepsilon\,a(\hat{n}), \qquad a(\hat{n}) = \begin{cases} +(K_4 - 3/5) & \text{compact / octahedral / dendritic (} \beta \text{ max at } \langle 100 \rangle \text{ axes)} \\\\ -(K_4 - 3/5) & \text{cubic (} \beta \text{ max at } \langle 111 \rangle \text{ corners)} \end{cases}$$
+
+Five presets cover the regime: **Compact** ($\varepsilon \approx 0$, rounded), **Octahedral** ($\varepsilon{=}2$, axial bulges), **Cubic** (inverted anisotropy, corner bulges), **Dendritic** (octahedral + temporal interface noise drives Mullins–Sekerka tip-splitting), and **Snowflake** (strong $\varepsilon$, low $D$ → fragile filaments).
 
 **Cahn-Hilliard** — Spinodal decomposition via fourth-order diffusion of the chemical potential:
 
