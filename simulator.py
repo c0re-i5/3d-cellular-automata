@@ -9856,39 +9856,56 @@ class Simulator:
         def _esc(s):
             return s.replace('\\', '\\\\').replace("'", "\u2019").replace(':', '\\:').replace('%', '%%')
 
+        # Scale overlays so they look the same at every output resolution.
+        # Reference design is 1440p; everything scales linearly by height,
+        # which gives perceptually-equal overlay sizes for both 16:9
+        # (4K → 720p) and 9:16 Shorts (1080×1920) since on Shorts the
+        # ~1.33× taller frame just means slightly larger overlays — fine
+        # for portrait viewing on a phone.
+        s = h / 1440.0
+        title_fs  = max(14, int(round(42 * s)))
+        desc_fs   = max(10, int(round(24 * s)))
+        param_fs  = max(10, int(round(20 * s)))
+        info_fs   = max(10, int(round(20 * s)))
+        score_fs  = max(12, int(round(28 * s)))
+        margin    = max(8,  int(round(24 * s)))
+        top_y     = max(6,  int(round(20 * s)))
+        title_h   = max(20, int(round(52 * s)))   # gap to description
+        bottom_y  = f'h-{max(20, int(round(42 * s)))}'
+        border_w  = max(1,  int(round(2 * s)))
+
         vf_parts = ['vflip']
-        base_y = 20
         # Title
         vf_parts.append(
             f"drawtext=fontfile='{fontb}':text='{_esc(title)}':"
-            f"fontcolor=white:fontsize=42:x=24:y={base_y}:"
-            f"borderw=2:bordercolor=black@0.8")
+            f"fontcolor=white:fontsize={title_fs}:x={margin}:y={top_y}:"
+            f"borderw={border_w}:bordercolor=black@0.8")
         # Description (under title)
         if desc:
             vf_parts.append(
                 f"drawtext=fontfile='{font}':text='{_esc(desc)}':"
-                f"fontcolor=white:fontsize=24:x=24:y={base_y + 52}:"
-                f"borderw=2:bordercolor=black@0.8")
+                f"fontcolor=white:fontsize={desc_fs}:x={margin}:y={top_y + title_h}:"
+                f"borderw={border_w}:bordercolor=black@0.8")
         # Parameters (bottom-left)
         if param_str:
             vf_parts.append(
                 f"drawtext=fontfile='{font}':text='{_esc(param_str)}':"
-                f"fontcolor=white:fontsize=20:x=24:y=h-42:"
-                f"borderw=2:bordercolor=black@0.8")
+                f"fontcolor=white:fontsize={param_fs}:x={margin}:y={bottom_y}:"
+                f"borderw={border_w}:bordercolor=black@0.8")
         # Seed + grid size (bottom-right)
         info_str = f'Seed {self.seed}  Grid {self.size}x{self.size}x{self.size}'
         vf_parts.append(
             f"drawtext=fontfile='{font}':text='{_esc(info_str)}':"
-            f"fontcolor=white:fontsize=20:x=w-tw-24:y=h-42:"
-            f"borderw=2:bordercolor=black@0.8")
+            f"fontcolor=white:fontsize={info_fs}:x=w-tw-{margin}:y={bottom_y}:"
+            f"borderw={border_w}:bordercolor=black@0.8")
         # Discovery score (top-right, if viewing a discovery)
         if self.discovery_index >= 0 and self.discovery_index < len(self.discoveries):
             score = self.discoveries[self.discovery_index].get('score', 0)
             score_str = f'Score\\: {score:.2f}'
             vf_parts.append(
                 f"drawtext=fontfile='{fontb}':text='{score_str}':"
-                f"fontcolor=yellow:fontsize=28:x=w-tw-24:y=20:"
-                f"borderw=2:bordercolor=black@0.8")
+                f"fontcolor=yellow:fontsize={score_fs}:x=w-tw-{margin}:y={top_y}:"
+                f"borderw={border_w}:bordercolor=black@0.8")
 
         vf_chain = ','.join(vf_parts)
 
