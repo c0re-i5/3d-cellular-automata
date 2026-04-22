@@ -19,7 +19,7 @@ Usage:
     python3 simulator.py --size 64 --rule reaction_diffusion_3d
 """
 
-import sys, math, time, argparse, json, os, random, subprocess, shutil, threading
+import sys, math, time, argparse, json, os, re, random, subprocess, shutil, threading
 import queue as _queue
 import numpy as np
 import glfw
@@ -9793,7 +9793,11 @@ class Simulator:
 
         os.makedirs('recordings', exist_ok=True)
         timestamp = time.strftime('%Y%m%d_%H%M%S')
-        rule_label = RULE_PRESETS[self.rule_name]['label'].replace(' ', '_')
+        # Sanitise: rule labels may contain '/' (e.g. '4/4/5 Crystal' GOL
+        # notation), parens, or other characters that confuse the path or
+        # later ffmpeg/json parsers.  Keep alnum, '.', '_', '-' only.
+        raw_label = RULE_PRESETS[self.rule_name]['label']
+        rule_label = re.sub(r'[^A-Za-z0-9._-]+', '_', raw_label.replace(' ', '_')).strip('_') or 'rule'
         self._rec_filename = f'recordings/{timestamp}_{rule_label}.mp4'
 
         w, h = self._rec_width, self._rec_height
@@ -9953,7 +9957,13 @@ class Simulator:
         self._rec_msg = f"Saved {self._rec_filename} ({self._rec_frame_count} frames, {duration:.1f}s)"
         self._rec_msg_time = time.time()
 
-        self._write_recording_metadata()
+        # Sidecar write must never crash the simulator on stop — the video
+        # is already saved, missing metadata is recoverable.
+        try:
+            self._write_recording_metadata()
+        except Exception as e:
+            self._rec_msg = f"WARN: sidecar write failed: {e}"
+            self._rec_msg_time = time.time()
 
     def _render_to_rec_fbo(self):
         """Render the scene into the recording FBO at fixed resolution."""
