@@ -9861,12 +9861,11 @@ class Simulator:
             return s.replace('\\', '\\\\').replace("'", "\u2019").replace(':', '\\:').replace('%', '%%')
 
         # Scale overlays so they look the same at every output resolution.
-        # Reference design is 1440p; everything scales linearly by height,
-        # which gives perceptually-equal overlay sizes for both 16:9
-        # (4K → 720p) and 9:16 Shorts (1080×1920) since on Shorts the
-        # ~1.33× taller frame just means slightly larger overlays — fine
-        # for portrait viewing on a phone.
-        s = h / 1440.0
+        # Reference design is 1440p; we scale by the *shorter* dimension so
+        # portrait Shorts (1080x1920) don't blow up font sizes past the
+        # 1080-wide frame and clip the title/description on the right.
+        # Landscape (4K/1440/1080/720) is unaffected because width >= height.
+        s = min(w, h) / 1440.0
         title_fs  = max(14, int(round(42 * s)))
         desc_fs   = max(10, int(round(24 * s)))
         param_fs  = max(10, int(round(20 * s)))
