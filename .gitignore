@@ -15,6 +15,10 @@ imgui.ini
 # Recordings (large media files)
 recordings/
 
+# YouTube upload pipeline (private branch only)
+youtube_pipeline/credentials/
+youtube_pipeline/__pycache__/
+
 # Discoveries — generated at runtime, not committed
 discoveries.json
 discoveries.json.lock
