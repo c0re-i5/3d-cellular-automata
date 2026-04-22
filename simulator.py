@@ -572,7 +572,11 @@ void main() {
 // u_param0 = undercooling (drives growth speed)
 // u_param1 = diffusion rate (thermal diffusivity)
 // u_param2 = anisotropy strength ε (cubic harmonic amplitude)
-// u_param3 = mode: 0=compact crystal, 1=dendritic (noise-driven branching)
+// u_param3 = shape mode:
+//              0 = compact (low ε → near-rounded blob)
+//              1 = octahedral (β max at <100>, axes bulge → 8 faces)
+//              2 = cubic     (β max at <111>, corners bulge → 6 faces)
+//              3 = dendritic (octahedral + temporal noise → branching arms)
 //
 // USE_SHARED_MEM=1 cooperatively loads a 10^3 vec2 tile of (phi, u_field)
 // so the 6 stencil reads (for both lap_phi+lap_u and the phi-gradient)
@@ -635,7 +639,7 @@ void main() {
     float undercooling = u_param0;
     float D = u_param1;
     float eps_strength = u_param2;
-    float mode = u_param3;
+    int shape_mode = int(round(u_param3));
 
     float lap_phi = (nxp.r + nxm.r + nyp.r + nym.r + nzp.r + nzm.r - 6.0 * phi)     * h_sq;
     float lap_u   = (nxp.g + nxm.g + nyp.g + nym.g + nzp.g + nzm.g - 6.0 * u_field) * h_sq;
@@ -647,11 +651,26 @@ void main() {
     float grad_mag = sqrt(gx*gx + gy*gy + gz*gz + 1e-8);
     vec3 n = vec3(gx, gy, gz) / grad_mag;
 
-    // Cubic harmonics anisotropy: β(n̂) = 1 + ε(nx⁴+ny⁴+nz⁴ - 3/5)
+    // Cubic harmonics K₄ = nx⁴+ny⁴+nz⁴.
+    //   K₄ = 1   at face-normal n=<100>      (axes)
+    //   K₄ = 1/3 at corner-normal n=<111>    (diagonals)
+    // With β as the kinetic prefactor, directions with HIGHER β advance
+    // faster → the surface bulges out along those normals.
     float nx2 = n.x*n.x, ny2 = n.y*n.y, nz2 = n.z*n.z;
-    float beta = 1.0 + eps_strength * (nx2*nx2 + ny2*ny2 + nz2*nz2 - 0.6);
+    float K4  = nx2*nx2 + ny2*ny2 + nz2*nz2;
+    float aniso;
+    if (shape_mode == 2) {
+        // Cubic: β max at <111> diagonals → 8 corner bulges → cube shape.
+        aniso = -(K4 - 0.6);
+    } else {
+        // Modes 0 (compact), 1 (octahedral), 3 (dendritic):
+        // β max at <100> axes → 6 axial bulges → octahedron shape.
+        // Mode 0 with low ε ≈ 0 collapses to near-isotropic rounded growth.
+        aniso = (K4 - 0.6);
+    }
+    float beta = 1.0 + eps_strength * aniso;
 
-    if (mode > 0.5) {
+    if (shape_mode == 3) {
         // Dendritic: add interface noise for Mullins-Sekerka tip-splitting.
         // Must be *temporal* — a static per-cell hash biases each interface
         // cell in the same direction every step, suppressing tip-splitting.
@@ -4745,14 +4764,56 @@ RULE_PRESETS = {
     "crystal_growth": {
         "label": "Crystal Growth",
         "shader": "crystal_growth",
-        "params": {"Undercooling": 0.3, "Diffusion": 0.15, "Anisotropy strength": 0.3, "Mode": 0},
-        "param_ranges": {"Undercooling": (0.05, 0.9), "Diffusion": (0.05, 0.5),
-                         "Anisotropy strength": (0.1, 1.0), "Mode": (0, 0)},
+        # Mode 0 + tiny ε ≈ near-isotropic surface energy → rounded blob.
+        # Single seed, modest supersaturation, generous diffusion to keep
+        # the supersaturation field smooth around the growing front.
+        "params": {"Undercooling": 0.25, "Diffusion": 0.20, "Anisotropy strength": 0.05, "Shape": 0},
+        "param_ranges": {"Undercooling": (0.05, 0.6), "Diffusion": (0.10, 0.5),
+                         "Anisotropy strength": (0.0, 0.25), "Shape": (0, 0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.08),
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
-        "description": "Compact crystal — low anisotropy gives smooth rounded growth front.",
+        "description": "Compact crystal — near-isotropic surface energy gives smooth rounded growth front.",
+        "vis_channels": ["Phase φ", "Supersaturation"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "crystal_octahedral": {
+        "label": "Crystal (Octahedral)",
+        "shader": "crystal_growth",
+        # Mode 1 + strong ε → β maximised at <100> axes → 6 axial bulges
+        # forming a sharp octahedron (8 triangular faces).
+        "params": {"Undercooling": 0.35, "Diffusion": 0.10, "Anisotropy strength": 2.0, "Shape": 1},
+        "param_ranges": {"Undercooling": (0.1, 0.7), "Diffusion": (0.05, 0.4),
+                         "Anisotropy strength": (1.0, 4.0), "Shape": (1, 1)},
+        "dt": 0.02,
+        "dt_range": (0.005, 0.08),
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        "description": "Octahedral crystal — strong <100> anisotropy: axes grow fast → 8-faced octahedron.",
+        "vis_channels": ["Phase φ", "Supersaturation"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "crystal_cubic": {
+        "label": "Crystal (Cubic)",
+        "shader": "crystal_growth",
+        # Mode 2 inverts the anisotropy: β maximised at <111> diagonals →
+        # corners advance fastest → 8 corner bulges fill in to form a cube
+        # with 6 square faces aligned to the grid axes.
+        "params": {"Undercooling": 0.35, "Diffusion": 0.10, "Anisotropy strength": 2.0, "Shape": 2},
+        "param_ranges": {"Undercooling": (0.1, 0.7), "Diffusion": (0.05, 0.4),
+                         "Anisotropy strength": (1.0, 4.0), "Shape": (2, 2)},
+        "dt": 0.02,
+        "dt_range": (0.005, 0.08),
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        "description": "Cubic crystal — inverted anisotropy: <111> corners grow fast → 6-faced cube.",
         "vis_channels": ["Phase φ", "Supersaturation"],
         "vis_default": 0,
         "vis_abs": False,
@@ -4762,31 +4823,37 @@ RULE_PRESETS = {
     "crystal_dendritic": {
         "label": "Crystal (Dendritic)",
         "shader": "crystal_growth",
-        "params": {"Undercooling": 0.4, "Diffusion": 0.12, "Anisotropy strength": 1.0, "Mode": 1},
-        "param_ranges": {"Undercooling": (0.05, 0.95), "Diffusion": (0.02, 0.5),
-                         "Anisotropy strength": (0.3, 3.0), "Mode": (1, 1)},
+        # Mode 3 = octahedral kernel + temporal interface noise →
+        # Mullins-Sekerka instability splits the tips into branching arms.
+        "params": {"Undercooling": 0.45, "Diffusion": 0.12, "Anisotropy strength": 1.5, "Shape": 3},
+        "param_ranges": {"Undercooling": (0.2, 0.95), "Diffusion": (0.05, 0.4),
+                         "Anisotropy strength": (0.5, 3.0), "Shape": (3, 3)},
         "dt": 0.01,
         "dt_range": (0.003, 0.06),
         "init": "crystal_multi_seed",
         "init_variants": ["crystal_multi_seed", "crystal_seed"],
-        "description": "Dendritic crystal — Mullins-Sekerka instability produces branching arms.",
+        "description": "Dendritic crystal — Mullins-Sekerka tip-splitting produces axis-aligned branching arms.",
         "vis_channels": ["Phase φ", "Supersaturation"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
         "boundary": "clamped",
     },
-    "crystal_faceted": {
-        "label": "Crystal (Faceted)",
+    "crystal_snowflake": {
+        "label": "Crystal (Snowflake)",
         "shader": "crystal_growth",
-        "params": {"Undercooling": 0.35, "Diffusion": 0.1, "Anisotropy strength": 2.0, "Mode": 0},
-        "param_ranges": {"Undercooling": (0.05, 0.8), "Diffusion": (0.02, 0.5),
-                         "Anisotropy strength": (1.0, 5.0), "Mode": (0, 0)},
-        "dt": 0.02,
-        "dt_range": (0.005, 0.08),
+        # Mode 3 with stronger anisotropy and lower diffusion → arms can't
+        # widen between branching events → fragile, fine snowflake-like
+        # filaments. Higher undercooling drives faster nucleation of new
+        # tips so the structure stays delicate even at long times.
+        "params": {"Undercooling": 0.6, "Diffusion": 0.05, "Anisotropy strength": 2.5, "Shape": 3},
+        "param_ranges": {"Undercooling": (0.3, 0.95), "Diffusion": (0.02, 0.15),
+                         "Anisotropy strength": (1.5, 4.0), "Shape": (3, 3)},
+        "dt": 0.008,
+        "dt_range": (0.003, 0.04),
         "init": "crystal_multi_seed",
         "init_variants": ["crystal_multi_seed", "crystal_seed"],
-        "description": "Strongly faceted crystal — high anisotropy makes sharp angular edges.",
+        "description": "Snowflake crystal — strong anisotropy + low diffusion → fine fragile dendritic filaments.",
         "vis_channels": ["Phase φ", "Supersaturation"],
         "vis_default": 0,
         "vis_abs": False,
@@ -5459,25 +5526,32 @@ def init_center_blob(size, rng):
     return data
 
 def init_crystal_seed(size, rng):
-    """Phase-field crystal seed: φ=1 solid seed(s), supersaturation field in liquid."""
+    """Phase-field crystal seed: single centred solid seed in undercooled melt.
+
+    Used by the single-crystal presets (compact/octahedral/cubic) where the
+    point is to watch one well-formed crystal grow symmetrically — so we
+    place one small seed near the middle and fill the box with full
+    supersaturation so the growth front has plenty of melt to consume.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
-    # R = phase field: start liquid (φ≈0) with small solid seeds
+    # R = phase field: start liquid (φ≈0)
     data[:, :, :, 0] = 0.0
-    # G = supersaturation: uniform in liquid, zero in solid
-    data[:, :, :, 1] = 0.3 + _canonical_noise(size, rng, -0.02, 0.02)
-    # Place 1-3 solid seeds
-    n_seeds = rng.randint(1, 4)
-    for _ in range(n_seeds):
-        fx = 0.5 + rng.uniform(-1.0/6, 1.0/6)
-        fy = 0.5 + rng.uniform(-1.0/6, 1.0/6)
-        fz = 0.5 + rng.uniform(-1.0/6, 1.0/6)
-        fr = rng.uniform(1.0 / size, 2.0 / size)
-        cx, cy, cz, r = fx * size, fy * size, fz * size, max(1, fr * size)
-        dist = np.sqrt((x - cx)**2 + (y - cy)**2 + (z - cz)**2)
-        mask = dist <= r
-        data[:, :, :, 0][mask] = 1.0  # solid
-        data[:, :, :, 1][mask] = 0.0  # supersaturation consumed
+    # G = supersaturation: uniform fully-undercooled melt + small noise so
+    # the symmetry-breaking that picks <100> vs <111> bulges has something
+    # to bite on (otherwise perfectly symmetric data → identical lattice
+    # directions → no preferred growth direction at the seed).
+    data[:, :, :, 1] = 1.0 + _canonical_noise(size, rng, -0.01, 0.01)
+    # One seed slightly off-centre so growth is visually centred.
+    fx = 0.5 + rng.uniform(-0.04, 0.04)
+    fy = 0.5 + rng.uniform(-0.04, 0.04)
+    fz = 0.5 + rng.uniform(-0.04, 0.04)
+    cx, cy, cz = fx * size, fy * size, fz * size
+    r = max(2.0, size * 0.025)
+    dist = np.sqrt((x - cx)**2 + (y - cy)**2 + (z - cz)**2)
+    mask = dist <= r
+    data[:, :, :, 0][mask] = 1.0  # solid
+    data[:, :, :, 1][mask] = 0.0  # supersaturation consumed
     return data
 
 def init_wave_pulse(size, rng):
