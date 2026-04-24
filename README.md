@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 27 compute shader rules, and 45 presets — from classic Game of Life to quantum mechanics.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 27 compute shader rules, and 49 presets — from classic Game of Life to quantum mechanics.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -10,7 +10,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 ## Features
 
 ### Simulation
-- **27 GPU compute shader rules** with 45 built-in presets
+- **27 GPU compute shader rules** with 49 built-in presets
 - **Grid sizes 32³ to 512³** with dynamic resizing (auto-switches rgba32f → rgba16f at large sizes)
 - **Resolution-independent physics** — h² Laplacian scaling and h⁻¹ gradient scaling keeps behavior consistent across grid sizes
 - **62 initialization patterns** — sparse/dense random, centered blobs, crystal seeds, orbital wavefunctions, terrain, and more
@@ -163,14 +163,14 @@ Each rule is a GLSL compute shader dispatched over an 8×8×8 workgroup grid. A 
 
 - Ping-pong textures (`u_src` / `u_dst`) as 3D `image3D` bindings
 - Resolution-independent scaling via `h_sq` and `h_inv` (referenced to 128³)
-- Boundary handling (toroidal wrap or clamp)
-- Utility functions: `fetch()`, `fetch_interp()`, `hash_temporal()`
+- Boundary handling (toroidal wrap, clamp, or mirror/Neumann)
+- Utility functions: `fetch()`, `fetch_interp()`, `hash_temporal()`, `lap19_v4()` (19-point isotropic Laplacian)
 
-Shaders that use large neighborhood radii (SmoothLife, Lenia) have an optimized shared memory tiling path with automatic fallback for drivers that don't support it.
+Shaders that use large neighborhood radii (SmoothLife, Lenia) have an optimized shared memory tiling path with automatic fallback for drivers that don't support it. Most reaction-diffusion shaders (Gray-Scott, BZ, Barkley, Gierer-Meinhardt, Cahn-Hilliard, predator-prey, lichen, fracture, wave) use a 19-point Patra-Karttunen stencil whose leading error ∝ ∇²(∇²f) is rotationally symmetric — the cheaper 6-point stencil's anisotropic Σ ∂⁴/∂xi⁴ error visibly distorts spirals and droplets toward grid axes.
 
 ## Mathematical Reference
 
-Every rule below runs as a GLSL compute shader on a 3D grid. All spatial derivatives use the 7-point stencil Laplacian $\nabla^2 f = \sum_{\text{nn}} f - 6f$, scaled by $h^2 = (128/N)^2$ for resolution independence. Gradients use central differences scaled by $h^{-1} = N/128$.
+Every rule below runs as a GLSL compute shader on a 3D grid. Spatial derivatives use either the 7-point stencil Laplacian $\nabla^2 f = \sum_{\text{nn}} f - 6f$ scaled by $h^2 = (128/N)^2$, or the isotropic 19-point Patra-Karttunen stencil $\nabla^2 f \approx (\tfrac{1}{3}\Sigma_{\text{face}} + \tfrac{1}{6}\Sigma_{\text{edge}} - 4f)/h^2$ where rotational invariance matters. Gradients use central differences scaled by $h^{-1} = N/128$.
 
 ---
 
