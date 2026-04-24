@@ -271,6 +271,15 @@ class HeadlessRunner:
             self.compute_prog = ctx.compute_shader(source)
             _shader_cache[cache_key] = self.compute_prog
 
+        # Cache uniform handles: `'u_foo' in prog` hashes the source every
+        # step otherwise (tens of thousands of string hashes per search run).
+        prog = self.compute_prog
+        self._u_size     = prog.get('u_size', None)
+        self._u_dt       = prog.get('u_dt', None)
+        self._u_boundary = prog.get('u_boundary', None)
+        self._u_frame    = prog.get('u_frame', None)
+        self._u_params   = [prog.get(f'u_param{i}', None) for i in range(4)]
+
         # Init volume
         rng = np.random.RandomState(seed)
         init_name = init_override if init_override else self.preset['init']
@@ -371,24 +380,28 @@ class HeadlessRunner:
         if self.is_element_ca:
             self.element_ssbo.bind_to_storage_buffer(2)
 
-        if 'u_size' in self.compute_prog:
-            self.compute_prog['u_size'].value = self.size
-        if 'u_dt' in self.compute_prog:
-            self.compute_prog['u_dt'].value = self.dt
-        if 'u_boundary' in self.compute_prog:
-            boundary = 1 if self.preset.get('boundary', 'toroidal') == 'clamped' else 0
-            self.compute_prog['u_boundary'].value = boundary
-        if 'u_frame' in self.compute_prog:
+        # Use cached uniform handles: avoids the per-step hash lookup against
+        # the shader's uniform table (significant in tight search loops).
+        if self._u_size is not None:
+            self._u_size.value = self.size
+        if self._u_dt is not None:
+            self._u_dt.value = self.dt
+        if self._u_boundary is not None:
+            # Match the simulator's mapping: toroidal=0, clamped=1, mirror=2.
+            b = self.preset.get('boundary', 'toroidal')
+            self._u_boundary.value = {'clamped': 1, 'mirror': 2,
+                                       'neumann': 2, 'reflect': 2,
+                                       'zero_flux': 2}.get(b, 0)
+        if self._u_frame is not None:
             if not hasattr(self, '_frame'):
                 self._frame = 0
-            self.compute_prog['u_frame'].value = self._frame
+            self._u_frame.value = self._frame
             self._frame += 1
 
         param_values = list(self.params.values())
-        for i in range(4):
-            name = f'u_param{i}'
-            if name in self.compute_prog:
-                self.compute_prog[name].value = float(param_values[i]) if i < len(param_values) else 0.0
+        for i, cu in enumerate(self._u_params):
+            if cu is not None:
+                cu.value = float(param_values[i]) if i < len(param_values) else 0.0
 
         groups = (self.size + 7) // 8
         self.compute_prog.run(groups, groups, groups)
@@ -559,12 +572,18 @@ def score_interestingness(metric_history):
     if repr_alive < 0.001:
         return 0.0
 
-    # Saturated penalty — soft: use repr_alive instead of just final
-    if repr_alive > 0.95 and mean_activity < 0.001:
-        return 0.05
-    # Still penalize saturation, but softer if there's activity
+    # Saturated penalty — smooth ramp starting at 0.70 instead of a cliff at
+    # 0.95.  Filling 80% of the cube is an undesirable equilibrium even with
+    # activity (it means the rule expands without bound), so we taper credit
+    # quickly through the 0.70-0.95 band and floor it after that.
     if repr_alive > 0.95:
-        return max(0.05, 0.15 * min(mean_activity * 10, 1.0))
+        if mean_activity < 0.001:
+            return 0.02
+        return max(0.05, 0.10 * min(mean_activity * 10, 1.0))
+    saturation_factor = 1.0
+    if repr_alive > 0.70:
+        # Linear ramp: 1.0 at 0.70, 0.10 at 0.95
+        saturation_factor = max(0.10, 1.0 - (repr_alive - 0.70) / 0.25 * 0.90)
 
     # Frozen penalty (no activity after initial transient) — softer for transient events
     late_activity = np.mean(activities[-5:]) if len(activities) >= 5 else mean_activity
@@ -579,9 +598,11 @@ def score_interestingness(metric_history):
 
     score = 0.0
 
-    # Alive ratio: smooth bell curve using repr_alive (best of median/final)
-    alive_center = 0.35 if continuous_field else 0.15
-    alive_width = 1.5 if continuous_field else 1.2
+    # Alive ratio: smooth bell curve using repr_alive (best of median/final).
+    # Centers/widths tightened so an 80%-filled cube no longer scores ~0.85;
+    # the prior values let cube-fillers dominate the search.
+    alive_center = 0.20 if continuous_field else 0.10
+    alive_width = 1.1 if continuous_field else 0.9
     alive_score = np.exp(-0.5 * ((np.log(max(repr_alive, 0.005)) - np.log(alive_center)) / alive_width)**2)
     score += 0.25 * alive_score
 
@@ -634,6 +655,9 @@ def score_interestingness(metric_history):
         elif drift < 0.01 and best_activity > 0.0001:
             score += 0.1         # stable but active
 
+    # Apply saturation taper from the 0.70-0.95 band (computed above).
+    score *= saturation_factor
+
     return max(min(score, 1.0), 0.0)
 
 
@@ -675,24 +699,30 @@ def slice_gol_coherence(grid, channel=0, axis=2, threshold=0.5):
     if size < 2:
         return 0.0
 
-    agreements = []
-    for i in range(size - 1):
-        s_cur = _binary_slice(vol, axis, i, threshold)
-        s_next = _binary_slice(vol, axis, i + 1, threshold)
-        # Skip trivial cases (both slices empty or both full)
-        alive_cur = s_cur.mean()
-        alive_next = s_next.mean()
-        if alive_cur < 0.01 and alive_next < 0.01:
-            continue  # both dead — trivially matches GoL, skip
-        if alive_cur > 0.99 and alive_next > 0.99:
-            continue  # both saturated
-        s_predicted = _gol_2d_step(s_cur)
-        # Fraction of cells where prediction matches reality
-        total = s_cur.shape[0] * s_cur.shape[1]
-        agreement = np.sum(s_predicted == s_next) / total
-        agreements.append(agreement)
-
-    return float(np.mean(agreements)) if agreements else 0.0
+    # Binarize once and move the stacking axis to front so b[i] is the
+    # i-th slice. Vectorized GoL step across ALL slices in a single pass
+    # (replaces the 31-iteration Python loop + scipy.pad-per-slice that
+    # used to dominate analyze_structure).
+    b = (vol > threshold).astype(np.int8)
+    b = np.moveaxis(b, axis, 0)  # (size, H, W)
+    # 8-neighbor sum with toroidal wrap via np.roll (no pad allocation).
+    rp1 = np.roll(b, 1, axis=1); rm1 = np.roll(b, -1, axis=1)
+    cp1 = np.roll(b, 1, axis=2); cm1 = np.roll(b, -1, axis=2)
+    n = (rp1 + rm1 + cp1 + cm1 +
+         np.roll(rp1, 1, axis=2) + np.roll(rp1, -1, axis=2) +
+         np.roll(rm1, 1, axis=2) + np.roll(rm1, -1, axis=2))
+    predicted = ((b == 0) & (n == 3)) | ((b == 1) & ((n == 2) | (n == 3)))
+    # Compare predicted[i] to actual slice[i+1].
+    pred_cur = predicted[:-1]
+    actual_next = b[1:].astype(bool)
+    # Skip trivial pairs (both dead or both saturated).
+    alive_cur  = b[:-1].mean(axis=(1, 2))
+    alive_next = b[1:].mean(axis=(1, 2))
+    trivial = ((alive_cur < 0.01) & (alive_next < 0.01)) | \
+              ((alive_cur > 0.99) & (alive_next > 0.99))
+    agreement = (pred_cur == actual_next).mean(axis=(1, 2))
+    valid = ~trivial
+    return float(agreement[valid].mean()) if valid.any() else 0.0
 
 
 def projection_entropy(grid, channel=0, threshold=0.01):
@@ -810,13 +840,20 @@ def spatial_variation(grid, channel=0, n_blocks=8):
     vol = np.abs(grid[:, :, :, channel])
     sz = vol.shape[0]
     bsz = max(1, sz // n_blocks)
-    block_means = []
-    for ix in range(0, sz, bsz):
-        for iy in range(0, sz, bsz):
-            for iz in range(0, sz, bsz):
-                block = vol[ix:ix+bsz, iy:iy+bsz, iz:iz+bsz]
-                block_means.append(block.mean())
-    block_means = np.array(block_means)
+    # When the grid divides evenly, do a single vectorized block-reduce
+    # instead of the Python triple loop (common case; 8× faster).
+    if sz == bsz * n_blocks:
+        block_means = vol.reshape(n_blocks, bsz, n_blocks, bsz, n_blocks, bsz)\
+                         .mean(axis=(1, 3, 5)).ravel()
+    else:
+        # Fallback for non-divisible sizes.
+        block_means = []
+        for ix in range(0, sz, bsz):
+            for iy in range(0, sz, bsz):
+                for iz in range(0, sz, bsz):
+                    block = vol[ix:ix+bsz, iy:iy+bsz, iz:iz+bsz]
+                    block_means.append(block.mean())
+        block_means = np.array(block_means)
     mean_val = block_means.mean()
     if mean_val < 1e-6:
         return 0.0
@@ -1511,7 +1548,15 @@ def _get_metric(result, metric_name):
         sv = result.get('spatial_variation', 0)
         # Spatial variation gates slice_mi: identical uniform slices shouldn't score well
         mi_adj = mi * max(sv, 0.1)  # dampen MI when spatially uniform
-        return s * 0.30 + ps * 0.25 + sv * 0.20 + mi_adj * 0.15 + pc * 0.10
+        raw = s * 0.30 + ps * 0.25 + sv * 0.20 + mi_adj * 0.15 + pc * 0.10
+        # Cluster-mass penalty: if one connected component owns >50% of
+        # alive cells, the rule has merged into a single mass — the opposite
+        # of an interesting Life-like ensemble of distinct structures.
+        lcf = result.get('largest_cluster_frac', 0.0)
+        alive = result.get('final_alive', 0.0)
+        if alive > 0.05 and lcf > 0.5:
+            raw -= min(0.30, (lcf - 0.5) * 0.6)  # up to -0.30 at lcf=1.0
+        return max(0.0, raw)
     elif metric_name == 'period':
         return result.get('period_score', 0)
     elif metric_name == 'glider':
@@ -1579,6 +1624,10 @@ def _get_metric(result, metric_name):
         raw = (s * 0.10 + period * 0.15 + glider * 0.20
                + clust * 0.15 + sym * 0.10 + grow * 0.05 + pc * 0.05
                + sv * 0.10 + density_bonus)
+        # Cluster-mass penalty: one giant blob is the opposite of elegant.
+        lcf = result.get('largest_cluster_frac', 0.0)
+        if alive > 0.05 and lcf > 0.5:
+            density_penalty += min(0.30, (lcf - 0.5) * 0.6)
         return max(0.0, raw - density_penalty)
     elif metric_name == 'gol_like':
         # Metric targeting classic 2D-GoL-like patterns in 3D:
@@ -1651,6 +1700,50 @@ _DYNAMICS_METRICS = {'period', 'glider', 'growth', 'clusters', 'symmetry', 'eleg
 def _needs_dynamics(metric_name):
     """Return True if this metric requires dynamics capture (grid snapshots)."""
     return metric_name in _DYNAMICS_METRICS
+
+
+# Behavioural fingerprint dimensions used by novelty / dedup. Keep this in
+# ONE place -- previously the same 10-12 features were inlined in three
+# different spots, which made it impossible to keep the dedup logic and
+# the novelty-bonus logic consistent.
+_FINGERPRINT_KEYS = (
+    'final_alive',
+    'final_activity',
+    'final_surface',
+    'spatial_variation',
+    'projection_complexity',
+    'projection_structure',
+    'gol_coherence_max',
+    'period_score',
+    'translation_score',
+    'cluster_score',
+    'symmetry_score',
+    'growth_score',
+)
+
+
+def _fingerprint(r):
+    """Extract the 12-D behavioural fingerprint as a numpy vector."""
+    return np.array([float(r.get(k, 0.0)) for k in _FINGERPRINT_KEYS])
+
+
+def _normalize_fingerprints(vectors):
+    """Z-score every dimension of a stack of fingerprints across the run.
+    Without this, raw L2 over the 12 features is dominated by whichever
+    one or two features happen to have the largest absolute spread (often
+    `projection_complexity` or `gol_coherence_max`), so the other 10
+    dimensions silently contribute almost nothing to novelty distance and
+    the search collapses onto the same one or two axes of variation.
+    Returns (normalized_vectors, mu, sigma) so single new results can be
+    normalized into the same space later via (v - mu) / sigma.
+    """
+    if len(vectors) == 0:
+        return vectors, np.zeros(len(_FINGERPRINT_KEYS)), np.ones(len(_FINGERPRINT_KEYS))
+    arr = np.asarray(vectors, dtype=np.float64)
+    mu = arr.mean(axis=0)
+    sigma = arr.std(axis=0)
+    sigma = np.where(sigma < 1e-6, 1.0, sigma)  # avoid div-zero on flat dims
+    return (arr - mu) / sigma, mu, sigma
 
 
 def _make_discovery(r):
@@ -1822,38 +1915,37 @@ def _param_distance(params_a, params_b, ranges):
 
 
 def _novelty_bonus(result, archive, ranges):
-    """Compute novelty bonus: average distance to k-nearest neighbors in archive.
+    """Compute novelty bonus: average distance to k-nearest neighbours in archive,
+    measured in PER-DIMENSION-NORMALIZED behavioural space + parameter space.
 
-    Returns a bonus in [0, 1]. High = far from everything in the archive = novel.
-    Uses broad behavioral fingerprint including dynamics metrics so that
-    structurally different patterns (e.g. gliders vs oscillators) are distinguished.
+    Without normalization, raw L2 over the 12 fingerprint features collapses
+    onto whichever 1-2 features have the widest absolute spread -- in our
+    runs that's usually projection_complexity (range 0..3) drowning out
+    period_score / translation_score (range 0..1). Result: the search
+    keeps finding patterns "novel" along the same one axis and clustering
+    on the others.
+
+    Returns a bonus where ~0 means an exact behavioural match and >1 means
+    "noticeably different in multiple independent dimensions" (since each
+    z-scored dim contributes ~1 stdev when fully novel).
     """
     if not archive:
         return 1.0  # first result is maximally novel
-    # Distance in param space + behavioral space
+    # Stack the archive fingerprints + this one, z-score every column once
+    archive_fps = [_fingerprint(o) for o in archive]
+    all_fps = archive_fps + [_fingerprint(result)]
+    normed, _, _ = _normalize_fingerprints(all_fps)
+    this_v = normed[-1]
+    archive_v = normed[:-1]
+    # Per-archive distance: blend behavioural (dominant) + param (regularizer)
     distances = []
-    for other in archive:
+    for v, other in zip(archive_v, archive):
+        b_dist = float(np.linalg.norm(this_v - v) / np.sqrt(len(_FINGERPRINT_KEYS)))
         p_dist = _param_distance(result['params'], other['params'], ranges)
-        # Extended behavioral fingerprint — 12 dimensions
-        def _bv(r):
-            return np.array([
-                r.get('final_alive', 0),
-                r.get('final_activity', 0),
-                r.get('final_surface', 0),
-                r.get('spatial_variation', 0),
-                r.get('projection_complexity', 0),
-                r.get('projection_structure', 0),
-                r.get('gol_coherence_max', 0),
-                r.get('period_score', 0),
-                r.get('translation_score', 0),
-                r.get('cluster_score', 0),
-                r.get('symmetry_score', 0),
-                r.get('growth_score', 0),
-            ])
-        b_dist = float(np.sqrt(np.sum((_bv(result) - _bv(other))**2)))
-        # Weight behavioral distance more than param distance
-        distances.append(0.4 * p_dist + 0.6 * b_dist)
-    # Average of k-nearest
+        # Behavioural carries 70% (it's what the user actually sees);
+        # 30% on params keeps two visually-similar regimes in different
+        # corners of param-space distinguishable.
+        distances.append(0.7 * b_dist + 0.3 * p_dist)
     k = min(5, len(distances))
     distances.sort()
     return float(np.mean(distances[:k]))
@@ -2007,8 +2099,6 @@ def cmd_search(ctx, args):
     print()
 
     rng = np.random.RandomState(args.seed)
-    best_results = []  # top-K pool for exploitation
-    all_quality = []   # all quality results for novelty archive
 
     # Use biased param generator for specific metrics
     if metric == 'gol_like':
@@ -2018,126 +2108,157 @@ def cmd_search(ctx, args):
     else:
         _gen_params = randomize_params
 
-    for trial in range(args.trials):
-        # Exploration-heavy: 75% random, 25% mutate from archive
-        if best_results and rng.random() < 0.25:
-            # Pick parent weighted toward diverse results (not just top score)
-            parent = best_results[rng.randint(len(best_results))]
-            params = _mutate_params(parent['params'], preset['param_ranges'], rng,
-                                    scale=0.1 + rng.random() * 0.3)  # vary mutation scale
+    # === MAP-Elites search ====================================================
+    # Maintain a grid of best-scoring "elites" partitioned across a 3-D
+    # behavioural-descriptor (BD) space:
+    #   axis 0: log10(final_alive)              (density regime)
+    #   axis 1: log10(final_activity)           (dynamism regime)
+    #   axis 2: largest_cluster_frac            (1 blob vs many structures)
+    #
+    # Each cell holds at most one result -- the highest-scoring one ever
+    # placed there. New trials pick a random filled cell as parent, mutate
+    # its (params, dt, density, init) tuple jointly, and try to claim a
+    # cell with the result. This:
+    #   - automatically enforces diversity (each cell has one occupant)
+    #   - preserves elites (only better-scoring trials displace incumbents)
+    #   - keeps mutation in the parent's regime (joint dt+density mutation)
+    #   - removes the O(N^2) novelty-archive recompute
+    #
+    # Replaces the prior random-explore + novelty-bonus + late-refinement
+    # scheme. Output discoveries = all elites above quality threshold.
+    GRID = 6  # 6**3 = 216 cells; with TRIALS=500 most filled cells get >1 hit
+    elites = {}  # cell_key -> result
+
+    def _bin(value, lo, hi, log=True):
+        """Map value into [0, GRID-1] bin index."""
+        if log:
+            v = np.log10(max(value, lo))
+            t = (v - np.log10(lo)) / (np.log10(hi) - np.log10(lo))
         else:
-            # Pure exploration: biased or random params depending on metric
-            params = _gen_params(preset, rng)
+            t = (value - lo) / (hi - lo)
+        return int(np.clip(t * GRID, 0, GRID - 1))
 
-        # Vary init density
-        init_density = None
-        if can_vary_density:
-            init_density = float(rng.uniform(d_lo, d_hi))
+    def cell_key(r):
+        a  = _bin(r.get('final_alive', 0),     1e-3, 1.0,  log=True)
+        ac = _bin(r.get('final_activity', 0),  1e-4, 1.0,  log=True)
+        lc = _bin(r.get('largest_cluster_frac', 0), 0.0, 1.0, log=False)
+        return (a, ac, lc)
 
-        # Vary dt within preset's dt_range (if defined)
-        # 15% of trials push dt to 1.2-1.5× the normal max for edge-of-stability phenomena
-        trial_dt = None
-        if dt_range:
-            if rng.random() < 0.15:
-                trial_dt = float(rng.uniform(dt_range[1] * 1.2, dt_range[1] * 1.5))
-            else:
-                trial_dt = float(rng.uniform(dt_range[0], dt_range[1]))
+    def try_insert(r, base_val):
+        # Quality floor: don't waste a cell on dead/NaN trials
+        if base_val < 0.05:
+            return False
+        k = cell_key(r)
+        cur = elites.get(k)
+        if cur is None or _get_metric(cur, metric) < base_val:
+            elites[k] = r
+            return True
+        return False
 
-        # Vary init variant: param-aware selection (50% of trials)
-        # When params suggest extreme regimes, pick inits that complement them
-        trial_init = None
-        if init_variants and len(init_variants) > 1 and rng.random() < 0.5:
-            trial_init = _pick_init_for_params(args.rule, params, init_variants, rng)
+    def sample_init_density():
+        return float(rng.uniform(d_lo, d_hi)) if can_vary_density else None
 
+    def sample_dt(parent_dt=None):
+        if not dt_range:
+            return None
+        if parent_dt is not None:
+            # Joint mutation: stay in parent's regime, +-25%
+            lo = max(dt_range[0], parent_dt * 0.75)
+            hi = min(dt_range[1] * 1.5, parent_dt * 1.25)
+            return float(rng.uniform(lo, hi))
+        if rng.random() < 0.15:
+            # Edge-of-stability probe
+            return float(rng.uniform(dt_range[1] * 1.2, dt_range[1] * 1.5))
+        return float(rng.uniform(dt_range[0], dt_range[1]))
+
+    def sample_init(params=None):
+        if not init_variants or len(init_variants) <= 1:
+            return None
+        if params is not None and rng.random() < 0.5:
+            return _pick_init_for_params(args.rule, params, init_variants, rng)
+        return init_variants[rng.randint(len(init_variants))]
+
+    def evaluate(params, init_density, trial_dt, trial_init):
         trial_seed = int(rng.randint(0, 10_000_000))
-        result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                          seed=trial_seed, params=params, dt=trial_dt, verbose=False,
-                          capture_dynamics=dynamics, init_density=init_density,
-                          init_override=trial_init)
+        r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                      seed=trial_seed, params=params, dt=trial_dt, verbose=False,
+                      capture_dynamics=dynamics, init_density=init_density,
+                      init_override=trial_init)
         if trial_init:
-            result['init_variant'] = trial_init
+            r['init_variant'] = trial_init
+        if init_density is not None:
+            r['init_density'] = init_density
+        bv = _get_metric(r, metric)
+        # Backward-compat fields used by the display/save code below.
+        r['_diverse_score'] = bv
+        r['_novelty'] = 0.0
+        return r, bv
 
-        # Compute composite score: base metric + novelty bonus
-        base_val = _get_metric(result, metric)
-        novelty = _novelty_bonus(result, all_quality, preset['param_ranges'])
-        # Diversity score: 50% quality + 50% novelty — balanced to avoid attractor collapse
-        diverse_val = base_val * 0.5 + novelty * 0.5
-        result['_diverse_score'] = diverse_val
-        result['_novelty'] = novelty
+    # Phase 1: bootstrap with uniform-random params to seed the grid.
+    # Larger bootstrap fraction (40%) for small trial budgets so the grid
+    # doesn't fall back into "no elites yet -> uniform" too often.
+    n_bootstrap = max(40, args.trials * 2 // 5)
+    n_bootstrap = min(n_bootstrap, args.trials)
+    print(f"MAP-Elites: bootstrap {n_bootstrap} trials, then {args.trials - n_bootstrap} from elites")
+    print(f"  BD grid: {GRID}x{GRID}x{GRID} = {GRID**3} cells "
+          f"(alive log, activity log, largest_cluster_frac linear)")
 
-        # Track quality results for archive
-        if base_val >= 0.2:
-            all_quality.append(result)
+    for trial in range(args.trials):
+        # Decide: bootstrap (random) or mutate-from-elite?
+        use_random = (trial < n_bootstrap) or (not elites)
+        if use_random:
+            params = _gen_params(preset, rng)
+            init_density = sample_init_density()
+            trial_dt = sample_dt()
+            trial_init = sample_init(params)
+            parent_key = None
+        else:
+            # Pick parent uniformly at random from filled cells -- this is
+            # the curiosity-driven "fill the grid" objective. Cells already
+            # filled are still re-sampled so successful regimes get more
+            # local exploration; new cells get filled by mutations of
+            # neighbouring elites.
+            keys = list(elites.keys())
+            parent_key = keys[rng.randint(len(keys))]
+            parent = elites[parent_key]
+            # Tighter mutation than before (5-15% vs 10-40%): we want to
+            # stay in or adjacent to the parent's regime. The grid takes
+            # care of macro-exploration; mutation only does local refine.
+            scale = 0.05 + rng.random() * 0.10
+            params = _mutate_params(parent['params'], preset['param_ranges'], rng, scale=scale)
+            # Joint mutation of dt + density: inherit from parent then jitter.
+            parent_dt = parent.get('dt', preset.get('dt'))
+            trial_dt = sample_dt(parent_dt) if dt_range else None
+            parent_dens = parent.get('init_density')
+            if can_vary_density and parent_dens is not None:
+                # +-30% multiplicative drift, clipped to range
+                d = parent_dens * float(np.exp(rng.normal(0, 0.25)))
+                init_density = float(np.clip(d, d_lo, d_hi))
+            else:
+                init_density = sample_init_density()
+            # Init variant: usually inherit, sometimes resample.
+            if init_variants and len(init_variants) > 1 and rng.random() < 0.2:
+                trial_init = sample_init(params)
+            else:
+                trial_init = parent.get('init_variant')
 
-        # Maintain top-K pool using diversity-aware score
-        best_results.append(result)
-        best_results.sort(key=lambda r: r.get('_diverse_score', 0), reverse=True)
-        best_results = best_results[:max(args.top * 3, 30)]
+        result, base_val = evaluate(params, init_density, trial_dt, trial_init)
+        placed = try_insert(result, base_val)
 
-        if base_val >= 0.3 or (trial + 1) % 20 == 0:
+        if base_val >= 0.3 or (trial + 1) % 50 == 0:
             tag = "***" if base_val >= 0.5 else "  *" if base_val >= 0.3 else "   "
-            best_so_far = max((r.get('_diverse_score', 0) for r in best_results), default=0)
             density_str = f" d={init_density:.2f}" if init_density is not None else ""
             dt_str = f" dt={trial_dt:.3f}" if trial_dt is not None else ""
-            print(f"{tag} trial {trial+1:4d}: {metric}={base_val:.3f} "
-                  f"nov={novelty:.2f}{density_str}{dt_str} "
-                  f"(best_div={best_so_far:.3f}) {_fmt_params(params)}")
+            mark = "+" if placed else " "
+            phase = "boot" if use_random else "mut "
+            print(f"{tag} {phase} {trial+1:4d}: {metric}={base_val:.3f} "
+                  f"cells={len(elites):3d}/{GRID**3} {mark}{density_str}{dt_str} "
+                  f"{_fmt_params(params)}")
 
-    # === Refinement pass: local search around top diverse results ===
-    # Take best 5 discoveries, perturb ±10% for 20% more trials
-    n_refine = min(5, len(best_results))
-    refine_trials = max(1, args.trials // 5)
-    if n_refine > 0 and refine_trials >= 2:
-        print(f"\nRefinement pass: {refine_trials} trials around top {n_refine} discoveries...")
-        refine_parents = [r for r in best_results[:n_refine]]
-        for rt in range(refine_trials):
-            parent = refine_parents[rt % len(refine_parents)]
-            params = _mutate_params(parent['params'], preset['param_ranges'], rng,
-                                    scale=0.05 + rng.random() * 0.10)  # tight ±5-15%
-
-            init_density = None
-            if can_vary_density:
-                init_density = float(rng.uniform(d_lo, d_hi))
-
-            trial_dt = parent.get('dt', preset['dt'])
-            if dt_range:
-                # Perturb parent dt by ±15%
-                dt_lo = max(dt_range[0], trial_dt * 0.85)
-                dt_hi = min(dt_range[1] * 1.5, trial_dt * 1.15)
-                trial_dt = float(rng.uniform(dt_lo, dt_hi))
-
-            trial_init = None
-            if init_variants and len(init_variants) > 1 and rng.random() < 0.4:
-                trial_init = init_variants[rng.randint(len(init_variants))]
-
-            trial_seed = int(rng.randint(0, 10_000_000))
-            result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                              seed=trial_seed, params=params, dt=trial_dt, verbose=False,
-                              capture_dynamics=dynamics, init_density=init_density,
-                              init_override=trial_init)
-            if trial_init:
-                result['init_variant'] = trial_init
-
-            base_val = _get_metric(result, metric)
-            novelty = _novelty_bonus(result, all_quality, preset['param_ranges'])
-            diverse_val = base_val * 0.5 + novelty * 0.5
-            result['_diverse_score'] = diverse_val
-            result['_novelty'] = novelty
-
-            if base_val >= 0.2:
-                all_quality.append(result)
-
-            best_results.append(result)
-            best_results.sort(key=lambda r: r.get('_diverse_score', 0), reverse=True)
-            best_results = best_results[:max(args.top * 3, 30)]
-
-            if base_val >= 0.3:
-                dt_str = f" dt={trial_dt:.3f}" if trial_dt is not None else ""
-                print(f"  R trial {rt+1:3d}: {metric}={base_val:.3f} "
-                      f"nov={novelty:.2f}{dt_str} {_fmt_params(params)}")
-
-    # Final results — sort by diversity score for display
-    best_results.sort(key=lambda r: r.get('_diverse_score', 0), reverse=True)
+    print(f"\nMAP-Elites complete: {len(elites)}/{GRID**3} cells filled")
+    # Output: all elites sorted by metric value.
+    best_results = sorted(elites.values(),
+                          key=lambda r: _get_metric(r, metric), reverse=True)
     top_n = min(args.top, len(best_results))
     print()
     print(f"Top {top_n} discoveries (by {metric} + novelty):")
@@ -2166,36 +2287,38 @@ def cmd_search(ctx, args):
                   f"{r.get('projection_structure', 0):5.3f} "
                   f"{r.get('slice_mi_max', 0):5.3f}  {_fmt_params(r['params'])}")
 
-    # Save — deduplicate behaviorally similar discoveries before saving
+    # Save -- deduplicate behaviorally similar discoveries before saving
     if args.save:
         min_q = getattr(args, 'min_quality', 0.25)
         candidates = [_make_discovery(r)
                       for r in best_results[:top_n]
                       if _is_quality(r, min_score=min_q)]
 
-        # Behavioral deduplication: reject discoveries too close to one already kept
-        discoveries = []
-        for d in candidates:
-            too_close = False
-            for kept in discoveries:
-                # Compare extended behavioral fingerprint (12D)
-                dist = np.sqrt(
-                    (d.get('final_alive', 0) - kept.get('final_alive', 0))**2 +
-                    (d.get('final_activity', 0) - kept.get('final_activity', 0))**2 +
-                    (d.get('spatial_variation', 0) - kept.get('spatial_variation', 0))**2 +
-                    (d.get('projection_complexity', 0) - kept.get('projection_complexity', 0))**2 +
-                    (d.get('projection_structure', 0) - kept.get('projection_structure', 0))**2 +
-                    (d.get('period_score', 0) - kept.get('period_score', 0))**2 +
-                    (d.get('translation_score', 0) - kept.get('translation_score', 0))**2 +
-                    (d.get('cluster_score', 0) - kept.get('cluster_score', 0))**2 +
-                    (d.get('symmetry_score', 0) - kept.get('symmetry_score', 0))**2 +
-                    (d.get('growth_score', 0) - kept.get('growth_score', 0))**2
-                )
-                if dist < 0.03:  # behaviorally near-identical (slightly raised for more dims)
-                    too_close = True
-                    break
-            if not too_close:
-                discoveries.append(d)
+        # Behavioural deduplication in z-scored fingerprint space.
+        # Threshold ~0.4 means "different by ~0.4 stdev average across the
+        # 12 dimensions" -- empirically separates visually-distinct
+        # patterns while collapsing ones that only differ by a few percent
+        # in one or two dimensions. The OLD raw-L2 threshold of 0.03 over
+        # un-normalized features admitted near-identical results because
+        # one feature differing by 0.03 alone passed; conversely it could
+        # also reject genuinely different results when one large-scale
+        # feature happened to match closely.
+        if candidates:
+            cand_fps = [_fingerprint(c) for c in candidates]
+            normed, _, _ = _normalize_fingerprints(cand_fps)
+            kept_indices = []
+            for i, v in enumerate(normed):
+                too_close = False
+                for j in kept_indices:
+                    avg_z_dist = np.linalg.norm(v - normed[j]) / np.sqrt(len(_FINGERPRINT_KEYS))
+                    if avg_z_dist < 0.4:
+                        too_close = True
+                        break
+                if not too_close:
+                    kept_indices.append(i)
+            discoveries = [candidates[i] for i in kept_indices]
+        else:
+            discoveries = []
 
         if discoveries:
             save_path = os.path.join(os.path.dirname(__file__), args.save)

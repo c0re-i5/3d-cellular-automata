@@ -104,13 +104,19 @@ uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (Dirichlet, zero ou
 uniform int u_frame;     // step counter for temporal noise
 
 // ── Grid-spacing scale factors ──────────────────────────────────────
-// PDE rules use discrete Laplacians with h=1 (voxel spacing).
-// The actual Laplacian is (sum - 6*center) / h², where h = REF/size.
-// h_sq normalizes so parameters tuned at REF_SIZE work at any resolution.
-// h_inv = size/REF for scaling radii and gradients.
+// PDE rules use discrete Laplacians on a grid with voxel spacing h = REF/size
+// (in "reference" units — physical domain is fixed at REF_SIZE, independent
+// of grid resolution). The continuous Laplacian is
+//     ∇²U ≈ (sum_neighbors - 6*center) / h²
+// so rules MULTIPLY the raw stencil by h_sq to obtain ∇²U. That makes h_sq
+// equal to 1/h² = (size/REF)², not h² itself — the variable name refers to
+// "the factor we multiply by", not "h squared" literally.
+// At REF_SIZE both definitions collapse to 1, which is why this bug went
+// unnoticed for a long time (presets were tuned at REF_SIZE=128).
+// h_inv = size/REF for scaling radii and gradients (physical length → voxels).
 const float REF_SIZE = 128.0;
-float h_sq  = (REF_SIZE / float(u_size)) * (REF_SIZE / float(u_size));  // multiply Laplacians by this
-float h_inv = float(u_size) / REF_SIZE;  // multiply radii by this
+float h_inv = float(u_size) / REF_SIZE;                 // multiply radii by this
+float h_sq  = h_inv * h_inv;                            // multiply Laplacians by this (= 1/h²)
 
 vec4 fetch(ivec3 p) {
     if (u_boundary == 1) {
@@ -140,6 +146,128 @@ float hash_temporal(ivec3 p, int channel) {
     seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
     seed = seed ^ (seed >> 16u);
     return float(seed) / 4294967295.0;
+}
+
+// Quenched (frozen) hash: depends on position only — same value every frame.
+// Use this for representing material heterogeneities like crystal lattice
+// defects, dopant atoms, or surface impurities that don't move with time.
+// Different `channel` values give independent random fields.
+float hash_static(ivec3 p, int channel) {
+    uint seed = uint(p.x * 73856093) ^ uint(p.y * 19349663) ^ uint(p.z * 83492791)
+              ^ uint(channel * 2246822519u);
+    seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
+    seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
+    seed = seed ^ (seed >> 16u);
+    return float(seed) / 4294967295.0;
+}
+
+// SMOOTH VALUE NOISE on a unit-spaced lattice (8-corner trilinear interp,
+// smoothstep blend). Output ~uniform [0,1]. Building block for fbm3.
+float value_noise3(vec3 p, int channel) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    t = t * t * (3.0 - 2.0 * t);  // C1-continuous smoothstep blend
+    ivec3 i = ivec3(pf);
+    float c000 = hash_static(i + ivec3(0,0,0), channel);
+    float c100 = hash_static(i + ivec3(1,0,0), channel);
+    float c010 = hash_static(i + ivec3(0,1,0), channel);
+    float c110 = hash_static(i + ivec3(1,1,0), channel);
+    float c001 = hash_static(i + ivec3(0,0,1), channel);
+    float c101 = hash_static(i + ivec3(1,0,1), channel);
+    float c011 = hash_static(i + ivec3(0,1,1), channel);
+    float c111 = hash_static(i + ivec3(1,1,1), channel);
+    float x00 = mix(c000, c100, t.x);
+    float x10 = mix(c010, c110, t.x);
+    float x01 = mix(c001, c101, t.x);
+    float x11 = mix(c011, c111, t.x);
+    float y0  = mix(x00, x10, t.y);
+    float y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+// FRACTIONAL BROWNIAN MOTION (3D, octave sum of value noise).
+//
+// fbm3(p, base_period, octaves, channel)
+//   base_period: lattice cells per period at the LOWEST frequency octave
+//                (octave 0 has wavelength ~ base_period cells)
+//   octaves:    number of doublings; each octave halves wavelength and amp
+//   channel:    seed offset; each octave gets channel + i*17 internally
+//
+// Output normalised to ~[0,1] (centred at ~0.5). The point of this over
+// raw white noise: pattern-forming PDEs on a uniform grid can only resolve
+// instabilities at one characteristic wavelength (the linear M-S/Turing
+// length), which collapses emergent shapes to a single scale (sphere,
+// octahedron, hex). Forcing with multi-octave noise injects
+// perturbations at several wavelengths simultaneously so branches can
+// have sub-branches "for free", giving a fractal envelope rather than a
+// clean smooth one.
+float fbm3(vec3 p, float base_period, int octaves, int channel) {
+    float amp  = 0.5;
+    float freq = 1.0 / max(base_period, 1e-3);
+    float sum  = 0.0;
+    float norm = 0.0;
+    for (int i = 0; i < octaves; ++i) {
+        sum  += amp * value_noise3(p * freq, channel + i * 17);
+        norm += amp;
+        amp  *= 0.5;
+        freq *= 2.0;
+    }
+    return sum / max(norm, 1e-6);
+}
+
+// TEMPORAL FBM: same as fbm3 but the lowest octave drifts in time, so the
+// noise field evolves rather than being frozen. Each octave is given an
+// independent time offset so they don't all march together (which would
+// look like uniform translation rather than evolution). The drift speed
+// per octave scales with the octave's frequency so finer detail flickers
+// faster than coarse structure -- matches the way real diffusive noise
+// has a power-law temporal spectrum.
+float fbm3_temporal(vec3 p, float base_period, int octaves, int channel) {
+    float amp  = 0.5;
+    float freq = 1.0 / max(base_period, 1e-3);
+    float sum  = 0.0;
+    float norm = 0.0;
+    float t    = float(u_frame) * 0.05;
+    for (int i = 0; i < octaves; ++i) {
+        // Per-octave time offset along an octave-specific axis so the
+        // "wind direction" varies between scales (more organic motion).
+        vec3 drift = vec3(float((i * 13) % 7), float((i * 19) % 5),
+                          float((i * 23) % 11)) * t;
+        sum  += amp * value_noise3(p * freq + drift, channel + i * 17);
+        norm += amp;
+        amp  *= 0.5;
+        freq *= 2.0;
+    }
+    return sum / max(norm, 1e-6);
+}
+
+// ── Isotropic 19-point compact Laplacian (Patra-Karttunen / Mehrstellen) ──
+//
+// Standard 6-point stencil:   ∇²f ≈ (Σ_face f - 6f₀) / h²
+//   Leading error:   (h²/12) · Σ_i ∂⁴f/∂xᵢ⁴   ← axis-aligned, anisotropic
+//
+// 19-point compact (this function):
+//   ∇²f ≈ (⅓ Σ_face f + ⅙ Σ_edge f - 4f₀) / h²
+//   Leading error:   (h²/12) · ∇²(∇²f)        ← rotationally symmetric, isotropic
+//
+// Visible consequence: BZ spirals stop being square-ish, Cahn-Hilliard
+// droplets become spherical, wavefronts radiate evenly in all directions.
+// Cost is ~3× memory traffic vs the 6-point fetch (18 vs 6 fetches).
+// Coefficient sanity: 6·(1/3) + 12·(1/6) − 4 = 0 (constants give zero).
+//
+// Returns the per-component Laplacian (multiplied by h_sq so it equals ∇²f
+// in continuum units, matching the 6-point convention used elsewhere).
+vec4 lap19_v4(ivec3 pos, vec4 self_val) {
+    vec4 face = fetch(pos + ivec3( 1, 0, 0)) + fetch(pos + ivec3(-1, 0, 0))
+              + fetch(pos + ivec3( 0, 1, 0)) + fetch(pos + ivec3( 0,-1, 0))
+              + fetch(pos + ivec3( 0, 0, 1)) + fetch(pos + ivec3( 0, 0,-1));
+    vec4 edge = fetch(pos + ivec3( 1, 1, 0)) + fetch(pos + ivec3( 1,-1, 0))
+              + fetch(pos + ivec3(-1, 1, 0)) + fetch(pos + ivec3(-1,-1, 0))
+              + fetch(pos + ivec3( 1, 0, 1)) + fetch(pos + ivec3( 1, 0,-1))
+              + fetch(pos + ivec3(-1, 0, 1)) + fetch(pos + ivec3(-1, 0,-1))
+              + fetch(pos + ivec3( 0, 1, 1)) + fetch(pos + ivec3( 0, 1,-1))
+              + fetch(pos + ivec3( 0,-1, 1)) + fetch(pos + ivec3( 0,-1,-1));
+    return ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * self_val) * h_sq;
 }
 
 // Trilinear interpolation: fetch at fractional position (for semi-Lagrangian advection)
@@ -282,8 +410,17 @@ float lerp_thresh(float alive, float birth_val, float survive_val) {
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
 
-    float inner_r = 1.5 * h_inv;
-    float outer_r = 2.5 * h_inv;
+    // Clamp the kernel scale at the LOW end so sub-reference grids don't
+    // degenerate: at size<128 the raw h_inv < 1 and inner_r falls below
+    // 1.5 voxels, leaving only ~7 cells in the inner disk and causing
+    // the averaging to alias. Clamping h_inv >= 1.0 means creatures in
+    // small grids are proportionally larger relative to the box (they
+    // have the same voxel footprint as at REF_SIZE), which matches the
+    // 128³ attractor instead of drifting to a different one. The high
+    // end is still capped by MAX_SCAN below.
+    float h_inv_eff = max(h_inv, 1.0);
+    float inner_r = 1.5 * h_inv_eff;
+    float outer_r = 2.5 * h_inv_eff;
     int scan = int(ceil(outer_r));
     // Shared cap — applied identically in tiled and direct paths.
     if (scan > MAX_SCAN) {
@@ -316,30 +453,46 @@ void main() {
 #endif
 
     float inner_sum = 0.0, outer_sum = 0.0;
-    int inner_count = 0, outer_count = 0;
+    float inner_w = 0.0, outer_w = 0.0;
     float inner_r2 = inner_r * inner_r;
     float outer_r2 = outer_r * outer_r;
+
+    // Antialias the inner/outer disk boundary across one cell. The hard
+    // step (boolean classification) used previously aliased badly at
+    // small radii (~14 inner cells, ~50 outer cells) -- a single-cell
+    // change flipped the inner mean by ~7%, giving the rule a pixellated
+    // look. Rafler's original SmoothLife uses smooth weights for exactly
+    // this reason. Cells at the boundary contribute fractionally to both
+    // disks, so the kernel is rotationally smooth in expectation even
+    // at radii where the cubic lattice is far from isotropic.
+    float aa_width = 0.7;  // ~one-cell smoothing band on each boundary
 
     for (int dz = -scan; dz <= scan; dz++)
     for (int dy = -scan; dy <= scan; dy++)
     for (int dx = -scan; dx <= scan; dx++) {
         float dist2 = float(dx*dx + dy*dy + dz*dz);
         if (dist2 < 0.25) continue;
-        if (dist2 > outer_r2) continue;
+        if (dist2 > (outer_r + aa_width) * (outer_r + aa_width)) continue;
+        float dist = sqrt(dist2);
 #if USE_SHARED_MEM
         float v = s_tile[tile_idx(tile_pos.x + dx, tile_pos.y + dy, tile_pos.z + dz)];
 #else
         float v = fetch(pos + ivec3(dx, dy, dz)).r;
 #endif
-        if (dist2 <= inner_r2) {
-            inner_sum += v; inner_count++;
-        } else {
-            outer_sum += v; outer_count++;
-        }
+        // Smooth indicator for inner disk: 1 inside inner_r, 0 beyond,
+        // smoothstep across the boundary.
+        float w_inner = 1.0 - smoothstep(inner_r - aa_width, inner_r + aa_width, dist);
+        // Smooth indicator for outer annulus: starts at inner_r, ends at outer_r.
+        float w_outer = smoothstep(inner_r - aa_width, inner_r + aa_width, dist)
+                      * (1.0 - smoothstep(outer_r - aa_width, outer_r + aa_width, dist));
+        inner_sum += v * w_inner;
+        outer_sum += v * w_outer;
+        inner_w += w_inner;
+        outer_w += w_outer;
     }
 
-    float m = inner_count > 0 ? inner_sum / float(inner_count) : 0.0;
-    float n = outer_count > 0 ? outer_sum / float(outer_count) : 0.0;
+    float m = inner_w > 0.0 ? inner_sum / inner_w : 0.0;
+    float n = outer_w > 0.0 ? outer_sum / outer_w : 0.0;
 
     float b_center = u_param0;
     float b_range = u_param1;
@@ -358,6 +511,10 @@ void main() {
 
     float result = self + u_dt * (2.0 * growth - 1.0);
     result = clamp(result, 0.0, 1.0);
+    // Death floor: tiny residual values snap to zero so dying patterns
+    // vanish cleanly. SmoothLife creatures live in the 0.3-0.8 range; a
+    // 0.005 floor never affects living structure but kills sub-visible fog.
+    if (result < 0.005) result = 0.0;
 
     imageStore(u_dst, pos, vec4(result, 0.0, 0.0, 0.0));
 }
@@ -407,15 +564,24 @@ void main() {
     float U = c.r;
     float V = c.g;
 
-    vec2 sum = vec2(0.0);
-    sum += s_uv[rd_idx(tp.x + 1, tp.y,     tp.z    )];
-    sum += s_uv[rd_idx(tp.x - 1, tp.y,     tp.z    )];
-    sum += s_uv[rd_idx(tp.x,     tp.y + 1, tp.z    )];
-    sum += s_uv[rd_idx(tp.x,     tp.y - 1, tp.z    )];
-    sum += s_uv[rd_idx(tp.x,     tp.y,     tp.z + 1)];
-    sum += s_uv[rd_idx(tp.x,     tp.y,     tp.z - 1)];
-    float sum_U = sum.x;
-    float sum_V = sum.y;
+    // 19-point compact isotropic Laplacian (face + edge, no corner).
+    // The 6-point stencil produces axis-aligned worms in the labyrinthine
+    // gray_scott_worms regime and slightly cubic spots in the mitosis
+    // regime. The 19-point error term is rotation-invariant ∇²(∇²f), so
+    // both regimes look natural in any orientation. Coefficients:
+    //   center -4   face 1/3   edge 1/6   (× h_sq for continuum units)
+    vec2 face = s_uv[rd_idx(tp.x+1, tp.y,   tp.z  )] + s_uv[rd_idx(tp.x-1, tp.y,   tp.z  )]
+              + s_uv[rd_idx(tp.x,   tp.y+1, tp.z  )] + s_uv[rd_idx(tp.x,   tp.y-1, tp.z  )]
+              + s_uv[rd_idx(tp.x,   tp.y,   tp.z+1)] + s_uv[rd_idx(tp.x,   tp.y,   tp.z-1)];
+    vec2 edge = s_uv[rd_idx(tp.x+1, tp.y+1, tp.z  )] + s_uv[rd_idx(tp.x+1, tp.y-1, tp.z  )]
+              + s_uv[rd_idx(tp.x-1, tp.y+1, tp.z  )] + s_uv[rd_idx(tp.x-1, tp.y-1, tp.z  )]
+              + s_uv[rd_idx(tp.x+1, tp.y,   tp.z+1)] + s_uv[rd_idx(tp.x+1, tp.y,   tp.z-1)]
+              + s_uv[rd_idx(tp.x-1, tp.y,   tp.z+1)] + s_uv[rd_idx(tp.x-1, tp.y,   tp.z-1)]
+              + s_uv[rd_idx(tp.x,   tp.y+1, tp.z+1)] + s_uv[rd_idx(tp.x,   tp.y+1, tp.z-1)]
+              + s_uv[rd_idx(tp.x,   tp.y-1, tp.z+1)] + s_uv[rd_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec2 lap_uv = ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * c) * h_sq;
+    float lap_U = lap_uv.x;
+    float lap_V = lap_uv.y;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
@@ -423,32 +589,35 @@ void main() {
     float U = self_val.r;
     float V = self_val.g;
 
-    // Sum 6 von Neumann neighbors for both species simultaneously
-    float sum_U = 0.0, sum_V = 0.0;
-    vec4 nb;
-    nb = fetch(pos + ivec3( 1, 0, 0)); sum_U += nb.r; sum_V += nb.g;
-    nb = fetch(pos + ivec3(-1, 0, 0)); sum_U += nb.r; sum_V += nb.g;
-    nb = fetch(pos + ivec3( 0, 1, 0)); sum_U += nb.r; sum_V += nb.g;
-    nb = fetch(pos + ivec3( 0,-1, 0)); sum_U += nb.r; sum_V += nb.g;
-    nb = fetch(pos + ivec3( 0, 0, 1)); sum_U += nb.r; sum_V += nb.g;
-    nb = fetch(pos + ivec3( 0, 0,-1)); sum_U += nb.r; sum_V += nb.g;
+    // 19-point isotropic Laplacian via shared helper (see COMPUTE_HEADER).
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_U = lap_v4.r;
+    float lap_V = lap_v4.g;
 #endif
-
-    // Standard 3D discrete Laplacian, scaled by h^2 for resolution-independence
-    float lap_U = (sum_U - 6.0 * U) * h_sq;
-    float lap_V = (sum_V - 6.0 * V) * h_sq;
 
     float F  = u_param0;  // feed rate
     float k  = u_param1;  // kill rate
     float Du = u_param2;  // U diffusion rate
     float Dv = u_param3;  // V diffusion rate
 
-    float uvv = U * V * V;
-    float dU = Du * lap_U - uvv + F * (1.0 - U);
-    float dV = Dv * lap_V + uvv - (F + k) * V;
+    // CFL-safe dt clamp. Explicit Euler 3D diffusion is stable when
+    // D * dt * h_sq ≤ 1/6 (it equals D·dt/h² in physical units). At grids
+    // larger than REF_SIZE, h_sq > 1 and a naïve user-specified dt violates
+    // CFL, corrupting the Turing instability and collapsing the pattern to
+    // the V-saturated well-mixed fixed point. Clamping here keeps the sim
+    // stable at any resolution — at the cost of advancing less physical
+    // time per step when h_sq > 1. The preset/audit should compensate by
+    // issuing more steps at high resolutions.
+    float D_max    = max(Du, Dv);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
 
-    float new_U = clamp(U + dU * u_dt, 0.0, 1.0);
-    float new_V = clamp(V + dV * u_dt, 0.0, 1.0);
+    float uvv = U * V * V;
+    float dU  = Du * lap_U - uvv + F * (1.0 - U);
+    float dV  = Dv * lap_V + uvv - (F + k) * V;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 1.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
 }
@@ -508,29 +677,31 @@ void main() {
     float u = self_val.r;
     float v = self_val.g;
 
-    float sum_u = 0.0;
-    sum_u += s_u[wtile_idx(tp.x + 1, tp.y,     tp.z    )];
-    sum_u += s_u[wtile_idx(tp.x - 1, tp.y,     tp.z    )];
-    sum_u += s_u[wtile_idx(tp.x,     tp.y + 1, tp.z    )];
-    sum_u += s_u[wtile_idx(tp.x,     tp.y - 1, tp.z    )];
-    sum_u += s_u[wtile_idx(tp.x,     tp.y,     tp.z + 1)];
-    sum_u += s_u[wtile_idx(tp.x,     tp.y,     tp.z - 1)];
+    // 19-point isotropic Laplacian. The 6-point stencil produces visibly
+    // octahedral wavefronts when a point source radiates: the leading
+    // dispersion error Σ ∂⁴/∂xᵢ⁴ slows axis-aligned propagation
+    // relative to diagonals. The 19-point stencil's error is ∇²(∇²u),
+    // which preserves rotational symmetry, so spherical wavefronts stay
+    // spherical to several wavelengths from the source.
+    float face = s_u[wtile_idx(tp.x+1, tp.y,   tp.z  )] + s_u[wtile_idx(tp.x-1, tp.y,   tp.z  )]
+               + s_u[wtile_idx(tp.x,   tp.y+1, tp.z  )] + s_u[wtile_idx(tp.x,   tp.y-1, tp.z  )]
+               + s_u[wtile_idx(tp.x,   tp.y,   tp.z+1)] + s_u[wtile_idx(tp.x,   tp.y,   tp.z-1)];
+    float edge = s_u[wtile_idx(tp.x+1, tp.y+1, tp.z  )] + s_u[wtile_idx(tp.x+1, tp.y-1, tp.z  )]
+               + s_u[wtile_idx(tp.x-1, tp.y+1, tp.z  )] + s_u[wtile_idx(tp.x-1, tp.y-1, tp.z  )]
+               + s_u[wtile_idx(tp.x+1, tp.y,   tp.z+1)] + s_u[wtile_idx(tp.x+1, tp.y,   tp.z-1)]
+               + s_u[wtile_idx(tp.x-1, tp.y,   tp.z+1)] + s_u[wtile_idx(tp.x-1, tp.y,   tp.z-1)]
+               + s_u[wtile_idx(tp.x,   tp.y+1, tp.z+1)] + s_u[wtile_idx(tp.x,   tp.y+1, tp.z-1)]
+               + s_u[wtile_idx(tp.x,   tp.y-1, tp.z+1)] + s_u[wtile_idx(tp.x,   tp.y-1, tp.z-1)];
+    float lap = ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * u) * h_sq;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
     vec4 self_val = fetch(pos);
     float u = self_val.r;  // displacement
     float v = self_val.g;  // velocity
 
-    // 3D discrete Laplacian, scaled by h^2 for resolution-independence
-    float sum_u = 0.0;
-    sum_u += fetch(pos + ivec3( 1, 0, 0)).r;
-    sum_u += fetch(pos + ivec3(-1, 0, 0)).r;
-    sum_u += fetch(pos + ivec3( 0, 1, 0)).r;
-    sum_u += fetch(pos + ivec3( 0,-1, 0)).r;
-    sum_u += fetch(pos + ivec3( 0, 0, 1)).r;
-    sum_u += fetch(pos + ivec3( 0, 0,-1)).r;
+    // 19-point isotropic Laplacian via shared helper.
+    float lap = lap19_v4(pos, self_val).r;
 #endif
-    float lap = (sum_u - 6.0 * u) * h_sq;
 
     float c         = u_param0;  // wave speed
     float damping   = u_param1;  // damping coefficient
@@ -567,25 +738,57 @@ void main() {
     "crystal_growth": """
 // Phase-field crystal growth with anisotropic surface energy
 // Kobayashi-type model: cubic harmonics anisotropy on the interface normal.
-// R = phase field φ [0=liquid, 1=solid]
-// G = supersaturation u (dimensionless undercooling, drives growth)
+//
+// FIELD 1 (primary state, image units 0,1):
+//   R = phase field phi [0=liquid, 1=solid]
+//   G = thermal undercooling u (T_eq - T_local; positive = supercooled melt;
+//       latent heat sink on solidification cools the local cell)
+//   B = grain orientation [0,1) packed angle
+//   A = trapped solute snapshot (frozen at moment of solidification, visual)
+//
+// FIELD 2 (extra physics scratchpad, image units 2,3):
+//   R = solute concentration c (diffusing impurity field; piles up at the
+//       growth front via partition rejection, drives constitutional
+//       undercooling and microsegregation patterns)
+//   G,B,A = reserved
+//
 // u_param0 = undercooling (drives growth speed)
 // u_param1 = diffusion rate (thermal diffusivity)
-// u_param2 = anisotropy strength ε (cubic harmonic amplitude)
-// u_param3 = shape mode:
-//              0 = compact (low ε → near-rounded blob)
-//              1 = octahedral (β max at <100>, axes bulge → 8 faces)
-//              2 = cubic     (β max at <111>, corners bulge → 6 faces)
-//              3 = dendritic (octahedral + temporal noise → branching arms)
+// u_param2 = anisotropy strength epsilon (cubic harmonic amplitude)
+// u_param3 = shape mode (each mode has distinct physics, not just
+//            a different anisotropy strength):
+//              0 = compact   - smooth K4 + low epsilon -> rounded blob (Wulff-ish)
+//              1 = octahedral- sharp peaks at 8 <111> facets -> octahedron
+//              2 = cubic     - sharp peaks at 6 <100> facets -> cube
+//              3 = dendritic - smooth K4 + temporal interface noise
+//                              -> Mullins-Sekerka tip-splitting -> branching
+//              4 = snowflake - basal + 6 prism facets -> hexagonal plate
+//                              with arms in basal plane
+//              5 = hopper    - cubic facets + corner-edge growth bias from
+//                              local melt depletion -> stair-stepped skeletal
 //
-// USE_SHARED_MEM=1 cooperatively loads a 10^3 vec2 tile of (phi, u_field)
-// so the 6 stencil reads (for both lap_phi+lap_u and the phi-gradient)
-// come from on-chip shared memory instead of 6 imageLoad ops per cell.
+// USE_SHARED_MEM=1 cooperatively loads a 10^3 vec4 tile of (phi, u_field,
+// orient, _) so the 6 stencil reads (for both lap_phi+lap_u, the phi-gradient,
+// and orientation propagation) come from on-chip shared memory instead of
+// 6 imageLoad ops per cell. We use vec4 (not vec3) because GLSL pads vec3
+// in shared memory to vec4 anyway -- explicit vec4 makes the layout clear.
+
+// Second-field bindings for solute concentration physics (paired with
+// _alloc_field2 / _step_sim binding tex_a2/tex_b2 to image units 2,3).
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+// Mirror-clamped read of the second field (matches the clamped boundary
+// mode used by all crystal presets; avoids halo wrap artefacts).
+vec4 fetch2(ivec3 p) {
+    p = clamp(p, ivec3(0), ivec3(u_size - 1));
+    return imageLoad(u_src2, p);
+}
 
 #if USE_SHARED_MEM
 #define CGTILE 10
 #define CGTILE3 (CGTILE * CGTILE * CGTILE)
-shared vec2 s_pu[CGTILE3];
+shared vec4 s_pu[CGTILE3];
 int cg_idx(int x, int y, int z) {
     return z * CGTILE * CGTILE + y * CGTILE + x;
 }
@@ -605,35 +808,102 @@ void main() {
         int tz = i / (CGTILE * CGTILE);
         int ty = (i / CGTILE) % CGTILE;
         int tx = i % CGTILE;
-        s_pu[i] = fetch(tile_origin + ivec3(tx, ty, tz)).rg;
+        s_pu[i] = fetch(tile_origin + ivec3(tx, ty, tz));
     }
     barrier();
 
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
     ivec3 tp = local + ivec3(1);
-    vec2 c = s_pu[cg_idx(tp.x, tp.y, tp.z)];
+    vec4 c = s_pu[cg_idx(tp.x, tp.y, tp.z)];
     float phi     = c.r;
     float u_field = c.g;
+    float orient  = c.b;  // grain orientation [0,1) ↔ rotation [0, π/2)
+    float trapped = c.a;  // frozen growth-history record (set once at solidification)
 
-    vec2 nxp = s_pu[cg_idx(tp.x + 1, tp.y,     tp.z    )];
-    vec2 nxm = s_pu[cg_idx(tp.x - 1, tp.y,     tp.z    )];
-    vec2 nyp = s_pu[cg_idx(tp.x,     tp.y + 1, tp.z    )];
-    vec2 nym = s_pu[cg_idx(tp.x,     tp.y - 1, tp.z    )];
-    vec2 nzp = s_pu[cg_idx(tp.x,     tp.y,     tp.z + 1)];
-    vec2 nzm = s_pu[cg_idx(tp.x,     tp.y,     tp.z - 1)];
+    vec4 nxp = s_pu[cg_idx(tp.x + 1, tp.y,     tp.z    )];
+    vec4 nxm = s_pu[cg_idx(tp.x - 1, tp.y,     tp.z    )];
+    vec4 nyp = s_pu[cg_idx(tp.x,     tp.y + 1, tp.z    )];
+    vec4 nym = s_pu[cg_idx(tp.x,     tp.y - 1, tp.z    )];
+    vec4 nzp = s_pu[cg_idx(tp.x,     tp.y,     tp.z + 1)];
+    vec4 nzm = s_pu[cg_idx(tp.x,     tp.y,     tp.z - 1)];
+
+    // 12 face-diagonal (edge) neighbours for the 19-point ISOTROPIC
+    // Laplacian. Free in the shared-mem path because the 10^3 tile
+    // already contains them. See lap_phi/lap_u below for why this
+    // matters: the standard 7-point Laplacian has an O(h^2) error term
+    // (h^2/12)*(d^4/dx^4 + d^4/dy^4 + d^4/dz^4) that's cubically
+    // anisotropic and biases growth along +-x, +-y, +-z. This bias is
+    // strong enough on its own to force any phase-field crystal into an
+    // octahedral envelope regardless of the prescribed kinetic
+    // anisotropy. Mixing in face-diagonal neighbours cancels the
+    // anisotropic part of the leading error.
+    vec4 nxyp = s_pu[cg_idx(tp.x + 1, tp.y + 1, tp.z    )];
+    vec4 nxyn = s_pu[cg_idx(tp.x + 1, tp.y - 1, tp.z    )];
+    vec4 nxny = s_pu[cg_idx(tp.x - 1, tp.y + 1, tp.z    )];
+    vec4 nxnyn= s_pu[cg_idx(tp.x - 1, tp.y - 1, tp.z    )];
+    vec4 nxzp = s_pu[cg_idx(tp.x + 1, tp.y,     tp.z + 1)];
+    vec4 nxzn = s_pu[cg_idx(tp.x + 1, tp.y,     tp.z - 1)];
+    vec4 nxnz = s_pu[cg_idx(tp.x - 1, tp.y,     tp.z + 1)];
+    vec4 nxnzn= s_pu[cg_idx(tp.x - 1, tp.y,     tp.z - 1)];
+    vec4 nyzp = s_pu[cg_idx(tp.x,     tp.y + 1, tp.z + 1)];
+    vec4 nyzn = s_pu[cg_idx(tp.x,     tp.y + 1, tp.z - 1)];
+    vec4 nynz = s_pu[cg_idx(tp.x,     tp.y - 1, tp.z + 1)];
+    vec4 nynzn= s_pu[cg_idx(tp.x,     tp.y - 1, tp.z - 1)];
+
+    // 8 cube-corner neighbours for the 27-POINT isotropic Laplacian
+    // (Spotz-Carey weights). Free in shared-mem since they're already
+    // in the 10^3 tile. The 19-point removes only the leading
+    // anisotropic O(h^2) error -- the next-order O(h^4) term still
+    // favours axes. 27-point cancels both, achieving full O(h^4)
+    // isotropy. This is what literature dendrite codes use.
+    vec4 nxyzp  = s_pu[cg_idx(tp.x + 1, tp.y + 1, tp.z + 1)];
+    vec4 nxyzn  = s_pu[cg_idx(tp.x + 1, tp.y + 1, tp.z - 1)];
+    vec4 nxynz  = s_pu[cg_idx(tp.x + 1, tp.y - 1, tp.z + 1)];
+    vec4 nxynzn = s_pu[cg_idx(tp.x + 1, tp.y - 1, tp.z - 1)];
+    vec4 nxnyz  = s_pu[cg_idx(tp.x - 1, tp.y + 1, tp.z + 1)];
+    vec4 nxnyzn = s_pu[cg_idx(tp.x - 1, tp.y + 1, tp.z - 1)];
+    vec4 nxnynz = s_pu[cg_idx(tp.x - 1, tp.y - 1, tp.z + 1)];
+    vec4 nxnynzn= s_pu[cg_idx(tp.x - 1, tp.y - 1, tp.z - 1)];
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     vec4 self_data = fetch(pos);
-    float phi = self_data.r;      // phase: 0=liquid, 1=solid
-    float u_field = self_data.g;  // supersaturation
+    float phi = self_data.r;       // phase: 0=liquid, 1=solid
+    float u_field = self_data.g;   // supersaturation
+    float orient  = self_data.b;   // grain orientation [0,1) ↔ rotation [0, π/2)
+    float trapped = self_data.a;   // frozen growth-history record
 
-    vec2 nxp = fetch(pos + ivec3( 1, 0, 0)).rg;
-    vec2 nxm = fetch(pos + ivec3(-1, 0, 0)).rg;
-    vec2 nyp = fetch(pos + ivec3( 0, 1, 0)).rg;
-    vec2 nym = fetch(pos + ivec3( 0,-1, 0)).rg;
-    vec2 nzp = fetch(pos + ivec3( 0, 0, 1)).rg;
-    vec2 nzm = fetch(pos + ivec3( 0, 0,-1)).rg;
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+
+    // 12 face-diagonal neighbours for the 19-point ISOTROPIC Laplacian.
+    // See note in shared-mem branch above for why these matter.
+    vec4 nxyp = fetch(pos + ivec3( 1,  1,  0));
+    vec4 nxyn = fetch(pos + ivec3( 1, -1,  0));
+    vec4 nxny = fetch(pos + ivec3(-1,  1,  0));
+    vec4 nxnyn= fetch(pos + ivec3(-1, -1,  0));
+    vec4 nxzp = fetch(pos + ivec3( 1,  0,  1));
+    vec4 nxzn = fetch(pos + ivec3( 1,  0, -1));
+    vec4 nxnz = fetch(pos + ivec3(-1,  0,  1));
+    vec4 nxnzn= fetch(pos + ivec3(-1,  0, -1));
+    vec4 nyzp = fetch(pos + ivec3( 0,  1,  1));
+    vec4 nyzn = fetch(pos + ivec3( 0,  1, -1));
+    vec4 nynz = fetch(pos + ivec3( 0, -1,  1));
+    vec4 nynzn= fetch(pos + ivec3( 0, -1, -1));
+
+    // 8 cube-corner neighbours for the 27-point isotropic Laplacian.
+    vec4 nxyzp  = fetch(pos + ivec3( 1,  1,  1));
+    vec4 nxyzn  = fetch(pos + ivec3( 1,  1, -1));
+    vec4 nxynz  = fetch(pos + ivec3( 1, -1,  1));
+    vec4 nxynzn = fetch(pos + ivec3( 1, -1, -1));
+    vec4 nxnyz  = fetch(pos + ivec3(-1,  1,  1));
+    vec4 nxnyzn = fetch(pos + ivec3(-1,  1, -1));
+    vec4 nxnynz = fetch(pos + ivec3(-1, -1,  1));
+    vec4 nxnynzn= fetch(pos + ivec3(-1, -1, -1));
 #endif
 
     float undercooling = u_param0;
@@ -641,8 +911,32 @@ void main() {
     float eps_strength = u_param2;
     int shape_mode = int(round(u_param3));
 
-    float lap_phi = (nxp.r + nxm.r + nyp.r + nym.r + nzp.r + nzm.r - 6.0 * phi)     * h_sq;
-    float lap_u   = (nxp.g + nxm.g + nyp.g + nym.g + nzp.g + nzm.g - 6.0 * u_field) * h_sq;
+    // 27-point isotropic Laplacian (Spotz-Carey weights, full O(h^4)
+    // isotropy). Center -128/30, faces 14/30, edges 3/30, corners 1/30.
+    // The 19-point removes only the leading anisotropic O(h^2) error;
+    // the residual O(h^4) still favours axes (still gives octahedral
+    // bias). 27-point cancels both anisotropic terms.
+    float face_sum_phi = nxp.r + nxm.r + nyp.r + nym.r + nzp.r + nzm.r;
+    float edge_sum_phi = nxyp.r + nxyn.r + nxny.r + nxnyn.r
+                       + nxzp.r + nxzn.r + nxnz.r + nxnzn.r
+                       + nyzp.r + nyzn.r + nynz.r + nynzn.r;
+    float corner_sum_phi = nxyzp.r + nxyzn.r + nxynz.r + nxynzn.r
+                         + nxnyz.r + nxnyzn.r + nxnynz.r + nxnynzn.r;
+    float lap_phi = ((-128.0/30.0) * phi
+                   + (14.0/30.0) * face_sum_phi
+                   + (3.0/30.0) * edge_sum_phi
+                   + (1.0/30.0) * corner_sum_phi) * h_sq;
+
+    float face_sum_u = nxp.g + nxm.g + nyp.g + nym.g + nzp.g + nzm.g;
+    float edge_sum_u = nxyp.g + nxyn.g + nxny.g + nxnyn.g
+                     + nxzp.g + nxzn.g + nxnz.g + nxnzn.g
+                     + nyzp.g + nyzn.g + nynz.g + nynzn.g;
+    float corner_sum_u = nxyzp.g + nxyzn.g + nxynz.g + nxynzn.g
+                       + nxnyz.g + nxnyzn.g + nxnynz.g + nxnynzn.g;
+    float lap_u   = ((-128.0/30.0) * u_field
+                   + (14.0/30.0) * face_sum_u
+                   + (3.0/30.0) * edge_sum_u
+                   + (1.0/30.0) * corner_sum_u) * h_sq;
 
     // Interface normal from ∇φ (scale gradient by h_inv for correct magnitude)
     float gx = (nxp.r - nxm.r) * 0.5 * h_inv;
@@ -651,55 +945,834 @@ void main() {
     float grad_mag = sqrt(gx*gx + gy*gy + gz*gz + 1e-8);
     vec3 n = vec3(gx, gy, gz) / grad_mag;
 
-    // Cubic harmonics K₄ = nx⁴+ny⁴+nz⁴.
-    //   K₄ = 1   at face-normal n=<100>      (axes)
-    //   K₄ = 1/3 at corner-normal n=<111>    (diagonals)
-    // With β as the kinetic prefactor, directions with HIGHER β advance
-    // faster → the surface bulges out along those normals.
-    float nx2 = n.x*n.x, ny2 = n.y*n.y, nz2 = n.z*n.z;
-    float K4  = nx2*nx2 + ny2*ny2 + nz2*nz2;
+    // GRAIN ORIENTATION PROPAGATION
+    // Each grain carries a single orientation angle θ ∈ [0, π/2) packed
+    // into the B channel as orient ∈ [0, 1). The β kernel is rotated
+    // by -θ around the y-axis when evaluating this cell, so different
+    // grains grow with their facets pointing in different directions.
+    // Where two grains collide their orientations differ → a sharp grain
+    // boundary appears. Single-seed presets default to orient=0 →
+    // identity rotation → identical to pre-orientation behaviour.
+    //
+    // Propagation rule: at the growth front (any non-fully-solid cell
+    // with at least one solid-ish neighbour), inherit the orientation of
+    // the most-solid neighbour. This is winner-takes-all: no averaging
+    // (which would smear orientations across boundaries) — one neighbour
+    // donates its orientation and the new cell joins that grain.
+    float new_orient = orient;
+    if (phi < 0.95) {
+        float best_phi = phi;
+        if (nxp.r > best_phi) { best_phi = nxp.r; new_orient = nxp.b; }
+        if (nxm.r > best_phi) { best_phi = nxm.r; new_orient = nxm.b; }
+        if (nyp.r > best_phi) { best_phi = nyp.r; new_orient = nyp.b; }
+        if (nym.r > best_phi) { best_phi = nym.r; new_orient = nym.b; }
+        if (nzp.r > best_phi) { best_phi = nzp.r; new_orient = nzp.b; }
+        if (nzm.r > best_phi) { best_phi = nzm.r; new_orient = nzm.b; }
+    }
+    // Rotate the interface normal by -θ around the y-axis. Equivalent to
+    // rotating the β kernel by +θ when evaluating it at this point.
+    // For cubic-symmetric kernels we map orient ∈ [0,1) to θ ∈ [0, π/2)
+    // since the kernel repeats every 90°. Snowflake mode uses the same
+    // mapping but its 6-fold symmetry repeats every 60°, so values
+    // beyond 2/3 alias onto the same orientations as values ≤ 2/3 —
+    // harmless aliasing, just less of the orientation range is unique.
+    float theta = new_orient * 1.5707963;  // π/2
+    float cos_t = cos(theta);
+    float sin_t = sin(theta);
+    vec3 n_local = vec3(cos_t * n.x + sin_t * n.z,
+                        n.y,
+                        -sin_t * n.x + cos_t * n.z);
+
+    // Per-mode kinetic anisotropy β(n̂).
+    //
+    // The standard cubic harmonic K₄ = nx⁴+ny⁴+nz⁴ varies only between
+    // 1/3 (corners) and 1 (faces) — a 3× ratio that's far too gentle to
+    // produce visible facets on a finite-width diffuse interface (2-3
+    // cells). Real faceted crystals have *singular* β(n̂): sharp peaks at
+    // a few preferred normals and near-zero growth elsewhere. We model
+    // that by taking the MAX of (n · f_i)^p over a small set of facet
+    // normals f_i, with large p giving narrow peaks.
+    //
+    // That non-differentiable max creates true edges/corners on the
+    // growing surface — facets where directions can't smoothly trade
+    // off — which is exactly the geometric distinction between rounded
+    // (smooth β) and faceted (singular β) crystals.
+    // Use the GRAIN-LOCAL normal n_local for the β kernel — that's what
+    // makes each grain's facets point along its own crystallographic
+    // axes rather than all sharing the world axes.
+    float nx2 = n_local.x*n_local.x, ny2 = n_local.y*n_local.y, nz2 = n_local.z*n_local.z;
+    float K4  = nx2*nx2 + ny2*ny2 + nz2*nz2;   // smooth kernel for non-faceted modes
     float aniso;
-    if (shape_mode == 2) {
-        // Cubic: β max at <111> diagonals → 8 corner bulges → cube shape.
-        aniso = -(K4 - 0.6);
+
+    if (shape_mode == 1) {
+        // OCTAHEDRAL: 8 facets at <111>. By the Wulff construction the
+        // visible faces are perpendicular to the SLOW-growth directions,
+        // so to get an octahedron we need β fastest along the cube AXES
+        // <100> — those grow out and leave the 8 <111> faces.
+        // max(|n_x|,|n_y|,|n_z|)^p — at <100> = 1, at <111> = (1/√3)^p.
+        // p=8 gives crisp triangular faces.
+        float a = max(abs(n_local.x), max(abs(n_local.y), abs(n_local.z)));
+        float a2 = a * a;
+        float a4 = a2 * a2;
+        float facet = a4 * a4;
+        // Normalise so aniso ∈ [0,1]: at <111> facet = 1/81, at <100> = 1.
+        aniso = (facet - 0.0123) / 0.988;
+    } else if (shape_mode == 2) {
+        // CUBIC: 6 facets at <100>. By the Wulff construction the visible
+        // faces are perpendicular to the SLOW-growth directions, so to get
+        // a cube we need β fastest along the cube DIAGONALS <111> — those
+        // grow out and leave the 6 <100> faces.
+        // For a unit normal n, max((±n_x ± n_y ± n_z)/√3)^p
+        // = (|n_x|+|n_y|+|n_z|)^p / 3^(p/2). p=8 gives crisp square faces.
+        float s = (abs(n_local.x) + abs(n_local.y) + abs(n_local.z)) / 1.732051;  // /√3
+        float s2 = s * s;        // ^2
+        float s4 = s2 * s2;      // ^4
+        float facet = s4 * s4;   // ^8
+        // At <100> s=1/√3 → s^8 = 1/81; at <111> s=1 → s^8 = 1.
+        aniso = (facet - 0.0123) / 0.988;
+    } else if (shape_mode == 4) {
+        // SNOWFLAKE -- hex plate with dendritic arms in the basal plane.
+        //
+        // Strictly POSITIVE-ONLY kernel. The previous form computed
+        // aniso = envelope - 0.5 which let beta = 1 + eps*aniso go
+        // negative across most of the surface (clamped to 0 by the
+        // floor), so dphi reduced to pure lap_phi -- isotropic capillary
+        // smoothing of a round disc grows it as a bigger round disc.
+        // That is the visible "rolling-pin" behaviour.
+        //
+        // Fix: keep aniso in [0, 1] so beta is in [1, 1+eps]. Slow
+        // directions (prism facets, c-axis) get beta = 1 -- enough to
+        // form facets via the Wulff construction without zeroing out the
+        // kinetic term entirely. Fast directions (hex corners in the
+        // basal plane) get beta = 1 + eps (~15 with eps_strength=14),
+        // giving the ~225x driving-force contrast needed to overcome the
+        // 4-fold cube-grid bias and form 6 visible arms.
+        //
+        //   basal_factor: pow(sin(angle from c-axis), 6) -- thin plate
+        //   hex_factor:   (1 - cos(6*theta))/2  -- 0 at facets, 1 at corners
+        //
+        // Their product is 0 in slow directions (c-axis OR prism
+        // facets) and 1 at hex corners in the basal plane.
+        float in_plane2 = nx2 + nz2;
+        float basal_factor = in_plane2 * in_plane2 * in_plane2;  // sin^6
+        float theta6 = 6.0 * atan(n_local.z, n_local.x);
+        float hex_factor = 0.5 - 0.5 * cos(theta6);
+        aniso = basal_factor * hex_factor;
+    } else if (shape_mode == 5) {
+        // HOPPER (skeletal cube): cubic facets but corner/edge growth bias.
+        // Same diagonal-fast kernel as cubic mode (β peaks at <111>, slow at
+        // <100> → leaves 6 square faces). The local-melt boost in the driving
+        // term below makes corners and edges (which see fresher melt than
+        // face centres) outrun the face interior — producing the iconic
+        // stair-stepped/skeletal shape of bismuth, halite, and ice at
+        // certain conditions.
+        float s = (abs(n_local.x) + abs(n_local.y) + abs(n_local.z)) / 1.732051;
+        float s4 = s*s*s*s;
+        aniso = (s4*s4 - 0.0123) / 0.988;
+    } else if (shape_mode == 6) {
+        // MORPHOLOGY: a single kernel that traverses the experimentally
+        // observed sequence compact -> faceted -> hopper -> dendritic
+        // as undercooling rises. Real materials show this whole sequence
+        // as one phase diagram (the Nakaya diagram for ice; analogous
+        // diagrams for metals and salts). Rather than committing to one
+        // mode at preset definition time, this kernel reads the live
+        // undercooling parameter and blends three component kernels:
+        //
+        //   - K4         (smooth, very weak anisotropy)         -> compact
+        //   - facet_cube (sharp diagonal-fast cubic kernel)     -> cube
+        //   - K4_strong  (smooth K4 with high contrast)         -> dendrite
+        //
+        // The driving force separately amplifies tip growth at high u_field
+        // (added below for any mode 6) which gives the hopper regime a
+        // natural emergence between cube and dendrite — exactly what
+        // happens in real growth as the front becomes unstable.
+        float facet_s = (abs(n_local.x) + abs(n_local.y) + abs(n_local.z)) / 1.732051;
+        float facet_cube = (pow(facet_s, 8.0) - 0.0123) / 0.988;
+        float K4_smooth = K4 - 0.333;        // [-0, 0.667] for non-axis dirs
+        float K4_strong = (K4 - 0.6) * 1.5;  // higher contrast for dendrite
+        // Regime weights driven by undercooling. Centred so:
+        //   u < 0.3  -> compact dominates (w_compact ~ 1)
+        //   u ~ 0.5  -> facet dominates
+        //   u > 0.7  -> dendrite dominates
+        float w_facet  = smoothstep(0.25, 0.45, undercooling)
+                       * (1.0 - smoothstep(0.55, 0.75, undercooling));
+        float w_dend   = smoothstep(0.55, 0.85, undercooling);
+        float w_compact = 1.0 - w_facet - w_dend;
+        w_compact = max(w_compact, 0.0);
+        aniso = w_compact * (K4_smooth * 0.3)   // gentle anisotropy
+              + w_facet   * facet_cube
+              + w_dend    * K4_strong;
+    } else if (shape_mode == 3) {
+        // DENDRITIC: canonical Karma-Rappel weak K4 anisotropy.
+        //
+        // Previous attempt set aniso=0 on the theory that any axis-peaked
+        // kernel forces a Wulff octahedron, with FBM noise + u^2 doing
+        // all the symmetry breaking. That gave the right physics on
+        // paper but produced a spherical roughened blob in practice:
+        // without a preferred direction the M-S bumps grow in random
+        // orientations and the resolved grid scale (64-128 voxels) is
+        // too small for them to coalesce into coherent arms before the
+        // crystal halts.
+        //
+        // Real solidification dendrites in cubic metals (Al, Ni, Fe) DO
+        // have weak kinetic anisotropy (eps ~ 0.02-0.05) and DO grow
+        // along cubic <100> axes -- "the dendrite knows which way to
+        // point" because the kernel orients it. The branching itself is
+        // still the M-S instability driven by latent-heat depletion;
+        // the kernel just selects which axes the unstable wavelengths
+        // amplify along. So the canonical Karma-Rappel form is:
+        //     beta = 1 + eps * (4*K4 - 3),  eps small (~0.05)
+        // which peaks at <100> (4*1-3=+1) and dips at <111> (4/3-3=-5/3).
+        // Rescale to aniso in [0,1] with eps_strength baseline so the
+        // user's "Anisotropy strength" slider 3..10 maps to physical
+        // eps 0.02..0.07 (multiply by 0.0067 outside, since the global
+        // beta = 1 + eps_strength * aniso means we want eps_strength*aniso
+        // to land in 0.02..0.07 range when slider is 3..10 and aniso~0.5).
+        // Use raw (4*K4-3) range [-5/3, 1] mapped to [0,1] as
+        // aniso = (4*K4-3 + 5/3) / (1 + 5/3) = (4*K4 - 4/3) * 3/8.
+        aniso = (4.0 * K4 - 4.0/3.0) * 0.375;  // [0,1], peaks at <100>
+        aniso = clamp(aniso, 0.0, 1.0);
     } else {
-        // Modes 0 (compact), 1 (octahedral), 3 (dendritic):
-        // β max at <100> axes → 6 axial bulges → octahedron shape.
-        // Mode 0 with low ε ≈ 0 collapses to near-isotropic rounded growth.
-        aniso = (K4 - 0.6);
+        // Mode 0 (compact).
+        //
+        // Use a SHARP axis-peak kernel so beta peaks narrowly along
+        // +-x, +-y, +-z. The compact preset uses tiny eps so the
+        // kernel is nearly isotropic anyway, just gently axis-aligned.
+        float a = max(abs(n_local.x), max(abs(n_local.y), abs(n_local.z)));
+        float a2 = a * a;
+        float a4 = a2 * a2;
+        float a8 = a4 * a4;
+        aniso = (a8 - 0.0123) / 0.988;  // [0, 1], same shape as octahedral mode
     }
     float beta = 1.0 + eps_strength * aniso;
 
-    if (shape_mode == 3) {
-        // Dendritic: add interface noise for Mullins-Sekerka tip-splitting.
-        // Must be *temporal* — a static per-cell hash biases each interface
-        // cell in the same direction every step, suppressing tip-splitting.
-        float noise = hash_temporal(pos, 1);
-        beta += eps_strength * 0.5 * (noise - 0.5) * smoothstep(0.01, 0.2, grad_mag);
+    if (shape_mode == 6) {
+        // Mode 6 inherits dendritic FBM noise weighted by the dendritic
+        // regime weight, so multi-scale forcing only kicks in at the
+        // high-undercooling end of the morphology slider where it
+        // belongs physically (compact and faceted regimes don't want
+        // multi-scale perturbation -- it would roughen the facets).
+        float w_dend = smoothstep(0.55, 0.85, undercooling);
+        float fnoise = fbm3_temporal(vec3(pos), 8.0, 4, 1);
+        beta += w_dend * 0.12 * (fnoise - 0.5)
+                       * smoothstep(0.01, 0.2, grad_mag);
     }
-    beta = max(beta, 0.01);
 
-    // Double-well driving + capillary anisotropy
-    float driving = phi * (1.0 - phi) * (phi - 0.5 + undercooling + u_field * 0.5);
+    // QUENCHED LATTICE DEFECTS: a frozen per-cell noise field representing
+    // microscopic lattice imperfections (vacancies, screw dislocations,
+    // adsorbed impurities) that locally bias growth velocity. These are
+    // what make every snowflake unique despite the 6-fold symmetry of the
+    // kernel — each arm sees the same physics but trips over a different
+    // realisation of the same defect statistics, so side-branches appear
+    // at slightly different positions on each branch. The defect amplitude
+    // is gated by smoothstep on the interface gradient so only growth-front
+    // cells feel it.
+    //
+    // Per-mode strength reflects the dominant physical role of defects:
+    //   compact:    none — pristine seed in clean melt
+    //   octahedral: faint (0.05) — growth-step nucleation on facets
+    //   cubic:      faint (0.05) — same
+    //   dendritic:  moderate (0.12) — seeds side-branch instabilities
+    //   snowflake:  light  (0.08) — too much defect noise on a 4-fold grid
+    //                              jitters the off-axis arms into the
+    //                              gridlock pattern; small amp gives unique
+    //                              side-branches without breaking 6-fold
+    //   hopper:     moderate (0.10) — nucleates the stair-step terraces
+    float defect_amp = 0.0;
+    if      (shape_mode == 1) defect_amp = 0.05;
+    else if (shape_mode == 2) defect_amp = 0.05;
+    else if (shape_mode == 3) defect_amp = 0.12;
+    else if (shape_mode == 4) defect_amp = 0.08;
+    else if (shape_mode == 5) defect_amp = 0.10;
+    if (defect_amp > 0.0) {
+        // FRACTAL quenched defects: octave-summed value noise rather than
+        // single-cell white noise. Coarse octaves (period ~12 cells) bias
+        // whole regions of the front; fine octaves (period ~1.5 cells)
+        // bias individual cells. The composite produces side-branches at
+        // multiple scales -- visible secondary and tertiary branches
+        // along arms instead of just per-cell jitter.
+        float dnoise = fbm3(vec3(pos), 12.0, 4, 7);
+        beta *= (1.0 + defect_amp * (dnoise - 0.5) *
+                       smoothstep(0.02, 0.25, grad_mag));
+    }
+    // Floor at near-zero (not the old 0.01 minimum) so non-facet directions
+    // genuinely stagnate in the faceted modes — that's what makes a facet a
+    // facet rather than a slow spheroidal patch.
+    // For mode 6 (morphology slider) the floor itself is interpolated:
+    // compact regime needs the small floor for numerical stability;
+    // facet regime wants strict zero so non-facet directions stagnate.
+    bool faceted = (shape_mode == 1 || shape_mode == 2 ||
+                    shape_mode == 4 || shape_mode == 5);
+    float floor_val;
+    if (shape_mode == 6) {
+        // Lerp from 0.01 (compact) -> 0 (facet/hopper/dendrite).
+        float w_facet_or_more = smoothstep(0.25, 0.45, undercooling);
+        floor_val = mix(0.01, 0.0, w_facet_or_more);
+    } else {
+        floor_val = faceted ? 0.0 : 0.01;
+    }
+    beta = max(beta, floor_val);
+
+    // Standard Kobayashi-type split: ISOTROPIC surface tension (lap_phi)
+    // + ANISOTROPIC kinetic mobility on the bulk driving force.
+    //
+    // The previous form `b² * (lap_phi + driving)` factored β² out of both
+    // terms, which meant cube corners (where β² is large in cubic mode)
+    // had BOTH amplified forward growth AND amplified curvature smoothing.
+    // Since corner curvature scales as 1/r, the smoothing eventually wins
+    // as the crystal grows — corners round out and the cubic shape is lost.
+    // Putting β² only on the driving keeps the kinetic anisotropy intact
+    // at all length scales while a single isotropic capillary term provides
+    // numerical stability without preferentially eroding corners.
+    // SOLUTE CONCENTRATION FIELD (second physics texture)
+    // Read the local solute concentration and a 6-neighbour stencil for
+    // its Laplacian. Solute c lives in tex_a2.r; in the melt c~1.0, and
+    // it piles up at the growth front via partition rejection (see below).
+    float c_local = fetch2(pos).r;
+    float c_xp = fetch2(pos + ivec3( 1, 0, 0)).r;
+    float c_xm = fetch2(pos + ivec3(-1, 0, 0)).r;
+    float c_yp = fetch2(pos + ivec3( 0, 1, 0)).r;
+    float c_ym = fetch2(pos + ivec3( 0,-1, 0)).r;
+    float c_zp = fetch2(pos + ivec3( 0, 0, 1)).r;
+    float c_zm = fetch2(pos + ivec3( 0, 0,-1)).r;
+    float lap_c = (c_xp + c_xm + c_yp + c_ym + c_zp + c_zm - 6.0 * c_local) * h_sq;
+
+    // KARMA-RAPPEL DRIVING: well is symmetric (phi-0.5) and biased only
+    // by available local supersaturation u_field, with a fixed lambda0=6
+    // baseline so the slider's working range stays in [0.1, 0.9]. The
+    // `undercooling` parameter modulates the coupling: large -> strong
+    // tilt toward solid even at modest u, small -> only fully saturated
+    // melt grows. As u_field depletes (each solidification consumes
+    // 0.5 of u via partition rejection), the well restores symmetry and
+    // growth halts naturally before filling the box. Combined with the
+    // limited initial reservoir (u_init=0.25), this caps growth around
+    // 50% of the box, preserving the transient morphology that the
+    // audit (scripts/audit_crystals.py) showed gets erased at saturation.
+    float driving = phi * (1.0 - phi) * (phi - 0.5 + 6.0 * undercooling * u_field);
+
+    // CONSTITUTIONAL UNDERCOOLING (currently disabled)
+    // Real impurities depress the local liquidus T_liq = T_eq - m*c, which
+    // in principle triggers Mullins-Sekerka instability via solute
+    // pile-up at the front. We tried `driving -= m*(c - c_inf)*phi*(1-phi)`
+    // but it has a hidden geometric bias on a 6-cell stencil: cells at
+    // convex CORNERS see more liquid neighbours, so solute diffuses away
+    // faster -> lower local c -> smaller penalty -> fastest growth at
+    // <111>. That accidental cube-corner coupling masquerades as an
+    // octahedral kinetic anisotropy and:
+    //   - makes the dendritic kernel's intended 6-axis K4 morphology
+    //     decay into an octahedron with bumps;
+    //   - washes out the snowflake's 6-fold basal arms (wrong symmetry);
+    //   - has no effect on cube/octahedral (already aligned with bias);
+    //   - actually helps the compact and morphology blends.
+    // The right formulation is a gradient coupling
+    //     driving -= m * (n . grad(c)) * phi*(1-phi)
+    // which is zero at uniform c regardless of geometry and only
+    // activates where solute genuinely piles up against the front. That
+    // requires a 6-stencil grad(c) read and reuses the interface normal
+    // we already have. Punted until the visual baseline is back; the
+    // solute field below still updates correctly and can be visualised.
+    // float c_inf = 1.0;
+    // float m_liquidus = 0.05;
+    // driving -= m_liquidus * (c_local - c_inf) * phi * (1.0 - phi);
+
+    // GIBBS-THOMSON CURVATURE UNDERCOOLING
+    // The melting point of a curved interface is depressed by an amount
+    // proportional to the local mean curvature: T_m(curved) = T_m(flat) - γ·κ.
+    // Equivalently, a small bump on the growth front needs MORE
+    // undercooling than a flat region to keep growing — so absent that
+    // extra undercooling, small bumps actually melt back.
+    //
+    // Mean curvature on a phase field is κ ≈ ∇²φ / |∇φ| (with sign such
+    // that κ > 0 for convex bulges into the liquid). We subtract a γ·κ
+    // term from the driving force, gated by phi(1-phi) so it only acts
+    // at the diffuse interface and doesn't perturb bulk solid/liquid.
+    //
+    // Three things this fixes for free:
+    //   1. Stray micro-bumps from the defect noise melt back instead of
+    //      blowing up into spurious side-arms — cleaner facets.
+    //   2. The corners of cubic/octahedral crystals (high curvature) get
+    //      a self-consistent slowdown that prevents runaway growth past
+    //      the Wulff envelope.
+    //   3. OSTWALD RIPENING in polycrystal mode: small grains have higher
+    //      curvature than large ones, so they shrink while large grains
+    //      grow at their expense. Visible over time as the grain count
+    //      drops while average grain size increases — exactly what real
+    //      annealing metals do.
+    //
+    // Mode-dependent strength:
+    //   - Faceted modes (0/1/2/4): γ=0 — capillary smoothing penalises
+    //     high curvature, which is exactly what corners and edges have,
+    //     so any positive γ visibly rounds the Wulff shape into a sphere
+    //     -with-bumps. The mass-conservation cap (finite u reservoir)
+    //     handles the runaway-corner stability problem that γ was
+    //     originally introduced for.
+    //   - Dendritic (3): γ=0 — branching REQUIRES tip sharpening, which
+    //     means letting the highest-curvature points grow fastest, the
+    //     opposite of capillarity. Without this exemption the FBM noise
+    //     bumps die before u² feedback can turn them into branches, and
+    //     the dendritic mode collapses into a Wulff blob (this was the
+    //     reason the user originally asked "why does dendritic look like
+    //     growth?" — answer: γ was killing the branches).
+    //   - Hopper/mode6 (5/6): γ=0.005 — minimal. Just enough to round
+    //     micro-bumps for stability; preserves the corner-vs-face
+    //     asymmetry that creates the skeletal void.
+    float gamma = 0.0;
+    if (shape_mode == 5)      gamma = 0.005;  // hopper: minimal capillary
+    else if (shape_mode == 6) gamma = 0.005;  // mode 6: minimal capillary
+    float kappa = lap_phi / max(grad_mag, 0.5);
+    driving -= gamma * kappa * phi * (1.0 - phi);
+
+    // HOPPER mode: extra growth boost proportional to *local* supersaturation
+    // squared. Face centres of a flat facet locally deplete u (they're a long
+    // wide sink), while corners and edges see fresher u from three orthogonal
+    // sides. The u² nonlinearity amplifies that asymmetry into runaway corner
+    // growth -> the face interior gets left behind -> stair-stepped skeletal
+    // box (the bismuth-crystal look). Coefficient bumped from 1.5 to 5 so
+    // the skeletal void actually opens before u depletes — at 1.5 the
+    // hopper produced a smooth cube barely distinguishable from cubic.
+    if (shape_mode == 5) {
+        driving += phi * (1.0 - phi) * 5.0 * u_field * u_field;
+    } else if (shape_mode == 6) {
+        // Mode 6: hopper-style edge boost emerges in the transition zone
+        // between facet and dendrite (undercooling ~0.5-0.7), exactly
+        // where real materials show skeletal/hopper morphologies.
+        float w_hopper = smoothstep(0.45, 0.55, undercooling)
+                       * (1.0 - smoothstep(0.65, 0.78, undercooling));
+        driving += w_hopper * phi * (1.0 - phi) * 5.0 * u_field * u_field;
+    }
+
     float b2 = beta * beta;
-    float dphi = b2 * lap_phi + b2 * driving * 30.0;
+    // Allen-Cahn evolution: lap_phi (isotropic relaxation) + anisotropic
+    // kinetic driving. The 30.0 multiplier on driving sets the natural
+    // ratio between anisotropic and isotropic terms; lowering it alone
+    // makes the isotropic Laplacian dominate and the crystal rounds into
+    // a sphere. To slow the visible clock (so the user can watch the
+    // dynamics frame-by-frame), apply a uniform growth_rate scale to the
+    // ENTIRE Allen-Cahn rhs -- preserves the anisotropic/isotropic
+    // balance, just stretches the timeline.
+    //
+    //   growth_rate = 1.0  -> original "balloon inflating" speed
+    //   growth_rate = 0.2  -> ~5x slower; facets visibly pull, grain
+    //                        fronts visibly compete, branches form
+    //                        before saturation
+    //   growth_rate = 0.06 -> dendritic mode: even slower so the user
+    //                        gets a wide visual window where the
+    //                        6-arm dendritic envelope is visible
+    //                        before lateral fill saturates the bbox.
+    //                        At 144^3 with U=0.5 / D=0.02, this gives
+    //                        a clear dendritic phase from ~step 400 to
+    //                        ~step 2000 instead of fill-in by step 400.
+    float growth_rate = (shape_mode == 3) ? 0.06 : 0.2;
+    float dphi;
+    if (shape_mode == 3) {
+        // DENDRITIC: keep the operator strictly isotropic (mass
+        // conservation respects the u_field reservoir) and source ALL
+        // anisotropy + side-branching from beta varying across the
+        // front. Six attempts at lateral-instability operators
+        // (anti-diffusive lap_eff, additive qnoise driving, multiplicative
+        // qnoise driving) all either failed to produce arms or filled
+        // the box past the mass cap. Conclusion: at this grid scale
+        // the M-S instability is not numerically resolvable; the
+        // visible "branching" must come from the K4 kernel + a STRONG
+        // multi-scale defect modulation of beta (see defect_amp block
+        // above). The u^2 axial-tip amplifier remains because it gives
+        // arm tips the boost they need to outpace lateral fill-in.
+        //
+        // FACET-FRONT SUPPRESSION via curvature gating.
+        //
+        // Two complementary curvature-dependent modulations:
+        //
+        // 1. TIP BOOST: an extra u^2 forcing that fires only at sharp
+        //    convex tips (kappa_signed << 0). The mild base term gives
+        //    arms slow steady extension; the bonus makes tips outrun
+        //    lateral fill.
+        //
+        // 2. FLAT-FRONT DAMP: the bulk `driving` term is multiplied by
+        //    a curvature-aware factor that approaches 1 at sharp tips
+        //    and shrinks to ~0.35 on flat sections of the front. This
+        //    is the OPPOSITE of Gibbs-Thomson capillarity: instead of
+        //    penalizing convex tips (which stabilizes a smooth front),
+        //    we penalize flat sections to let dendrites pull ahead.
+        //    Without this, the entire interface advances at nearly the
+        //    same rate and tips never gain visible lead.
+        //
+        // The curvature measure kappa_signed = lap_phi / |grad phi| is
+        // negative at convex outward tips, ~0 on flat sections, and
+        // positive in concave gaps between arms. We map -kappa_signed
+        // through smoothstep to get a tip-ness indicator in [0,1].
+        float kappa_signed = lap_phi / max(grad_mag, 0.5);
+        float gate3 = phi * (1.0 - phi);
+        float fuel3 = max(u_field, 0.0);
+        float tip_ness = smoothstep(0.15, 0.6, -kappa_signed);
+        // Flat-front damping: factor in [0.35, 1.0] gating the bulk
+        // driving. flat=1 -> 0.35, tip=1 -> 1.0. Only acts at the
+        // diffuse interface (gate3>0); bulk relaxation is unaffected.
+        float drive_factor = mix(1.0, mix(0.35, 1.0, tip_ness), gate3 * 4.0);
+        drive_factor = clamp(drive_factor, 0.35, 1.0);
+        float drive_d = driving * drive_factor;
+        // Mild base amplifier (keeps arms growing); large bonus only
+        // at sharp tips so they accelerate past the damped flat front.
+        drive_d += gate3 * fuel3 * fuel3 * (8.0 + 24.0 * tip_ness);
+        dphi = (lap_phi + b2 * drive_d * 30.0) * growth_rate;
+    } else {
+        dphi = (lap_phi + b2 * driving * 30.0) * growth_rate;
+    }
+
+    // SURFACE DIFFUSION (tangential-only smoothing -> step bunching)
+    // Real adatoms land on a growing facet and hop ALONG the surface
+    // before locking into the lattice -- they don't randomly jump back
+    // into the bulk liquid. The effect is a tangential smoothing that
+    // levels out small bumps within a facet but doesn't smear the
+    // interface itself (which is what the regular Laplacian does).
+    //
+    // The surface-projected Laplacian is
+    //     surf_lap(phi) = lap(phi) - (n . grad)^2 phi
+    // We approximate the second directional derivative along n_hat from
+    // the 6-point stencil by reusing the diagonal of the Hessian:
+    //     (n . grad)^2 phi ~= n_x^2 phi_xx + n_y^2 phi_yy + n_z^2 phi_zz
+    // (cross terms drop because we don't compute mixed partials in the
+    // 6-cell stencil; this is the standard cheap approximation).
+    //
+    // The effect is small but noticeable on facets:
+    //   - terraces level out into smoother flats between step edges
+    //   - step edges ARE NOT removed (they're sharp transitions across
+    //     the surface, which the tangential operator preserves), so
+    //     the visual signature is "bunching" -- many fine steps merge
+    //     into a few well-defined macro-steps
+    //   - on dendrite tips, slightly slows the tip but doesn't damp the
+    //     side-branch instability since side-branches grow normal to
+    //     the trunk surface (the tangential operator can't see them)
+    float phi_xx = (nxp.r + nxm.r - 2.0 * phi) * h_sq;
+    float phi_yy = (nyp.r + nym.r - 2.0 * phi) * h_sq;
+    float phi_zz = (nzp.r + nzm.r - 2.0 * phi) * h_sq;
+    float normal_2nd = nx2 * phi_xx + ny2 * phi_yy + nz2 * phi_zz;
+    float surf_lap = lap_phi - normal_2nd;
+    // Mobility: only acts at the diffuse interface (phi(1-phi) gate) and
+    // only on faceted modes where it matters visually — for dendritic
+    // and compact, tangential smoothing would only slow tip growth.
+    // Scaled by growth_rate to stay proportional to the rest of the
+    // Allen-Cahn rhs (otherwise it would dominate after the slowdown).
+    float surf_mobility = faceted ? 0.15 : 0.0;
+    dphi += surf_mobility * surf_lap * phi * (1.0 - phi) * growth_rate;
+
     float new_phi = clamp(phi + dphi * u_dt, 0.0, 1.0);
 
     // Supersaturation: diffuses + depleted by solidification (latent heat)
     float du = D * lap_u - (new_phi - phi) * 0.5 / max(u_dt, 0.001);
     float new_u = u_field + du * u_dt;
 
-    // Boundary feed: replenish supersaturation at edges
-    if (u_boundary == 1) {
-        if (pos.x == 0 || pos.x == u_size-1 ||
-            pos.y == 0 || pos.y == u_size-1 ||
-            pos.z == 0 || pos.z == u_size-1) {
-            new_u = mix(new_u, undercooling, 0.05 * u_dt);
+    // No boundary feed: with the Karma-Rappel coupling the bulk
+    // supersaturation reservoir is finite (= initial_u * volume), and
+    // growth depletes it. When u_field empties locally the front halts
+    // there, leaving the morphology preserved. A boundary feed would
+    // turn the wall into an infinite source and recreate the runaway
+    // "crystal fills the whole box" failure mode.
+
+    new_u = clamp(new_u, -1.0, 2.0);
+
+    // SOLUTE TRAPPING BANDS ("growth striations")
+    // Real crystals trap impurity-rich melt as visible internal bands when
+    // the growth-front velocity exceeds the solute diffusion rate. The
+    // trapped solute concentration scales with how fast the front passed
+    // through this cell — faster front → less time for impurities to
+    // diffuse away → higher trapped concentration.
+    //
+    // We snapshot a "trapped solute" value into the A channel at the
+    // instant a cell crosses the solidification threshold (phi 0.5).
+    // The value combines the local supersaturation with the front
+    // velocity (= dphi for this step), so cells that solidified during
+    // a fast-growth burst get bright bands while cells that solidified
+    // during a slow phase get dark bands. Once φ > 0.5 the value freezes
+    // and never updates again — a permanent record of the moment of
+    // solidification, like tree-ring growth.
+    float trapped_new = trapped;
+    bool just_solidified = (phi <= 0.5 && new_phi > 0.5);
+    if (just_solidified) {
+        // Front velocity proxy: how much phi changed this step (always
+        // positive when crossing 0.5 from below). Multiply by the local
+        // supersaturation (the impurity reservoir actually available to
+        // be trapped) and stretch into a visible 0..1 band-amplitude.
+        float velocity = max(dphi, 0.0);
+        trapped_new = clamp(velocity * (0.5 + u_field) * 0.4, 0.0, 1.0);
+
+        // TWIN NUCLEATION
+        // Real crystals occasionally form twin boundaries at the moment
+        // of solidification: a thin plane where the lattice is mirrored
+        // by a crystal-symmetry operation. Twins are seeded by impurities
+        // or stress, so they sit at FIXED lattice positions (not drifting
+        // with time) — represented by a quenched hash_static probe.
+        //
+        // For a cubic crystal the simplest twin is a 60deg rotation
+        // around <111>, which we approximate here as a 60deg rotation
+        // around the y-axis applied to the parent orientation. Where a
+        // twin event fires, the new cell joins a sub-grain rotated by
+        // 60deg from its parent — visible as an internal grain boundary
+        // inside what was a single growing crystal, often with a
+        // re-entrant V-groove that becomes a preferred nucleation site
+        // for further growth.
+        //
+        // Rate is set so a 64^3 interface might host ~5 twin sites total
+        // — enough to see them, few enough to avoid speckle.
+        float twin_probe = hash_static(pos, 13);
+        if (twin_probe > 0.997) {
+            // 60deg in our orient mapping (where 1.0 == 90deg) is 2/3.
+            // Modular addition keeps orient in [0,1).
+            new_orient = fract(new_orient + 0.6667);
         }
     }
 
-    new_u = clamp(new_u, -1.0, 2.0);
-    imageStore(u_dst, pos, vec4(new_phi, new_u, 0.0, 0.0));
+    imageStore(u_dst, pos, vec4(new_phi, new_u, new_orient, trapped_new));
+
+    // SOLUTE CONCENTRATION UPDATE (second physics field)
+    // Two effects govern c:
+    //   1. DIFFUSION at low D_c: solute is much slower than heat in real
+    //      alloys (D_c ~ 1e-9 vs D_T ~ 1e-5 m^2/s), so its boundary layer
+    //      stays thin near the front and pile-up is preserved. We further
+    //      suppress diffusion in solid (frozen-in solute, no Brownian
+    //      motion in the lattice).
+    //   2. PARTITION REJECTION on solidification: the equilibrium solid
+    //      composition is k * c_liquid (k = partition coefficient < 1
+    //      for typical impurities, ~0.1-0.5). The fraction (1-k)*c is
+    //      rejected from the volume that just solidified and ends up in
+    //      the remaining liquid. We model this by adding the rejected
+    //      mass as a local source term proportional to the front
+    //      velocity dphi/dt. Over many steps, this builds the
+    //      characteristic boundary-layer pile-up that drives the
+    //      Mullins-Sekerka instability above.
+    // D_c chosen so the diffusion length per step (sqrt(D_c*dt)) covers
+    // ~half a cell at typical preset dt -- enough that rejected solute
+    // spreads sideways before being re-injected, so a 3D bulge (more
+    // liquid neighbours to fan out into) ends up with LESS solute at its
+    // tip than a flat region (only one liquid neighbour ahead). That
+    // spatial difference is what drives the morphological instability.
+    float D_c = 0.25;                                  // solute diffusivity (slower than thermal but fast enough to spread)
+    float c_diffusivity = D_c * (1.0 - 0.95 * phi);    // suppressed in solid
+    float dc = c_diffusivity * lap_c;
+    float k_partition = 0.3;                           // distribution coefficient
+    float dphi_pos = max(new_phi - phi, 0.0);          // only solidification rejects (melting reabsorbs)
+    if (dphi_pos > 0.0) {
+        // Interface-gated source: the rejected (1-k)*c is added at the
+        // diffuse interface zone (phi(1-phi) ~ 0.25 at phi=0.5, falling
+        // off into bulk). This avoids two failure modes of the naive
+        // 1/(1-phi) form:
+        //   (a) The cell that's becoming solid would otherwise receive
+        //       its own rejected mass and immediately use it to suppress
+        //       its own continued growth -- a numerical self-strangling
+        //       that has nothing to do with real Mullins-Sekerka physics.
+        //   (b) 1/(1-phi) blows up as the front sweeps through, building
+        //       a >>1 boundary layer that, with m_liquidus=0.3, generates
+        //       constitutional undercooling exceeding the entire driving
+        //       force -- the crystal then melts back.
+        // Gating by phi*(1-phi) confines the source to the interface
+        // strip, where solute diffusion can spread it into the adjacent
+        // bulk liquid over the next few steps. Pile-up still builds (~2x
+        // bulk in steady state), enough to drive cellular instability,
+        // but bounded.
+        float interface_gate = 4.0 * phi * (1.0 - phi);  // peak 1.0 at phi=0.5
+        dc += dphi_pos * (1.0 - k_partition) * c_local * interface_gate / max(u_dt, 0.001);
+    }
+    float new_c = clamp(c_local + dc * u_dt, 0.0, 2.5);
+
+    // Boundary feed: keep the far-field solute concentration at the bulk
+    // value (c_inf = 1.0). Same Dirichlet BC as the thermal field.
+    if (pos.x == 0 || pos.x == u_size-1 ||
+        pos.y == 0 || pos.y == u_size-1 ||
+        pos.z == 0 || pos.z == u_size-1) {
+        new_c = mix(new_c, 1.0, 0.4 * u_dt);
+    }
+
+    imageStore(u_dst2, pos, vec4(new_c, 0.0, 0.0, 0.0));
+}
+""",
+
+    "dielectric_breakdown": """
+// DIELECTRIC BREAKDOWN MODEL (continuum DLA / Niemeyer-Pietronero-Wiesmann)
+//
+// Branching fractal growth driven by harmonic measure on a Laplace field.
+// Mathematically guaranteed to produce fractal aggregates -- this is the
+// algorithm behind lightning bolts, Lichtenberg figures, mineral
+// dendrites, electrodeposition, and the canonical "snowflake-on-a-window"
+// frost pattern. Fractal dimension ~ 2.5 (DLA limit, eta=1) down to
+// ~ 1.6 (lightning limit, eta=4) in 3D.
+//
+// FIELD encoding:
+//   R = cluster phase phi (0 = empty, 1 = solid; binary in steady state)
+//   G = potential phi_e (Laplace solution, =0 on cluster, =1 at boundary)
+//   B = age (frame index when cell solidified, 0=alive, normalised /4096)
+//   A = visualisation: |grad phi_e|^eta at moment of solidification
+//
+// PHYSICAL ANALOGY
+//   Imagine the cluster is a perfect conductor at potential 0, surrounded
+//   by a sphere held at potential 1. The potential phi_e satisfies
+//   Laplace's equation between them. Charge accumulates wherever
+//   |grad phi_e| (the field strength) is highest -- always at protruding
+//   tips, never in interior bays. New material adds with probability
+//   (|grad phi_e|)^eta, where:
+//     eta = 0  -> compact ball (Eden growth)
+//     eta = 1  -> Diffusion-Limited Aggregation (proven fractal D~2.5)
+//     eta = 2  -> branchy lightning structure
+//     eta > 3  -> sparse "lightning bolt" with few main channels
+//
+// SHADER STRATEGY
+//   Each step: (a) one Jacobi relaxation sweep on phi_e using the 27-point
+//   isotropic Laplacian; (b) growth probability check at front cells.
+//   Growth is gated to be MUCH slower than relaxation (rate ~ 1/100 of
+//   step cadence) so phi_e converges to the harmonic measure between
+//   addition events. The 27-point stencil is critical: any anisotropic
+//   Laplacian biases the harmonic measure toward axes, producing octahedral
+//   clusters instead of fractal ones.
+//
+// u_param0 = eta (growth-rule exponent; 0.5 compact -> 4.0 lightning)
+// u_param1 = growth rate scale (per-step probability multiplier)
+// u_param2 = boundary potential pull strength (how strongly far field is held at 1)
+// u_param3 = unused (kept for slider symmetry)
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    float phi   = self_data.r;  // cluster: 0=empty, 1=solid
+    float pot   = self_data.g;  // potential phi_e
+    float age   = self_data.b;
+    float vis_g = self_data.a;
+
+    float eta         = u_param0;
+    float growth_rate = u_param1;
+    float bdy_pull    = u_param2;
+
+    // Hard Dirichlet BC inside the cluster: solid stays solid at potential 0.
+    if (phi > 0.5) {
+        // Just keep the cell pinned. Age accumulates so visualisation can
+        // show growth history.
+        float new_age = min(age + (1.0 / 4096.0), 1.0);
+        imageStore(u_dst, pos, vec4(1.0, 0.0, new_age, vis_g));
+        return;
+    }
+
+    // Read the 26 neighbours (face + edge + corner) for the 27-point
+    // isotropic Laplacian. Critical: a 7-point stencil's anisotropic
+    // O(h^2) error biases the harmonic measure toward the axes, which on
+    // a fractal-growth model collapses the cluster to a noisy octahedron.
+    // The 27-point stencil cancels both leading anisotropic error terms.
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+
+    vec4 nxyp  = fetch(pos + ivec3( 1,  1,  0));
+    vec4 nxyn  = fetch(pos + ivec3( 1, -1,  0));
+    vec4 nxny  = fetch(pos + ivec3(-1,  1,  0));
+    vec4 nxnyn = fetch(pos + ivec3(-1, -1,  0));
+    vec4 nxzp  = fetch(pos + ivec3( 1,  0,  1));
+    vec4 nxzn  = fetch(pos + ivec3( 1,  0, -1));
+    vec4 nxnz  = fetch(pos + ivec3(-1,  0,  1));
+    vec4 nxnzn = fetch(pos + ivec3(-1,  0, -1));
+    vec4 nyzp  = fetch(pos + ivec3( 0,  1,  1));
+    vec4 nyzn  = fetch(pos + ivec3( 0,  1, -1));
+    vec4 nynz  = fetch(pos + ivec3( 0, -1,  1));
+    vec4 nynzn = fetch(pos + ivec3( 0, -1, -1));
+
+    vec4 nxyzp   = fetch(pos + ivec3( 1,  1,  1));
+    vec4 nxyzn   = fetch(pos + ivec3( 1,  1, -1));
+    vec4 nxynz   = fetch(pos + ivec3( 1, -1,  1));
+    vec4 nxynzn  = fetch(pos + ivec3( 1, -1, -1));
+    vec4 nxnyz   = fetch(pos + ivec3(-1,  1,  1));
+    vec4 nxnyzn  = fetch(pos + ivec3(-1,  1, -1));
+    vec4 nxnynz  = fetch(pos + ivec3(-1, -1,  1));
+    vec4 nxnynzn = fetch(pos + ivec3(-1, -1, -1));
+
+    // Treat solid neighbours as potential = 0 (Dirichlet BC). Doing this
+    // here (rather than relying on the previous step's stored zero) makes
+    // the BC propagate immediately when growth happens, avoiding a
+    // potential-leak band of width ~1 cell behind the freshly-solid front.
+    float p_xp = (nxp.r > 0.5) ? 0.0 : nxp.g;
+    float p_xm = (nxm.r > 0.5) ? 0.0 : nxm.g;
+    float p_yp = (nyp.r > 0.5) ? 0.0 : nyp.g;
+    float p_ym = (nym.r > 0.5) ? 0.0 : nym.g;
+    float p_zp = (nzp.r > 0.5) ? 0.0 : nzp.g;
+    float p_zm = (nzm.r > 0.5) ? 0.0 : nzm.g;
+
+    float face_sum = p_xp + p_xm + p_yp + p_ym + p_zp + p_zm;
+    float edge_sum = ((nxyp.r  > 0.5) ? 0.0 : nxyp.g)
+                   + ((nxyn.r  > 0.5) ? 0.0 : nxyn.g)
+                   + ((nxny.r  > 0.5) ? 0.0 : nxny.g)
+                   + ((nxnyn.r > 0.5) ? 0.0 : nxnyn.g)
+                   + ((nxzp.r  > 0.5) ? 0.0 : nxzp.g)
+                   + ((nxzn.r  > 0.5) ? 0.0 : nxzn.g)
+                   + ((nxnz.r  > 0.5) ? 0.0 : nxnz.g)
+                   + ((nxnzn.r > 0.5) ? 0.0 : nxnzn.g)
+                   + ((nyzp.r  > 0.5) ? 0.0 : nyzp.g)
+                   + ((nyzn.r  > 0.5) ? 0.0 : nyzn.g)
+                   + ((nynz.r  > 0.5) ? 0.0 : nynz.g)
+                   + ((nynzn.r > 0.5) ? 0.0 : nynzn.g);
+    float corner_sum = ((nxyzp.r   > 0.5) ? 0.0 : nxyzp.g)
+                     + ((nxyzn.r   > 0.5) ? 0.0 : nxyzn.g)
+                     + ((nxynz.r   > 0.5) ? 0.0 : nxynz.g)
+                     + ((nxynzn.r  > 0.5) ? 0.0 : nxynzn.g)
+                     + ((nxnyz.r   > 0.5) ? 0.0 : nxnyz.g)
+                     + ((nxnyzn.r  > 0.5) ? 0.0 : nxnyzn.g)
+                     + ((nxnynz.r  > 0.5) ? 0.0 : nxnynz.g)
+                     + ((nxnynzn.r > 0.5) ? 0.0 : nxnynzn.g);
+
+    // 27-point isotropic Jacobi: solve Laplace(phi_e) = 0 by averaging
+    // weighted neighbour potentials. The Jacobi update is the average
+    // weighted by stencil coefficients, so phi_new = (sum w_i * phi_i) /
+    // sum_i w_i. With Spotz-Carey weights (face 14/30, edge 3/30,
+    // corner 1/30), sum of off-centre weights = 6*14 + 12*3 + 8*1 = 128.
+    // Plus the 28/30 from over-relaxation -- here we use plain Jacobi.
+    float new_pot = (14.0 * face_sum + 3.0 * edge_sum + 1.0 * corner_sum) / 128.0;
+
+    // Boundary condition at the box edge: hold potential at 1.0 (the
+    // "infinity" reservoir). Using a soft pull (mix) so the field
+    // smoothly relaxes rather than jumping.
+    if (pos.x == 0 || pos.x == u_size-1 ||
+        pos.y == 0 || pos.y == u_size-1 ||
+        pos.z == 0 || pos.z == u_size-1) {
+        new_pot = mix(new_pot, 1.0, bdy_pull);
+    }
+
+    // Detect "front" cells: empty AND at least one solid face neighbour.
+    // Only front cells are eligible to grow.
+    bool front = (nxp.r > 0.5) || (nxm.r > 0.5) || (nyp.r > 0.5)
+              || (nym.r > 0.5) || (nzp.r > 0.5) || (nzm.r > 0.5);
+
+    float new_phi = phi;
+    float new_vis = vis_g;
+    if (front) {
+        // Local field magnitude. Use the mean of the 6 face-neighbour
+        // potentials as a proxy for |grad phi_e|: front cells with high
+        // mean neighbour potential are deep in the field (far from
+        // shielded interior), low mean means surrounded by cluster on
+        // multiple sides (a bay).
+        float mean_p = (p_xp + p_xm + p_yp + p_ym + p_zp + p_zm) / 6.0;
+        // Growth probability ~ mean_potential^eta. Tips with high mean_p
+        // ~ 0.3-0.6 grow much faster than bays with mean_p ~ 0.01-0.05.
+        // The eta exponent controls the disparity: eta=1 is DLA, eta>=2
+        // makes the disparity exponential -> sparse lightning channels.
+        float p_eta = pow(max(mean_p, 0.0), eta);
+        float prob = growth_rate * p_eta;
+        // Per-cell-per-step random gate. Earlier we used fbm3_temporal
+        // here to get multi-scale "lumpy" growth bursts, but its octave-0
+        // term has zero time-drift — the lowest-frequency component
+        // becomes a fixed spatial mask that pins growth probability at
+        // each (x,y,z), and at typical seeds *all six* face neighbours
+        // happened to land in the high-noise band → cluster could never
+        // grow (audit caught this as EXTINCT, cluster_cells=1 forever).
+        // hash_temporal is a per-cell-per-frame uniform [0,1) so each
+        // front cell gets an independent draw every step — recovers the
+        // canonical Niemeyer-Pietronero-Wiesmann harmonic-measure DLA.
+        float noise = hash_temporal(pos, 7);
+        if (noise < prob) {
+            new_phi = 1.0;
+            new_pot = 0.0;
+            new_vis = clamp(p_eta, 0.0, 1.0);
+        }
+    }
+
+    imageStore(u_dst, pos, vec4(new_phi, new_pot, age, new_vis));
 }
 """,
 
@@ -738,7 +1811,14 @@ void main() {
     // Shared cap — applied identically in both paths so dynamics match.
     // At size ≥ 4x REF_SIZE (radius*h_inv > MAX_R) the kernel saturates
     // at R = MAX_R voxels. See commit log.
-    int R = min(int(radius * h_inv), MAX_R);
+    // Lower bound R≥3 is a *resolution* floor: with the default
+    // ring_pos=0.5 and ring sigma 0.15, the kernel ring needs at least
+    // ~3 voxels of radius to be sampled at more than 2 distinct shells.
+    // Below R=3 the kernel collapses toward a uniform 6-neighbour blur
+    // which makes the growth function bistable on the Nyquist mode and
+    // produces a checkerboard "noise cube" instead of Lenia patterns
+    // (audit caught this at u_size=64 → naïve R=2 → adj_corr ≈ -0.25).
+    int R = clamp(int(round(radius * h_inv)), 3, MAX_R);
 
 #if USE_SHARED_MEM
     ivec3 local = ivec3(gl_LocalInvocationID);
@@ -802,6 +1882,11 @@ void main() {
 
     float result = self + u_dt * growth;
     result = clamp(result, 0.0, 1.0);
+    // Death floor: snap tiny residual values to exactly zero so dying
+    // patterns vanish cleanly instead of leaving a sub-visible field that
+    // can later regrow when an active region drifts past. Threshold
+    // chosen below the visualisation cutoff but above the noise floor.
+    if (result < 0.005) result = 0.0;
 
     imageStore(u_dst, pos, vec4(result, 0.0, 0.0, 0.0));
 }
@@ -909,6 +1994,8 @@ void main() {
 
     vec3 result = self_rgb + u_dt * vec3(ga, gb, gc);
     result = clamp(result, 0.0, 1.0);
+    // Per-channel death floor (see lenia_3d for rationale).
+    result = mix(result, vec3(0.0), step(result, vec3(0.005)));
 
     float activity = (abs(ga) + abs(gb) + abs(gc)) / 3.0;
 
@@ -962,13 +2049,20 @@ void main() {
     float u = c.r;
     float v = c.g;
 
-    vec2 sum_uv = vec2(0.0);
-    sum_uv += s_uv[pp_idx(tp.x + 1, tp.y,     tp.z    )];
-    sum_uv += s_uv[pp_idx(tp.x - 1, tp.y,     tp.z    )];
-    sum_uv += s_uv[pp_idx(tp.x,     tp.y + 1, tp.z    )];
-    sum_uv += s_uv[pp_idx(tp.x,     tp.y - 1, tp.z    )];
-    sum_uv += s_uv[pp_idx(tp.x,     tp.y,     tp.z + 1)];
-    sum_uv += s_uv[pp_idx(tp.x,     tp.y,     tp.z - 1)];
+    // 19-point isotropic Laplacian — keeps pursuit waves circular at
+    // the Hopf bifurcation instead of forming square front patterns.
+    vec2 face = s_uv[pp_idx(tp.x+1, tp.y,   tp.z  )] + s_uv[pp_idx(tp.x-1, tp.y,   tp.z  )]
+              + s_uv[pp_idx(tp.x,   tp.y+1, tp.z  )] + s_uv[pp_idx(tp.x,   tp.y-1, tp.z  )]
+              + s_uv[pp_idx(tp.x,   tp.y,   tp.z+1)] + s_uv[pp_idx(tp.x,   tp.y,   tp.z-1)];
+    vec2 edge = s_uv[pp_idx(tp.x+1, tp.y+1, tp.z  )] + s_uv[pp_idx(tp.x+1, tp.y-1, tp.z  )]
+              + s_uv[pp_idx(tp.x-1, tp.y+1, tp.z  )] + s_uv[pp_idx(tp.x-1, tp.y-1, tp.z  )]
+              + s_uv[pp_idx(tp.x+1, tp.y,   tp.z+1)] + s_uv[pp_idx(tp.x+1, tp.y,   tp.z-1)]
+              + s_uv[pp_idx(tp.x-1, tp.y,   tp.z+1)] + s_uv[pp_idx(tp.x-1, tp.y,   tp.z-1)]
+              + s_uv[pp_idx(tp.x,   tp.y+1, tp.z+1)] + s_uv[pp_idx(tp.x,   tp.y+1, tp.z-1)]
+              + s_uv[pp_idx(tp.x,   tp.y-1, tp.z+1)] + s_uv[pp_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec2 lap_uv = ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * c) * h_sq;
+    float lap_u = lap_uv.x;
+    float lap_v = lap_uv.y;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
@@ -976,17 +2070,11 @@ void main() {
     float u = self_val.r;  // prey density
     float v = self_val.g;  // predator density
 
-    // Laplacian
-    vec2 sum_uv = vec2(0.0);
-    sum_uv += fetch(pos + ivec3( 1, 0, 0)).rg;
-    sum_uv += fetch(pos + ivec3(-1, 0, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 1, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0,-1, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 0, 1)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 0,-1)).rg;
+    // 19-point isotropic Laplacian via shared helper.
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_u = lap_v4.r;
+    float lap_v = lap_v4.g;
 #endif
-    float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
-    float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
 
     float a  = u_param0;  // predation rate
     float r  = u_param1;  // prey growth rate
@@ -1133,8 +2221,15 @@ void main() {
 // near a Hopf bifurcation. R = Re(A), G = Im(A) where A is complex amplitude.
 // Produces spiral defect chaos and scroll wave turbulence in 3D.
 //
-// USE_SHARED_MEM=1 loads a 10^3 vec2 tile of (u, v) so the 6 stencil reads
-// for the coupled Laplacian come from on-chip shared memory.
+// USE_SHARED_MEM=1 loads a 10^3 vec2 tile of (u, v) so the 18 stencil reads
+// for the isotropic Laplacian come from on-chip shared memory.
+//
+// LAPLACIAN: 19-point compact isotropic (face + edge, no corner). The
+// older 6-point stencil produced visibly axis-aligned spirals because
+// its leading discretization error has the form Σ ∂⁴/∂xᵢ⁴ (anisotropic);
+// the 19-point error is ∇⁴f (rotationally symmetric), so spirals and
+// scroll wavefronts stay round at modest grids. Coefficients:
+//   center -4   face 1/3   edge 1/6   (× h_sq for continuum units)
 
 #if USE_SHARED_MEM
 #define BZTILE 10
@@ -1166,13 +2261,16 @@ void main() {
     float u = c.r;  // Re(A)
     float v = c.g;  // Im(A)
 
-    vec2 sum_uv = vec2(0.0);
-    sum_uv += s_uv[bz_idx(tp.x + 1, tp.y,     tp.z    )];
-    sum_uv += s_uv[bz_idx(tp.x - 1, tp.y,     tp.z    )];
-    sum_uv += s_uv[bz_idx(tp.x,     tp.y + 1, tp.z    )];
-    sum_uv += s_uv[bz_idx(tp.x,     tp.y - 1, tp.z    )];
-    sum_uv += s_uv[bz_idx(tp.x,     tp.y,     tp.z + 1)];
-    sum_uv += s_uv[bz_idx(tp.x,     tp.y,     tp.z - 1)];
+    vec2 face_sum = s_uv[bz_idx(tp.x+1, tp.y,   tp.z  )] + s_uv[bz_idx(tp.x-1, tp.y,   tp.z  )]
+                  + s_uv[bz_idx(tp.x,   tp.y+1, tp.z  )] + s_uv[bz_idx(tp.x,   tp.y-1, tp.z  )]
+                  + s_uv[bz_idx(tp.x,   tp.y,   tp.z+1)] + s_uv[bz_idx(tp.x,   tp.y,   tp.z-1)];
+    vec2 edge_sum = s_uv[bz_idx(tp.x+1, tp.y+1, tp.z  )] + s_uv[bz_idx(tp.x+1, tp.y-1, tp.z  )]
+                  + s_uv[bz_idx(tp.x-1, tp.y+1, tp.z  )] + s_uv[bz_idx(tp.x-1, tp.y-1, tp.z  )]
+                  + s_uv[bz_idx(tp.x+1, tp.y,   tp.z+1)] + s_uv[bz_idx(tp.x+1, tp.y,   tp.z-1)]
+                  + s_uv[bz_idx(tp.x-1, tp.y,   tp.z+1)] + s_uv[bz_idx(tp.x-1, tp.y,   tp.z-1)]
+                  + s_uv[bz_idx(tp.x,   tp.y+1, tp.z+1)] + s_uv[bz_idx(tp.x,   tp.y+1, tp.z-1)]
+                  + s_uv[bz_idx(tp.x,   tp.y-1, tp.z+1)] + s_uv[bz_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec2 lap_uv = ((1.0/3.0) * face_sum + (1.0/6.0) * edge_sum - 4.0 * c) * h_sq;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
@@ -1180,17 +2278,12 @@ void main() {
     float u = self_val.r;  // Re(A)
     float v = self_val.g;  // Im(A)
 
-    // Laplacian of both components (von Neumann 6-neighbor)
-    vec2 sum_uv = vec2(0.0);
-    sum_uv += fetch(pos + ivec3( 1, 0, 0)).rg;
-    sum_uv += fetch(pos + ivec3(-1, 0, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 1, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0,-1, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 0, 1)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 0,-1)).rg;
+    // Isotropic 19-point Laplacian via shared helper.
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    vec2 lap_uv = lap_v4.rg;
 #endif
-    float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
-    float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
+    float lap_u = lap_uv.x;
+    float lap_v = lap_uv.y;
 
     float alpha = u_param0;  // dispersion (linear cross-diffusion)
     float beta  = u_param1;  // nonlinear frequency shift
@@ -1264,15 +2357,21 @@ void main() {
     float u = c.r;  // activator
     float v = c.g;  // inhibitor
 
-    vec2 sum_uv = vec2(0.0);
-    sum_uv += s_uv[bk_idx(tp.x + 1, tp.y,     tp.z    )];
-    sum_uv += s_uv[bk_idx(tp.x - 1, tp.y,     tp.z    )];
-    sum_uv += s_uv[bk_idx(tp.x,     tp.y + 1, tp.z    )];
-    sum_uv += s_uv[bk_idx(tp.x,     tp.y - 1, tp.z    )];
-    sum_uv += s_uv[bk_idx(tp.x,     tp.y,     tp.z + 1)];
-    sum_uv += s_uv[bk_idx(tp.x,     tp.y,     tp.z - 1)];
-    float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
-    float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
+    // 19-point isotropic Laplacian. Excitable wavefronts launched from
+    // a point source stay spherical instead of flattening into octahedra
+    // along the cardinal axes.
+    vec2 face = s_uv[bk_idx(tp.x+1, tp.y,   tp.z  )] + s_uv[bk_idx(tp.x-1, tp.y,   tp.z  )]
+              + s_uv[bk_idx(tp.x,   tp.y+1, tp.z  )] + s_uv[bk_idx(tp.x,   tp.y-1, tp.z  )]
+              + s_uv[bk_idx(tp.x,   tp.y,   tp.z+1)] + s_uv[bk_idx(tp.x,   tp.y,   tp.z-1)];
+    vec2 edge = s_uv[bk_idx(tp.x+1, tp.y+1, tp.z  )] + s_uv[bk_idx(tp.x+1, tp.y-1, tp.z  )]
+              + s_uv[bk_idx(tp.x-1, tp.y+1, tp.z  )] + s_uv[bk_idx(tp.x-1, tp.y-1, tp.z  )]
+              + s_uv[bk_idx(tp.x+1, tp.y,   tp.z+1)] + s_uv[bk_idx(tp.x+1, tp.y,   tp.z-1)]
+              + s_uv[bk_idx(tp.x-1, tp.y,   tp.z+1)] + s_uv[bk_idx(tp.x-1, tp.y,   tp.z-1)]
+              + s_uv[bk_idx(tp.x,   tp.y+1, tp.z+1)] + s_uv[bk_idx(tp.x,   tp.y+1, tp.z-1)]
+              + s_uv[bk_idx(tp.x,   tp.y-1, tp.z+1)] + s_uv[bk_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec2 lap_uv = ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * c) * h_sq;
+    float lap_u = lap_uv.x;
+    float lap_v = lap_uv.y;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
@@ -1280,17 +2379,10 @@ void main() {
     float u = self_val.r;  // activator (excitation)
     float v = self_val.g;  // inhibitor (recovery)
 
-    // 6-neighbor Laplacian of (u, v) — same additive grouping as tiled path
-    // so USE_SHARED_MEM=1 and =0 are byte-exact equivalent.
-    vec2 sum_uv = vec2(0.0);
-    sum_uv += fetch(pos + ivec3( 1, 0, 0)).rg;
-    sum_uv += fetch(pos + ivec3(-1, 0, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 1, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0,-1, 0)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 0, 1)).rg;
-    sum_uv += fetch(pos + ivec3( 0, 0,-1)).rg;
-    float lap_u = (sum_uv.x - 6.0 * u) * h_sq;
-    float lap_v = (sum_uv.y - 6.0 * v) * h_sq;
+    // 19-point isotropic Laplacian via shared helper.
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_u = lap_v4.r;
+    float lap_v = lap_v4.g;
 #endif
 
     float a = u_param0;       // excitability (0.6-1.0)
@@ -1298,23 +2390,27 @@ void main() {
     float epsilon = u_param2; // timescale separation (0.02-0.1)
     float D_u = u_param3;     // diffusion
 
-    // Barkley kinetics: du/dt = ε⁻¹ · u(1-u)(u - v_thresh) + D∇²u
-    //                   dv/dt = u - v + small v-diffusion
-    // Self-excitation boost: when v is low (fresh/resting tissue), u excitation
-    // is amplified → sharper wavefronts and more sustained propagation
+    // Barkley kinetics (canonical form):
+    //   du/dt = (1/eps) * u(1-u)(u - v_thresh) + D*lap(u)
+    //   dv/dt = u - v + small v-diffusion
+    // Where v_thresh = (v + b) / a is the dynamic excitation threshold.
+    // The cubic in u has roots at 0, v_thresh, 1: bistable for
+    // 0 < v_thresh < 1, with sharp travelling fronts because eps << 1.
     float v_thresh = (v + b) / max(a, 1e-3);  // guard: u_param0 is user-settable
-    float self_excite = 1.0 + 0.5 * max(0.0, 1.0 - 3.0 * v);  // up to 1.5× when v≈0
-    float du = self_excite * u * (1.0 - u) * (u - v_thresh) / max(epsilon, 0.001);
+    float du = u * (1.0 - u) * (u - v_thresh) / max(epsilon, 0.001);
     float dv = u - v;
 
     float new_u = u + (du + D_u * lap_u) * u_dt;
     // Small v-diffusion maintains spatial heterogeneity in recovery
     float new_v = v + (dv + D_u * 0.05 * lap_v) * u_dt;
 
-    // Stochastic nucleation: rare random excitation of resting cells
-    // Creates ongoing wave sources like pacemaker sites in real BZ
+    // Stochastic nucleation: rare random excitation of resting cells.
+    // Probability ~2e-5 per cell per frame -> at 256^3 about 340 spontaneous
+    // wavefronts per frame, sparse enough to act as scattered pacemaker
+    // sites rather than a uniform fog. (Earlier 0.998 threshold gave
+    // probability 2e-3 -> 33000 events/frame, which collided into noise.)
     float nuc = hash_temporal(pos, 0);
-    if (nuc > 0.998 && u < 0.1 && v < 0.1) {
+    if (nuc > 0.99998 && u < 0.1 && v < 0.1) {
         new_u = 1.0;
     }
 
@@ -1369,13 +2465,23 @@ void main() {
     float h   = c.g;  // inhibitor
     float rho = c.b;  // tissue density / growth
 
-    vec3 sum_f = vec3(0.0);
-    sum_f += s_ahr[mg_idx(tp.x + 1, tp.y,     tp.z    )];
-    sum_f += s_ahr[mg_idx(tp.x - 1, tp.y,     tp.z    )];
-    sum_f += s_ahr[mg_idx(tp.x,     tp.y + 1, tp.z    )];
-    sum_f += s_ahr[mg_idx(tp.x,     tp.y - 1, tp.z    )];
-    sum_f += s_ahr[mg_idx(tp.x,     tp.y,     tp.z + 1)];
-    sum_f += s_ahr[mg_idx(tp.x,     tp.y,     tp.z - 1)];
+    // 19-point isotropic Laplacian. Inhibitor diffuses much faster
+    // than activator → at axis-aligned wavelengths the 6-point stencil
+    // produces square-ish Turing spots; the 19-point variant gives
+    // round spots at the same spectral peak.
+    vec3 face = s_ahr[mg_idx(tp.x+1, tp.y,   tp.z  )] + s_ahr[mg_idx(tp.x-1, tp.y,   tp.z  )]
+              + s_ahr[mg_idx(tp.x,   tp.y+1, tp.z  )] + s_ahr[mg_idx(tp.x,   tp.y-1, tp.z  )]
+              + s_ahr[mg_idx(tp.x,   tp.y,   tp.z+1)] + s_ahr[mg_idx(tp.x,   tp.y,   tp.z-1)];
+    vec3 edge = s_ahr[mg_idx(tp.x+1, tp.y+1, tp.z  )] + s_ahr[mg_idx(tp.x+1, tp.y-1, tp.z  )]
+              + s_ahr[mg_idx(tp.x-1, tp.y+1, tp.z  )] + s_ahr[mg_idx(tp.x-1, tp.y-1, tp.z  )]
+              + s_ahr[mg_idx(tp.x+1, tp.y,   tp.z+1)] + s_ahr[mg_idx(tp.x+1, tp.y,   tp.z-1)]
+              + s_ahr[mg_idx(tp.x-1, tp.y,   tp.z+1)] + s_ahr[mg_idx(tp.x-1, tp.y,   tp.z-1)]
+              + s_ahr[mg_idx(tp.x,   tp.y+1, tp.z+1)] + s_ahr[mg_idx(tp.x,   tp.y+1, tp.z-1)]
+              + s_ahr[mg_idx(tp.x,   tp.y-1, tp.z+1)] + s_ahr[mg_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec3 lap = ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * c) * h_sq;
+    float lap_a = lap.r;
+    float lap_h = lap.g;
+    float lap_rho = lap.b;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
@@ -1384,18 +2490,12 @@ void main() {
     float h = self_val.g;   // inhibitor
     float rho = self_val.b; // tissue density / growth
 
-    // Laplacians (inhibitor diffuses much faster — key to Turing instability)
-    vec3 sum_f = vec3(0.0);
-    sum_f += fetch(pos + ivec3( 1, 0, 0)).rgb;
-    sum_f += fetch(pos + ivec3(-1, 0, 0)).rgb;
-    sum_f += fetch(pos + ivec3( 0, 1, 0)).rgb;
-    sum_f += fetch(pos + ivec3( 0,-1, 0)).rgb;
-    sum_f += fetch(pos + ivec3( 0, 0, 1)).rgb;
-    sum_f += fetch(pos + ivec3( 0, 0,-1)).rgb;
+    // 19-point isotropic Laplacian via shared helper.
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_a = lap_v4.r;
+    float lap_h = lap_v4.g;
+    float lap_rho = lap_v4.b;
 #endif
-    float lap_a = (sum_f.r - 6.0 * a) * h_sq;
-    float lap_h = (sum_f.g - 6.0 * h) * h_sq;
-    float lap_rho = (sum_f.b - 6.0 * rho) * h_sq;
 
     float Da      = u_param0;  // activator diffusion (small)
     float Dh      = u_param1;  // inhibitor diffusion (large — key ratio!)
@@ -1590,25 +2690,24 @@ void main() {
     float c = sc.r;
     float mu = sc.g;
 
-    vec2 nxp = s_ch[ch_idx(tp.x + 1, tp.y,     tp.z    )];
-    vec2 nxm = s_ch[ch_idx(tp.x - 1, tp.y,     tp.z    )];
-    vec2 nyp = s_ch[ch_idx(tp.x,     tp.y + 1, tp.z    )];
-    vec2 nym = s_ch[ch_idx(tp.x,     tp.y - 1, tp.z    )];
-    vec2 nzp = s_ch[ch_idx(tp.x,     tp.y,     tp.z + 1)];
-    vec2 nzm = s_ch[ch_idx(tp.x,     tp.y,     tp.z - 1)];
-
-    // Preserve exact FP-associativity grouping of the direct-fetch path
-    float lap_c = 0.0;
-    lap_c += nxp.r + nxm.r;
-    lap_c += nyp.r + nym.r;
-    lap_c += nzp.r + nzm.r;
-    lap_c = (lap_c - 6.0 * c) * h_sq;
-
-    float lap_mu = 0.0;
-    lap_mu += nxp.g + nxm.g;
-    lap_mu += nyp.g + nym.g;
-    lap_mu += nzp.g + nzm.g;
-    lap_mu = (lap_mu - 6.0 * mu) * h_sq;
+    // 19-point isotropic Laplacian. CRITICAL for Cahn-Hilliard: the
+    // biharmonic ∇⁴ formed by chaining two Laplacians inherits the
+    // anisotropy of each. With 6-point, droplets/spinodal domains are
+    // visibly square-aligned (a known artifact in the literature). The
+    // 19-point variant restores rotational symmetry of the interface
+    // energy term, giving spherical droplets and isotropic sponges.
+    vec2 face = s_ch[ch_idx(tp.x+1, tp.y,   tp.z  )] + s_ch[ch_idx(tp.x-1, tp.y,   tp.z  )]
+              + s_ch[ch_idx(tp.x,   tp.y+1, tp.z  )] + s_ch[ch_idx(tp.x,   tp.y-1, tp.z  )]
+              + s_ch[ch_idx(tp.x,   tp.y,   tp.z+1)] + s_ch[ch_idx(tp.x,   tp.y,   tp.z-1)];
+    vec2 edge = s_ch[ch_idx(tp.x+1, tp.y+1, tp.z  )] + s_ch[ch_idx(tp.x+1, tp.y-1, tp.z  )]
+              + s_ch[ch_idx(tp.x-1, tp.y+1, tp.z  )] + s_ch[ch_idx(tp.x-1, tp.y-1, tp.z  )]
+              + s_ch[ch_idx(tp.x+1, tp.y,   tp.z+1)] + s_ch[ch_idx(tp.x+1, tp.y,   tp.z-1)]
+              + s_ch[ch_idx(tp.x-1, tp.y,   tp.z+1)] + s_ch[ch_idx(tp.x-1, tp.y,   tp.z-1)]
+              + s_ch[ch_idx(tp.x,   tp.y+1, tp.z+1)] + s_ch[ch_idx(tp.x,   tp.y+1, tp.z-1)]
+              + s_ch[ch_idx(tp.x,   tp.y-1, tp.z+1)] + s_ch[ch_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec2 lap_cmu = ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * sc) * h_sq;
+    float lap_c = lap_cmu.x;
+    float lap_mu = lap_cmu.y;
 #else
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
@@ -1616,19 +2715,10 @@ void main() {
     float c = self_data.r;     // order parameter
     float mu = self_data.g;    // chemical potential from previous step
 
-    // Von Neumann Laplacian of c (resolution-independent)
-    float lap_c = 0.0;
-    lap_c += fetch(pos + ivec3(1,0,0)).r + fetch(pos + ivec3(-1,0,0)).r;
-    lap_c += fetch(pos + ivec3(0,1,0)).r + fetch(pos + ivec3(0,-1,0)).r;
-    lap_c += fetch(pos + ivec3(0,0,1)).r + fetch(pos + ivec3(0,0,-1)).r;
-    lap_c = (lap_c - 6.0 * c) * h_sq;
-
-    // Laplacian of chemical potential (for ∇²μ → gives ∇⁴c term)
-    float lap_mu = 0.0;
-    lap_mu += fetch(pos + ivec3(1,0,0)).g + fetch(pos + ivec3(-1,0,0)).g;
-    lap_mu += fetch(pos + ivec3(0,1,0)).g + fetch(pos + ivec3(0,-1,0)).g;
-    lap_mu += fetch(pos + ivec3(0,0,1)).g + fetch(pos + ivec3(0,0,-1)).g;
-    lap_mu = (lap_mu - 6.0 * mu) * h_sq;
+    // 19-point isotropic Laplacian via shared helper (see CHTILE comment).
+    vec4 lap_v4 = lap19_v4(pos, self_data);
+    float lap_c = lap_v4.r;
+    float lap_mu = lap_v4.g;
 #endif
 
     float mobility = u_param0;
@@ -1636,12 +2726,36 @@ void main() {
     float noise_str = u_param2;
     float asymmetry = u_param3;
 
-    // Chemical potential: μ = f'(c) - ε²∇²c
-    // f(c) = 0.25*(c²-1)² + asymmetry*c → f'(c) = c³ - c + asymmetry
-    float new_mu = (c * c * c - c + asymmetry) - eps2 * lap_c;
+    // Linear-stability floor on ε² for explicit Euler.
+    // Linearizing c³-c around c=0 gives growth rate at Nyquist mode of
+    //   ω_nyq = 12·M·h_sq·(1 - 12·ε²·h_sq).
+    // Stable iff ε² > 1/(12·h_sq). We pad to 1/(8·h_sq) for a ~50% margin so
+    // the Nyquist (checkerboard) mode is reliably *damped* rather than
+    // marginally stable. Without this, sub-128 grids lock into salt-and-pepper
+    // alternation and never form real spinodal domains.
+    float eps2_floor = 1.0 / (8.0 * h_sq);
+    float eps2_eff = max(eps2, eps2_floor);
 
-    // Cahn-Hilliard: ∂c/∂t = M·∇²μ
-    float new_c = c + mobility * lap_mu * u_dt;
+    // CFL safety on the biharmonic explicit step:
+    //   dt < 1 / (72 · M · ε² · h_sq²).
+    // Sub-step internally if user-chosen dt exceeds this so the scheme can't
+    // blow up at very high ε² or very large grids.
+    float dt_max = 0.5 / (72.0 * max(mobility, 1e-6) * eps2_eff * h_sq * h_sq);
+    int substeps = int(ceil(u_dt / dt_max));
+    substeps = clamp(substeps, 1, 8);
+    float dt_sub = u_dt / float(substeps);
+
+    float new_c = c;
+    float new_mu = mu;
+    for (int s = 0; s < substeps; s++) {
+        // Chemical potential: μ = f'(c) - ε²∇²c
+        // f(c) = 0.25*(c²-1)² + asymmetry*c → f'(c) = c³ - c + asymmetry
+        new_mu = (new_c * new_c * new_c - new_c + asymmetry) - eps2_eff * lap_c;
+        // Cahn-Hilliard: ∂c/∂t = M·∇²μ. lap_mu is from the previous frame's
+        // μ field (one-step lag) but with eps2_eff floored, the resulting
+        // implicit-leapfrog-like scheme is stable.
+        new_c = new_c + mobility * lap_mu * dt_sub;
+    }
 
     // Thermal noise for nucleation in metastable regions
     float hash = hash_temporal(pos, 0);
@@ -1883,11 +2997,16 @@ void main() {
         // Emit signal
         new_sig += biomass * 0.02 * u_dt;
         // Die if nutrient depleted
-        if (nutrient < 0.01) new_bio -= 0.1 * u_dt;
+        if (nutrient < 0.01) new_bio -= 0.02 * u_dt;
     } else if (biomass > 0.01) {
         // Growing region
         new_bio += growth * nutrient * u_dt;
         new_nut -= consumption * 0.5 * u_dt;
+        // Maintenance starvation: half-grown cells without food retract.
+        // Without this they get stuck forever at biomass=0.4999 (audit
+        // caught this as FROZEN). Decay rate is small so the network
+        // persists for a while after local nutrient depletion.
+        if (nutrient < 0.01) new_bio -= 0.01 * u_dt;
         if (new_bio > 0.5) new_bio = 1.0;  // solidify
     } else {
         // Empty cell: can be colonized by adjacent tip
@@ -1899,7 +3018,21 @@ void main() {
             // Branching: new tips from existing tips (probability)
             float branch_chance = branch_factor * 0.1 * max_tip;
             float total_prob = min(grow_prob + branch_chance, 1.0);
-            if (hash < total_prob * u_dt && bio_count >= 1 && bio_count <= 3) {
+            // Restrict colonization: linear extension (1 neighbour) is
+            // the dominant case; with 2 neighbours we only branch with
+            // a lower probability scaled by branch_factor; with ≥3
+            // neighbours we never colonize (prevents filling solid
+            // volumes — real hyphae stop when surrounded). This makes
+            // the network filamentous instead of a uniform sponge.
+            float prob;
+            if (bio_count == 1) {
+                prob = total_prob;
+            } else if (bio_count == 2) {
+                prob = branch_chance * 0.5;
+            } else {
+                prob = 0.0;
+            }
+            if (hash < prob * u_dt) {
                 new_bio = 0.1;  // start growing
                 new_tip = 1.0;  // this is now a tip
             }
@@ -1990,23 +3123,22 @@ void main() {
     float freq = u_param2;
     float amplitude = u_param3;
 
-    // Curl of B → updates E: dEz/dt = c²(dBy/dx - dBx/dy + dBy/dz - dBx/dz)
-    // Scale derivatives by h_inv for resolution-independence
+    // Curl of B → updates E. For a TE-like mode (Ez, Bx, By) the only
+    // physical contribution to dEz/dt is c²(dBy/dx - dBx/dy). The previous
+    // implementation added spurious dBy/dz and dBx/dz terms that broke
+    // Maxwell's equations and pumped energy into the box.
     float dBy_dx = (nxp.b - nxm.b) * 0.5 * h_inv;
     float dBx_dy = (nyp.g - nym.g) * 0.5 * h_inv;
-    float dBy_dz = (nzp.b - nzm.b) * 0.5 * h_inv;
-    float dBx_dz = (nzp.g - nzm.g) * 0.5 * h_inv;
 
-    float new_Ez = Ez + c * c * (dBy_dx - dBx_dy + dBy_dz - dBx_dz) * u_dt;
+    float new_Ez = Ez + c * c * (dBy_dx - dBx_dy) * u_dt;
 
-    // Curl of E → updates B: dBx/dt = -dEz/dy + dEz/dz, dBy/dt = dEz/dx - dEz/dz
-    // Scale derivatives by h_inv for resolution-independence
+    // Curl of E → updates B. dBx/dt = -dEz/dy, dBy/dt = +dEz/dx.
+    // The previous code added ±dEz/dz cross-terms which were unphysical.
     float dEz_dx = (nxp.r - nxm.r) * 0.5 * h_inv;
     float dEz_dy = (nyp.r - nym.r) * 0.5 * h_inv;
-    float dEz_dz = (nzp.r - nzm.r) * 0.5 * h_inv;
 
-    float new_Bx = Bx - dEz_dy * u_dt + dEz_dz * u_dt;
-    float new_By = By + dEz_dx * u_dt - dEz_dz * u_dt;
+    float new_Bx = Bx - dEz_dy * u_dt;
+    float new_By = By + dEz_dx * u_dt;
 
     // Absorbing conductor: damp fields
     if (medium > 0.0) {
@@ -2016,14 +3148,22 @@ void main() {
         new_By *= exp(-d * u_dt);
     }
 
-    // Dipole source at center — soft oscillator driven by local field sign
+    // Dipole source at center — time-driven sinusoid (proper antenna).
+    // Hard-set Ez at the source so it actually radiates instead of being
+    // immediately washed out by the surrounding curl update.
     int mid = u_size / 2;
     if (abs(pos.x - mid) <= 1 && abs(pos.y - mid) <= 1 && abs(pos.z - mid) <= 1) {
-        // Drive Ez toward a sinusoidal target using feedback:
-        // target oscillates based on current phase of the local field
-        float target = amplitude * sin(freq * 6.28 * Ez);
-        new_Ez += (target - Ez) * freq * u_dt;
+        float t = float(u_frame) * u_dt;
+        new_Ez = amplitude * sin(6.2831853 * freq * t);
     }
+
+    // Tiny background loss models radiation escaping the finite box and
+    // suppresses standing-wave buildup against the clamped boundary.
+    // Conductors (medium > 0) get the larger configurable damping below.
+    float vacuum_loss = 0.005 * u_dt;
+    new_Ez *= (1.0 - vacuum_loss);
+    new_Bx *= (1.0 - vacuum_loss);
+    new_By *= (1.0 - vacuum_loss);
 
     new_Ez = clamp(new_Ez, -2.0, 2.0);
     new_Bx = clamp(new_Bx, -2.0, 2.0);
@@ -2276,11 +3416,15 @@ void main() {
     float new_oxy = oxygen + diffusion * 0.8 * lap_oxy * u_dt;
     float new_ember = ember;
 
-    // Combustion: fuel burns when temp > ignition and oxygen present
+    // Combustion: fuel burns when temp > ignition and oxygen present.
+    // The exothermic factor (4.0) was 2.0 but the fire wavefront then
+    // lost more heat to diffusion than combustion produced and the
+    // fire extinguished by t~1000 without spreading. 4.0 sustains a
+    // self-propagating front through fuel.
     if (fuel > 0.01 && temp > ignition && oxygen > 0.05) {
         float burn_rate = fuel * (temp - ignition) * oxygen * heat_output;
         new_fuel -= burn_rate * u_dt;
-        new_temp += burn_rate * 2.0 * u_dt;  // exothermic
+        new_temp += burn_rate * 4.0 * u_dt;  // exothermic
         new_oxy -= burn_rate * 0.5 * u_dt;   // consume oxygen
 
         // Ember generation (stochastic)
@@ -2295,8 +3439,13 @@ void main() {
     // Embers can ignite fuel
     if (new_ember > 0.3 && fuel > 0.5) new_temp += new_ember * 0.3 * u_dt;
 
-    // Radiative cooling
-    new_temp -= temp * 0.02 * u_dt;
+    // Radiative cooling. The previous rate (0.02) extinguished
+    // propagating fronts before they could ignite new fuel: cells
+    // marginally above the ignition threshold cooled below it within
+    // ~10 steps, so the fire never travelled far from the ignition
+    // zone (audit: fire fully extinct by t=1700). 0.005 keeps cooling
+    // realistic but lets the wavefront reach fresh fuel.
+    new_temp -= temp * 0.005 * u_dt;
 
     // Oxygen replenishment from boundaries
     if (u_boundary == 1) {
@@ -2507,33 +3656,30 @@ void main() {
     float diffusion = u_param2;
     float intensity = u_param3;
 
-    // Displacement Laplacian (elastic wave equation) — preserve pairwise grouping
-    float lap_disp = 0.0;
+    // 19-point isotropic Laplacian shared by displacement (elastic
+    // wave equation) and stress (stress diffusion). Crack networks
+    // form along directions of maximum stress concentration; with the
+    // 6-point stencil the discrete dispersion error tilts that
+    // direction toward grid axes, producing visibly axis-aligned
+    // cracks. The 19-point error is rotationally symmetric so cracks
+    // follow the underlying physics rather than the lattice.
+    vec4 face_sum, edge_sum;
 #if USE_SHARED_MEM
-    lap_disp += s_fc[fc_idx(tp.x+1, tp.y,   tp.z  )].r + s_fc[fc_idx(tp.x-1, tp.y,   tp.z  )].r;
-    lap_disp += s_fc[fc_idx(tp.x,   tp.y+1, tp.z  )].r + s_fc[fc_idx(tp.x,   tp.y-1, tp.z  )].r;
-    lap_disp += s_fc[fc_idx(tp.x,   tp.y,   tp.z+1)].r + s_fc[fc_idx(tp.x,   tp.y,   tp.z-1)].r;
+    face_sum = s_fc[fc_idx(tp.x+1, tp.y,   tp.z  )] + s_fc[fc_idx(tp.x-1, tp.y,   tp.z  )]
+             + s_fc[fc_idx(tp.x,   tp.y+1, tp.z  )] + s_fc[fc_idx(tp.x,   tp.y-1, tp.z  )]
+             + s_fc[fc_idx(tp.x,   tp.y,   tp.z+1)] + s_fc[fc_idx(tp.x,   tp.y,   tp.z-1)];
+    edge_sum = s_fc[fc_idx(tp.x+1, tp.y+1, tp.z  )] + s_fc[fc_idx(tp.x+1, tp.y-1, tp.z  )]
+             + s_fc[fc_idx(tp.x-1, tp.y+1, tp.z  )] + s_fc[fc_idx(tp.x-1, tp.y-1, tp.z  )]
+             + s_fc[fc_idx(tp.x+1, tp.y,   tp.z+1)] + s_fc[fc_idx(tp.x+1, tp.y,   tp.z-1)]
+             + s_fc[fc_idx(tp.x-1, tp.y,   tp.z+1)] + s_fc[fc_idx(tp.x-1, tp.y,   tp.z-1)]
+             + s_fc[fc_idx(tp.x,   tp.y+1, tp.z+1)] + s_fc[fc_idx(tp.x,   tp.y+1, tp.z-1)]
+             + s_fc[fc_idx(tp.x,   tp.y-1, tp.z+1)] + s_fc[fc_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec4 lap_v4 = ((1.0/3.0) * face_sum + (1.0/6.0) * edge_sum - 4.0 * self_data) * h_sq;
 #else
-    lap_disp += fetch(pos + ivec3(1,0,0)).r + fetch(pos + ivec3(-1,0,0)).r;
-    lap_disp += fetch(pos + ivec3(0,1,0)).r + fetch(pos + ivec3(0,-1,0)).r;
-    lap_disp += fetch(pos + ivec3(0,0,1)).r + fetch(pos + ivec3(0,0,-1)).r;
+    vec4 lap_v4 = lap19_v4(pos, self_data);
 #endif
-    lap_disp -= 6.0 * disp;
-    lap_disp *= h_sq;  // resolution-independent
-
-    // Stress Laplacian (stress diffusion / redistribution)
-    float lap_stress = 0.0;
-#if USE_SHARED_MEM
-    lap_stress += s_fc[fc_idx(tp.x+1, tp.y,   tp.z  )].g + s_fc[fc_idx(tp.x-1, tp.y,   tp.z  )].g;
-    lap_stress += s_fc[fc_idx(tp.x,   tp.y+1, tp.z  )].g + s_fc[fc_idx(tp.x,   tp.y-1, tp.z  )].g;
-    lap_stress += s_fc[fc_idx(tp.x,   tp.y,   tp.z+1)].g + s_fc[fc_idx(tp.x,   tp.y,   tp.z-1)].g;
-#else
-    lap_stress += fetch(pos + ivec3(1,0,0)).g + fetch(pos + ivec3(-1,0,0)).g;
-    lap_stress += fetch(pos + ivec3(0,1,0)).g + fetch(pos + ivec3(0,-1,0)).g;
-    lap_stress += fetch(pos + ivec3(0,0,1)).g + fetch(pos + ivec3(0,0,-1)).g;
-#endif
-    lap_stress -= 6.0 * stress;
-    lap_stress *= h_sq;  // resolution-independent
+    float lap_disp = lap_v4.r;
+    float lap_stress = lap_v4.g;
 
     // Count broken neighbors (stress concentrates at crack tips)
     float broken_neighbors = 0.0;
@@ -2745,43 +3891,62 @@ void main() {
     float regen = u_param2;
     float diffusion = u_param3;
 
-    // Laplacians for each species + resource
-    float lap_a = 0.0, lap_b = 0.0, lap_c = 0.0, lap_r = 0.0;
-    for (int i = 0; i < 6; i++) {
-        ivec3 off = ivec3(0);
-        int axis = i / 2; int dir = (i % 2) * 2 - 1;
-        off[axis] = dir;
+    // Laplacians for each species + resource — 19-point isotropic
+    // (face + edge). Important here because the RPS territorial
+    // boundaries are ripple/curve fronts that look unnaturally
+    // axis-aligned with the 6-point stencil.
+    vec4 face_sum = vec4(0.0), edge_sum = vec4(0.0);
 #if USE_SHARED_MEM
-        vec4 nb = s_lc[lc_idx(tp.x + off.x, tp.y + off.y, tp.z + off.z)];
+    face_sum += s_lc[lc_idx(tp.x+1, tp.y,   tp.z  )] + s_lc[lc_idx(tp.x-1, tp.y,   tp.z  )]
+              + s_lc[lc_idx(tp.x,   tp.y+1, tp.z  )] + s_lc[lc_idx(tp.x,   tp.y-1, tp.z  )]
+              + s_lc[lc_idx(tp.x,   tp.y,   tp.z+1)] + s_lc[lc_idx(tp.x,   tp.y,   tp.z-1)];
+    edge_sum += s_lc[lc_idx(tp.x+1, tp.y+1, tp.z  )] + s_lc[lc_idx(tp.x+1, tp.y-1, tp.z  )]
+              + s_lc[lc_idx(tp.x-1, tp.y+1, tp.z  )] + s_lc[lc_idx(tp.x-1, tp.y-1, tp.z  )]
+              + s_lc[lc_idx(tp.x+1, tp.y,   tp.z+1)] + s_lc[lc_idx(tp.x+1, tp.y,   tp.z-1)]
+              + s_lc[lc_idx(tp.x-1, tp.y,   tp.z+1)] + s_lc[lc_idx(tp.x-1, tp.y,   tp.z-1)]
+              + s_lc[lc_idx(tp.x,   tp.y+1, tp.z+1)] + s_lc[lc_idx(tp.x,   tp.y+1, tp.z-1)]
+              + s_lc[lc_idx(tp.x,   tp.y-1, tp.z+1)] + s_lc[lc_idx(tp.x,   tp.y-1, tp.z-1)];
+    vec4 lap_v4 = ((1.0/3.0) * face_sum + (1.0/6.0) * edge_sum - 4.0 * self_data) * h_sq;
 #else
-        vec4 nb = fetch(pos + off);
+    vec4 lap_v4 = lap19_v4(pos, self_data);
 #endif
-        lap_a += nb.r; lap_b += nb.g; lap_r += nb.b; lap_c += nb.a;
-    }
-    lap_a -= 6.0 * a; lap_b -= 6.0 * b; lap_r -= 6.0 * res; lap_c -= 6.0 * c;
-    lap_a *= h_sq; lap_b *= h_sq; lap_r *= h_sq; lap_c *= h_sq;  // resolution-independent
+    float lap_a = lap_v4.r;
+    float lap_b = lap_v4.g;
+    float lap_r = lap_v4.b;
+    float lap_c = lap_v4.a;
 
     float total_bio = a + b + c;
     float space = max(0.0, 1.0 - total_bio);
 
-    // Species A: fast pioneer — grows 3x faster but dies under competition
-    float grow_a = growth_mult * 3.0 * a * res * space;
-    float die_a = a * (competition * (b * 1.5 + c * 0.5) + 0.02);  // vulnerable to B
+    // Three-way rock-paper-scissors competition: B>A, C>B, A>C.
+    // Earlier tuning had B nearly invincible (0.005 mortality) and the
+    // C→B suppression weak (×0.8), so the cycle collapsed and B took
+    // the entire grid by t≈800 (audit caught species A as effectively
+    // extinct by then). The coefficients below balance each link of
+    // the cycle so all three species coexist as a territorial mosaic.
 
-    // Species B: slow competitor — grows slowly but dominates in encounters
-    float grow_b = growth_mult * 1.0 * b * res * space;
-    float die_b = b * (competition * (c * 0.8) + 0.005);  // very resilient, only C threatens
+    // Species A: pioneer — modest growth advantage, vulnerable to B
+    float grow_a = growth_mult * 1.6 * a * res * space;
+    float die_a = a * (competition * (b * 1.5 + c * 0.3) + 0.015);  // vulnerable to B
 
-    // Species C: nomad — medium growth, spreads faster (higher diffusion)
+    // Species B: competitor — slow but resilient, strongly suppressed
+    // by C so the cycle closes
+    float grow_b = growth_mult * 1.4 * b * res * space;
+    float die_b = b * (competition * (c * 1.5 + a * 0.2) + 0.015);  // C dominates B
+
+    // Species C: nomad — medium growth, spreads further; survives
+    // contact with B (C's prey) but is killed by A
     float grow_c = growth_mult * 1.5 * c * res * space;
-    float die_c = c * (competition * (a * 0.3 + b * 0.3) + 0.01);
+    float die_c = c * (competition * (a * 1.5 + b * 0.2) + 0.015);  // A dominates C
 
     float new_a = a + (grow_a - die_a) * u_dt + diffusion * lap_a * u_dt;
     float new_b = b + (grow_b - die_b) * u_dt + diffusion * 0.5 * lap_b * u_dt;
     float new_c = c + (grow_c - die_c) * u_dt + diffusion * 2.0 * lap_c * u_dt;
 
-    // Resource: regenerates, consumed by all species
-    float consumption = (a * 3.0 + b * 1.0 + c * 1.5) * growth_mult;
+    // Resource: regenerates, consumed by all species (equal rates so
+    // the rock-paper-scissors competition isn't masked by one species
+    // monopolising the food supply).
+    float consumption = (a + b + c) * growth_mult;
     float new_res = res + regen * (1.0 - res) * u_dt
                     - consumption * res * u_dt
                     + diffusion * 0.3 * lap_r * u_dt;
@@ -3310,6 +4475,21 @@ void main() {
         }
     }
 
+    // 5. Radiative cooling toward ambient temperature.
+    // Without this the chemical reactions deposit en_diff*200 K per
+    // event with no sink, so temperature accumulates indefinitely and
+    // pegs at the 10000 K cap (audit: max=10000 forever). Newton's
+    // law of cooling with a small linear coefficient lets the system
+    // dissipate accumulated reaction heat to the environment, plus a
+    // quadratic term provides extra cooling at the high end so
+    // blackbody-hot cells return to manageable temperatures.
+    float T_amb = u_param0;  // ambient temperature slider
+    float dT = new_temp - T_amb;
+    new_temp -= 0.05 * dT * u_dt;             // linear (~Newton)
+    if (dT > 0.0) {
+        new_temp -= 1e-5 * dT * dT * u_dt;    // quadratic boost at high T
+    }
+
     new_temp = clamp(new_temp, -273.15, 10000.0);
     imageStore(u_dst, pos, vec4(float(self_id), new_temp, new_phase, new_vy));
 }
@@ -3504,6 +4684,65 @@ void main() {
 }
 """
 
+# ── Min/max range reduction over the _mm_tex mipmap ───────────────
+# Async-friendly replacement for a synchronous _mm_tex.read() that was
+# causing periodic frame drops. Each workgroup reduces a 4³ tile into
+# workgroup-local shared min/max, then performs ONE global atomic
+# float emulation per workgroup -- so for a 64³ mipmap we do ~4096
+# atomic operations per dispatch, not millions.
+#
+# atomicMin/atomicMax aren't available for floats in core GLSL 4.30,
+# so we encode floats as their IEEE-754 bit pattern in a uint and use
+# atomicMin/atomicMax on that. For non-negative floats this preserves
+# ordering. For negative floats we'd need a sign flip; here the values
+# in _mm_tex come from a view-tex that is either raw, abs(), or signed
+# remapped to [0,1], so we range-shift by adding +10 to guarantee
+# non-negative IEEE-comparable values, then subtract back on readback.
+RANGE_REDUCE_SHADER = """
+#version 430
+layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
+
+uniform sampler3D u_minmax;   // RG16F: per-block (min, max) of view tex
+uniform int u_dim;            // mipmap dimension along each axis
+
+layout(std430, binding=0) buffer RangeBuf {
+    uint range_min_bits;  // float bits of (min + 10.0)
+    uint range_max_bits;  // float bits of (max + 10.0)
+};
+
+shared float s_lo[64];
+shared float s_hi[64];
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    uint lid = gl_LocalInvocationIndex;
+    float lo =  1e10;
+    float hi = -1e10;
+    if (all(lessThan(p, ivec3(u_dim)))) {
+        vec2 mm = texelFetch(u_minmax, p, 0).rg;
+        lo = mm.r;
+        hi = mm.g;
+    }
+    s_lo[lid] = lo;
+    s_hi[lid] = hi;
+    barrier();
+    // Tree reduction in shared memory (64 -> 1)
+    for (uint stride = 32u; stride > 0u; stride >>= 1) {
+        if (lid < stride) {
+            s_lo[lid] = min(s_lo[lid], s_lo[lid + stride]);
+            s_hi[lid] = max(s_hi[lid], s_hi[lid + stride]);
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        // Float-as-uint atomic min/max via +10 bias to keep IEEE bits
+        // monotonic even for negative inputs (range is [-10, +Inf)).
+        atomicMin(range_min_bits, floatBitsToUint(s_lo[0] + 10.0));
+        atomicMax(range_max_bits, floatBitsToUint(s_hi[0] + 10.0));
+    }
+}
+"""
+
 # ── GPU-side metrics reduction shader ─────────────────────────────
 # Computes alive_count, change_count, surface_count, nan_count using
 # workgroup-local shared-memory reduction, then one global atomicAdd
@@ -3614,6 +4853,255 @@ void main() {
         if (s_change > 0u)  atomicAdd(change_count, s_change);
         if (s_surface > 0u) atomicAdd(surface_count, s_surface);
         if (s_nan > 0u)     atomicAdd(nan_count, s_nan);
+    }
+}
+"""
+
+# ─────────────────────────────────────────────────────────────────────
+# DEBUG STATS SHADER — comprehensive single-pass instrumentation
+# ─────────────────────────────────────────────────────────────────────
+# Captures, in ONE compute dispatch over the grid:
+#   • Per-channel (4 ch): finite count, NaN count, Inf count, min, max,
+#     sum (fixed-point, pre-normalized by total cells -> mean), and
+#     sum-of-squares (likewise -> variance).
+#   • Active-mask spatial decomposition: count, AABB (bbox_min/max),
+#     center-of-mass (sum of positions), boundary count (active cells
+#     in the outer 4-cell shell on any axis), radius-of-gyration
+#     accumulator (sum of |pos|² scaled).
+#   • 64-bucket histogram per channel (4 × 64 = 256 buckets), bucketed
+#     against the previous frame's min/max range (passed in via uniform).
+#
+# SSBO layout (std430, all uints; total 296 uints = 1184 bytes):
+#
+#   index   field                          notes
+#   ─────   ───────────────────────────    ─────────────────────────────
+#   0..3    finite_count[4]                cells where !isnan && !isinf
+#   4..7    nan_count[4]
+#   8..11   inf_count[4]
+#   12..15  min_bits[4]                    floatBitsToUint(value + BIAS)
+#   16..19  max_bits[4]                    same encoding
+#   20..23  sum_fp[4]                      atomicAdd of int(value*SCALE_S/N)
+#   24..27  sumsq_fp[4]                    atomicAdd of int(value²*SCALE_Q/N)
+#   28      active_count
+#   29..31  bbox_min[3]                    atomicMin on uint coords
+#   32..34  bbox_max[3]                    atomicMax on uint coords
+#   35..37  com_sum[3]                     fixed-point sum of positions
+#   38      rg_sum                         fixed-point sum of (pos-center)²
+#   39      boundary_count
+#   40..295 hist[4][64]                    atomicAdd of 1 per cell
+#
+# Fixed-point scales are chosen so that, given a normalization by
+# total_cells inside the shader, atomic accumulators don't overflow
+# uint32 even on 512³ grids. They are passed back to Python which
+# divides them out to recover floats (with a small precision loss).
+#
+# Why single-pass: avoids an extra full-grid sweep per frame. The
+# "stale by one frame" histogram bounds are perfectly fine for live
+# visualization -- the alternative (two dispatches) would double the
+# debug-mode cost with no perceptual win.
+DEBUG_STATS_SHADER = """
+#version 430
+layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+
+layout(rgba32f, binding=0) readonly uniform image3D u_grid;
+
+layout(std430, binding=7) buffer DebugStats {
+    uint finite_count[4];
+    uint nan_count[4];
+    uint inf_count[4];
+    uint min_bits[4];
+    uint max_bits[4];
+    uint sum_fp[4];
+    uint sumsq_fp[4];
+    uint active_count;
+    uint bbox_min[3];
+    uint bbox_max[3];
+    uint com_sum[3];
+    uint rg_sum;
+    uint boundary_count;
+    uint hist[4 * 64];
+};
+
+uniform int   u_size;
+uniform int   u_active_channel;   // which channel defines "active"
+uniform float u_active_threshold; // active iff value > threshold (or |v|>thr in mode==2)
+uniform int   u_active_mode;      // 0=>thr, 1=>thr, 2=>abs(thr), 3=>element-id
+uniform int   u_boundary_shell;   // shell thickness (default 4)
+uniform float u_hist_min[4];      // previous frame's min per channel
+uniform float u_hist_max[4];      // previous frame's max per channel
+uniform float u_norm_n;           // 1.0 / total_cells
+
+// Encoded constants (must match Python decoder)
+#define BIAS      1.0e6
+#define SCALE_S   1.0e6
+#define SCALE_Q   1.0e3
+
+// Workgroup-shared accumulators -- one atomic per workgroup per metric.
+// (Atomic-bombing the global SSBO from every thread would be ~5-50x
+//  slower at 256³ on real hardware.)
+shared uint s_finite[4];
+shared uint s_nan[4];
+shared uint s_inf[4];
+shared uint s_min_bits[4];
+shared uint s_max_bits[4];
+shared int  s_sum_int[4];     // signed local sum, fixed-point
+shared uint s_sumsq[4];       // unsigned local sum-of-squares, fixed-point
+shared uint s_active;
+shared uint s_bbox_min[3];
+shared uint s_bbox_max[3];
+shared uint s_com[3];
+shared uint s_rg;
+shared uint s_boundary;
+
+bool is_active(vec4 cell) {
+    float v = cell[u_active_channel];
+    if (u_active_mode == 3) return abs(v) > 0.5 && abs(v - 119.0) > 0.5;
+    if (u_active_mode == 2) return abs(v) > u_active_threshold;
+    return v > u_active_threshold;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+
+    // ── Init shared memory (1 thread per slot) ───────────────────────
+    if (lid < 4u) {
+        s_finite[lid] = 0u;
+        s_nan[lid] = 0u;
+        s_inf[lid] = 0u;
+        // Min sentinel: a huge positive biased value (~floatBitsToUint(1e30),
+        // a large positive uint). atomicMin against any real biased data
+        // (BIAS ± v, a normal positive float bit-pattern ≪ 1e30 bits)
+        // replaces the sentinel with the real value.
+        s_min_bits[lid] = floatBitsToUint(BIAS + 1.0e30);
+        // Max sentinel: 0u, the smallest possible uint. atomicMax against any
+        // real biased data (positive uint, since BIAS keeps things > 0) wins.
+        // CRITICAL: do NOT use floatBitsToUint(BIAS - 1e30); that float is
+        // negative, which sets the sign bit and produces a HUGE uint that
+        // beats every real datum in atomicMax (the bug that pinned max to
+        // −1e30 in the first JSON dump).
+        s_max_bits[lid] = 0u;
+        s_sum_int[lid] = 0;
+        s_sumsq[lid] = 0u;
+    }
+    if (lid < 3u) {
+        s_bbox_min[lid] = uint(u_size);   // start large (= no active yet)
+        s_bbox_max[lid] = 0u;             // start small
+        s_com[lid] = 0u;
+    }
+    if (lid == 0u) {
+        s_active = 0u; s_rg = 0u; s_boundary = 0u;
+    }
+    barrier();
+
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    bool in_grid = all(lessThan(pos, ivec3(u_size)));
+
+    if (in_grid) {
+        vec4 cur = imageLoad(u_grid, pos);
+
+        // ── Per-channel scalar stats ────────────────────────────────
+        for (int c = 0; c < 4; c++) {
+            float v = cur[c];
+            if (isnan(v)) {
+                atomicAdd(s_nan[c], 1u);
+                continue;
+            }
+            if (isinf(v)) {
+                atomicAdd(s_inf[c], 1u);
+                continue;
+            }
+            atomicAdd(s_finite[c], 1u);
+            // Keep per-cell accumulation UN-normalized so small values
+            // don't truncate to zero (the bug that pinned ch0_mean=0 at
+            // size>=128). Workgroup local sum is bounded by
+            //   512 * |v|_max * SCALE_S  ~ 5.12e8  -> fits int32.
+            // We normalize by u_norm_n only at flush-to-global time.
+            int s_int = int(v * SCALE_S);
+            // sum-of-squares is non-negative; 512 * v²_max * SCALE_Q
+            // ~ 5e5..5e8 depending on rule -> fits uint32.
+            uint sq_uint = uint(v * v * SCALE_Q);
+            atomicAdd(s_sum_int[c], s_int);
+            atomicAdd(s_sumsq[c], sq_uint);
+            // Min/max via float-bits + bias for atomicMin/Max ordering.
+            uint biased_bits = floatBitsToUint(v + BIAS);
+            atomicMin(s_min_bits[c], biased_bits);
+            atomicMax(s_max_bits[c], biased_bits);
+
+            // Histogram. Use previous frame's range so we have stable bins.
+            float lo = u_hist_min[c];
+            float hi = u_hist_max[c];
+            float span = max(hi - lo, 1.0e-12);
+            int bin = int(clamp((v - lo) / span * 64.0, 0.0, 63.0));
+            atomicAdd(hist[c * 64 + bin], 1u);
+        }
+
+        // ── Active-mask spatial stats ───────────────────────────────
+        if (is_active(cur)) {
+            atomicAdd(s_active, 1u);
+            atomicMin(s_bbox_min[0], uint(pos.x));
+            atomicMin(s_bbox_min[1], uint(pos.y));
+            atomicMin(s_bbox_min[2], uint(pos.z));
+            atomicMax(s_bbox_max[0], uint(pos.x));
+            atomicMax(s_bbox_max[1], uint(pos.y));
+            atomicMax(s_bbox_max[2], uint(pos.z));
+            atomicAdd(s_com[0], uint(pos.x));
+            atomicAdd(s_com[1], uint(pos.y));
+            atomicAdd(s_com[2], uint(pos.z));
+            // Radius-of-gyration accumulator: sum of |p - center|² where
+            // center = size/2. Stored as fixed-point: divide by size² so
+            // the per-cell contribution is in [0, 0.75] before scaling.
+            vec3 d = vec3(pos) - vec3(u_size) * 0.5;
+            float r2_norm = dot(d, d) / float(u_size * u_size);
+            atomicAdd(s_rg, uint(r2_norm * 1024.0));
+            // Boundary shell: count active cells within u_boundary_shell
+            // of any face.
+            int sh = u_boundary_shell;
+            if (pos.x < sh || pos.x >= u_size - sh ||
+                pos.y < sh || pos.y >= u_size - sh ||
+                pos.z < sh || pos.z >= u_size - sh) {
+                atomicAdd(s_boundary, 1u);
+            }
+        }
+    }
+
+    barrier();
+
+    // ── Flush workgroup totals to global SSBO (one atomic each) ─────
+    if (lid < 4u) {
+        if (s_finite[lid] > 0u) atomicAdd(finite_count[lid], s_finite[lid]);
+        if (s_nan[lid]    > 0u) atomicAdd(nan_count[lid],    s_nan[lid]);
+        if (s_inf[lid]    > 0u) atomicAdd(inf_count[lid],    s_inf[lid]);
+        // Min/max: ONLY flush when this workgroup actually saw finite data.
+        // Otherwise the sentinels (huge-uint for min, 0 for max) would
+        // corrupt the global running min/max via the atomic ops.
+        if (s_finite[lid] > 0u) {
+            atomicMin(min_bits[lid], s_min_bits[lid]);
+            atomicMax(max_bits[lid], s_max_bits[lid]);
+        }
+        // Normalize workgroup totals by 1/N on flush. Each global-atomic
+        // contribution is tiny per workgroup but sums correctly across
+        // the whole grid. Signed->uint reinterpret preserves the bit
+        // pattern so Python's int32 view decodes negatives properly.
+        // CRITICAL: use round-to-nearest-even, not truncation. At huge
+        // grids (512³) per-workgroup normalized values can be <1 and
+        // `int(x)` would systematically truncate them to 0, losing the
+        // entire signal.
+        float sum_norm_f   = float(s_sum_int[lid]) * u_norm_n;
+        float sumsq_norm_f = float(s_sumsq[lid])   * u_norm_n;
+        int  ws_sum_norm   = int(floor(sum_norm_f + sign(sum_norm_f) * 0.5));
+        uint ws_sumsq_norm = uint(sumsq_norm_f + 0.5);
+        if (ws_sum_norm  != 0)  atomicAdd(sum_fp[lid],   uint(ws_sum_norm));
+        if (ws_sumsq_norm > 0u) atomicAdd(sumsq_fp[lid], ws_sumsq_norm);
+    }
+    if (lid < 3u) {
+        atomicMin(bbox_min[lid], s_bbox_min[lid]);
+        atomicMax(bbox_max[lid], s_bbox_max[lid]);
+        if (s_com[lid] > 0u) atomicAdd(com_sum[lid], s_com[lid]);
+    }
+    if (lid == 0u) {
+        if (s_active > 0u)   atomicAdd(active_count,   s_active);
+        if (s_rg > 0u)       atomicAdd(rg_sum,         s_rg);
+        if (s_boundary > 0u) atomicAdd(boundary_count, s_boundary);
     }
 }
 """
@@ -4669,8 +6157,12 @@ RULE_PRESETS = {
         "param_ranges": {"Birth min": (0, 26), "Birth max": (0, 26),
                          "Survive min": (0, 26), "Survive max": (0, 26)},
         "dt": 1.0,
-        "init": "random_dense",
-        "init_variants": ["random_dense", "game_of_life_centered"],
+        # Uniform-random at 40% gives mean neighbour count ~10.4,
+        # far outside the S5-7 window -> everything dies frame 1.
+        # FBM at 18% puts local maxima in the viable band while global
+        # density stays low enough that births have room to happen.
+        "init": "life_fbm_moderate",
+        "init_variants": ["life_fbm_moderate", "life_fbm_dense", "random_dense", "game_of_life_centered"],
         "description": "Classic discrete Life in 3D. B6-7/S5-7 — stable clusters.",
         "vis_channels": ["Value"],
         "vis_default": 0,
@@ -4686,7 +6178,14 @@ RULE_PRESETS = {
         "param_ranges": {"Birth min": (3, 6), "Birth max": (3, 7),
                          "Survive min": (3, 6), "Survive max": (3, 8)},
         "dt": 1.0,
-        "init": "random_sparse",
+        # B4/S4 is a strict rule: lone cells with too few neighbours die,
+        # so volume-filling random seeds (life_fbm_sparse) just collapse
+        # to noise across the box. game_of_life_centered concentrates
+        # 35% density in the center third, giving the rule a coherent
+        # seed cluster from which the diamond-shaped attractor can grow
+        # outward into empty space.
+        "init": "game_of_life_centered",
+        "init_variants": ["game_of_life_centered", "life_fbm_sparse"],
         "description": "B4/S4 — strict rule grows diamond-like crystals.",
         "vis_channels": ["Value"],
         "vis_default": 0,
@@ -4704,8 +6203,12 @@ RULE_PRESETS = {
                          "Survive center": (0.05, 0.45), "Survive range": (0.005, 0.20)},
         "dt": 0.15,
         "dt_range": (0.01, 0.8),
-        "init": "random_smooth",
-        "init_variants": ["random_smooth", "smoothlife_sparse"],
+        # random_smooth is globally smoothed uniform noise with mean ~0.5,
+        # far above the ~0.22 survival center -> density collapses within
+        # a few steps. FBM remapped to mean 0.22 with natural multi-scale
+        # variation nucleates stable creatures from the first frame.
+        "init": "smoothlife_fbm",
+        "init_variants": ["smoothlife_fbm", "random_smooth", "smoothlife_sparse"],
         "description": "Continuous analog of Life: cells survive within a density band.",
         "vis_channels": ["Value"],
         "vis_default": 0,
@@ -4759,7 +6262,12 @@ RULE_PRESETS = {
         "vis_channels": ["Displacement", "Velocity"],
         "vis_default": 0,
         "vis_abs": True,
-        "boundary": "clamped",
+        # Neumann (mirror) boundary preserves mean displacement exactly —
+        # critical for cross-grid reproducibility. The previous "clamped"
+        # (Dirichlet zero) boundary acted as an absorber that leaked mean
+        # proportionally to the surface/volume ratio, causing measurable
+        # drift that was ~10x worse at 64³ than 128³.
+        "boundary": "mirror",
     },
     "crystal_growth": {
         "label": "Crystal Growth",
@@ -4767,15 +6275,17 @@ RULE_PRESETS = {
         # Mode 0 + tiny ε ≈ near-isotropic surface energy → rounded blob.
         # Single seed, modest supersaturation, generous diffusion to keep
         # the supersaturation field smooth around the growing front.
-        "params": {"Undercooling": 0.25, "Diffusion": 0.20, "Anisotropy strength": 0.05, "Shape": 0},
-        "param_ranges": {"Undercooling": (0.05, 0.6), "Diffusion": (0.10, 0.5),
+        # `Undercooling` is the Karma-Rappel coupling lambda; growth is
+        # mass-limited and stops naturally as u_field depletes.
+        "params": {"Undercooling": 0.5, "Diffusion": 0.20, "Anisotropy strength": 0.05, "Shape": 0},
+        "param_ranges": {"Undercooling": (0.2, 1.5), "Diffusion": (0.10, 0.5),
                          "Anisotropy strength": (0.0, 0.25), "Shape": (0, 0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.08),
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
         "description": "Compact crystal — near-isotropic surface energy gives smooth rounded growth front.",
-        "vis_channels": ["Phase φ", "Supersaturation"],
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
@@ -4784,17 +6294,27 @@ RULE_PRESETS = {
     "crystal_octahedral": {
         "label": "Crystal (Octahedral)",
         "shader": "crystal_growth",
-        # Mode 1 + strong ε → β maximised at <100> axes → 6 axial bulges
-        # forming a sharp octahedron (8 triangular faces).
-        "params": {"Undercooling": 0.35, "Diffusion": 0.10, "Anisotropy strength": 2.0, "Shape": 1},
-        "param_ranges": {"Undercooling": (0.1, 0.7), "Diffusion": (0.05, 0.4),
-                         "Anisotropy strength": (1.0, 4.0), "Shape": (1, 1)},
-        "dt": 0.02,
-        "dt_range": (0.005, 0.08),
+        # Mode 1 = singular β(n̂) with sharp peaks at the 8 <111> facets
+        # via max projection (|nx|+|ny|+|nz|)^8/3^4. Non-facet directions
+        # have β ≈ 0 and genuinely stagnate, leaving 8 flat triangular faces
+        # — a true octahedron, not just an axially-bulged sphere. Higher ε
+        # than other modes because the 1/3² normalisation scales the kernel
+        # down strongly and we need contrast to overpower defect roughening.
+        # U=0.5 (was 0.7): the matched-af shape audit shows envelope_octa
+        # peaks at 1.14 around U=0.4-0.5 and degrades to 1.05 at U=0.7 —
+        # high U pushes the front into the Mullins-Sekerka instability
+        # regime (visible as growth/shrink oscillations) which both
+        # destabilises the facets and rounds them. The clean monotonic
+        # growth at U=0.5 is also what the user described wanting visually.
+        "params": {"Undercooling": 0.5, "Diffusion": 0.08, "Anisotropy strength": 18.0, "Shape": 1},
+        "param_ranges": {"Undercooling": (0.3, 1.5), "Diffusion": (0.04, 0.3),
+                         "Anisotropy strength": (8.0, 30.0), "Shape": (1, 1)},
+        "dt": 0.015,
+        "dt_range": (0.005, 0.06),
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
-        "description": "Octahedral crystal — strong <100> anisotropy: axes grow fast → 8-faced octahedron.",
-        "vis_channels": ["Phase φ", "Supersaturation"],
+        "description": "Octahedral crystal — sharp <111>-facet kernel: 8 flat triangular faces, like fluorite or magnetite.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
@@ -4803,18 +6323,23 @@ RULE_PRESETS = {
     "crystal_cubic": {
         "label": "Crystal (Cubic)",
         "shader": "crystal_growth",
-        # Mode 2 inverts the anisotropy: β maximised at <111> diagonals →
-        # corners advance fastest → 8 corner bulges fill in to form a cube
-        # with 6 square faces aligned to the grid axes.
-        "params": {"Undercooling": 0.35, "Diffusion": 0.10, "Anisotropy strength": 2.0, "Shape": 2},
-        "param_ranges": {"Undercooling": (0.1, 0.7), "Diffusion": (0.05, 0.4),
-                         "Anisotropy strength": (1.0, 4.0), "Shape": (2, 2)},
+        # Mode 2 = singular β(n̂) with sharp peaks at the 6 <100> facets
+        # via max(|nx|,|ny|,|nz|)^8. Non-facet directions truly stagnate,
+        # so the crystal grows as a true cube (6 flat square faces) rather
+        # than a smoothly-rounded blob with axial bulges.
+        # U=0.55 (was 0.7): same reasoning as octahedral — U≥0.7 puts the
+        # front into a 20-grow / 10-shrink oscillation (Mullins-Sekerka),
+        # which both rounds the corners and produces visible pulsing.
+        # U=0.55 grows monotonically to a clean cube and halts.
+        "params": {"Undercooling": 0.55, "Diffusion": 0.10, "Anisotropy strength": 14.0, "Shape": 2},
+        "param_ranges": {"Undercooling": (0.3, 1.5), "Diffusion": (0.05, 0.4),
+                         "Anisotropy strength": (6.0, 25.0), "Shape": (2, 2)},
         "dt": 0.02,
         "dt_range": (0.005, 0.08),
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
-        "description": "Cubic crystal — inverted anisotropy: <111> corners grow fast → 6-faced cube.",
-        "vis_channels": ["Phase φ", "Supersaturation"],
+        "description": "Cubic crystal — sharp <100>-facet kernel: 6 flat square faces, like halite or pyrite.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
@@ -4823,17 +6348,39 @@ RULE_PRESETS = {
     "crystal_dendritic": {
         "label": "Crystal (Dendritic)",
         "shader": "crystal_growth",
-        # Mode 3 = octahedral kernel + temporal interface noise →
-        # Mullins-Sekerka instability splits the tips into branching arms.
-        "params": {"Undercooling": 0.45, "Diffusion": 0.12, "Anisotropy strength": 1.5, "Shape": 3},
-        "param_ranges": {"Undercooling": (0.2, 0.95), "Diffusion": (0.05, 0.4),
-                         "Anisotropy strength": (0.5, 3.0), "Shape": (3, 3)},
-        "dt": 0.01,
-        "dt_range": (0.003, 0.06),
-        "init": "crystal_multi_seed",
-        "init_variants": ["crystal_multi_seed", "crystal_seed"],
-        "description": "Dendritic crystal — Mullins-Sekerka tip-splitting produces axis-aligned branching arms.",
-        "vis_channels": ["Phase φ", "Supersaturation"],
+        # Mode 3 = canonical Karma-Rappel WEAK anisotropy kernel:
+        #   beta = 1 + eps * aniso,  aniso = (4*K4 - 4/3) * 0.375 in [0,1]
+        # peaks at <100>. The DEFAULT eps=2.5 (rather than the textbook
+        # eps~0.05) is required because at our 64-128^3 grid scale the
+        # diffusion-driven Mullins-Sekerka instability has too few cells
+        # per unstable wavelength to amplify; we lean instead on the
+        # KINETIC anisotropy to do the symmetry breaking. With eps=2.5
+        # and dt~0.025 a 6-arm cross is clearly visible by step ~500
+        # (af~0.05), with bbox/equiv-sphere ratio ~1.7 -- i.e. the
+        # crystal is 70% wider along the <100> axes than an isotropic
+        # blob of the same volume. This was tuned from interactive
+        # GUI-debug saves at U~0.5 / A~2.5 / dt~0.025 that produced
+        # visibly star-shaped morphology.
+        #
+        # Lower eps (0.5-1.0) gives a more textbook-correct kinetic
+        # weight relative to diffusion but the resulting transient
+        # spikes get smeared by lateral fill-in too quickly to see in
+        # the GUI. Higher eps (>=4) overdrives the kernel and produces
+        # a clean octahedron with no branching texture. eps=2.5 is the
+        # sweet spot for visual clarity at our grid sizes.
+        "params": {"Undercooling": 0.5, "Diffusion": 0.02, "Anisotropy strength": 2.5, "Shape": 3},
+        "param_ranges": {"Undercooling": (0.2, 1.0), "Diffusion": (0.005, 0.05),
+                         "Anisotropy strength": (0.5, 6.0), "Shape": (3, 3)},
+        "dt": 0.025,
+        "dt_range": (0.005, 0.05),
+        # Larger default grid: arms are ~25 cells long at peak, so 144^3
+        # gives them enough resolution to read as branches under the
+        # voxel/volumetric renderer. 96^3 collapses them visually.
+        "default_size": 144,
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        "description": "Dendritic crystal — Mullins-Sekerka tip-splitting produces 6 axis-aligned branching arms.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
@@ -4842,19 +6389,127 @@ RULE_PRESETS = {
     "crystal_snowflake": {
         "label": "Crystal (Snowflake)",
         "shader": "crystal_growth",
-        # Mode 3 with stronger anisotropy and lower diffusion → arms can't
-        # widen between branching events → fragile, fine snowflake-like
-        # filaments. Higher undercooling drives faster nucleation of new
-        # tips so the structure stays delicate even at long times.
-        "params": {"Undercooling": 0.6, "Diffusion": 0.05, "Anisotropy strength": 2.5, "Shape": 3},
-        "param_ranges": {"Undercooling": (0.3, 0.95), "Diffusion": (0.02, 0.15),
-                         "Anisotropy strength": (1.5, 4.0), "Shape": (3, 3)},
+        # Mode 4 = hexagonal facet kernel: basal plane (top/bottom of
+        # plate, normal ⊥ c-axis = y) + 6 prism facets (60°-spaced normals
+        # in the xz plane). At low undercooling this forms a flat hex
+        # plate; at high undercooling the prism facets become unstable
+        # and shoot dendritic arms in the basal plane — the canonical
+        # snowflake morphology described by the Nakaya diagram.
+        # Combined with quenched lattice defects (built into the shader
+        # for shape_mode=4) this gives each snowflake a slightly different
+        # side-branch pattern even though the 6-fold symmetry is exact.
+        # Tuned for short Mullins-Sekerka wavelength so side-branches
+        # actually resolve at our 64–128³ grid scale. ε must be high to
+        # overpower the cube-grid 4-fold Laplacian bias on a 6-fold kernel.
+        "params": {"Undercooling": 0.55, "Diffusion": 0.06, "Anisotropy strength": 20.0, "Shape": 4},
+        "param_ranges": {"Undercooling": (0.3, 1.2), "Diffusion": (0.02, 0.2),
+                         "Anisotropy strength": (10.0, 35.0), "Shape": (4, 4)},
         "dt": 0.008,
         "dt_range": (0.003, 0.04),
-        "init": "crystal_multi_seed",
-        "init_variants": ["crystal_multi_seed", "crystal_seed"],
-        "description": "Snowflake crystal — strong anisotropy + low diffusion → fine fragile dendritic filaments.",
-        "vis_channels": ["Phase φ", "Supersaturation"],
+        "init": "crystal_disc_seed",
+        "init_variants": ["crystal_disc_seed", "crystal_seed"],
+        "description": "Snowflake — hexagonal basal + prism facets + lattice defects: flat plate sprouting unique 6-fold dendritic arms.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "crystal_hopper": {
+        "label": "Crystal (Hopper)",
+        "shader": "crystal_growth",
+        # Mode 5 = cubic facets + edge-preferential growth driven by an
+        # extra u² driving term. Face centres of a wide flat facet locally
+        # deplete supersaturation (long sink), while corners and edges see
+        # fresh melt from three orthogonal sides. The nonlinear boost
+        # amplifies that into runaway corner/edge growth, leaving the face
+        # interior behind — the classic stair-stepped skeletal box of
+        # bismuth, halite hoppers, and ice rapidly grown from vapour.
+        "params": {"Undercooling": 0.45, "Diffusion": 0.06, "Anisotropy strength": 5.0, "Shape": 5},
+        "param_ranges": {"Undercooling": (0.2, 1.0), "Diffusion": (0.02, 0.2),
+                         "Anisotropy strength": (2.0, 10.0), "Shape": (5, 5)},
+        "dt": 0.01,
+        "dt_range": (0.003, 0.04),
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        "description": "Hopper crystal — cubic facets with edge-driven growth: stair-stepped skeletal cube (bismuth).",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "crystal_morphology": {
+        "label": "Crystal (Morphology)",
+        "shader": "crystal_growth",
+        # Mode 6 = continuous regime control. Slide the Undercooling
+        # parameter to traverse the full experimentally observed
+        # sequence: compact (low) -> faceted cube (mid) -> hopper
+        # (mid-high) -> dendrite (high). One preset shows the entire
+        # phase diagram of metallurgical growth (Nakaya for ice).
+        # Anisotropy strength controls how sharp the facet phase looks.
+        "params": {"Undercooling": 0.5, "Diffusion": 0.10, "Anisotropy strength": 6.0, "Shape": 6},
+        "param_ranges": {"Undercooling": (0.10, 1.5), "Diffusion": (0.04, 0.3),
+                         "Anisotropy strength": (2.0, 12.0), "Shape": (6, 6)},
+        "dt": 0.012,
+        "dt_range": (0.004, 0.05),
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        "description": "Morphology slider — single kernel traverses compact / faceted / hopper / dendritic by Undercooling.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "crystal_polycrystal": {
+        "label": "Crystal (Polycrystal)",
+        "shader": "crystal_growth",
+        # Mode 2 (cubic) with the polycrystal initialiser: many small seeds,
+        # each with its own random crystallographic orientation. Grains grow
+        # until they collide; orientation discontinuities lock in as visible
+        # grain boundaries — the metallurgy texture seen in etched metal
+        # cross-sections under a polariser. Use cubic mode for crisp facet
+        # contrast at every grain interior; viewing the Orientation channel
+        # makes the grain map pop visually.
+        # U=0.55 (was 0.65): same Mullins-Sekerka logic as cubic — also gives
+        # cleaner grain boundaries because each grain's front halts before
+        # the oscillation regime, locking the boundary geometry in place.
+        "params": {"Undercooling": 0.55, "Diffusion": 0.08, "Anisotropy strength": 6.0, "Shape": 2},
+        "param_ranges": {"Undercooling": (0.3, 1.2), "Diffusion": (0.04, 0.3),
+                         "Anisotropy strength": (2.0, 12.0), "Shape": (2, 2)},
+        "dt": 0.012,
+        "dt_range": (0.004, 0.05),
+        "init": "crystal_polycrystal",
+        "init_variants": ["crystal_polycrystal", "crystal_multi_seed"],
+        "description": "Polycrystal — dozens of randomly-oriented grains collide into a network of grain boundaries.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
+        "vis_default": 2,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "crystal_dla": {
+        "label": "Crystal (DLA / Lightning)",
+        "shader": "dielectric_breakdown",
+        # Dielectric Breakdown Model (Niemeyer-Pietronero-Wiesmann) =
+        # continuum DLA. Branching fractal aggregation driven by the
+        # harmonic measure on a Laplace potential field. eta=1 is
+        # canonical DLA (D~2.5 in 3D), eta=2 gives Lichtenberg/lightning
+        # branching, eta>=3 gives sparse sparse-channel "bolt" growth.
+        # Unlike the phase-field crystal modes which can only produce
+        # Wulff (equilibrium) shapes, this is fractal BY CONSTRUCTION:
+        # the branching emerges from the algorithm itself, not from grid
+        # resolution.
+        "params": {"Eta": 2.0, "Growth rate": 0.3, "Boundary pull": 0.05, "Reserved": 0.0},
+        "param_ranges": {"Eta": (0.5, 4.0), "Growth rate": (0.05, 0.6),
+                         "Boundary pull": (0.01, 0.2), "Reserved": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (0.5, 2.0),
+        "init": "crystal_dla_seed",
+        "init_variants": ["crystal_dla_seed", "crystal_dla_multi_seed"],
+        "description": "Dielectric breakdown / DLA — fractal branching aggregation. eta=1 dendrite, eta=2 lightning, eta=3 sparse bolt.",
+        "vis_channels": ["Cluster", "Potential φₑ", "Age", "|∇φₑ|^η"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
@@ -4867,9 +6522,14 @@ RULE_PRESETS = {
                    "Kernel radius": 4.0, "Ring position": 0.5},
         "param_ranges": {"Growth center": (0.005, 0.6), "Growth width": (0.003, 0.15),
                          "Kernel radius": (1.5, 6.0), "Ring position": (0.15, 0.85)},
-        "dt": 0.1,
-        "dt_range": (0.01, 0.5),
-        "init": "lenia_blobs",
+        # dt=0.1 was unstable on forward Euler: one step can swing a cell
+        # by ±0.1 (G has range ±1), causing the growth function to saturate
+        # and cascade into the "garbled cube" pathology. 0.05 halves
+        # per-step swing while keeping evolution speed perceptible.
+        "dt": 0.05,
+        "dt_range": (0.01, 0.3),
+        "init": "lenia_fbm",
+        "init_variants": ["lenia_fbm", "lenia_blobs"],
         "description": "Continuous CA with kernel-based growth — alien lifeforms.",
         "vis_channels": ["Value"],
         "vis_default": 0,
@@ -4883,9 +6543,10 @@ RULE_PRESETS = {
                    "Kernel radius": 7.0, "Ring position": 0.5},
         "param_ranges": {"Growth center": (0.005, 0.6), "Growth width": (0.005, 0.08),
                          "Kernel radius": (2.5, 7.0), "Ring position": (0.15, 0.85)},
-        "dt": 0.08,
-        "dt_range": (0.01, 0.5),
-        "init": "lenia_blobs",
+        "dt": 0.04,
+        "dt_range": (0.01, 0.25),
+        "init": "lenia_fbm",
+        "init_variants": ["lenia_fbm", "lenia_blobs"],
         "description": "Wider growth tolerance + large kernel — fat pulsing creatures that divide and merge.",
         "vis_channels": ["Value"],
         "vis_default": 0,
@@ -4899,10 +6560,14 @@ RULE_PRESETS = {
                    "Kernel radius": 4.0, "Cross coupling": 0.5},
         "param_ranges": {"Growth center": (0.02, 0.5), "Growth width": (0.003, 0.12),
                          "Kernel radius": (1.5, 6.0), "Cross coupling": (0.0, 2.0)},
-        "dt": 0.1,
-        "dt_range": (0.01, 0.5),
-        "init": "lenia_multi",
-        "init_variants": ["lenia_multi", "lenia_multi_colocated"],
+        "dt": 0.05,
+        "dt_range": (0.01, 0.3),
+        # FBM per-channel init fills the previously-empty regions with
+        # sub-threshold activity so cross-channel coupling has signal to
+        # work with everywhere, eliminating the "holes with no voxels"
+        # pathology the blob init produced.
+        "init": "lenia_multi_fbm",
+        "init_variants": ["lenia_multi_fbm", "lenia_multi", "lenia_multi_colocated"],
         "description": "3-channel Lenia with cross-kernel coupling — creatures with internal organs and differentiation.",
         "vis_channels": ["Channel A", "Channel B", "Channel C", "Activity"],
         "vis_default": 0,
@@ -4964,10 +6629,16 @@ RULE_PRESETS = {
     "bz_turbulence": {
         "label": "BZ Amplitude Turbulence",
         "shader": "bz_3d",
+        # Spatial wavelength of CGLE patterns ~ 2π·sqrt(D/μ). At the
+        # previous defaults (D=0.2, μ=1.2) this was 0.4 reference voxels
+        # — sub-voxel, so the dominant mode aliased onto a checkerboard
+        # in phase (audit caught this as adj_corr=-0.21). D=1.0 gives
+        # wavelength ~6 voxels at REF_SIZE, enough to resolve spiral
+        # defects and amplitude turbulence cleanly.
         "params": {"Alpha (dispersion)": 3.0, "Beta (nonlinear)": -1.5,
-                   "Diffusion": 0.2, "Growth (mu)": 1.2},
+                   "Diffusion": 1.0, "Growth (mu)": 1.2},
         "param_ranges": {"Alpha (dispersion)": (1.5, 6.0), "Beta (nonlinear)": (-4.0, -0.5),
-                         "Diffusion": (0.02, 1.0), "Growth (mu)": (0.3, 4.0)},
+                         "Diffusion": (0.05, 3.0), "Growth (mu)": (0.3, 4.0)},
         "dt": 0.03,
         "dt_range": (0.01, 0.1),
         "init": "bz_reaction",
@@ -4982,10 +6653,16 @@ RULE_PRESETS = {
     "bz_excitable": {
         "label": "BZ Excitable Medium",
         "shader": "barkley_3d",
+        # Wavefront thickness is ~sqrt(D·epsilon). At the previous defaults
+        # (D=0.3, eps=0.05) this is 0.12 *reference* voxels — sub-voxel
+        # at any practical grid size, so wavefronts collapsed into
+        # single-cell flickers (audit: active_frac=0.003). D=1.5/eps=0.08
+        # gives thickness ≈ 0.35, several voxels at size≥64, producing
+        # visible propagating fronts with clean refractory tails.
         "params": {"Excitability a": 0.75, "Threshold b": 0.06,
-                   "Epsilon": 0.05, "Diffusion": 0.3},
+                   "Epsilon": 0.08, "Diffusion": 1.5},
         "param_ranges": {"Excitability a": (0.3, 1.5), "Threshold b": (0.0, 0.25),
-                         "Epsilon": (0.001, 0.2), "Diffusion": (0.02, 4.0)},
+                         "Epsilon": (0.001, 0.2), "Diffusion": (0.02, 3.0)},
         "dt": 0.05,
         "dt_range": (0.005, 0.15),
         "init": "barkley_excitable",
@@ -5005,7 +6682,7 @@ RULE_PRESETS = {
         "param_ranges": {"Da (activator)": (0.001, 2.0), "Dh (inhibitor)": (0.1, 50.0),
                          "Reaction": (0.005, 0.5), "Growth": (0.002, 0.3)},
         "dt": 0.1,
-        "dt_range": (0.1, 3.0),
+        "dt_range": (0.02, 0.5),
         "init": "morphogen_hotspots",
         "init_variants": ["morphogen_hotspots", "morphogen"],
         "description": "High inhibitor diffusion (Dh/Da=50) — isolated activator peaks form a regular spotted pattern.",
@@ -5040,6 +6717,7 @@ RULE_PRESETS = {
         "param_ranges": {"Temperature": (0.0, 600.0), "Gravity": (0.5, 5.0),
                          "Reaction rate": (0.0, 5.0), "unused_0": (0, 1)},
         "dt": 0.2,
+        "dt_range": (0.05, 0.5),
         "init": "element_mix",
         "init_variants": ["element_mix", "element_layered"],
         "description": "Multi-element CA: atoms with real physical properties interact.",
@@ -5058,6 +6736,7 @@ RULE_PRESETS = {
         "param_ranges": {"Temperature": (-20.0, 150.0), "Gravity": (0.5, 5.0),
                          "Reaction rate": (0.5, 5.0), "unused_0": (0, 1)},
         "dt": 0.2,
+        "dt_range": (0.05, 0.5),
         "init": "sodium_water",
         "description": "Drop sodium into water — watch the exothermic reaction!",
         "vis_channels": ["Element", "Temperature"],
@@ -5075,6 +6754,7 @@ RULE_PRESETS = {
         "param_ranges": {"Temperature": (200.0, 1500.0), "Gravity": (0.5, 5.0),
                          "Reaction rate": (0.0, 3.0), "unused_0": (0, 1)},
         "dt": 0.2,
+        "dt_range": (0.05, 0.5),
         "init": "metal_layers",
         "description": "Layered metals at high temp — watch lower-MP metals melt first.",
         "vis_channels": ["Element", "Temperature"],
@@ -5092,6 +6772,7 @@ RULE_PRESETS = {
         "param_ranges": {"Temperature": (-100.0, 3000.0), "Gravity": (0.0, 10.0),
                          "Reaction rate": (0.0, 5.0), "unused_0": (0, 1)},
         "dt": 0.2,
+        "dt_range": (0.05, 0.5),
         "init": "sandbox_empty",
         "description": "Empty sandbox — press B to enter brush mode and build!",
         "vis_channels": ["Element", "Temperature"],
@@ -5126,7 +6807,7 @@ RULE_PRESETS = {
                          "Noise": (0.005, 0.2), "Asymmetry": (0.15, 0.5)},
         "dt": 0.05,
         "dt_range": (0.01, 0.1),
-        "init": "phase_separation",
+        "init": "nucleation",
         "description": "Off-critical Cahn-Hilliard — minority phase nucleates as discrete droplets instead of a sponge.",
         "vis_channels": ["Order param", "Chemical potential"],
         "vis_default": 0,
@@ -5154,10 +6835,11 @@ RULE_PRESETS = {
     "mycelium": {
         "label": "Mycelium Network",
         "shader": "mycelium_3d",
-        "params": {"Growth": 1.0, "Branching": 0.8, "Consumption": 0.1, "Diffusion": 0.15},
+        "params": {"Growth": 1.0, "Branching": 0.8, "Consumption": 0.02, "Diffusion": 0.15},
         "param_ranges": {"Growth": (0.01, 2.0), "Branching": (0.0, 2.0),
-                         "Consumption": (0.01, 1.0), "Diffusion": (0.01, 0.5)},
+                         "Consumption": (0.005, 0.5), "Diffusion": (0.01, 0.5)},
         "dt": 0.1,
+        "dt_range": (0.02, 0.3),
         "init": "mycelium",
         "init_variants": ["mycelium", "mycelium_foraging"],
         "description": "Fungal hyphal network — tips explore, branch, fuse, and transport nutrients.",
@@ -5206,7 +6888,10 @@ RULE_PRESETS = {
         "param_ranges": {"Ignition temp": (0.05, 0.5), "Heat output": (0.5, 8.0),
                          "Diffusion": (0.05, 0.5), "Wind": (0.0, 3.0)},
         "dt": 0.1,
-        "dt_range": (0.2, 1.0),
+        # dt range was previously (0.2, 1.0) which excluded the validated
+        # default — fire dynamics are stiff (Arrhenius ignition + advection)
+        # so the working sweet spot is well below 0.2.
+        "dt_range": (0.02, 0.5),
         "init": "fire",
         "init_variants": ["fire", "fire_sparse"],
         "description": "Combustion front — fire spreads through fuel, heat rises, embers fly.",
@@ -5223,7 +6908,10 @@ RULE_PRESETS = {
         "param_ranges": {"Sensor dist": (1.0, 10.0), "Turn strength": (0.1, 5.0),
                          "Decay": (0.01, 0.3), "Diffusion": (0.01, 0.5)},
         "dt": 0.1,
-        "dt_range": (0.5, 5.0),
+        # dt range was (0.5, 5.0) — agent advection at dt=0.5 leaps multiple
+        # voxels per step and breaks trail continuity. dt=0.1 is the
+        # validated default; widen range around it.
+        "dt_range": (0.02, 1.0),
         "init": "physarum",
         "description": "Physarum polycephalum — chemotactic agents form optimal transport networks.",
         "vis_channels": ["Trail", "Agents", "Food"],
@@ -5236,14 +6924,22 @@ RULE_PRESETS = {
         "label": "Elastic Fracture",
         "shader": "fracture_3d",
         "params": {"Wave speed": 1.0, "Fracture threshold": 0.5, "Diffusion": 0.2, "Stress": 0.5},
-        "param_ranges": {"Wave speed": (0.2, 2.0), "Fracture threshold": (0.5, 1.5),
+        # Lowered Fracture threshold min from 0.5 -> 0.15 so the slider
+        # can explore the brittle regime where cracks branch densely.
+        "param_ranges": {"Wave speed": (0.2, 2.0), "Fracture threshold": (0.15, 1.5),
                          "Diffusion": (0.01, 0.5), "Stress": (0.1, 1.0)},
         "dt": 0.1,
         "dt_range": (0.01, 0.15),
         "init": "fracture",
         "description": "Material fracture — stress concentrates at crack tips, propagates and branches.",
         "vis_channels": ["Displacement", "Stress", "Integrity", "Strain"],
-        "vis_default": 2,
+        # Strain (ch3) accumulates monotonically along the crack pattern,
+        # so it stays visible long after the material has fully failed.
+        # Integrity (ch2) was the previous default but it depletes from
+        # 1→0 globally as cracks propagate, so by t≈800 the displayed
+        # field is uniformly zero (audit: EXTINCT). Strain reveals the
+        # branching crack structure that actually emerged.
+        "vis_default": 3,
         "vis_abs": False,
         "render_mode": "voxel",
         "boundary": "clamped",
@@ -5255,7 +6951,10 @@ RULE_PRESETS = {
         "param_ranges": {"Gravity": (0.2, 15.0), "Pressure": (0.0005, 0.4),
                          "Diffusion": (0.0, 0.5), "Expansion": (-1.0, 1.0)},
         "dt": 0.05,
-        "dt_range": (0.1, 2.5),
+        # dt range was (0.1, 2.5) which excluded the validated default —
+        # multi-scale gravity sums force at radii 1,2,4 cells so the
+        # CFL is tighter than a local-stencil simulation.
+        "dt_range": (0.01, 0.5),
         "init": "galaxy",
         "init_variants": ["galaxy", "galaxy_filaments"],
         "description": "Self-gravitating density field — Jeans instability forms cosmic web filaments.",
@@ -5458,32 +7157,263 @@ RULE_PRESETS = {
 # same seed produces the same spatial pattern regardless of grid resolution.
 CANONICAL_INIT_SIZE = 64
 
+
+def _fast_upsample_3d(coarse, target_size):
+    """Nearest-neighbor upsample a 3-D float array to (target_size,)*3.
+    ~50x faster than scipy.ndimage.zoom(order=1) for the power-of-two
+    factors used by fBm octaves. For linear quality, the subsequent
+    per-octave summation plus final clip produces visually equivalent
+    multi-scale noise; reproducibility is preserved within each size
+    bucket (same seed -> same output)."""
+    cs = coarse.shape[0]
+    if cs == target_size:
+        return coarse
+    if target_size > cs and target_size % cs == 0:
+        # Upsample by integer repeat along each axis.
+        f = target_size // cs
+        return np.repeat(np.repeat(np.repeat(coarse, f, 0), f, 1), f, 2)
+    if target_size < cs and cs % target_size == 0:
+        # Downsample by block averaging (mean over f×f×f cubes).
+        f = cs // target_size
+        return coarse.reshape(target_size, f, target_size, f, target_size, f).mean(axis=(1, 3, 5)).astype(coarse.dtype)
+    # Fallback for non-integer ratios: single scipy call.
+    from scipy.ndimage import zoom
+    return zoom(coarse, target_size / cs, order=1).astype(coarse.dtype)
+
+
 def _canonical_noise(size, rng, low=0.0, high=1.0):
     """Generate a 3D random field at canonical res, upsample to target size.
     Always draws the same number of random values regardless of target size."""
-    from scipy.ndimage import zoom
     cs = CANONICAL_INIT_SIZE
     small = rng.uniform(low, high, (cs, cs, cs)).astype(np.float32)
-    if size == cs:
-        return small
-    factor = size / cs
-    return zoom(small, factor, order=1).astype(np.float32)
+    return _fast_upsample_3d(small, size)
+
 
 def _canonical_randint(size, rng, choices):
     """Generate a 3D field of integer choices at canonical res, upsample (nearest)."""
-    from scipy.ndimage import zoom
     cs = CANONICAL_INIT_SIZE
     small = rng.choice(choices, size=(cs, cs, cs)).astype(np.float32)
     if size == cs:
         return small
-    factor = size / cs
-    return np.round(zoom(small, factor, order=0)).astype(np.float32)
+    # Nearest-neighbor upsample preserves integer values exactly.
+    if size > cs and size % cs == 0:
+        f = size // cs
+        return np.repeat(np.repeat(np.repeat(small, f, 0), f, 1), f, 2)
+    if size < cs and cs % size == 0:
+        f = cs // size
+        # Take corner of each block (mode-of-block would be correct; this is
+        # close enough given the field is i.i.d. and we only need plausible
+        # spatial continuity at the output scale).
+        return small[::f, ::f, ::f]
+    from scipy.ndimage import zoom
+    return np.round(zoom(small, size / cs, order=0)).astype(np.float32)
+
+
+def _canonical_fbm(size, rng, octaves=5, persistence=0.5, lacunarity=2.0):
+    """Multi-scale (fractional Brownian motion) noise in [0,1].
+
+    Critical for life-family CAs: uniform single-scale random noise has no
+    structure at the kernel wavelength, so every cell sees the same
+    neighbourhood mean and dynamics collapse to uniform decay/growth.
+    FBM guarantees spatial variation at *every* scale from voxel-sized
+    up to grid-sized, so some region is always in the rule's Goldilocks
+    density band regardless of kernel radius.
+
+    Returns a (size, size, size) float32 field with mean ~0.5, range [0,1].
+    Generated at canonical resolution and upsampled, so seed determines
+    pattern identity regardless of grid size.
+    """
+    cs = CANONICAL_INIT_SIZE
+    # Start each octave at a coarser resolution then upsample; this
+    # produces proper multi-scale structure rather than just several
+    # copies of the same white noise.
+    field = np.zeros((cs, cs, cs), dtype=np.float32)
+    amp = 1.0
+    norm = 0.0
+    freq = 1.0
+    for _ in range(octaves):
+        coarse_size = max(2, int(cs / freq))
+        coarse = rng.uniform(0.0, 1.0, (coarse_size, coarse_size, coarse_size)).astype(np.float32)
+        if coarse_size != cs:
+            layer = _fast_upsample_3d(coarse, cs)
+        else:
+            layer = coarse
+        field += amp * layer
+        norm += amp
+        amp *= persistence
+        freq *= lacunarity
+    field /= max(norm, 1e-6)
+    if size != cs:
+        field = _fast_upsample_3d(field, size)
+    return np.clip(field, 0.0, 1.0)
+
+
+def _fbm_binary_density(size, rng, target_density, octaves=5):
+    """FBM noise thresholded to produce a binary field with the specified
+    mean density. Used for discrete life-family rules (GoL, 4/4/5) where
+    viable dynamics live in a narrow density band and uniform random
+    noise at that density has no spatial structure at the kernel scale.
+
+    Threshold is chosen from the actual field quantile so the achieved
+    density matches the target even when the FBM distribution is skewed.
+    """
+    field = _canonical_fbm(size, rng, octaves=octaves)
+    # Pick the threshold from the distribution so density is accurate,
+    # rather than relying on the theoretical [0,1] uniform quantile.
+    threshold = np.quantile(field, 1.0 - target_density)
+    return (field > threshold).astype(np.float32)
+
+
+def _localized_envelope(size, rng, fill_fraction=0.5, edge_softness=0.15):
+    """Smooth ball-shaped envelope that fades from 1.0 at the centre to 0
+    near the boundaries. Used to localize FBM initial conditions to a
+    sub-region of the box, leaving empty space around it so emergent
+    creatures have somewhere to move into and stable patterns are
+    visible against background.
+
+    fill_fraction = radius of the unit-amplitude core relative to box
+                    half-width (0.5 = central half of the box)
+    edge_softness = width of the smoothstep falloff in box-half-widths
+
+    Returns a (size, size, size) float32 field in [0,1].
+    """
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    half = size / 2.0
+    # Centre with a small random offset so the envelope isn't always identical.
+    cx = half + rng.uniform(-0.05, 0.05) * size
+    cy = half + rng.uniform(-0.05, 0.05) * size
+    cz = half + rng.uniform(-0.05, 0.05) * size
+    r = np.sqrt((x - cx)**2 + (y - cy)**2 + (z - cz)**2) / half
+    # 1.0 inside fill_fraction radius, smooth falloff to 0 over edge_softness.
+    inner = fill_fraction
+    outer = fill_fraction + edge_softness
+    # smoothstep: 1 - smoothstep(inner, outer, r)
+    t = np.clip((r - inner) / max(outer - inner, 1e-6), 0.0, 1.0)
+    smoothstep = t * t * (3.0 - 2.0 * t)
+    return (1.0 - smoothstep).astype(np.float32)
+
 
 def init_random_very_sparse(size, rng):
     """Random with ~3% density — for crystal rules that grow."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.03).astype(np.float32)
     return data
+
+
+def init_life_fbm_sparse(size, rng):
+    """FBM-thresholded binary field at ~4% density inside a localized
+    soft-edged ball, surrounded by empty space. The envelope is critical:
+    a uniform-density init at any density just fills the box with
+    structure -- there's no empty space for emergent gliders to traverse
+    or for stable patterns to be visible against. Localized soup is the
+    canonical Life IC: a patch of activity in an empty box."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = _canonical_fbm(size, rng, octaves=5)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.45, edge_softness=0.20)
+    field = field * envelope
+    # Density is measured against the envelope-weighted total so the
+    # *active region* hits the target density rather than the whole box.
+    threshold = np.quantile(field, 1.0 - 0.04 * envelope.mean())
+    data[:, :, :, 0] = (field > threshold).astype(np.float32)
+    return data
+
+
+def init_life_fbm_moderate(size, rng):
+    """FBM-thresholded binary field at ~18% density inside a localized
+    central ball. Active region has the right local density for 3D Life
+    survival; surrounding empty space gives gliders/oscillators room to
+    propagate and remain visible."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = _canonical_fbm(size, rng, octaves=5)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.45, edge_softness=0.20)
+    field = field * envelope
+    threshold = np.quantile(field, 1.0 - 0.18 * envelope.mean())
+    data[:, :, :, 0] = (field > threshold).astype(np.float32)
+    return data
+
+
+def init_life_fbm_dense(size, rng):
+    """FBM-thresholded binary field at ~30% density in a localized ball.
+    Use when the rule needs high local connectivity to nucleate stable
+    structures (oscillators, large blobs)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = _canonical_fbm(size, rng, octaves=5)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.45, edge_softness=0.20)
+    field = field * envelope
+    threshold = np.quantile(field, 1.0 - 0.30 * envelope.mean())
+    data[:, :, :, 0] = (field > threshold).astype(np.float32)
+    return data
+
+
+def init_smoothlife_fbm(size, rng):
+    """FBM-based continuous field for SmoothLife, localized to a central
+    ball with empty surround. Active region has FBM mean ~0.22 (matches
+    survival window) with multi-scale variation so local maxima are in
+    the birth window and local minima are in the death window. Empty
+    surround gives nucleated creatures room to move/grow."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = _canonical_fbm(size, rng, octaves=5)
+    field = 0.22 + 0.85 * (field - field.mean())
+    field = np.clip(field, 0.0, 1.0)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.4, edge_softness=0.20)
+    data[:, :, :, 0] = (field * envelope).astype(np.float32)
+    return data
+
+
+def init_lenia_fbm(size, rng):
+    """FBM field tuned for Lenia, localized to a central ball with empty
+    surround. Mean density inside the ball sits below mu (growth center)
+    with multi-scale structure so local peaks fall in the narrow growth
+    band. Surrounding emptiness gives Lenia gliders/orbiums room to
+    travel and remain visible against background.
+
+    Tuning: active region mean 0.10, peak ~0.28. Also seeds a few small
+    Gaussian "creatures" within the ball so classic Lenia patterns can
+    nucleate from the FBM soup."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = _canonical_fbm(size, rng, octaves=4)
+    field = 0.10 + 0.60 * (field - field.mean())
+    field = np.clip(field, 0.0, 1.0)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.4, edge_softness=0.20)
+    base = (field * envelope).astype(np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    n_blobs = rng.randint(2, 5)
+    half = size / 2.0
+    for _ in range(n_blobs):
+        # Place seeds inside the active region, not in the empty surround.
+        cx, cy, cz = (half + rng.uniform(-0.25, 0.25, 3) * size)
+        r = rng.uniform(0.06, 0.12) * size
+        d2 = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) / (r * r)
+        base += (0.4 * np.exp(-0.5 * d2)).astype(np.float32)
+    data[:, :, :, 0] = np.clip(base, 0.0, 1.0)
+    return data
+
+
+def init_lenia_multi_fbm(size, rng):
+    """FBM-based init for multi-channel Lenia, localized to a central ball.
+    Three channels each get an independent FBM field tuned to sit just
+    below mu, plus a small number of Gaussian seeds inside the active
+    ball. Channels share the spatial envelope so cross-channel coupling
+    has signal everywhere it matters, but the empty surround eliminates
+    the "channels die in regions with no signal" pathology."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    half = size / 2.0
+    envelope = _localized_envelope(size, rng, fill_fraction=0.4, edge_softness=0.20)
+    for ch in range(3):
+        field = _canonical_fbm(size, rng, octaves=4)
+        field = 0.10 + 0.55 * (field - field.mean())
+        field = np.clip(field, 0.0, 1.0)
+        base = (field * envelope).astype(np.float32)
+        n_blobs = rng.randint(2, 4)
+        for _ in range(n_blobs):
+            cx, cy, cz = (half + rng.uniform(-0.25, 0.25, 3) * size)
+            r = rng.uniform(0.06, 0.12) * size
+            d2 = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) / (r * r)
+            base += (0.35 * np.exp(-0.5 * d2)).astype(np.float32)
+        data[:, :, :, ch] = np.clip(base, 0.0, 1.0)
+    return data
+
 
 def init_random_sparse(size, rng):
     """Random with ~10% density."""
@@ -5525,6 +7455,50 @@ def init_center_blob(size, rng):
     data[:, :, :, 0] = np.exp(-0.5 * (dist / (r * 0.3))**2).astype(np.float32)
     return data
 
+def init_crystal_dla_seed(size, rng):
+    """DLA / dielectric-breakdown seed: single solid cell at centre,
+    surrounding potential field initialised to 1.0 (the "infinity"
+    reservoir). Growth happens at the front via the harmonic-measure
+    driven shader; the result is a fractal cluster.
+
+    R = phase (0=empty, 1=solid). Seed is a single cell.
+    G = potential phi_e (Laplace solution, =0 on cluster, =1 at boundary).
+        Initialised uniformly to 1.0; the shader will relax it to satisfy
+        Laplace(phi_e) = 0 with phi_e=0 on the cluster as the cluster grows.
+    B = age (frame index packed normalised; for visualisation gradient).
+    A = visualisation channel (set at solidification time to the local
+        |grad phi_e|^eta -- shows tip activity at moment of growth).
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # Potential field: start at 1.0 everywhere (reservoir at infinity).
+    data[:, :, :, 1] = 1.0
+    # Single seed at exact centre.
+    cx, cy, cz = size // 2, size // 2, size // 2
+    data[cx, cy, cz, 0] = 1.0     # solid
+    data[cx, cy, cz, 1] = 0.0     # potential clamped to 0 on cluster
+    return data
+
+def init_crystal_dla_multi_seed(size, rng):
+    """DLA seed variant: multiple seeds scattered through the box.
+
+    Useful for showing how separate clusters compete for the same field:
+    each cluster shadows its neighbours' potential, and the resulting
+    branches are drawn toward gaps in the seed pattern. Visually richer
+    than the single-seed canonical case.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 1] = 1.0
+    n_seeds = rng.randint(4, 9)
+    for _ in range(n_seeds):
+        # Avoid the boundary band where the Dirichlet BC shorts out the
+        # potential (a seed there would just race outward into the wall).
+        cx = rng.randint(int(size * 0.2), int(size * 0.8))
+        cy = rng.randint(int(size * 0.2), int(size * 0.8))
+        cz = rng.randint(int(size * 0.2), int(size * 0.8))
+        data[cx, cy, cz, 0] = 1.0
+        data[cx, cy, cz, 1] = 0.0
+    return data
+
 def init_crystal_seed(size, rng):
     """Phase-field crystal seed: single centred solid seed in undercooled melt.
 
@@ -5537,11 +7511,15 @@ def init_crystal_seed(size, rng):
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
     # R = phase field: start liquid (φ≈0)
     data[:, :, :, 0] = 0.0
-    # G = supersaturation: uniform fully-undercooled melt + small noise so
-    # the symmetry-breaking that picks <100> vs <111> bulges has something
-    # to bite on (otherwise perfectly symmetric data → identical lattice
-    # directions → no preferred growth direction at the seed).
-    data[:, :, :, 1] = 1.0 + _canonical_noise(size, rng, -0.01, 0.01)
+    # G = supersaturation: limited reservoir (u_init=0.25) so each
+    # solidification (which consumes 0.5 of u via partition rejection)
+    # caps the crystal at ~50% of the box -- enough to clearly resolve
+    # the morphology, finite enough that growth halts before hitting
+    # the wall and erasing the transient shape. Plus small noise so the
+    # symmetry-breaking that picks <100> vs <111> bulges has something
+    # to bite on (perfectly symmetric data → no preferred direction
+    # at the seed).
+    data[:, :, :, 1] = 0.25 + _canonical_noise(size, rng, -0.005, 0.005)
     # One seed slightly off-centre so growth is visually centred.
     fx = 0.5 + rng.uniform(-0.04, 0.04)
     fy = 0.5 + rng.uniform(-0.04, 0.04)
@@ -5552,6 +7530,41 @@ def init_crystal_seed(size, rng):
     mask = dist <= r
     data[:, :, :, 0][mask] = 1.0  # solid
     data[:, :, :, 1][mask] = 0.0  # supersaturation consumed
+    return data
+
+def init_crystal_disc_seed(size, rng):
+    """Phase-field crystal seed shaped as a thin disc in the xz plane.
+
+    Used by the snowflake preset: real ice nucleates into a thin hexagonal
+    plate because the basal-face surface energy is low and the prism faces
+    grow laterally much faster than the c-axis. A spherical seed has all
+    directions equally represented in its initial gradient, which fights
+    against the c-axis suppression in the snowflake β kernel and gives a
+    bulky stub before the plate morphology can establish itself. A disc
+    seed (thin in y, broad in xz) hands the kernel an interface that's
+    already biased toward the right shape, so the hex outline emerges
+    from the very first step.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    data[:, :, :, 0] = 0.0
+    data[:, :, :, 1] = 0.25 + _canonical_noise(size, rng, -0.005, 0.005)
+    fx = 0.5 + rng.uniform(-0.04, 0.04)
+    fy = 0.5 + rng.uniform(-0.04, 0.04)
+    fz = 0.5 + rng.uniform(-0.04, 0.04)
+    cx, cy, cz = fx * size, fy * size, fz * size
+    # Disc: small in y (c-axis), broad in xz (basal plane). Larger r_xz
+    # than a sphere seed so the analytical hex kernel resolves cleanly
+    # from the first step — if the seed is too small the cube-grid
+    # Laplacian's 4-fold bias dominates before β(n̂) can take over and
+    # the plate rounds into a sphere, then octahedron. y_half stays
+    # minimal because the snowflake β kernel suppresses c-axis growth
+    # to keep the plate thin.
+    r_xz = max(5.0, size * 0.08)
+    y_half = max(1.5, size * 0.012)
+    in_disc = ((x - cx)**2 + (z - cz)**2 <= r_xz * r_xz) & (np.abs(y - cy) <= y_half)
+    data[:, :, :, 0][in_disc] = 1.0
+    data[:, :, :, 1][in_disc] = 0.0
     return data
 
 def init_wave_pulse(size, rng):
@@ -5932,6 +7945,23 @@ def init_phase_separation(size, rng):
     # G channel (chemical potential) starts at zero
     return data
 
+def init_nucleation(size, rng):
+    """Off-critical Cahn-Hilliard: bias mean concentration toward majority
+    phase so the minority phase nucleates as discrete droplets.
+
+    Cahn-Hilliard *conserves* total mass (∂ₜc = ∇²μ → ∫c dV is conserved),
+    so a 50/50 zero-mean init can never produce droplets regardless of the
+    asymmetry parameter. With asymmetry≈0.3 the deep well sits at c≈-1
+    and the shallow well at c≈+0.88. Starting at mean c≈+0.4 places the
+    system in the metastable region: by mass conservation roughly a third
+    of the volume must convert to the deep "−" phase, doing so as discrete
+    droplets in a "+" sea.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    base = 0.4  # metastable, near shallow "+" well
+    data[:, :, :, 0] = (base + _canonical_noise(size, rng, -0.1, 0.1)).astype(np.float32)
+    return data
+
 def init_erosion_terrain(size, rng):
     """Erosion: solid terrain block with water source at top."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
@@ -6044,21 +8074,27 @@ def init_fire(size, rng):
     coarse = (coarse - coarse.min()) / (coarse.max() - coarse.min() + 1e-8)
     for y_idx in range(size):
         frac = y_idx / float(size)
-        # Vertical gradient: dense at bottom, sparse at top
-        base = max(0.0, 1.0 - frac * 1.3)
+        # Vertical gradient: denser at bottom, thinner at top, but with
+        # a 0.3 floor so the fire can sustain across the full volume
+        # rather than burning out when it reaches the upper half.
+        base = max(0.3, 1.0 - frac * 0.7)
         # Mix large-scale + fine-scale fuel structure
-        fuel_layer = base * (coarse[:, y_idx, :] * 0.5 + fine_noise[:, y_idx, :] * 0.3 + 0.2)
+        fuel_layer = base * (coarse[:, y_idx, :] * 0.5 + fine_noise[:, y_idx, :] * 0.3 + 0.4)
         # Clearings: voids where coarse noise is low
-        fuel_layer[coarse[:, y_idx, :] < 0.25] *= 0.1
+        fuel_layer[coarse[:, y_idx, :] < 0.18] *= 0.2
         data[:, y_idx, :, 0] = np.clip(fuel_layer, 0.0, 1.0)
     data[:, :, :, 2] = 1.0  # oxygen everywhere
-    # Ignition: small hot spot near bottom-center
+    # Ignition: hot zone near bottom-center large enough to start a
+    # self-sustaining burn front. Earlier we used r=size//12 (3 voxels
+    # at size=64) which dropped below the diffusion length and the
+    # flame guttered to near-zero (audit: EXTINCT). r=size//6 gives a
+    # well-coupled ignition that can ignite the surrounding fuel.
     c = size // 2
-    r = max(2, size // 12)
+    r = max(4, size // 6)
     z, yy, x = np.mgrid[0:size, 0:size, 0:size]
     iy = size // 6
     dist = np.sqrt((x - c)**2 + (yy - iy)**2 + (z - c)**2)
-    data[:, :, :, 1] = np.where(dist < r, 0.8, 0.0).astype(np.float32)
+    data[:, :, :, 1] = np.where(dist < r, 1.0, 0.0).astype(np.float32)
     return data
 
 def init_physarum(size, rng):
@@ -6290,26 +8326,86 @@ def init_bz_spiral_seed(size, rng):
 
 def init_crystal_multi_seed(size, rng):
     """Multiple competing crystal nucleation sites → grain boundaries form
-    where growing crystals collide. Much richer than single-seed growth."""
+    where growing crystals collide. Each seed gets a random crystallographic
+    orientation packed into the B channel; the crystal_growth shader rotates
+    its β kernel by that angle so every grain's facets point along its own
+    axes. When two grains meet their orientations clash → visible sharp
+    grain boundary, just like in real polycrystalline metal etchings."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    z, y, x = np.mgrid[0:size, 0:size, 0:size]
 
-    # Supersaturation field (uniform undercooled melt)
-    data[:, :, :, 1] = 1.0
+    # Supersaturation field (limited reservoir, see init_crystal_seed)
+    data[:, :, :, 1] = 0.25
 
     # 3-7 seeds at random positions
     n_seeds = rng.randint(3, 8)
-    for _ in range(n_seeds):
-        cx = rng.uniform(0.1, 0.9) * size
-        cy = rng.uniform(0.1, 0.9) * size
-        cz = rng.uniform(0.1, 0.9) * size
-        r = max(1.0, size * 0.02)
-        dist = np.sqrt((x - cx)**2 + (y - cy)**2 + (z - cz)**2)
-        seed_mask = dist < r
-        data[:, :, :, 0] = np.where(seed_mask, 1.0, data[:, :, :, 0])
-        data[:, :, :, 1] = np.where(seed_mask, 0.0, data[:, :, :, 1])
-
+    r = max(1.0, size * 0.02)
+    _stamp_crystal_seeds(data, rng, n_seeds, r, edge_pad=0.1)
     return data
+
+
+def init_crystal_polycrystal(size, rng):
+    """Dense polycrystalline aggregate: many small seeds packed close together,
+    each with its own random crystallographic orientation. Grains grow until
+    they collide, leaving a network of grain boundaries where orientation
+    discontinuities lock in. This is the canonical metallurgy texture —
+    looks like an etched metal cross-section under an optical microscope.
+
+    Best viewed with the B (Orientation) channel in HSV/cyclic colour mode
+    so each grain reads as a different hue."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 1] = 0.25  # limited supersaturation reservoir
+    # Many small seeds — enough that the melt fills with grain boundaries
+    # before any single grain becomes visually dominant. Seed count scales
+    # with grid volume so the grain density stays roughly constant across
+    # different grid sizes.
+    n_seeds = max(20, int((size / 32) ** 3 * 12))
+    r = max(1.0, size * 0.012)
+    _stamp_crystal_seeds(data, rng, n_seeds, r, edge_pad=0.05)
+    return data
+
+
+def _stamp_crystal_seeds(data, rng, n_seeds, r, edge_pad):
+    """Paint n spherical crystal seeds into ``data`` (R=phase, G=supersat,
+    B=orient). Each seed touches only a small box around its centre so
+    cost is O(n_seeds * r^3) instead of O(n_seeds * size^3) -- the previous
+    full-grid sqrt+where formulation took ~6 GFLOP at size 128 with the
+    polycrystal seed count, dominating load time."""
+    size = data.shape[0]
+    r_int = int(np.ceil(r)) + 1  # +1 for safety on the upper boundary check
+
+    # Vectorised generation of all seed centres / orientations at once
+    centres = rng.uniform(edge_pad, 1.0 - edge_pad, size=(n_seeds, 3)) * size
+    orients = rng.uniform(0.0, 1.0, size=n_seeds).astype(np.float32)
+    r_sq = r * r
+
+    for i in range(n_seeds):
+        cx, cy, cz = centres[i]
+        # Bounding box clamped to the grid
+        x_lo = max(0, int(cx) - r_int);  x_hi = min(size, int(cx) + r_int + 1)
+        y_lo = max(0, int(cy) - r_int);  y_hi = min(size, int(cy) + r_int + 1)
+        z_lo = max(0, int(cz) - r_int);  z_hi = min(size, int(cz) + r_int + 1)
+        if x_lo >= x_hi or y_lo >= y_hi or z_lo >= z_hi:
+            continue
+        # Local distance field (one box per seed instead of one full grid)
+        zs = np.arange(z_lo, z_hi, dtype=np.float32) - cz
+        ys = np.arange(y_lo, y_hi, dtype=np.float32) - cy
+        xs = np.arange(x_lo, x_hi, dtype=np.float32) - cx
+        dz2 = (zs * zs)[:, None, None]
+        dy2 = (ys * ys)[None, :, None]
+        dx2 = (xs * xs)[None, None, :]
+        mask = (dz2 + dy2 + dx2) < r_sq
+        if not mask.any():
+            continue
+        # In-place writes into the bounded slab. Later seeds OVERWRITE
+        # earlier ones inside their own box -- same behaviour as the
+        # original full-grid np.where chain since seeds are painted
+        # in the same order.
+        slab_phi   = data[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi, 0]
+        slab_super = data[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi, 1]
+        slab_orient= data[z_lo:z_hi, y_lo:y_hi, x_lo:x_hi, 2]
+        slab_phi[mask]    = 1.0
+        slab_super[mask]  = 0.0
+        slab_orient[mask] = orients[i]
 
 
 def init_erosion_ridges(size, rng):
@@ -7129,8 +9225,17 @@ INIT_FUNCS = {
     'random_sparse': init_random_sparse,
     'random_dense': init_random_dense,
     'random_smooth': init_random_smooth,
+    'life_fbm_sparse': init_life_fbm_sparse,
+    'life_fbm_moderate': init_life_fbm_moderate,
+    'life_fbm_dense': init_life_fbm_dense,
+    'smoothlife_fbm': init_smoothlife_fbm,
+    'lenia_fbm': init_lenia_fbm,
+    'lenia_multi_fbm': init_lenia_multi_fbm,
     'center_blob': init_center_blob,
     'crystal_seed': init_crystal_seed,
+    'crystal_disc_seed': init_crystal_disc_seed,
+    'crystal_dla_seed': init_crystal_dla_seed,
+    'crystal_dla_multi_seed': init_crystal_dla_multi_seed,
     'wave_pulse': init_wave_pulse,
     'gray_scott': init_gray_scott,
     'predator_prey': init_predator_prey,
@@ -7145,6 +9250,7 @@ INIT_FUNCS = {
     'sodium_water': init_sodium_water,
     'metal_layers': init_metal_layers,
     'phase_separation': init_phase_separation,
+    'nucleation': init_nucleation,
     'erosion_terrain': init_erosion_terrain,
     'mycelium': init_mycelium,
     'em_wave': init_em_wave,
@@ -7158,6 +9264,7 @@ INIT_FUNCS = {
     'morphogen_hotspots': init_morphogen_hotspots,
     'bz_spiral_seed': init_bz_spiral_seed,
     'crystal_multi_seed': init_crystal_multi_seed,
+    'crystal_polycrystal': init_crystal_polycrystal,
     'erosion_ridges': init_erosion_ridges,
     'flocking_vortex': init_flocking_vortex,
     'game_of_life_centered': init_game_of_life_centered,
@@ -7199,13 +9306,70 @@ def init_sandbox_empty(size, rng):
 INIT_FUNCS['sandbox_empty'] = init_sandbox_empty
 
 
+# ── GPU fence helpers ────────────────────────────────────────────────
+# `Buffer.read()` in moderngl wraps `glGetBufferSubData`, which performs
+# an *implicit pipeline flush*: the driver waits for every previously
+# issued GL command that touches that buffer to complete. At small grid
+# sizes that wait is a few microseconds; at 384³+ where each compute
+# dispatch can take 20-50 ms, the queue depth grows enough that even a
+# 16-byte read drains the entire pile and produces a visible stutter.
+#
+# The cure is an explicit fence + non-blocking poll: after the dispatch
+# we insert a `glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE)`; on the read
+# path we call `glClientWaitSync(timeout=0)` which returns *immediately*
+# with ALREADY_SIGNALED / CONDITION_SATISFIED if the GPU has finished,
+# or TIMEOUT_EXPIRED otherwise. On a not-yet-ready fence we simply
+# defer the read to a future frame -- never block.
+def _fence_after_dispatch():
+    """Insert a fence right after a compute dispatch. Returns the sync
+    handle, or None if the GL driver doesn't support fences."""
+    try:
+        return GL.glFenceSync(GL.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+    except Exception:
+        return None
+
+
+def _fence_ready(fence):
+    """Non-blocking poll. Returns True iff the fence has been signaled.
+    Never flushes, never waits."""
+    if fence is None:
+        # No fence available (driver issue) — fall back to "always ready"
+        # so the system still works, just without the stall protection.
+        return True
+    try:
+        result = GL.glClientWaitSync(fence, 0, 0)  # flags=0, timeout=0 ns
+        return result in (GL.GL_ALREADY_SIGNALED, GL.GL_CONDITION_SATISFIED)
+    except Exception:
+        return True
+
+
+def _fence_delete(fence):
+    if fence is None:
+        return
+    try:
+        GL.glDeleteSync(fence)
+    except Exception:
+        pass
+
+
 # ── Simulator class ──────────────────────────────────────────────────
 
 class Simulator:
-    def __init__(self, size=64, rule='game_of_life_3d'):
+    def __init__(self, size=64, rule='game_of_life_3d', headless=False):
+        # Honour the preset's preferred grid size when the caller didn't
+        # explicitly request a larger one. Some presets (e.g. dendritic
+        # crystals) need >=144^3 to resolve their characteristic features
+        # at all, so an unmodified launch with default size=64 would just
+        # show a blob.
+        preset = RULE_PRESETS[rule]
+        pref = preset.get('default_size')
+        if pref and size < pref:
+            size = pref
         self.size = size
         self.rule_name = rule
-        self.preset = RULE_PRESETS[rule]
+        self.preset = preset
+        self._current_init = self.preset.get('init')
+        self.headless = headless
         self.paused = True
         self.step_count = 0
         self.sim_speed = 1  # steps per batch
@@ -7248,6 +9412,18 @@ class Simulator:
         self.voxel_threshold = 0.5  # visibility threshold for non-element CAs
         self.voxel_alpha = 1.0      # transparency
         self._cull_valid = False     # True when SSBO has valid cull data for current state
+        # Adaptive voxel-threshold state. Fixed per-shader thresholds were
+        # often well below a rule's natural "dead" field value (e.g.
+        # Gray-Scott U sits near 1.0 everywhere by default with threshold
+        # 0.01) so EVERY voxel rendered, producing a solid "ghost cube"
+        # framing the simulation. The adaptive path reads back the
+        # existing min/max accel mipmap once every N steps and sets
+        # threshold = min + (max - min) * frac.
+        self._adaptive_threshold = True
+        self._adaptive_threshold_frac = 0.20
+        self._steps_since_threshold_update = 1_000_000  # force on next render
+        self._threshold_update_interval = 30
+        self._user_overrode_threshold = False  # set when user moves slider
 
         # Visualization channel (for multi-field rules)
         self.vis_channels = self.preset.get('vis_channels', ['Value'])
@@ -7295,16 +9471,44 @@ class Simulator:
         self._rec_start_time = 0.0
         self._rec_frame_count = 0
         self._rec_fps = 60
-        self._rec_width = 2560       # output resolution (1440p)
-        self._rec_height = 1440
+        # Output resolution presets. Lower resolutions cut bandwidth
+        # roughly proportionally to pixel count: 720p is ~1/4 the bytes
+        # of 1440p, 1080p is ~1/2. ffmpeg encodes whatever frame size we
+        # pipe in, so changing this just resizes the offscreen FBO.
+        self._rec_resolutions = [
+            ('4K (2160p)',   3840, 2160),
+            ('1440p',        2560, 1440),
+            ('1080p',        1920, 1080),
+            ('720p',         1280,  720),
+            ('Shorts 1080p', 1080, 1920),  # vertical 9:16
+        ]
+        self._rec_resolution_idx = 1   # 1440p default
+        self._rec_width  = self._rec_resolutions[self._rec_resolution_idx][1]
+        self._rec_height = self._rec_resolutions[self._rec_resolution_idx][2]
         self._rec_filename = ''
         self._rec_msg = ''
         self._rec_msg_time = 0.0
+        # Route the next recording into recordings/upload_queue/ instead
+        # of recordings/ — the YouTube upload pipeline watches that
+        # subdirectory. Toggle from the UI before pressing F5/Record.
+        self._rec_upload_queue = False
         self._rec_fbo = None         # offscreen framebuffer
         self._rec_rbo_color = None
         self._rec_rbo_depth = None
         self._rec_write_thread = None
         self._rec_write_queue = None
+        # Pixel-pack buffers (PBOs) for async GPU->CPU readback. We
+        # ping-pong between two so the GPU can DMA frame N's pixels
+        # while the CPU consumes frame N-1's pixels -- removes the
+        # per-frame pipeline stall that fbo.read() into a bytes object
+        # would otherwise impose.
+        self._rec_pbo = [None, None]
+        self._rec_pbo_idx = 0
+        self._rec_pbo_pending = False  # true once at least one read has been issued
+        # Pre-rendered text overlay (RGBA PNG generated once at record start).
+        # Replaces 4-5 per-frame drawtext filters with a single overlay blit.
+        self._rec_overlay_path = None
+        self._rec_dropped_frames = 0
 
         # Quick-access element palette
         self.palette_elements = [
@@ -7328,6 +9532,8 @@ class Simulator:
         glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
         glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
         glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
+        if self.headless:
+            glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
 
         self.window = glfw.create_window(self.width, self.height,
                                           "3D Cellular Automata Simulator", None, None)
@@ -7337,6 +9543,12 @@ class Simulator:
 
         glfw.make_context_current(self.window)
         glfw.swap_interval(1)  # vsync
+
+        if self.headless:
+            # No imgui, no input callbacks in headless mode. We only need
+            # the GL context for compute shaders + SSBO readbacks.
+            self.imgui_renderer = None
+            return
 
         # imgui setup — GlfwRenderer handles context, fonts, input, and rendering
         imgui.create_context()
@@ -7477,6 +9689,41 @@ class Simulator:
         # Compile GPU metrics reduction shader + tiny SSBO (4 uints = 16 bytes)
         self._compile_metrics()
         self._metrics_ssbo = self.ctx.buffer(reserve=16)
+
+        # GPU min/max reduction over the _mm_tex mipmap, async readback.
+        # Earlier code synchronously read the entire ~1 MB mipmap every
+        # 30 frames -- that pipeline stall was the source of a periodic
+        # frame drop (~every 0.5s at 60fps). Reduction shader + 8-byte
+        # SSBO + the same in-flight pattern as metrics removes the stall.
+        self._range_reduce_prog = self.ctx.compute_shader(RANGE_REDUCE_SHADER)
+        self._range_ssbo = self.ctx.buffer(reserve=8)  # 2 floats: min, max
+        self._range_fence = None  # GPU fence; non-None ⇒ readback pending
+
+        # ── Debug stats: comprehensive per-step instrumentation ───────
+        # Compiled lazily only when debug mode is first toggled on, so
+        # users who never use it pay nothing.
+        self._debug_prog = None
+        self._debug_ssbo = None      # 296 uints = 1184 bytes
+        self._debug_fence = None
+        self._debug_pending_step = -1
+        # Master + per-category toggles. All off by default.
+        self._debug_enabled = False
+        self._debug_show_scalars = True
+        self._debug_show_histograms = True
+        self._debug_show_spatial = True
+        self._debug_active_channel = 0
+        self._debug_active_threshold = 0.5
+        self._debug_sample_interval = 5  # capture every N sim steps
+        self._debug_steps_since_sample = 0
+        # Adaptive histogram bounds: seeded from the first capture, then
+        # updated with EMA so bins don't constantly flicker.
+        self._debug_hist_min = [-1.0, -1.0, -1.0, -1.0]
+        self._debug_hist_max = [ 1.0,  1.0,  1.0,  1.0]
+        # History ring buffer (latest entries at the end).
+        from collections import deque
+        self._debug_history = deque(maxlen=2048)
+        # Latest decoded snapshot (also the most recent entry of history)
+        self._debug_latest = None
 
         # Voxel SSBOs — size dynamically based on grid
         self._alloc_voxel_buffer(self.size)
@@ -7695,6 +9942,89 @@ class Simulator:
         GL.glMemoryBarrier(GL.GL_TEXTURE_FETCH_BARRIER_BIT |
                            GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
         self._accel_textures_valid = True
+        # Adaptive voxel-threshold update piggybacks on the just-built
+        # min/max mipmap. Cheap (~1 MB readback every 30 frames) and
+        # only runs when the user hasn't manually pinned the threshold.
+        self._maybe_update_adaptive_threshold()
+
+    def _maybe_update_adaptive_threshold(self):
+        """Periodically rescale ``voxel_threshold`` from the actual field
+        min/max so the threshold never falls below the rule's background
+        level (which would cause every voxel to render as a solid cube).
+
+        Uses an async in-flight pattern: each call either dispatches a
+        GPU min/max reduction OR consumes the previous reduction's
+        result. Reading 8 bytes that the GPU finished writing many
+        frames ago is effectively free; reading the full _mm_tex
+        synchronously was a ~1 MB pipeline-draining stall responsible
+        for periodic frame drops."""
+        if (not self._adaptive_threshold
+                or self._user_overrode_threshold
+                or self.is_element_ca
+                or self.renderer_mode != 'voxel'):
+            return
+        # ── Stage 1: harvest previous reduction (non-blocking) ─────
+        # We only call .read() if the GPU fence is signaled. Otherwise
+        # we leave the fence pending and try again on the next call.
+        if self._range_fence is not None and _fence_ready(self._range_fence):
+            try:
+                raw = self._range_ssbo.read()
+            except Exception:
+                raw = None
+            _fence_delete(self._range_fence)
+            self._range_fence = None
+            if raw is not None and len(raw) >= 8:
+                # Decode: shader stored floatBitsToUint(value + 10.0)
+                # using atomicMin/atomicMax on the bit pattern.
+                vals = np.frombuffer(raw, dtype=np.uint32).view(np.float32) - 10.0
+                field_min = float(vals[0])
+                field_max = float(vals[1])
+                rng = field_max - field_min
+                if rng >= 1e-4:
+                    new_threshold = field_min + rng * self._adaptive_threshold_frac
+                    # Hysteresis: only invalidate the cull cache when the
+                    # threshold moved enough to matter; small jitter
+                    # would thrash the cull every frame.
+                    if abs(new_threshold - self.voxel_threshold) > rng * 0.02:
+                        self.voxel_threshold = new_threshold
+                        self._cull_valid = False
+        # ── Stage 2: throttle and dispatch next reduction ──────────
+        # Don't dispatch a new one if a previous one is still pending —
+        # we'd lose the fence and leak the buffer state.
+        if self._range_fence is not None:
+            return
+        self._steps_since_threshold_update += 1
+        if self._steps_since_threshold_update < self._threshold_update_interval:
+            return
+        self._steps_since_threshold_update = 0
+        # Dispatch the GPU reduction. Result will be picked up next call.
+        bs = self._occ_block_size
+        occ_dim = self._occ_dim
+        # Seed sentinels: shader uses atomicMin/atomicMax on
+        # floatBitsToUint(value + 10.0). For min, seed with a very
+        # large positive number so any real input wins. For max, seed
+        # with the smallest non-negative biased value so any real
+        # input wins. Negative biased values would have larger uint
+        # bit patterns than positive ones (sign bit), breaking the
+        # atomicMax monotonicity assumption -- the +10 bias keeps
+        # everything positive in practice (view tex range is roughly
+        # [-1, 1]).
+        sentinels = np.array(
+            [np.float32(1e10 + 10.0), np.float32(0.0)],
+            dtype=np.float32,
+        ).view(np.uint32)
+        self._range_ssbo.write(sentinels.tobytes())
+        self._mm_tex.use(location=0)
+        self._range_ssbo.bind_to_storage_buffer(0)
+        self._range_reduce_prog['u_minmax'].value = 0
+        self._range_reduce_prog['u_dim'].value = occ_dim
+        groups = (occ_dim + 3) // 4
+        self._range_reduce_prog.run(groups, groups, groups)
+        # Memory barrier so the SSBO writes complete before we read on a
+        # future frame, then a fence so we can poll completion without
+        # ever blocking the CPU.
+        GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT)
+        self._range_fence = _fence_after_dispatch()
 
     def _alloc_half_res_fbo(self, width, height):
         """Create or recreate the half-resolution FBO for volume rendering."""
@@ -7742,6 +10072,42 @@ class Simulator:
             self.compute_prog.release()
         self.compute_prog = self.ctx.compute_shader(source)
 
+    def _needs_field2(self):
+        """True when the active rule uses the second 4-channel scratchpad texture.
+        Currently only crystal_growth (separate solute concentration field for
+        partition rejection / constitutional undercooling)."""
+        return self.preset.get('shader', '') == 'crystal_growth'
+
+    def _make_field2_init(self):
+        """Initial state for the second physics field. Only crystal_growth uses it.
+        R = solute concentration c (uniform 1.0 in the melt, 0 in pre-existing solid).
+        G,B,A = reserved for future fields (anisotropic temperature, convection v, ...)."""
+        arr = np.zeros((self.size, self.size, self.size, 4), dtype=np.float32)
+        arr[..., 0] = 1.0  # uniform solute concentration in the melt
+        return arr
+
+    def _alloc_field2(self):
+        """Allocate tex_a2/tex_b2 sized to current grid. Caller must have already
+        released any prior pair via _release_field2."""
+        init2 = self._make_field2_init()
+        init2_bytes = np.ascontiguousarray(init2.astype(self._tex_np_dtype)).tobytes()
+        self.tex_a2 = self.ctx.texture3d((self.size, self.size, self.size), 4,
+                                          init2_bytes, dtype=self._tex_dtype)
+        del init2, init2_bytes
+        self.tex_b2 = self.ctx.texture3d((self.size, self.size, self.size), 4,
+                                          bytes(self.size ** 3 * self._tex_bpt),
+                                          dtype=self._tex_dtype)
+        self.tex_a2.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.tex_b2.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    def _release_field2(self):
+        if getattr(self, 'tex_a2', None) is not None:
+            self.tex_a2.release()
+            self.tex_a2 = None
+        if getattr(self, 'tex_b2', None) is not None:
+            self.tex_b2.release()
+            self.tex_b2 = None
+
     def _init_volume(self):
         rng = np.random.RandomState(self.seed)
         init_name = getattr(self, '_current_init', self.preset['init'])
@@ -7760,6 +10126,10 @@ class Simulator:
         self.tex_a.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.tex_b.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.ping = 0
+        # Allocate (or release) the optional second physics field
+        self._release_field2()
+        if self._needs_field2():
+            self._alloc_field2()
         # Allocate acceleration structures for new volume
         self._alloc_accel_textures(self.size)
 
@@ -8055,6 +10425,7 @@ class Simulator:
         if loaded_size != self.size:
             self.tex_a.release()
             self.tex_b.release()
+            self._release_field2()
             self.size = loaded_size
             self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
                 _tex_format_for_size(loaded_size)
@@ -8094,7 +10465,18 @@ class Simulator:
         self._metric_history = []
         self._prev_grid = None
         self._cpu_grid_dirty = True
-        self._metrics_in_flight = False
+        # Drop any in-flight async readbacks; their SSBOs/programs may
+        # have been reallocated under our feet.
+        _fence_delete(getattr(self, '_metrics_fence', None))
+        self._metrics_fence = None
+        _fence_delete(getattr(self, '_range_fence', None))
+        self._range_fence = None
+        _fence_delete(getattr(self, '_debug_fence', None))
+        self._debug_fence = None
+        if hasattr(self, '_debug_history'):
+            self._debug_history.clear()
+            self._debug_latest = None
+            self._debug_steps_since_sample = 0
 
     # ── Input callbacks ───────────────────────────────────────────────
 
@@ -8214,6 +10596,15 @@ class Simulator:
                 self.brush_tool = 1  # temperature
             elif key == glfw.KEY_3:
                 self.brush_tool = 2  # eraser
+            elif key == glfw.KEY_F12:
+                self._show_perf_overlay = not getattr(self, '_show_perf_overlay', False)
+            elif key == glfw.KEY_F11:
+                # Master toggle for the debug stats overlay
+                self._debug_enabled = not self._debug_enabled
+                if not self._debug_enabled:
+                    # Drop pending fence so we don't leak
+                    _fence_delete(getattr(self, '_debug_fence', None))
+                    self._debug_fence = None
             elif key == glfw.KEY_ESCAPE:
                 glfw.set_window_should_close(window, True)
             elif key == glfw.KEY_F5:
@@ -8243,6 +10634,14 @@ class Simulator:
 
         src.bind_to_image(0, read=True, write=False)
         dst.bind_to_image(1, read=False, write=True)
+
+        # Optional second 4-channel physics field (e.g. crystal_growth solute).
+        # Pings in lockstep with the primary pair so reads/writes stay coherent.
+        if getattr(self, 'tex_a2', None) is not None:
+            src2 = self.tex_a2 if self.ping == 0 else self.tex_b2
+            dst2 = self.tex_b2 if self.ping == 0 else self.tex_a2
+            src2.bind_to_image(2, read=True, write=False)
+            dst2.bind_to_image(3, read=False, write=True)
 
         if self.is_element_ca:
             self.element_ssbo.bind_to_storage_buffer(2)
@@ -8285,8 +10684,30 @@ class Simulator:
         del data
         self.tex_b.write(bytes(self.size ** 3 * self._tex_bpt))
         self.ping = 0
+        # Sync the optional second physics field to current rule's needs.
+        # If textures already exist and rule still wants them: reset to initial
+        # values. If they exist but are no longer needed: release. If they're
+        # needed but not yet allocated (rule just changed): allocate.
+        if self._needs_field2():
+            if getattr(self, 'tex_a2', None) is None:
+                self._alloc_field2()
+            else:
+                init2 = self._make_field2_init()
+                self.tex_a2.write(np.ascontiguousarray(init2.astype(self._tex_np_dtype)).tobytes())
+                self.tex_b2.write(bytes(self.size ** 3 * self._tex_bpt))
+        else:
+            self._release_field2()
         self._prev_grid = None
-        self._metrics_in_flight = False
+        _fence_delete(getattr(self, '_metrics_fence', None))
+        self._metrics_fence = None
+        _fence_delete(getattr(self, '_range_fence', None))
+        self._range_fence = None
+        _fence_delete(getattr(self, '_debug_fence', None))
+        self._debug_fence = None
+        if hasattr(self, '_debug_history'):
+            self._debug_history.clear()
+            self._debug_latest = None
+            self._debug_steps_since_sample = 0
         self._metric_history = []
         self._score = 0.0
         self._score_metrics = {}
@@ -8328,8 +10749,13 @@ class Simulator:
             self.voxel_threshold = 0.01
         elif shader == 'wave_3d':
             self.voxel_threshold = 0.005
-        elif shader in ('smoothlife_3d', 'lenia_3d'):
-            self.voxel_threshold = 0.01
+        elif shader in ('smoothlife_3d', 'lenia_3d', 'lenia_multi_3d'):
+            # Life CAs settle into stable values around 0.3-0.6 for live
+            # cells; values below ~0.1 are decaying / sub-threshold and
+            # rendering them gives the appearance of "the cube filling
+            # with fog". Raising the threshold to 0.12 hides the dying
+            # tail without clipping any genuine living structure.
+            self.voxel_threshold = 0.12
         elif shader == 'cahn_hilliard':
             self.voxel_threshold = 0.1
         elif shader == 'erosion_3d':
@@ -8344,6 +10770,18 @@ class Simulator:
             self.voxel_threshold = 0.01
         else:
             self.voxel_threshold = 0.5
+        # Per-preset overrides. 'voxel_threshold' = absolute value (also
+        # disables adaptive). 'voxel_threshold_frac' = fraction of the
+        # field's dynamic range used by the adaptive updater.
+        if 'voxel_threshold' in self.preset:
+            self.voxel_threshold = float(self.preset['voxel_threshold'])
+            self._adaptive_threshold = False
+        else:
+            self._adaptive_threshold = True
+        self._adaptive_threshold_frac = float(
+            self.preset.get('voxel_threshold_frac', 0.20))
+        self._steps_since_threshold_update = 1_000_000
+        self._user_overrode_threshold = False
         # Auto-set ħ/2m = size/50 for quantum shaders so a₀ matches init
         self._sync_quantum_K()
         self._compile_compute()
@@ -8356,6 +10794,7 @@ class Simulator:
         self._cull_valid = False
         self.tex_a.release()
         self.tex_b.release()
+        self._release_field2()
         old_fmt = self._tex_glsl_fmt
         self.size = new_size
         self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
@@ -8374,7 +10813,16 @@ class Simulator:
         self._init_volume()
         self.step_count = 0
         self._prev_grid = None
-        self._metrics_in_flight = False
+        _fence_delete(getattr(self, '_metrics_fence', None))
+        self._metrics_fence = None
+        _fence_delete(getattr(self, '_range_fence', None))
+        self._range_fence = None
+        _fence_delete(getattr(self, '_debug_fence', None))
+        self._debug_fence = None
+        if hasattr(self, '_debug_history'):
+            self._debug_history.clear()
+            self._debug_latest = None
+            self._debug_steps_since_sample = 0
         self._metric_history = []
         self._score = 0.0
         self._score_metrics = {}
@@ -8693,6 +11141,206 @@ class Simulator:
         self.discovery_index = index
         self._reset()
 
+    # ── Debug stats: GPU dispatch + async harvest ────────────────────
+    # Layout constants must match DEBUG_STATS_SHADER. If the shader
+    # struct changes, update both the GLSL and these offsets/scales.
+    _DEBUG_STATS_NUINTS = 296
+    _DEBUG_BIAS    = 1.0e6   # min/max float-bits bias
+    _DEBUG_SCALE_S = 1.0e6   # sum fixed-point scale (pre-normalized by N)
+    _DEBUG_SCALE_Q = 1.0e3   # sumsq fixed-point scale (pre-normalized by N)
+
+    def _ensure_debug_resources(self):
+        """Lazy-compile the debug shader and allocate its SSBO. Called the
+        first time debug mode is enabled; cheap to call repeatedly."""
+        if self._debug_prog is not None:
+            return
+        self._debug_prog = self.ctx.compute_shader(DEBUG_STATS_SHADER)
+        self._debug_ssbo = self.ctx.buffer(reserve=self._DEBUG_STATS_NUINTS * 4)
+
+    def _dispatch_debug_stats(self):
+        """Issue one debug-stats compute dispatch over the current grid.
+        Throttled by ``_debug_sample_interval``; obeys the master toggle.
+        Result is collected later by ``_harvest_debug_stats`` via fence."""
+        if not self._debug_enabled:
+            return
+        self._ensure_debug_resources()
+        # Throttle: most rules don't need stats every step at 60+ fps.
+        self._debug_steps_since_sample += 1
+        if self._debug_steps_since_sample < self._debug_sample_interval:
+            return
+        # If a previous dispatch hasn't been harvested yet, skip this
+        # one rather than overwriting the in-flight buffer.
+        if self._debug_fence is not None:
+            return
+        self._debug_steps_since_sample = 0
+
+        # Zero the SSBO, then pre-seed the global min_bits sentinel so
+        # the shader's atomicMin(global, real_data_bits) actually wins.
+        # (The shader uses bits-of-(BIAS+1e30) as its workgroup-local min
+        # sentinel; we put the same value into the 4 global slots.)
+        # max_bits stays at 0 (smallest uint), which is the correct
+        # max sentinel since real biased data is always positive.
+        zeros = bytearray(self._DEBUG_STATS_NUINTS * 4)
+        # min_bits lives at uint indices 12..15 → byte offset 48..63
+        min_sentinel = np.float32(self._DEBUG_BIAS + 1.0e30).tobytes()
+        for c in range(4):
+            zeros[48 + c * 4 : 52 + c * 4] = min_sentinel
+        self._debug_ssbo.write(bytes(zeros))
+
+        src = self.tex_a if self.ping == 0 else self.tex_b
+        src.bind_to_image(0, read=True, write=False)
+        self._debug_ssbo.bind_to_storage_buffer(7)
+
+        prog = self._debug_prog
+        prog['u_size'].value = self.size
+        prog['u_active_channel'].value = self._debug_active_channel
+        prog['u_active_threshold'].value = self._debug_active_threshold
+        # Reuse the metrics mode mapping: 2=>abs, 3=>element-id, else thr
+        shader = self.preset['shader']
+        if self.preset.get('is_element_ca', False):
+            mode = 3
+        elif shader in ('wave_3d', 'em_wave_3d'):
+            mode = 2
+        else:
+            mode = 1
+        prog['u_active_mode'].value = mode
+        prog['u_boundary_shell'].value = max(1, self.size // 64)
+        # u_norm_n is the PER-WORKGROUP FLUSH SCALE, not 1/N. We pick a
+        # divisor D = max(1, N / 2048) so:
+        #   - per-wg flush value fits comfortably in int32 even at 512³
+        #   - global sum fits in int32 (max ≈ 2048 × |v|_max × SCALE_S)
+        #   - the per-wg fractional part stays well above 1.0 for normal
+        #     rules, so rounding doesn't eat the signal at large N
+        # Python decoder must divide by (N * u_norm_n * SCALE_S) to get
+        # the mean (stored in self._debug_sum_divisor for clarity).
+        N = float(self.size ** 3)
+        self._debug_sum_divisor = max(1.0, N / 2048.0)
+        prog['u_norm_n'].value = 1.0 / self._debug_sum_divisor
+        # Histogram bounds = previous frame's range (per channel). moderngl
+        # array uniforms are set by writing the whole packed array.
+        prog['u_hist_min'].write(np.array(self._debug_hist_min, dtype=np.float32).tobytes())
+        prog['u_hist_max'].write(np.array(self._debug_hist_max, dtype=np.float32).tobytes())
+
+        gx = (self.size + 7) // 8
+        prog.run(gx, gx, gx)
+        GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT)
+        self._debug_fence = _fence_after_dispatch()
+        self._debug_pending_step = self.step_count
+
+    def _harvest_debug_stats(self):
+        """Non-blocking: if the GPU has finished, decode the SSBO into
+        a Python dict, append to ``_debug_history``, update adaptive
+        histogram bounds. Always safe to call; cheap if no fence."""
+        if self._debug_fence is None or not _fence_ready(self._debug_fence):
+            return
+        try:
+            raw = self._debug_ssbo.read()
+        except Exception:
+            raw = None
+        _fence_delete(self._debug_fence)
+        self._debug_fence = None
+        if raw is None or len(raw) < self._DEBUG_STATS_NUINTS * 4:
+            return
+        u = np.frombuffer(raw, dtype=np.uint32)
+
+        # ── Decode per-channel scalars ──────────────────────────────
+        finite = u[0:4].astype(np.int64)
+        nans   = u[4:8].astype(np.int64)
+        infs   = u[8:12].astype(np.int64)
+        # Min/max: bits → float, subtract bias.
+        min_bits = u[12:16].copy()
+        max_bits = u[16:20].copy()
+        mins_raw = np.frombuffer(min_bits.tobytes(), dtype=np.float32) - self._DEBUG_BIAS
+        maxs_raw = np.frombuffer(max_bits.tobytes(), dtype=np.float32) - self._DEBUG_BIAS
+        # The shader pre-seeds min with bits of (BIAS+1e30) and leaves max
+        # at 0. If a channel had no finite cells in any workgroup, those
+        # sentinels survive into the global SSBO. Detect by either:
+        # (a) finite[c] == 0, or
+        # (b) the decoded min is impossibly large (>1e29) — sentinel survived,
+        # (c) the decoded max equals -BIAS exactly (max stayed at uint 0).
+        sentinel_min = mins_raw > 1.0e29
+        sentinel_max = max_bits == 0  # global never atomicMax'd
+        no_finite = finite == 0
+        mins = np.where(no_finite | sentinel_min, np.nan, mins_raw).astype(np.float32)
+        maxs = np.where(no_finite | sentinel_max, np.nan, maxs_raw).astype(np.float32)
+        # Sum: signed 32-bit wrap, then multiply by divisor/(N*SCALE_S) to
+        # get mean. Shader stored Σ(ws_int * (1/divisor)) where divisor is
+        # chosen so the global sum fits int32 with good sub-unit precision.
+        sum_signed = u[20:24].view(np.int32).astype(np.float64)
+        sumsq_u    = u[24:28].astype(np.float64)
+        N = float(self.size ** 3)
+        divisor = getattr(self, '_debug_sum_divisor', max(1.0, N / 2048.0))
+        means = sum_signed * divisor / (N * self._DEBUG_SCALE_S)
+        e_x2  = sumsq_u    * divisor / (N * self._DEBUG_SCALE_Q)
+        # Variance = E[X²] - E[X]², clamped at 0 to absorb FP noise.
+        variances = np.maximum(e_x2 - means * means, 0.0)
+
+        # ── Spatial ─────────────────────────────────────────────────
+        active_count = int(u[28])
+        bbox_min = u[29:32].astype(np.int64)
+        bbox_max = u[32:35].astype(np.int64)
+        com_sum = u[35:38].astype(np.float64)
+        rg_sum  = float(u[38])
+        boundary_count = int(u[39])
+        size = float(self.size)
+
+        if active_count > 0:
+            com = (com_sum / active_count) / size  # normalized to [0, 1]
+            # rg per active cell, normalized: shader stored sum of
+            # |p - center|²/size² × 1024 per active. So mean is divided
+            # by active_count and 1024.
+            rg = np.sqrt(rg_sum / active_count / 1024.0)
+            bbox = ((bbox_min / size).tolist(), (bbox_max / size).tolist())
+            boundary_frac = boundary_count / active_count
+        else:
+            com = np.array([np.nan] * 3)
+            rg = float('nan')
+            bbox = (None, None)
+            boundary_frac = 0.0
+
+        # ── Histograms ──────────────────────────────────────────────
+        hist = u[40:40 + 4 * 64].reshape(4, 64).astype(np.int64)
+
+        # Update adaptive histogram bounds (EMA toward current min/max,
+        # widened by 5% so the next frame's outliers still bin into 0/63
+        # rather than getting clipped invisibly).
+        for c in range(4):
+            if finite[c] > 0 and not np.isnan(mins[c]) and not np.isnan(maxs[c]):
+                lo, hi = float(mins[c]), float(maxs[c])
+                if hi - lo < 1.0e-6:
+                    hi = lo + 1.0e-6
+                pad = (hi - lo) * 0.05
+                target_lo, target_hi = lo - pad, hi + pad
+                # EMA factor 0.3 -> roughly converges in ~10 samples.
+                self._debug_hist_min[c] = 0.7 * self._debug_hist_min[c] + 0.3 * target_lo
+                self._debug_hist_max[c] = 0.7 * self._debug_hist_max[c] + 0.3 * target_hi
+
+        snap = {
+            'step': self._debug_pending_step,
+            't_wall': time.time(),
+            'finite': finite.tolist(),
+            'nan': nans.tolist(),
+            'inf': infs.tolist(),
+            'min': mins.tolist(),
+            'max': maxs.tolist(),
+            'mean': means.tolist(),
+            'var': variances.tolist(),
+            'std': np.sqrt(variances).tolist(),
+            'active_count': active_count,
+            'active_frac': active_count / float(self.size ** 3),
+            'bbox_min': bbox[0],
+            'bbox_max': bbox[1],
+            'com': com.tolist(),
+            'rg': rg,
+            'boundary_count': boundary_count,
+            'boundary_frac': boundary_frac,
+            'hist': hist.tolist(),
+            'hist_min': list(self._debug_hist_min),
+            'hist_max': list(self._debug_hist_max),
+        }
+        self._debug_latest = snap
+        self._debug_history.append(snap)
+
     def _update_score(self):
         """Compute live interestingness score entirely on the GPU.
 
@@ -8705,11 +11353,15 @@ class Simulator:
         src = self.tex_a if self.ping == 0 else self.tex_b
         total = self.size ** 3
 
-        # ── 1. Harvest previous results (if any) ─────────────────────
-        if getattr(self, '_metrics_in_flight', False):
-            # Barrier ensures compute writes are visible to CPU read
-            GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT)
+        # ── 1. Harvest previous results (non-blocking) ───────────────
+        # Only read the SSBO if the GPU fence is signaled. Otherwise
+        # leave the read pending and try again next time -- this keeps
+        # heavy-step grids (384³+) from stalling on glGetBufferSubData.
+        metrics_fence = getattr(self, '_metrics_fence', None)
+        if metrics_fence is not None and _fence_ready(metrics_fence):
             raw = np.frombuffer(self._metrics_ssbo.read(), dtype=np.uint32)
+            _fence_delete(metrics_fence)
+            self._metrics_fence = None
             alive_count = int(raw[0])
             change_count = int(raw[1])
             surface_count = int(raw[2])
@@ -8750,6 +11402,11 @@ class Simulator:
             channel, mode, threshold, change_thr = 0, 0, 0.5, 0.01
 
         # ── 3. Zero SSBO, dispatch reduction shader (no CPU sync) ─────
+        # Don't dispatch a new reduction if the previous one's result
+        # hasn't been collected yet -- we'd lose the fence and read
+        # half-written data on the next harvest.
+        if getattr(self, '_metrics_fence', None) is not None:
+            return
         self._metrics_ssbo.write(b'\x00' * 16)
 
         # Bind current grid and the *previous step* texture (the other
@@ -8772,9 +11429,10 @@ class Simulator:
         gx = (self.size + 7) // 8
         prog.run(gx, gx, gx)
 
-        # Barrier ensures compute SSBO writes complete before next CPU read
+        # Barrier ensures compute SSBO writes complete before next CPU read,
+        # then a fence so we can poll completion without ever blocking.
         GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT)
-        self._metrics_in_flight = True
+        self._metrics_fence = _fence_after_dispatch()
 
     # ── Rendering ─────────────────────────────────────────────────────
 
@@ -8940,6 +11598,15 @@ class Simulator:
         Uses multi-pass spatial chunking for large grids: the grid is split
         into chunks, each cull+draw pass reuses the same SSBO, so no voxels
         are ever dropped regardless of grid size or fill density."""
+        # Ensure the min/max acceleration mipmap is up to date -- the
+        # adaptive voxel-threshold updater piggybacks on it inside
+        # _build_accel_textures().  Without this call the voxel renderer
+        # would never trigger an accel rebuild and the threshold would
+        # stay frozen at its initial per-shader guess (often well below
+        # the rule's natural background, causing the entire cube to render
+        # as a solid block).
+        if not self._accel_textures_valid:
+            self._build_accel_textures()
         self.ctx.clear(0.02, 0.02, 0.04)
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.BLEND)
@@ -9072,20 +11739,27 @@ class Simulator:
         self.ctx.disable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.BLEND)
 
-        # Read back total voxel count via async copy of the accumulator.
+        # Read back total voxel count via async copy + fence-polled read.
         self._voxel_count_frame = getattr(self, '_voxel_count_frame', 0) + 1
         if self._voxel_count_frame >= 15:
             self._voxel_count_frame = 0
             if not hasattr(self, '_total_staging'):
                 self._total_staging = self.ctx.buffer(reserve=4)
-                self._total_staging_ready = False
-            if self._total_staging_ready:
+                self._total_staging_fence = None
+            # Harvest the previous copy ONLY if its fence has signaled.
+            # Otherwise we'd block on glGetBufferSubData while the copy
+            # (or any earlier compute work) is still draining the queue.
+            tsf = self._total_staging_fence
+            if tsf is not None and _fence_ready(tsf):
                 raw_count = int(np.frombuffer(self._total_staging.read(), dtype=np.uint32)[0])
                 self._last_voxel_count = raw_count
                 self._voxels_clipped = False
-            # Issue copy for next readback (returns immediately)
-            self.ctx.copy_buffer(self._total_staging, self._voxel_total_counter)
-            self._total_staging_ready = True
+                _fence_delete(tsf)
+                self._total_staging_fence = None
+            # Don't issue a new copy if the previous one is still pending.
+            if self._total_staging_fence is None:
+                self.ctx.copy_buffer(self._total_staging, self._voxel_total_counter)
+                self._total_staging_fence = _fence_after_dispatch()
 
     def _render(self):
         """Dispatch to the appropriate renderer."""
@@ -9220,6 +11894,265 @@ class Simulator:
         self._upsample_vao.render(moderngl.TRIANGLE_STRIP)
 
     # ── ImGui UI ──────────────────────────────────────────────────────
+
+    def _draw_debug_overlay(self):
+        """Comprehensive per-CA debug overlay (toggle: F11).
+
+        Three collapsible sections:
+          • Scalars: per-channel mean / var / min / max / NaN / Inf
+          • Histograms: 64-bucket per-channel value distribution
+          • Spatial: active cell count + fraction, AABB, COM, R_g,
+            boundary-shell occupancy
+
+        Plus a header with master toggle, sample interval, and the
+        active-mask channel/threshold used by the spatial decomposition.
+        Per-section visibility is toggled by checkboxes; cost of the
+        underlying GPU dispatch is NOT affected by which sections are
+        visible (we always compute everything in one pass), but the
+        master toggle disables the dispatch entirely."""
+        if not self._debug_enabled:
+            return
+        snap = self._debug_latest
+        imgui.set_next_window_pos(imgui.ImVec2(340, 10), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(430, 600), imgui.Cond_.first_use_ever)
+        imgui.begin("Debug (F11)")
+
+        # ── Header / controls ───────────────────────────────────────
+        changed, val = imgui.checkbox("Enabled", self._debug_enabled)
+        if changed:
+            self._debug_enabled = val
+        imgui.same_line()
+        imgui.text(f"step {self.step_count}  samples {len(self._debug_history)}")
+
+        changed, val = imgui.slider_int("Sample every N steps",
+                                         self._debug_sample_interval, 1, 30)
+        if changed:
+            self._debug_sample_interval = val
+
+        changed, val = imgui.slider_int("Active channel", self._debug_active_channel, 0, 3)
+        if changed:
+            self._debug_active_channel = val
+        changed, val = imgui.slider_float("Active threshold", self._debug_active_threshold,
+                                            -2.0, 5.0)
+        if changed:
+            self._debug_active_threshold = val
+
+        imgui.separator()
+        if snap is None:
+            imgui.text_colored(imgui.ImVec4(0.7, 0.7, 0.7, 1.0),
+                "Waiting for first GPU sample...")
+            imgui.end()
+            return
+
+        # ── Health flags (always shown; the most important info) ────
+        # These short-circuit the user to "is this CA broken?"
+        flags = []
+        any_nan = sum(snap['nan']) > 0
+        any_inf = sum(snap['inf']) > 0
+        if any_nan:
+            flags.append(("NaN detected", (1.0, 0.3, 0.3, 1.0)))
+        if any_inf:
+            flags.append(("Inf detected", (1.0, 0.3, 0.3, 1.0)))
+        max_abs = max(abs(v) for v in snap['min'] + snap['max']
+                       if not np.isnan(v)) if any(not np.isnan(v) for v in snap['min'] + snap['max']) else 0.0
+        if max_abs > 1.0e6:
+            flags.append((f"Blowup: |val|>{max_abs:.2e}", (1.0, 0.4, 0.2, 1.0)))
+        af = snap['active_frac']
+        if af < 1.0e-4:
+            flags.append((f"Near-dead ({af*100:.3f}%)", (0.6, 0.6, 0.6, 1.0)))
+        elif af > 0.95:
+            flags.append((f"Saturated ({af*100:.1f}%)", (1.0, 0.7, 0.2, 1.0)))
+        if snap['boundary_frac'] > 0.30 and snap['active_count'] > 100:
+            flags.append((f"Boundary-bound ({snap['boundary_frac']*100:.0f}%)",
+                          (1.0, 0.7, 0.2, 1.0)))
+        if not flags:
+            imgui.text_colored(imgui.ImVec4(0.4, 1.0, 0.4, 1.0), "Health: OK")
+        else:
+            for label, color in flags:
+                imgui.text_colored(imgui.ImVec4(*color), f"⚠ {label}")
+        imgui.separator()
+
+        # ── Scalars ─────────────────────────────────────────────────
+        changed, val = imgui.checkbox("Scalars", self._debug_show_scalars)
+        if changed:
+            self._debug_show_scalars = val
+        if self._debug_show_scalars and imgui.collapsing_header(
+                "Per-channel scalars", imgui.TreeNodeFlags_.default_open):
+            imgui.text(f"{'ch':<3}{'mean':>10}{'std':>10}{'min':>10}{'max':>10}")
+            for c in range(4):
+                if snap['finite'][c] == 0:
+                    imgui.text_colored(imgui.ImVec4(0.5, 0.5, 0.5, 1.0),
+                        f"{c:<3}{'(empty)':>40}")
+                    continue
+                m = snap['mean'][c]; s = snap['std'][c]
+                lo = snap['min'][c]; hi = snap['max'][c]
+                imgui.text(f"{c:<3}{m:>10.4g}{s:>10.4g}{lo:>10.4g}{hi:>10.4g}")
+            # Extra row: NaN / Inf counts (color-coded only when nonzero)
+            for c in range(4):
+                if snap['nan'][c] > 0 or snap['inf'][c] > 0:
+                    imgui.text_colored(imgui.ImVec4(1.0, 0.4, 0.4, 1.0),
+                        f"ch{c}: {snap['nan'][c]} NaN, {snap['inf'][c]} Inf")
+            imgui.separator()
+            # Time series of mean / active_frac (last 200 samples)
+            if len(self._debug_history) >= 4:
+                hist = list(self._debug_history)[-200:]
+                af_arr = np.array([h['active_frac'] for h in hist], dtype=np.float32)
+                imgui.text(f"Active fraction over time (last {len(hist)} samples)")
+                imgui.plot_lines("##af", af_arr,
+                                  graph_size=imgui.ImVec2(0, 60))
+
+        # ── Histograms ──────────────────────────────────────────────
+        changed, val = imgui.checkbox("Histograms", self._debug_show_histograms)
+        if changed:
+            self._debug_show_histograms = val
+        if self._debug_show_histograms and imgui.collapsing_header(
+                "Channel histograms", imgui.TreeNodeFlags_.default_open):
+            for c in range(4):
+                if snap['finite'][c] == 0:
+                    continue
+                bins = np.array(snap['hist'][c], dtype=np.float32)
+                # Log-scale: heavy-tailed distributions otherwise show
+                # a single tall bin and 63 zero-height bars.
+                bins_log = np.log1p(bins)
+                lo, hi = snap['hist_min'][c], snap['hist_max'][c]
+                imgui.text(f"ch{c}: range [{lo:.3g}, {hi:.3g}]  log-count")
+                imgui.plot_histogram(f"##h{c}", bins_log,
+                                      graph_size=imgui.ImVec2(0, 50))
+
+        # ── Spatial ─────────────────────────────────────────────────
+        changed, val = imgui.checkbox("Spatial", self._debug_show_spatial)
+        if changed:
+            self._debug_show_spatial = val
+        if self._debug_show_spatial and imgui.collapsing_header(
+                "Spatial decomposition", imgui.TreeNodeFlags_.default_open):
+            imgui.text(f"Active cells: {snap['active_count']:,}  "
+                       f"({snap['active_frac']*100:.3f}%)")
+            imgui.text(f"Boundary-shell: {snap['boundary_count']:,}  "
+                       f"({snap['boundary_frac']*100:.1f}% of active)")
+            if snap['bbox_min'] is not None:
+                bmin = snap['bbox_min']; bmax = snap['bbox_max']
+                imgui.text(f"AABB min:  [{bmin[0]:.3f}, {bmin[1]:.3f}, {bmin[2]:.3f}]")
+                imgui.text(f"AABB max:  [{bmax[0]:.3f}, {bmax[1]:.3f}, {bmax[2]:.3f}]")
+                ext = [bmax[i] - bmin[i] for i in range(3)]
+                imgui.text(f"Extent:    [{ext[0]:.3f}, {ext[1]:.3f}, {ext[2]:.3f}]")
+            com = snap['com']
+            if not np.isnan(com[0]):
+                imgui.text(f"COM:       [{com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f}]  "
+                           f"(0.5 = grid center)")
+            if not np.isnan(snap['rg']):
+                imgui.text(f"R_g:       {snap['rg']:.4f}  (gyration radius / size)")
+            # Time series of r_g
+            if len(self._debug_history) >= 4:
+                hist = list(self._debug_history)[-200:]
+                rg_arr = np.array([h['rg'] if not np.isnan(h['rg']) else 0.0
+                                    for h in hist], dtype=np.float32)
+                imgui.text(f"R_g over time (last {len(hist)} samples)")
+                imgui.plot_lines("##rg", rg_arr,
+                                  graph_size=imgui.ImVec2(0, 60))
+
+        imgui.separator()
+        if imgui.button("Save snapshot JSON"):
+            self._debug_save_snapshot()
+        imgui.same_line()
+        imgui.text_colored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0),
+            f"-> debug_runs/")
+
+        imgui.end()
+
+    def _debug_save_snapshot(self):
+        """Dump the entire debug history ring to a JSON file under
+        debug_runs/<rule>_<size>_<timestamp>.json.
+
+        Includes the rule name, all parameters, dt, seed, init variant,
+        renderer mode, and the full per-step ring buffer. Designed to
+        be re-loadable by an offline analysis script for grid-size
+        comparison reports."""
+        import os
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'debug_runs')
+        os.makedirs(out_dir, exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(out_dir,
+            f"{self.rule_name}_{self.size}_{ts}.json")
+        payload = {
+            'rule': self.rule_name,
+            'size': self.size,
+            'dt': float(self.dt),
+            'seed': int(self.seed),
+            'renderer_mode': self.renderer_mode,
+            'init_variant': getattr(self, '_current_init', None),
+            'params': {k: float(v) for k, v in self.params.items()},
+            'sample_interval': self._debug_sample_interval,
+            'active_channel': self._debug_active_channel,
+            'active_threshold': self._debug_active_threshold,
+            'history': list(self._debug_history),
+        }
+        try:
+            with open(path, 'w') as f:
+                json.dump(payload, f)
+            print(f"[debug] saved {len(self._debug_history)} samples -> {path}",
+                  flush=True)
+        except Exception as e:
+            print(f"[debug] save failed: {e!r}", flush=True)
+
+    def _draw_perf_overlay(self, history):
+        """Tiny always-on-top window showing per-section frame timings.
+        Toggle with F12. Helps localize stutter to a specific stage of
+        the main loop. We show the *worst* frame in the last 120 frames
+        because spikes are what make stutter visible -- means hide them.
+
+        Sections measured (wall-clock, perf_counter):
+            poll   - glfw.poll_events + imgui process_inputs
+            step   - sim step shader dispatches (excluding score)
+            score  - GPU score reduction dispatch (every score_interval)
+            render - _render() OR _restore_scene_snapshot
+            ui     - imgui draw calls + Python panel code
+            swap   - glfw.swap_buffers (often blocks on vsync)
+            total  - whole frame
+        Any section consistently >5ms is suspicious; any section that
+        spikes to 30+ms occasionally is your stutter source."""
+        if not getattr(self, '_show_perf_overlay', False) or len(history) < 5:
+            return
+        # Aggregate stats over the rolling window
+        keys = ('poll', 'step', 'score', 'render', 'ui', 'swap', 'total')
+        worst = {k: 0.0 for k in keys}
+        worst_frame_idx = {k: -1 for k in keys}
+        mean = {k: 0.0 for k in keys}
+        counts = {k: 0 for k in keys}
+        for i, sec in enumerate(history):
+            for k in keys:
+                v = sec.get(k, None)
+                if v is None:
+                    continue
+                mean[k] += v
+                counts[k] += 1
+                if v > worst[k]:
+                    worst[k] = v
+                    worst_frame_idx[k] = i
+        for k in keys:
+            if counts[k] > 0:
+                mean[k] /= counts[k]
+
+        imgui.set_next_window_pos(imgui.ImVec2(10, 250), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(320, 0), imgui.Cond_.first_use_ever)
+        imgui.begin("Perf (F12)", flags=imgui.WindowFlags_.always_auto_resize)
+        imgui.text(f"Window: last {len(history)} frames")
+        imgui.text(f"{'section':<8} {'mean':>7} {'worst':>7} {'frame':>6}")
+        imgui.separator()
+        for k in keys:
+            ms_mean = mean[k] * 1000
+            ms_worst = worst[k] * 1000
+            # Highlight any section whose worst is >2x its mean — that's
+            # the signature of an occasional stall hiding inside an
+            # otherwise cheap operation.
+            spiky = ms_worst > 2.0 * ms_mean and ms_worst > 5.0
+            color = (1.0, 0.4, 0.4, 1.0) if spiky else (1.0, 1.0, 1.0, 1.0)
+            imgui.text_colored(imgui.ImVec4(*color),
+                f"{k:<8} {ms_mean:>6.2f}m {ms_worst:>6.2f}m {worst_frame_idx[k]:>6d}")
+        imgui.separator()
+        imgui.text_colored(imgui.ImVec4(0.7, 0.7, 0.7, 1.0),
+            "red = worst > 2x mean (likely stutter)")
+        imgui.end()
 
     def _draw_ui(self):
         imgui.set_next_window_pos(imgui.ImVec2(10, 10), imgui.Cond_.first_use_ever)
@@ -9369,6 +12302,23 @@ class Simulator:
         else:
             if imgui.button("Record Video [F5]"):
                 self._start_recording()
+            imgui.same_line()
+            changed, self._rec_upload_queue = imgui.checkbox(
+                "Queue for upload", self._rec_upload_queue)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "When enabled, the next recording is written to\n"
+                    "recordings/upload_queue/ where the YouTube pipeline\n"
+                    "will pick it up. Otherwise records to recordings/.")
+
+            # Resolution selector
+            res_labels = [r[0] for r in self._rec_resolutions]
+            imgui.set_next_item_width(180)
+            changed, self._rec_resolution_idx = imgui.combo(
+                "Resolution", self._rec_resolution_idx, res_labels)
+            if changed:
+                _, w, h = self._rec_resolutions[self._rec_resolution_idx]
+                self._rec_width, self._rec_height = w, h
         if self._rec_msg and time.time() - self._rec_msg_time < 5.0:
             imgui.same_line()
             imgui.text_colored(imgui.ImVec4(0.5, 1.0, 0.5, 1.0), self._rec_msg)
@@ -9532,10 +12482,31 @@ class Simulator:
                 self.voxel_gap = new_val
 
             if not self.is_element_ca:
+                # Adaptive auto-threshold toggle. When enabled, the threshold
+                # is rescaled every ~30 sim steps from the field's current
+                # min/max range -- this prevents the entire cube from
+                # rendering when a rule's natural background sits well above
+                # any fixed threshold (e.g. Gray-Scott U near 1.0 everywhere).
+                changed_a, new_a = imgui.checkbox("Auto threshold", self._adaptive_threshold)
+                if changed_a:
+                    self._adaptive_threshold = new_a
+                    self._user_overrode_threshold = False
+                    self._steps_since_threshold_update = 1_000_000
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "Threshold = field_min + (field_max - field_min) * fraction")
+                if self._adaptive_threshold:
+                    changed_f, new_f = imgui.slider_float(
+                        "  Auto frac", self._adaptive_threshold_frac, 0.01, 0.95)
+                    if changed_f:
+                        self._adaptive_threshold_frac = new_f
+                        self._steps_since_threshold_update = 1_000_000
+                # Manual slider overrides adaptive thresholding for this run.
                 changed, new_val = imgui.slider_float("Threshold", self.voxel_threshold, 0.01, 0.99)
                 if changed:
                     self.voxel_threshold = new_val
                     self._cull_valid = False
+                    self._user_overrode_threshold = True
 
             changed, new_val = imgui.slider_float("Opacity", self.voxel_alpha, 0.1, 1.0)
             if changed:
@@ -9817,19 +12788,33 @@ class Simulator:
     # ── Video recording ─────────────────────────────────────────────────
 
     def _init_rec_fbo(self):
-        """Create (or recreate) the offscreen FBO for recording."""
+        """Create (or recreate) the offscreen FBO + PBOs for recording."""
         w, h = self._rec_width, self._rec_height
         # Cleanup old
         for attr in ('_rec_fbo', '_rec_rbo_color', '_rec_rbo_depth'):
             obj = getattr(self, attr, None)
             if obj is not None:
                 obj.release()
+        for pbo in self._rec_pbo:
+            if pbo is not None:
+                pbo.release()
 
         self._rec_rbo_color = self.ctx.renderbuffer((w, h))
         self._rec_rbo_depth = self.ctx.depth_renderbuffer((w, h))
         self._rec_fbo = self.ctx.framebuffer(
             color_attachments=[self._rec_rbo_color],
             depth_attachment=self._rec_rbo_depth)
+
+        # Two RGB PBOs sized to one frame each; reused for the lifetime
+        # of the recording. dynamic_draw is the right hint for "GPU writes,
+        # CPU reads, every frame".
+        frame_bytes = w * h * 3
+        self._rec_pbo = [
+            self.ctx.buffer(reserve=frame_bytes, dynamic=True),
+            self.ctx.buffer(reserve=frame_bytes, dynamic=True),
+        ]
+        self._rec_pbo_idx = 0
+        self._rec_pbo_pending = False
 
     @staticmethod
     def _rec_writer_loop(queue, proc):
@@ -9865,19 +12850,30 @@ class Simulator:
             self._rec_msg_time = time.time()
             return
 
-        os.makedirs('recordings', exist_ok=True)
+        rec_dir = 'recordings/upload_queue' if self._rec_upload_queue else 'recordings'
+        os.makedirs(rec_dir, exist_ok=True)
         timestamp = time.strftime('%Y%m%d_%H%M%S')
         # Sanitise: rule labels may contain '/' (e.g. '4/4/5 Crystal' GOL
         # notation), parens, or other characters that confuse the path or
         # later ffmpeg/json parsers.  Keep alnum, '.', '_', '-' only.
         raw_label = RULE_PRESETS[self.rule_name]['label']
         rule_label = re.sub(r'[^A-Za-z0-9._-]+', '_', raw_label.replace(' ', '_')).strip('_') or 'rule'
-        self._rec_filename = f'recordings/{timestamp}_{rule_label}.mp4'
+        # Tag filename with resolution so downstream tooling (e.g. the
+        # upload pipeline picking shorts vs landscape destinations) can
+        # route on shape without re-probing the file.
+        res_tag = f'{self._rec_width}x{self._rec_height}'
+        self._rec_filename = f'{rec_dir}/{timestamp}_{rule_label}_{res_tag}.mp4'
 
         w, h = self._rec_width, self._rec_height
         self._init_rec_fbo()
+        self._rec_dropped_frames = 0
 
         # --- Build text overlay via ffmpeg drawtext filters ---
+        # The overlay text never changes during a recording, so we render
+        # it ONCE to a transparent PNG and apply it via a single overlay
+        # filter at runtime. The previous design re-rasterised 4-5 drawtext
+        # filters per frame, costing ~3-5 ms CPU per frame on top of
+        # everything else.
         font = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
         fontb = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
         if not os.path.exists(fontb):
@@ -9896,60 +12892,116 @@ class Simulator:
         def _esc(s):
             return s.replace('\\', '\\\\').replace("'", "\u2019").replace(':', '\\:').replace('%', '%%')
 
-        vf_parts = ['vflip']
-        base_y = 20
+        # Scale overlays so they look the same at every output resolution.
+        # Reference design is 1440p; we scale by the *shorter* dimension so
+        # portrait Shorts (1080x1920) don't blow up font sizes past the
+        # 1080-wide frame and clip the title/description on the right.
+        # Landscape (4K/1440/1080/720) is unaffected because width >= height.
+        s = min(w, h) / 1440.0
+        title_fs  = max(14, int(round(42 * s)))
+        desc_fs   = max(10, int(round(24 * s)))
+        param_fs  = max(10, int(round(20 * s)))
+        info_fs   = max(10, int(round(20 * s)))
+        score_fs  = max(12, int(round(28 * s)))
+        margin    = max(8,  int(round(24 * s)))
+        top_y     = max(6,  int(round(20 * s)))
+        title_h   = max(20, int(round(52 * s)))   # gap to description
+        bottom_y  = f'h-{max(20, int(round(42 * s)))}'
+        border_w  = max(1,  int(round(2 * s)))
+
+        drawtext_parts = []
         # Title
-        vf_parts.append(
+        drawtext_parts.append(
             f"drawtext=fontfile='{fontb}':text='{_esc(title)}':"
-            f"fontcolor=white:fontsize=42:x=24:y={base_y}:"
-            f"borderw=2:bordercolor=black@0.8")
+            f"fontcolor=white:fontsize={title_fs}:x={margin}:y={top_y}:"
+            f"borderw={border_w}:bordercolor=black@0.8")
         # Description (under title)
         if desc:
-            vf_parts.append(
+            drawtext_parts.append(
                 f"drawtext=fontfile='{font}':text='{_esc(desc)}':"
-                f"fontcolor=white:fontsize=24:x=24:y={base_y + 52}:"
-                f"borderw=2:bordercolor=black@0.8")
+                f"fontcolor=white:fontsize={desc_fs}:x={margin}:y={top_y + title_h}:"
+                f"borderw={border_w}:bordercolor=black@0.8")
         # Parameters (bottom-left)
         if param_str:
-            vf_parts.append(
+            drawtext_parts.append(
                 f"drawtext=fontfile='{font}':text='{_esc(param_str)}':"
-                f"fontcolor=white:fontsize=20:x=24:y=h-42:"
-                f"borderw=2:bordercolor=black@0.8")
+                f"fontcolor=white:fontsize={param_fs}:x={margin}:y={bottom_y}:"
+                f"borderw={border_w}:bordercolor=black@0.8")
         # Seed + grid size (bottom-right)
         info_str = f'Seed {self.seed}  Grid {self.size}x{self.size}x{self.size}'
-        vf_parts.append(
+        drawtext_parts.append(
             f"drawtext=fontfile='{font}':text='{_esc(info_str)}':"
-            f"fontcolor=white:fontsize=20:x=w-tw-24:y=h-42:"
-            f"borderw=2:bordercolor=black@0.8")
+            f"fontcolor=white:fontsize={info_fs}:x=w-tw-{margin}:y={bottom_y}:"
+            f"borderw={border_w}:bordercolor=black@0.8")
         # Discovery score (top-right, if viewing a discovery)
         if self.discovery_index >= 0 and self.discovery_index < len(self.discoveries):
             score = self.discoveries[self.discovery_index].get('score', 0)
             score_str = f'Score\\: {score:.2f}'
-            vf_parts.append(
+            drawtext_parts.append(
                 f"drawtext=fontfile='{fontb}':text='{score_str}':"
-                f"fontcolor=yellow:fontsize=28:x=w-tw-24:y=20:"
-                f"borderw=2:bordercolor=black@0.8")
+                f"fontcolor=yellow:fontsize={score_fs}:x=w-tw-{margin}:y={top_y}:"
+                f"borderw={border_w}:bordercolor=black@0.8")
 
-        vf_chain = ','.join(vf_parts)
+        # --- Pre-render overlay to a transparent PNG (one ffmpeg invocation,
+        #     synchronous, takes ~50-100 ms; saves ~3-5 ms per recorded frame).
+        try:
+            self._rec_overlay_path = self._render_overlay_png(
+                w, h, drawtext_parts)
+        except Exception as e:
+            sys.stderr.write(f"[recording] overlay pre-render failed ({e}); "
+                             f"falling back to per-frame drawtext\n")
+            self._rec_overlay_path = None
+
+        # --- Encoder selection.  NVENC is ~5-10x faster than libx264 medium
+        #     and runs entirely on the GPU's dedicated encoder block, so it
+        #     does not contend with the simulator's compute/render workload.
+        codec = os.environ.get('CA_RECORDING_CODEC', 'nvenc').lower()
+        if codec == 'nvenc' or codec == 'h264_nvenc':
+            enc_args = [
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p5',          # quality / speed balance (p1=fastest, p7=best)
+                '-tune', 'hq',
+                '-rc', 'vbr',
+                '-cq', '21',              # ~equivalent to libx264 -crf 21
+                '-b:v', '0',              # let -cq drive bitrate
+                '-profile:v', 'high',
+                '-pix_fmt', 'yuv420p',
+            ]
+        else:
+            enc_args = [
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+                '-threads', str(min(os.cpu_count() or 4, 8)),
+            ]
 
         cmd = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            # Input: raw RGB from pipe
+            # Single input: raw RGB from pipe.  Using only one input means
+            # ffmpeg exits cleanly the moment we close stdin -- we tried
+            # `-loop 1 -i overlay.png` as input #1 with `-shortest`, and
+            # in practice the looped input keeps ffmpeg alive forever
+            # after stop, hanging the simulator.
             '-f', 'rawvideo',
             '-pixel_format', 'rgb24',
             '-video_size', f'{w}x{h}',
             '-framerate', str(self._rec_fps),
             '-i', 'pipe:0',
-            # Flip + text overlay + encode
-            '-vf', vf_chain,
-            '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart',
-            '-threads', str(min(os.cpu_count() or 4, 8)),
-            self._rec_filename,
         ]
+        if self._rec_overlay_path is not None:
+            # `movie` source filter loads the static overlay PNG inside
+            # the filter graph, so the input-stream count stays at 1.
+            cmd += [
+                '-filter_complex',
+                f'[0:v]vflip[bg];movie={self._rec_overlay_path}[ovl];'
+                f'[bg][ovl]overlay=0:0',
+            ]
+        else:
+            # Fallback: per-frame drawtext (vflip + all drawtext filters)
+            cmd += ['-vf', ','.join(['vflip', *drawtext_parts])]
+
+        cmd += enc_args + ['-movflags', '+faststart', self._rec_filename]
         self._rec_process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, bufsize=w * h * 3 * 2)
@@ -9967,8 +13019,11 @@ class Simulator:
         self._rec_start_time = time.time()
         self._rec_frame_count = 0
 
-        # Background writer thread to avoid blocking main loop on pipe writes
-        self._rec_write_queue = _queue.Queue(maxsize=30)
+        # Background writer thread to avoid blocking main loop on pipe writes.
+        # Queue holds up to 120 frames (~2 s @ 60 fps) to absorb transient
+        # encoder hiccups without dropping frames.  At 1440p that's ~1.3 GB
+        # worst case, which is trivial on the target hardware.
+        self._rec_write_queue = _queue.Queue(maxsize=120)
         self._rec_write_thread = threading.Thread(
             target=self._rec_writer_loop,
             args=(self._rec_write_queue, self._rec_process),
@@ -9986,6 +13041,20 @@ class Simulator:
 
         # Signal writer thread to stop, then wait for it to drain.
         # Bounded waits so a hung writer cannot block window close.
+        # Drain the last pending PBO read into the queue so the final frame
+        # isn't lost.  Safe even if ffmpeg already exited -- the writer
+        # thread will just notice the broken pipe and stop.
+        if self._rec_pbo_pending:
+            try:
+                prev = 1 - self._rec_pbo_idx
+                data = self._rec_pbo[prev].read()
+                if self._rec_write_queue is not None:
+                    self._rec_write_queue.put(data, timeout=0.5)
+                    self._rec_frame_count += 1
+            except Exception:
+                pass
+            self._rec_pbo_pending = False
+
         if self._rec_write_queue is not None:
             try:
                 self._rec_write_queue.put(None, timeout=1.0)  # sentinel
@@ -9998,6 +13067,19 @@ class Simulator:
                 print("[record] WARNING: writer thread did not exit cleanly", flush=True)
             self._rec_write_thread = None
         self._rec_write_queue = None
+
+        # Release PBOs (the FBO itself is reused / released on next start).
+        for i, pbo in enumerate(self._rec_pbo):
+            if pbo is not None:
+                try: pbo.release()
+                except Exception: pass
+                self._rec_pbo[i] = None
+
+        # Clean up the overlay PNG (best effort).
+        if self._rec_overlay_path:
+            try: os.unlink(self._rec_overlay_path)
+            except Exception: pass
+            self._rec_overlay_path = None
 
         # Close ffmpeg stdin after writer thread has finished (avoids BrokenPipeError).
         # Bounded wait + escalating SIGTERM/SIGKILL so a hung ffmpeg cannot
@@ -10065,30 +13147,80 @@ class Simulator:
             self.ctx.viewport = old_viewport
 
     def _record_frame(self):
-        """Read back the recording FBO and queue frame data for ffmpeg."""
+        """Read back the recording FBO and queue frame data for ffmpeg.
+
+        Uses two pixel-pack buffers (PBOs) ping-ponged across frames so the
+        GPU->CPU DMA overlaps with the next frame's render work instead of
+        stalling the pipeline. Frame N issues a read into pbo[N%2]; frame N
+        retrieves the bytes from pbo[(N-1)%2] (queued the previous frame's
+        DMA) and hands them to the writer thread. Net effect: one frame of
+        added end-to-end latency, ~3-6 ms/frame saved on the main thread.
+        """
         if not self._recording or not self._rec_process:
             return
 
-        # Render scene to recording FBO
+        # Render scene to recording FBO.
         self._render_to_rec_fbo()
 
-        # Read pixels via moderngl (handles format matching internally)
-        data = self._rec_fbo.read(components=3)
-        try:
-            self._rec_write_queue.put_nowait(bytes(data))
-            self._rec_frame_count += 1
-        except _queue.Full:
-            # ffmpeg is falling behind — record the loss visibly so users notice
-            # before checking the resulting MP4. Throttle the log so a sustained
-            # backlog doesn't spam stderr.
-            self._rec_dropped_frames = getattr(self, '_rec_dropped_frames', 0) + 1
-            if self._rec_dropped_frames % 30 == 1:
-                sys.stderr.write(
-                    f"[recording] dropped {self._rec_dropped_frames} frame(s); "
-                    f"ffmpeg writer queue is saturated\n")
-                self._rec_msg = (
-                    f"WARN: dropped {self._rec_dropped_frames} frame(s)")
-                self._rec_msg_time = time.time()
+        cur = self._rec_pbo_idx
+        prev = 1 - cur
+
+        # Issue async DMA: GPU copies the FBO contents into the current PBO.
+        # This call returns immediately on the driver side; the actual copy
+        # happens in parallel with whatever we do next.
+        self._rec_fbo.read_into(self._rec_pbo[cur], components=3)
+
+        # If we have a pending read from the previous frame, retrieve it now.
+        # By this point the DMA is one frame old and almost certainly done,
+        # so .read() returns without blocking.
+        if self._rec_pbo_pending:
+            data = self._rec_pbo[prev].read()
+            try:
+                self._rec_write_queue.put_nowait(data)
+                self._rec_frame_count += 1
+            except _queue.Full:
+                # ffmpeg is falling behind — surface the loss so users notice
+                # before checking the MP4. Throttle the log so a sustained
+                # backlog doesn't spam stderr.
+                self._rec_dropped_frames += 1
+                if self._rec_dropped_frames % 30 == 1:
+                    sys.stderr.write(
+                        f"[recording] dropped {self._rec_dropped_frames} frame(s); "
+                        f"ffmpeg writer queue is saturated\n")
+                    self._rec_msg = (
+                        f"WARN: dropped {self._rec_dropped_frames} frame(s)")
+                    self._rec_msg_time = time.time()
+
+        self._rec_pbo_pending = True
+        self._rec_pbo_idx = prev  # swap for next frame
+
+    def _render_overlay_png(self, w, h, drawtext_parts):
+        """Render the static text overlay to a transparent RGBA PNG.
+
+        Returns the path to the generated file (or raises). The file lives
+        in the system temp dir and is cleaned up on _stop_recording().
+        """
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix='ca_overlay_', suffix='.png')
+        os.close(fd)
+        # lavfi color source supplies a transparent RGBA frame; drawtext
+        # filters draw onto it; -frames:v 1 dumps a single PNG.
+        vf = ','.join(drawtext_parts) if drawtext_parts else 'null'
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi',
+            '-i', f'color=c=#00000000:s={w}x{h}:d=1,format=rgba',
+            '-vf', vf,
+            '-frames:v', '1',
+            path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=10)
+        if proc.returncode != 0 or not os.path.exists(path) or os.path.getsize(path) == 0:
+            try: os.unlink(path)
+            except Exception: pass
+            err = proc.stderr.decode(errors='replace').strip()[:200]
+            raise RuntimeError(f"overlay PNG generation failed: {err}")
+        return path
 
     def _write_recording_metadata(self):
         """Write a JSON sidecar with rule info, params, and description."""
@@ -10121,11 +13253,24 @@ class Simulator:
 
     def run(self):
         frame_times = []
+        # ── Per-section timings for the perf overlay (toggle with F12) ──
+        # We track the *worst* and *mean* of each section over the last
+        # 120 frames. A section's worst-case time tells you which slice
+        # of the loop is responsible for the visible stutter; the mean
+        # tells you the steady-state cost. Both are wall-clock python
+        # time (perf_counter), so a stall waiting for the GPU is visible
+        # as "slow" on whichever section did the call that caused it.
+        # Recorded sections: poll, step, score, render, snap, ui, swap.
+        from collections import deque
+        section_history = deque(maxlen=120)
         try:
             while not glfw.window_should_close(self.window):
-                t0 = time.time()
+                t0 = time.perf_counter()
+                sec = {}
                 glfw.poll_events()
                 self.imgui_renderer.process_inputs()
+                t_after_poll = time.perf_counter()
+                sec['poll'] = t_after_poll - t0
 
                 # Update framebuffer size
                 fb_w, fb_h = glfw.get_framebuffer_size(self.window)
@@ -10135,6 +13280,7 @@ class Simulator:
                     self.ctx.viewport = (0, 0, fb_w, fb_h)
 
                 # Simulation step (rate-limited)
+                t_step_start = time.perf_counter()
                 if not self.paused:
                     now = time.time()
                     should_step = False
@@ -10149,43 +13295,62 @@ class Simulator:
                     if should_step:
                         for _ in range(self.sim_speed):
                             self._step_sim()
+                            # Debug stats: throttled GPU dispatch per step
+                            self._dispatch_debug_stats()
 
                         # Live scoring (periodic GPU reduction — no full readback)
                         self._score_frame += 1
                         if self._score_frame >= self._score_interval:
                             self._score_frame = 0
+                            t_score_start = time.perf_counter()
                             self._update_score()
+                            sec['score'] = time.perf_counter() - t_score_start
+                # Harvest debug stats every frame (no-op if no fence pending
+                # or fence not yet signaled). Cheap.
+                self._harvest_debug_stats()
+                sec['step'] = time.perf_counter() - t_step_start - sec.get('score', 0.0)
 
                 # Render — skip if scene state is identical to last frame
                 # (camera still, sim paused or between steps, UI knobs idle).
                 # Paying ~0.3 ms for a screen-size blit beats a full ray-march
                 # which at 512³ can be 10–30 ms. Recording forces a full render
                 # because the video pipeline reads the backbuffer each frame.
+                t_render_start = time.perf_counter()
                 cur_hash = self._scene_hash()
                 if (cur_hash == self._last_scene_hash
                         and self._scene_cache_fbo is not None
                         and self._scene_cache_size == (self.width, self.height)
                         and not self._recording):
                     self._restore_scene_snapshot()
+                    sec['render_skipped'] = True
                 else:
                     self._render()
                     self._snapshot_scene()
                     self._last_scene_hash = cur_hash
+                sec['render'] = time.perf_counter() - t_render_start
 
                 # Capture frame for video (scene only, before UI overlay)
                 if self._recording:
                     self._record_frame()
 
                 # Render UI
+                t_ui_start = time.perf_counter()
                 imgui.new_frame()
                 self._draw_ui()
+                self._draw_debug_overlay()
+                self._draw_perf_overlay(section_history)
                 imgui.render()
                 self.imgui_renderer.render(imgui.get_draw_data())
+                sec['ui'] = time.perf_counter() - t_ui_start
 
+                t_swap_start = time.perf_counter()
                 glfw.swap_buffers(self.window)
+                sec['swap'] = time.perf_counter() - t_swap_start
 
                 # FPS tracking
-                dt_frame = time.time() - t0
+                dt_frame = time.perf_counter() - t0
+                sec['total'] = dt_frame
+                section_history.append(sec)
                 frame_times.append(dt_frame)
                 if len(frame_times) > 60:
                     frame_times.pop(0)
@@ -10342,6 +13507,135 @@ class Simulator:
 
 # ── main ──────────────────────────────────────────────────────────────
 
+def _audit_one(rule, size, steps, seed, sample_interval, warmup, quiet=False):
+    """Run a single headless audit pass for (rule, size). Returns the
+    saved snapshot's path and the final harvested sample dict (or None)."""
+    t_build = time.time()
+    sim = Simulator(size=size, rule=rule, headless=True)
+    if seed is not None:
+        sim.seed = int(seed)
+        sim._reset()
+    sim._debug_enabled = True
+    sim._debug_sample_interval = max(1, int(sample_interval))
+    build_dt = time.time() - t_build
+
+    if not quiet:
+        print(f"[audit] rule={rule} size={size} steps={steps} "
+              f"interval={sim._debug_sample_interval} seed={sim.seed} "
+              f"(build {build_dt*1000:.0f}ms)", flush=True)
+
+    t_run = time.time()
+    next_report = time.time() + 2.0
+    total = int(steps) + int(warmup)
+    for i in range(total):
+        sim._step_sim()
+        # Deterministic sampling: after warmup, every `sample_interval`
+        # steps we force a synchronous sample so the history ring has
+        # predictable coverage. Async fence polling inside a tight headless
+        # loop would race and drop most dispatches.
+        if i >= warmup and ((i - warmup) % sim._debug_sample_interval == 0):
+            # Drain any in-flight fence from a prior dispatch first.
+            t_block = time.time()
+            while sim._debug_fence is not None and time.time() - t_block < 2.0:
+                sim._harvest_debug_stats()
+            # Force-fire (bypass internal throttle).
+            sim._debug_steps_since_sample = sim._debug_sample_interval
+            sim._dispatch_debug_stats()
+            t_block = time.time()
+            while sim._debug_fence is not None and time.time() - t_block < 2.0:
+                sim._harvest_debug_stats()
+        if not quiet and time.time() > next_report:
+            sps = (i + 1) / (time.time() - t_run)
+            print(f"[audit]   step {i+1}/{total}  "
+                  f"{sps:.0f} steps/s  samples={len(sim._debug_history)}",
+                  flush=True)
+            next_report = time.time() + 2.0
+
+    # Force a final sample so the saved history includes the final state,
+    # then drain the fence with a short poll loop.
+    sim._debug_steps_since_sample = sim._debug_sample_interval
+    sim._dispatch_debug_stats()
+    t_drain = time.time()
+    while sim._debug_fence is not None and time.time() - t_drain < 2.0:
+        sim._harvest_debug_stats()
+
+    # Save snapshot using the existing path convention.
+    sim._debug_save_snapshot()
+    final = sim._debug_latest
+    run_dt = time.time() - t_run
+
+    if not quiet:
+        if final is not None:
+            print(f"[audit]   done: {run_dt:.1f}s, "
+                  f"active_frac={final['active_frac']:.4f}, "
+                  f"rg={final['rg']:.3f}, "
+                  f"finite={final['finite']}, nan={final['nan']}, inf={final['inf']}",
+                  flush=True)
+        else:
+            print(f"[audit]   done: {run_dt:.1f}s (no final sample)", flush=True)
+
+    # Tear down so the next size gets a fresh context.
+    try:
+        sim.ctx.release()
+    except Exception:
+        pass
+    try:
+        glfw.destroy_window(sim.window)
+    except Exception:
+        pass
+    return final
+
+
+def run_audit(rule, sizes, steps, seed=None, sample_interval=5, warmup=0,
+              scale_steps=False):
+    """Run a full CLI audit sweep across grid sizes for one rule, then
+    print a side-by-side comparison table of the final samples.
+
+    When `scale_steps` is True, the step and warmup counts are multiplied
+    per size by max(1, (size/REF_SIZE)²) so every size advances the same
+    physical time — essential for a fair comparison of PDE rules whose
+    shaders clamp dt for CFL stability at high resolutions.
+    """
+    REF = 128
+    print(f"\n=== Audit: rule={rule}, sizes={sizes}, steps={steps}, "
+          f"warmup={warmup}, seed={seed}, scale_steps={scale_steps} ===\n",
+          flush=True)
+    results = {}
+    for sz in sizes:
+        if scale_steps and sz > REF:
+            mult = (sz / REF) ** 2
+            sz_steps  = int(round(steps  * mult))
+            sz_warmup = int(round(warmup * mult))
+        else:
+            sz_steps, sz_warmup = int(steps), int(warmup)
+        final = _audit_one(rule, sz, sz_steps, seed, sample_interval, sz_warmup)
+        results[sz] = final
+        print('', flush=True)
+
+    # Cross-size comparison table
+    print("=== Comparison ===")
+    hdr = f"{'size':>6} {'active_frac':>12} {'rg':>7} {'com_xyz':>21}" \
+          f" {'ch0_mean':>10} {'ch0_std':>10} {'boundary':>10}" \
+          f" {'nan':>6} {'inf':>6}"
+    print(hdr)
+    print('-' * len(hdr))
+    for sz, s in results.items():
+        if s is None:
+            print(f"{sz:>6}  (no sample)")
+            continue
+        com = s.get('com') or [float('nan')] * 3
+        com_str = f"({com[0]:.2f},{com[1]:.2f},{com[2]:.2f})"
+        ch0_mean = s['mean'][0] if s['mean'] else float('nan')
+        ch0_std  = s['std'][0]  if s['std']  else float('nan')
+        nan_total = sum(s['nan'])
+        inf_total = sum(s['inf'])
+        print(f"{sz:>6} {s['active_frac']:>12.4f} {s['rg']:>7.3f}"
+              f" {com_str:>21} {ch0_mean:>10.4g} {ch0_std:>10.4g}"
+              f" {s['boundary_frac']:>10.4f} {nan_total:>6d} {inf_total:>6d}")
+    print('', flush=True)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="3D CA Simulator")
     parser.add_argument('--size', type=int, default=64, help='Grid size (default: 64)')
@@ -10352,7 +13646,46 @@ def main():
                         help='Load discovery from JSON file (index with --discovery-index)')
     parser.add_argument('--discovery-index', type=int, default=0,
                         help='Which discovery to load (0-based index)')
+    # --- audit mode ---
+    parser.add_argument('--audit', action='store_true',
+                        help='Run a headless debug audit across --audit-sizes '
+                             'and exit (does not open the UI).')
+    parser.add_argument('--audit-sizes', type=str, default='64,128,256',
+                        help='Comma-separated grid sizes for --audit '
+                             '(default: 64,128,256)')
+    parser.add_argument('--audit-steps', type=int, default=500,
+                        help='Steps per size during --audit (default: 500)')
+    parser.add_argument('--audit-warmup', type=int, default=0,
+                        help='Steps to run before starting to record '
+                             '(default: 0)')
+    parser.add_argument('--audit-interval', type=int, default=5,
+                        help='Debug sample interval during --audit (default: 5)')
+    parser.add_argument('--audit-scale-steps', action='store_true',
+                        help='For --audit: scale step/warmup counts by '
+                             '(size/128)² at sizes > 128, so each size '
+                             'advances the same physical time. Use for '
+                             'PDE rules (reaction-diffusion, wave, etc.) '
+                             'whose shaders clamp dt for CFL stability.')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Override seed before reset (applies to audit '
+                             'and non-audit runs)')
     args = parser.parse_args()
+
+    # Audit mode: loop through sizes headlessly, dump per-size JSON, exit.
+    if args.audit:
+        try:
+            sizes = [int(s) for s in args.audit_sizes.split(',') if s.strip()]
+        except ValueError:
+            print(f"Invalid --audit-sizes: {args.audit_sizes}")
+            sys.exit(1)
+        run_audit(args.rule, sizes, args.audit_steps, seed=args.seed,
+                  sample_interval=args.audit_interval, warmup=args.audit_warmup,
+                  scale_steps=args.audit_scale_steps)
+        try:
+            glfw.terminate()
+        except Exception:
+            pass
+        return
 
     # Load discovery params if specified
     if args.discovery:
@@ -10378,6 +13711,10 @@ def main():
               f"score={disc.get('score', '?')} params={disc['params']}")
     else:
         sim = Simulator(size=args.size, rule=args.rule)
+
+    if args.seed is not None:
+        sim.seed = int(args.seed)
+        sim._reset()
 
     sim.run()
 
