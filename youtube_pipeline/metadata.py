@@ -12,6 +12,22 @@ DESCRIPTION_MAX = 5000
 TAG_MAX_TOTAL = 500   # combined character count across all tags
 
 
+def _sanitize(text: str) -> str:
+    """Strip characters YouTube rejects in title / description / tags.
+
+    The Data API rejects ``<`` and ``>`` in the snippet metadata as a
+    blanket anti-injection measure (HttpError 400 ``invalidDescription``
+    / ``invalidTitle``).  Crystal preset descriptions use Miller-index
+    notation like ``<100>-facet`` which trips this filter, so we replace
+    angle brackets with their nearest typographic equivalents.
+    """
+    if not text:
+        return text
+    # U+27E8 / U+27E9 are mathematical angle brackets -- visually almost
+    # identical to ASCII < > and accepted by YouTube.
+    return text.replace('<', '\u27e8').replace('>', '\u27e9')
+
+
 def _is_shorts(resolution: list[int]) -> bool:
     """Vertical aspect ratio (9:16-ish) → Shorts."""
     if not resolution or len(resolution) != 2:
@@ -89,9 +105,9 @@ def build_metadata(sidecar_path: Path) -> dict:
     tags = _trim_tags(tags)
 
     result = {
-        'title': title,
-        'description': description,
-        'tags': tags,
+        'title': _sanitize(title),
+        'description': _sanitize(description),
+        'tags': [_sanitize(t) for t in tags],
         'shorts': shorts,
         'category_id': '28',   # Science & Technology
     }
