@@ -29,6 +29,11 @@ import sys, os, json, time, argparse
 import warnings
 import numpy as np
 
+try:
+    from OpenGL import GL  # type: ignore
+except Exception:  # pragma: no cover -- already optional in step()
+    GL = None  # type: ignore
+
 # Suppress numpy overflow/invalid warnings from degenerate CA states (all-NaN grids, etc.)
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
 
@@ -71,6 +76,265 @@ _shader_cache = {}
 _texture_pool = {}
 # Shared element SSBO (same data every time)
 _element_ssbo_cache = {}
+
+# ── Per-phase timing (opt-in via CA_HARNESS_PROFILE=1) ───────────────
+# Lightweight: O(few ns) per perf_counter call when enabled, O(0) when off.
+# Phases tracked per trial: init, step, read, metrics, dynamics, release.
+_PROFILE_ENABLED = os.environ.get('CA_HARNESS_PROFILE', '0') == '1'
+_profile_totals = {'init': 0.0, 'step': 0.0, 'read': 0.0,
+                   'metrics': 0.0, 'dynamics': 0.0, 'release': 0.0,
+                   'wall': 0.0, 'trials': 0, 'steps': 0, 'reads': 0}
+
+def _profile_print():
+    """Print rollup of per-phase timings. Called at end of cmd_search."""
+    if not _PROFILE_ENABLED or _profile_totals['trials'] == 0:
+        return
+    t = _profile_totals
+    n = t['trials']
+    print()
+    print(f"=== PROFILE ({n} trials, {t['steps']} steps, {t['reads']} reads) ===")
+    accounted = sum(t[k] for k in ('init', 'step', 'read', 'metrics',
+                                    'dynamics', 'release'))
+    other = max(0.0, t['wall'] - accounted)
+    rows = [
+        ('init',     t['init'],     t['init']     / n * 1000),
+        ('step',     t['step'],     t['step']     / max(1, t['steps']) * 1000),
+        ('read',     t['read'],     t['read']     / max(1, t['reads']) * 1000),
+        ('metrics',  t['metrics'],  t['metrics']  / max(1, t['reads']) * 1000),
+        ('dynamics', t['dynamics'], t['dynamics'] / n * 1000),
+        ('release',  t['release'],  t['release']  / n * 1000),
+        ('other',    other,         other         / n * 1000),
+    ]
+    print(f"  {'phase':<10} {'total(s)':>10} {'per-unit(ms)':>14} {'%':>6}")
+    for name, total, per in rows:
+        pct = 100.0 * total / max(1e-9, t['wall'])
+        print(f"  {name:<10} {total:>10.3f} {per:>14.3f} {pct:>5.1f}%")
+    print(f"  {'WALL':<10} {t['wall']:>10.3f} {t['wall']/n*1000:>14.3f}  100.0%")
+
+
+# ── GPU-side metrics (opt-out via CA_HARNESS_GPU_METRICS=0) ──────────
+# Replaces compute_metrics()'s 6+ whole-grid CPU passes with one (or two)
+# compute dispatches plus a tiny ~96-byte SSBO readback. At size=256 the
+# CPU read+metrics phase drops from ~360ms/sample to ~10-20ms/sample.
+#
+# Two-pass dispatch is required for `deviation` mode (alive iff |v - mean|
+# > thr) because the mean is needed before thresholding. All other modes
+# fit in a single dispatch.
+_GPU_METRICS_ENABLED = os.environ.get('CA_HARNESS_GPU_METRICS', '1') == '1'
+
+# Mode IDs (must match GLSL switch in HARNESS_METRICS_SHADER):
+_MODE_ID = {
+    'discrete':         0,   # alive iff v > thr
+    'continuous':       0,   # same
+    'wave':             1,   # alive iff |v| > thr
+    'element':          2,   # non-vacuum & non-wall (uses ch0)
+    'deviation':        3,   # alive iff |v - field_mean| > thr (needs 2 passes)
+    'phase_coherence':  4,   # alive iff incoherence > thr (uses 6-nb sin)
+}
+
+# Layout of the metrics SSBO. All slots are uint32. Floats are bit-encoded
+# via floatBitsToUint(v + BIAS) so atomicMin/Max work; sums are fixed-point
+# pre-divided by a per-workgroup divisor so the global sum fits int32.
+_METRICS_NUINTS = 16   # finite, nan, inf, min, max, sum, sumsq,
+                       # alive, surface, activity, mean_sum_for_deviation,
+                       # 5 spare
+_METRICS_BIAS    = 1.0e6
+_METRICS_SCALE_S = 1.0e6
+_METRICS_SCALE_Q = 1.0e3
+
+# Single-pass shader: computes per-channel scalar stats (on `measure_channel`
+# only — the 4-channel version was unused by run_trial), the alive mask,
+# surface count, and activity (vs prev_grid).
+HARNESS_METRICS_SHADER = """
+#version 430
+layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+
+layout(rgba32f, binding=0) readonly uniform image3D u_grid;
+layout(rgba32f, binding=1) readonly uniform image3D u_prev;
+
+layout(std430, binding=2) buffer Stats {
+    uint finite_count;
+    uint nan_count;
+    uint inf_count;
+    uint min_bits;        // floatBitsToUint(v + BIAS) of measured channel
+    uint max_bits;
+    uint sum_fp;          // signed (cast int->uint) fixed-point, pre-normalized
+    uint sumsq_fp;        // unsigned fixed-point, pre-normalized
+    uint alive_count;
+    uint surface_count;
+    uint activity_count;
+    uint deviation_mean_fp;   // dispatch-1 output for deviation mode
+    uint pad11;
+    uint pad12;
+    uint pad13;
+    uint pad14;
+    uint pad15;
+};
+
+uniform int   u_size;
+uniform int   u_channel;
+uniform int   u_mode;             // 0=thr, 1=abs(thr), 2=element, 3=deviation, 4=phase_coh
+uniform float u_alive_thr;
+uniform float u_change_thr;
+uniform int   u_have_prev;        // 0/1 — skip activity when 0
+uniform int   u_is_element;       // also count temp(ch1) changes for activity
+uniform float u_field_mean;       // pre-computed mean for deviation mode (pass 2)
+uniform float u_norm_n;           // 1.0 / per-wg flush divisor
+
+#define BIAS    1.0e6
+#define SCALE_S 1.0e6
+#define SCALE_Q 1.0e3
+#define TWO_PI  6.283185307179586
+
+shared uint s_finite;
+shared uint s_nan;
+shared uint s_inf;
+shared uint s_min_bits;
+shared uint s_max_bits;
+shared int  s_sum;
+shared uint s_sumsq;
+shared uint s_alive;
+shared uint s_surface;
+shared uint s_activity;
+
+bool is_alive(vec4 cell, ivec3 pos) {
+    float v = cell[u_channel];
+    if (u_mode == 2) {
+        // element: non-vacuum (|v|>0.5) AND non-wall (|v-119|>0.5)
+        return abs(v) > 0.5 && abs(v - 119.0) > 0.5;
+    }
+    if (u_mode == 1) return abs(v) > u_alive_thr;
+    if (u_mode == 3) return abs(v - u_field_mean) > u_alive_thr;
+    if (u_mode == 4) {
+        // phase_coherence: alive iff mean |sin(nb_phase - phase)| > thr.
+        // Phase stored as v in [0,1] = [0, 2pi].
+        float phase = v * TWO_PI;
+        float incoh = 0.0;
+        ivec3 nbs[6] = ivec3[6](
+            ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+            ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+            ivec3( 0, 0, 1), ivec3( 0, 0,-1)
+        );
+        for (int i = 0; i < 6; i++) {
+            ivec3 np = (pos + nbs[i] + ivec3(u_size)) % ivec3(u_size);
+            float nv = imageLoad(u_grid, np)[u_channel] * TWO_PI;
+            incoh += abs(sin(nv - phase));
+        }
+        incoh *= (1.0 / 6.0);
+        return incoh > u_alive_thr;
+    }
+    return v > u_alive_thr;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    if (lid == 0u) {
+        s_finite = 0u; s_nan = 0u; s_inf = 0u;
+        s_min_bits = floatBitsToUint(BIAS + 1.0e30);
+        s_max_bits = 0u;
+        s_sum = 0; s_sumsq = 0u;
+        s_alive = 0u; s_surface = 0u; s_activity = 0u;
+    }
+    barrier();
+
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    bool in_grid = all(lessThan(pos, ivec3(u_size)));
+
+    if (in_grid) {
+        vec4 cur = imageLoad(u_grid, pos);
+        float v = cur[u_channel];
+
+        // ── Scalar stats on measured channel ────────────────────────
+        if (isnan(v))      atomicAdd(s_nan, 1u);
+        else if (isinf(v)) atomicAdd(s_inf, 1u);
+        else {
+            atomicAdd(s_finite, 1u);
+            // For wave mode (mode==1), stats are on |v| not v -- matches CPU path
+            float vstat = (u_mode == 1) ? abs(v) : v;
+            int s_int = int(vstat * SCALE_S);
+            uint sq_uint = uint(vstat * vstat * SCALE_Q);
+            atomicAdd(s_sum, s_int);
+            atomicAdd(s_sumsq, sq_uint);
+            uint bits = floatBitsToUint(vstat + BIAS);
+            atomicMin(s_min_bits, bits);
+            atomicMax(s_max_bits, bits);
+        }
+
+        // ── Alive mask & surface count ──────────────────────────────
+        bool alive = is_alive(cur, pos);
+        if (alive) {
+            atomicAdd(s_alive, 1u);
+            // Surface = alive AND at least one of 6 toroidal neighbours dead.
+            // Note: for phase_coherence mode this re-runs is_alive on each
+            // neighbour (6 more 6-neighbour scans = 36 extra fetches per
+            // alive cell). Acceptable: phase_coherence is one rule.
+            bool has_dead_nb = false;
+            ivec3 nbs[6] = ivec3[6](
+                ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+                ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+                ivec3( 0, 0, 1), ivec3( 0, 0,-1)
+            );
+            for (int i = 0; i < 6; i++) {
+                ivec3 np = (pos + nbs[i] + ivec3(u_size)) % ivec3(u_size);
+                if (!is_alive(imageLoad(u_grid, np), np)) {
+                    has_dead_nb = true;
+                    break;
+                }
+            }
+            if (has_dead_nb) atomicAdd(s_surface, 1u);
+        }
+
+        // ── Activity (vs prev_grid) ─────────────────────────────────
+        if (u_have_prev != 0) {
+            vec4 prev = imageLoad(u_prev, pos);
+            bool changed = abs(v - prev[u_channel]) > u_change_thr;
+            if (u_is_element != 0 && !changed) {
+                changed = abs(cur.y - prev.y) > 1.0;
+            }
+            if (changed) atomicAdd(s_activity, 1u);
+        }
+    }
+
+    barrier();
+
+    // ── Flush workgroup totals to global SSBO ───────────────────────
+    if (lid == 0u) {
+        if (s_finite > 0u) atomicAdd(finite_count,    s_finite);
+        if (s_nan    > 0u) atomicAdd(nan_count,       s_nan);
+        if (s_inf    > 0u) atomicAdd(inf_count,       s_inf);
+        if (s_finite > 0u) {
+            atomicMin(min_bits, s_min_bits);
+            atomicMax(max_bits, s_max_bits);
+        }
+        // Normalize per-wg sums by 1/divisor before flushing so global fits.
+        float sum_f   = float(s_sum)   * u_norm_n;
+        float sumsq_f = float(s_sumsq) * u_norm_n;
+        int  sum_q    = int(floor(sum_f   + sign(sum_f) * 0.5));
+        uint sumsq_q  = uint(sumsq_f + 0.5);
+        if (sum_q   != 0)  atomicAdd(sum_fp,   uint(sum_q));
+        if (sumsq_q > 0u)  atomicAdd(sumsq_fp, sumsq_q);
+        if (s_alive    > 0u) atomicAdd(alive_count,    s_alive);
+        if (s_surface  > 0u) atomicAdd(surface_count,  s_surface);
+        if (s_activity > 0u) atomicAdd(activity_count, s_activity);
+    }
+}
+"""
+
+# Pre-pass for deviation mode: just sum the channel to compute the mean.
+# Same flush-divisor pattern, but we only need finite_count + sum_fp, so we
+# reuse the main shader's SSBO layout (other slots stay zeroed).
+
+
+def _gpu_metrics_compile(ctx, glsl_fmt='rgba32f'):
+    """One-time compile per (context, format), cached."""
+    cache = _shader_cache
+    key = (id(ctx), 'harness_metrics_v1', glsl_fmt)
+    if key not in cache:
+        src = HARNESS_METRICS_SHADER
+        if glsl_fmt != 'rgba32f':
+            src = src.replace('rgba32f', glsl_fmt)
+        cache[key] = ctx.compute_shader(src)
+    return cache[key]
 
 
 def _pool_key(ctx, size, dtype):
@@ -421,7 +685,231 @@ class HeadlessRunner:
             return raw.copy()
         return raw.astype(np.float32)
 
+    # ── GPU-side metrics ─────────────────────────────────────────────
+    # Lazy-allocates prev-grid texture + stats SSBO + program on first call.
+    # All resources released in release().
+
+    def _ensure_metrics_resources(self):
+        if getattr(self, '_metrics_prog', None) is not None:
+            return
+        self._metrics_prog = _gpu_metrics_compile(self.ctx, self._tex_glsl_fmt)
+        # Cache uniform handles
+        p = self._metrics_prog
+        self._mu = {
+            'size':       p.get('u_size', None),
+            'channel':    p.get('u_channel', None),
+            'mode':       p.get('u_mode', None),
+            'alive_thr':  p.get('u_alive_thr', None),
+            'change_thr': p.get('u_change_thr', None),
+            'have_prev':  p.get('u_have_prev', None),
+            'is_element': p.get('u_is_element', None),
+            'field_mean': p.get('u_field_mean', None),
+            'norm_n':     p.get('u_norm_n', None),
+        }
+        # 16 uint32s
+        self._metrics_ssbo = self.ctx.buffer(reserve=_METRICS_NUINTS * 4)
+        # Prev-grid texture (for activity); created lazily on first sample
+        self._prev_tex = None
+        self._has_prev = False
+        # Per-wg flush divisor; set per dispatch.
+        self._metrics_divisor = 1.0
+
+    def _alloc_prev_tex(self):
+        if self._prev_tex is not None:
+            return
+        # Match main grid format
+        sz = self.size
+        self._prev_tex = self.ctx.texture3d((sz, sz, sz), 4, dtype=self._tex_dtype)
+
+    def _metrics_dispatch(self, src_tex, mode_id, field_mean=0.0,
+                           with_prev=True):
+        """Dispatch the metrics shader against src_tex. Returns nothing;
+        result lives in _metrics_ssbo."""
+        prog = self._metrics_prog
+        ssbo = self._metrics_ssbo
+
+        # Zero SSBO and pre-seed min sentinel (bits of BIAS+1e30).
+        zeros = bytearray(_METRICS_NUINTS * 4)
+        sentinel = np.float32(_METRICS_BIAS + 1.0e30).tobytes()
+        zeros[12:16] = sentinel  # min_bits is uint index 3
+        ssbo.write(bytes(zeros))
+
+        src_tex.bind_to_image(0, read=True, write=False)
+        if with_prev and self._has_prev:
+            self._prev_tex.bind_to_image(1, read=True, write=False)
+            have_prev = 1
+        else:
+            # Bind something to slot 1 anyway (driver requirement)
+            src_tex.bind_to_image(1, read=True, write=False)
+            have_prev = 0
+        ssbo.bind_to_storage_buffer(2)
+
+        N = float(self.size ** 3)
+        divisor = max(1.0, N / 2048.0)
+        self._metrics_divisor = divisor
+
+        mu = self._mu
+        if mu['size']       is not None: mu['size'].value       = self.size
+        if mu['channel']    is not None: mu['channel'].value    = self.measure_channel
+        if mu['mode']       is not None: mu['mode'].value       = mode_id
+        if mu['alive_thr']  is not None: mu['alive_thr'].value  = float(self.alive_threshold)
+        if mu['change_thr'] is not None: mu['change_thr'].value = float(self.change_threshold)
+        if mu['have_prev']  is not None: mu['have_prev'].value  = have_prev
+        if mu['is_element'] is not None: mu['is_element'].value = 1 if self.is_element_ca else 0
+        if mu['field_mean'] is not None: mu['field_mean'].value = float(field_mean)
+        if mu['norm_n']     is not None: mu['norm_n'].value     = 1.0 / divisor
+
+        gx = (self.size + 7) // 8
+        prog.run(gx, gx, gx)
+        if GL is not None:
+            try:
+                GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT |
+                                   GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            except Exception:
+                self.ctx.memory_barrier()
+        else:
+            self.ctx.memory_barrier()
+
+    def _metrics_decode(self):
+        """Read the SSBO and decode into a metrics dict matching compute_metrics()."""
+        raw = self._metrics_ssbo.read()
+        u = np.frombuffer(raw, dtype=np.uint32)
+        finite = int(u[0])
+        nans   = int(u[1])
+        infs   = int(u[2])
+        min_bits = u[3]
+        max_bits = u[4]
+        sum_signed = np.int32(u[5])  # bit reinterpret to signed
+        sumsq_u    = u[6]
+        alive_count    = int(u[7])
+        surface_count  = int(u[8])
+        activity_count = int(u[9])
+
+        N = float(self.size ** 3)
+        divisor = self._metrics_divisor
+        if finite > 0:
+            v_mean = float(sum_signed) * divisor / (N * _METRICS_SCALE_S)
+            e_x2   = float(sumsq_u)    * divisor / (N * _METRICS_SCALE_Q)
+            v_std  = float(np.sqrt(max(e_x2 - v_mean * v_mean, 0.0)))
+            mins_f = np.frombuffer(np.uint32(min_bits).tobytes(), dtype=np.float32)[0]
+            maxs_f = np.frombuffer(np.uint32(max_bits).tobytes(), dtype=np.float32)[0]
+            v_min = float(mins_f - _METRICS_BIAS) if min_bits != 0 and not (mins_f - _METRICS_BIAS) > 1e29 else 0.0
+            v_max = float(maxs_f - _METRICS_BIAS) if max_bits != 0 else 0.0
+        else:
+            v_mean = v_std = v_min = v_max = 0.0
+
+        return {
+            'finite': finite, 'nans': nans, 'infs': infs,
+            'mean': v_mean, 'std': v_std, 'min': v_min, 'max': v_max,
+            'sum_raw': float(sum_signed) * divisor / _METRICS_SCALE_S,
+            'alive_count': alive_count,
+            'surface_count': surface_count,
+            'activity_count': activity_count,
+        }
+
+    def compute_metrics_gpu(self, prev_is_valid):
+        """Replacement for CPU compute_metrics(). Returns the same dict shape.
+
+        prev_is_valid: True iff a prev-grid texture exists with last sample's
+        data (i.e. not the first sample of a trial).
+        """
+        self._ensure_metrics_resources()
+        src = self.tex_a if self.ping == 0 else self.tex_b
+        size = self.size
+        total = size ** 3
+        mode = self.measure_mode
+        mode_id = _MODE_ID.get(mode, 0)
+
+        # Mark whether the prev texture is meaningful for this dispatch.
+        self._has_prev = prev_is_valid and self._prev_tex is not None
+
+        if mode == 'deviation':
+            # Pass 1: compute mean by running shape with mode_id=0 but we
+            # only consume sum_fp. The thresholding is wrong for this pass
+            # (alive/surface/activity will be garbage) — but we ignore them
+            # and re-dispatch.
+            # To avoid the wasted alive/surface work we set mode to a cheap
+            # 'continuous' (mode 0) with an impossibly high threshold so
+            # alive_count comes out 0 and surface_count is 0 — only the
+            # scalar stats are useful.
+            saved_thr = self.alive_threshold
+            self.alive_threshold = 1.0e30  # nothing alive
+            self._metrics_dispatch(src, mode_id=0, with_prev=False)
+            self.alive_threshold = saved_thr
+            partial = self._metrics_decode()
+            field_mean = partial['mean']
+            # Pass 2: real deviation thresholding + activity
+            self._metrics_dispatch(src, mode_id=3, field_mean=field_mean,
+                                    with_prev=True)
+            stats = self._metrics_decode()
+            # Use mean/std/min/max from the pass-1 stats (the second pass's
+            # are identical -- same channel data -- but pass-1 already paid
+            # for them and pass 2 sees same inputs, so either works).
+            stats['mean'] = field_mean
+            stats['std']  = partial['std']
+            stats['min']  = partial['min']
+            stats['max']  = partial['max']
+            stats['finite'] = partial['finite']
+            stats['nans']   = partial['nans']
+            stats['infs']   = partial['infs']
+        else:
+            self._metrics_dispatch(src, mode_id=mode_id, with_prev=True)
+            stats = self._metrics_decode()
+
+        # Copy current src into prev_tex for next sample's activity calc.
+        # glCopyImageSubData is the right primitive (server-side, no readback).
+        self._alloc_prev_tex()
+        copied = False
+        if GL is not None:
+            try:
+                GL.glCopyImageSubData(
+                    src.glo, GL.GL_TEXTURE_3D, 0, 0, 0, 0,
+                    self._prev_tex.glo, GL.GL_TEXTURE_3D, 0, 0, 0, 0,
+                    size, size, size,
+                )
+                copied = True
+            except Exception:
+                copied = False
+        if not copied:
+            # Fallback: read & write via host. Slow but safe.
+            self._prev_tex.write(src.read())
+        self._has_prev = True
+
+        # Build output dict matching compute_metrics() shape.
+        alive_count = stats['alive_count']
+        alive_ratio = alive_count / total
+        activity = stats['activity_count'] / total if prev_is_valid else 0.0
+        surface_ratio = stats['surface_count'] / max(alive_count, 1)
+        has_nan = stats['nans'] > 0
+        has_inf = stats['infs'] > 0
+
+        return {
+            'alive_count': alive_count,
+            'alive_ratio': alive_ratio,
+            'mean': stats['mean'],
+            'std': stats['std'],
+            'min': stats['min'],
+            'max': stats['max'],
+            'activity': activity,
+            'surface_ratio': surface_ratio,
+            'has_nan': has_nan,
+            'has_inf': has_inf,
+            'measure_mode': mode,
+        }
+
     def release(self):
+        # Release prev tex + SSBO to the OpenGL driver. (No pool for these:
+        # prev-tex is per-runner only and ssbo is tiny.)
+        pt = getattr(self, '_prev_tex', None)
+        if pt is not None:
+            try: pt.release()
+            except Exception: pass
+            self._prev_tex = None
+        ssbo = getattr(self, '_metrics_ssbo', None)
+        if ssbo is not None:
+            try: ssbo.release()
+            except Exception: pass
+            self._metrics_ssbo = None
         _return_textures(self.ctx, self.size, self._tex_dtype,
                          self.tex_a, self.tex_b)
 
@@ -1261,13 +1749,22 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
     symmetry).  This uses more memory but enables detection of gliders,
     oscillators, guns, etc.
     """
+    _t_wall0 = time.perf_counter() if _PROFILE_ENABLED else 0.0
+    _t0 = _t_wall0
     runner = HeadlessRunner(ctx, rule_name, size=size, seed=seed, params=params,
                            dt=dt, init_density=init_density,
                            init_override=init_override)
+    if _PROFILE_ENABLED:
+        _profile_totals['init'] += time.perf_counter() - _t0
 
     metric_history = []
     grid_snapshots = [] if capture_dynamics else None
     prev_grid = None
+    # Use GPU metrics path when (a) globally enabled, (b) we don't need full
+    # grid readback for capture_dynamics. The readback is required when
+    # snapshotting for analyze_dynamics(), so GPU metrics buy nothing then.
+    use_gpu_metrics = _GPU_METRICS_ENABLED and not capture_dynamics
+    have_prev_gpu = False  # tracks runner's prev-tex state
 
     # Early termination state
     _abort = False
@@ -1275,15 +1772,42 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
 
     for step in range(steps + 1):
         if step % sample_interval == 0:
-            grid = runner.read_grid()
-            m = compute_metrics(grid, prev_grid, runner)
-            m['step'] = step
+            if use_gpu_metrics:
+                if _PROFILE_ENABLED:
+                    _t0 = time.perf_counter()
+                m = runner.compute_metrics_gpu(prev_is_valid=have_prev_gpu)
+                m['step'] = step
+                if _PROFILE_ENABLED:
+                    _profile_totals['metrics'] += time.perf_counter() - _t0
+                    _profile_totals['reads'] += 1  # count for averaging
+                have_prev_gpu = True
+                grid = None  # not read back; callers below must handle this
+            else:
+                if _PROFILE_ENABLED:
+                    _t0 = time.perf_counter()
+                grid = runner.read_grid()
+                if _PROFILE_ENABLED:
+                    _profile_totals['read'] += time.perf_counter() - _t0
+                    _profile_totals['reads'] += 1
+                    _t0 = time.perf_counter()
+                m = compute_metrics(grid, prev_grid, runner)
+                m['step'] = step
+                if _PROFILE_ENABLED:
+                    _profile_totals['metrics'] += time.perf_counter() - _t0
 
             # Auto-calibrate alive threshold on first sample if it gives extreme results
             # This catches cases where parameter exploration shifts the field range
             if len(metric_history) == 0 and runner.measure_mode not in ('element', 'discrete'):
                 ar = m['alive_ratio']
                 if ar < 0.005 or ar > 0.995:
+                    # Need full grid for percentile calibration. If we're on
+                    # the GPU path we have to read back this once.
+                    if grid is None:
+                        if _PROFILE_ENABLED:
+                            _t0 = time.perf_counter()
+                        grid = runner.read_grid()
+                        if _PROFILE_ENABLED:
+                            _profile_totals['read'] += time.perf_counter() - _t0
                     ch = grid[:, :, :, runner.measure_channel]
                     if runner.measure_mode == 'wave':
                         ch = np.abs(ch)
@@ -1293,7 +1817,15 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
                     new_thresh = float(np.percentile(ch[np.isfinite(ch)], 75)) if np.isfinite(ch).any() else runner.alive_threshold
                     if new_thresh > 1e-6 and abs(new_thresh - runner.alive_threshold) > 1e-6:
                         runner.alive_threshold = new_thresh
-                        m = compute_metrics(grid, prev_grid, runner)
+                        if use_gpu_metrics:
+                            # Re-dispatch with the new threshold. prev tex was
+                            # set to current src by previous call; not valid
+                            # for activity yet (no prior frame), so pass
+                            # have_prev=False to match original semantics.
+                            m = runner.compute_metrics_gpu(prev_is_valid=False)
+                            have_prev_gpu = True
+                        else:
+                            m = compute_metrics(grid, prev_grid, runner)
                         m['step'] = step
 
             metric_history.append(m)
@@ -1309,7 +1841,11 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
                       f"{'  NaN!' if m['has_nan'] else ''}"
                       f"{'  Inf!' if m['has_inf'] else ''}")
 
-            prev_grid = grid
+            # On GPU path the grid is None; prev_grid stays None (CPU
+            # compute_metrics is no longer called for activity, the GPU
+            # shader handles it via prev_tex).
+            if grid is not None:
+                prev_grid = grid
 
             # Early termination checks (after at least 3 samples)
             if len(metric_history) >= 3 and step >= 30:
@@ -1330,13 +1866,31 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
                 break
 
         if step < steps:
+            if _PROFILE_ENABLED:
+                _t0 = time.perf_counter()
             runner.step()
+            if _PROFILE_ENABLED:
+                _profile_totals['step'] += time.perf_counter() - _t0
+                _profile_totals['steps'] += 1
 
     channel = runner.measure_channel
     measure_mode = runner.measure_mode
     params = dict(runner.params)
     dt = runner.dt
+    # Always need final grid for analyze_structure (CPU-side slice metrics).
+    # On the GPU-metrics path we never read it back during the loop, so do
+    # it here. Counted under 'read' for honest profiling.
+    if grid is None:
+        if _PROFILE_ENABLED:
+            _t0 = time.perf_counter()
+        grid = runner.read_grid()
+        if _PROFILE_ENABLED:
+            _profile_totals['read'] += time.perf_counter() - _t0
+    if _PROFILE_ENABLED:
+        _t0 = time.perf_counter()
     runner.release()
+    if _PROFILE_ENABLED:
+        _profile_totals['release'] += time.perf_counter() - _t0
 
     score = score_interestingness(metric_history)
     final = metric_history[-1]
@@ -1368,8 +1922,16 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
 
     # Advanced dynamics analysis
     if capture_dynamics and grid_snapshots:
+        if _PROFILE_ENABLED:
+            _t0 = time.perf_counter()
         dynamics = analyze_dynamics(grid_snapshots, metric_history, channel=channel)
         result.update(dynamics)
+        if _PROFILE_ENABLED:
+            _profile_totals['dynamics'] += time.perf_counter() - _t0
+
+    if _PROFILE_ENABLED:
+        _profile_totals['wall'] += time.perf_counter() - _t_wall0
+        _profile_totals['trials'] += 1
 
     return result
 
@@ -2332,6 +2894,8 @@ def cmd_search(ctx, args):
             n_deduped = len(candidates) - len(discoveries)
             dedup_msg = f" ({n_deduped} duplicates removed)" if n_deduped > 0 else ""
             print(f"\nSaved {len(discoveries)} discoveries to {save_path}{dedup_msg}")
+
+    _profile_print()
 
 
 def _mutate_params(params, ranges, rng, scale=0.15):
