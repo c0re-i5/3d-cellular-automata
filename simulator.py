@@ -19,7 +19,7 @@ Usage:
     python3 simulator.py --size 64 --rule reaction_diffusion_3d
 """
 
-import sys, math, time, argparse, json, os, re, random, subprocess, shutil, threading
+import sys, math, time, argparse, json, os, re, random, subprocess, shutil, tempfile, threading
 import queue as _queue
 import numpy as np
 import glfw
@@ -5485,6 +5485,8 @@ layout(rgba8, binding=0) writeonly uniform image2D u_output;
 
 uniform sampler3D u_volume;
 uniform int u_size;
+uniform float u_inv_size;     // 1.0 / float(u_size), set from Python on size change
+uniform int u_max_steps;      // u_size * 3, set from Python on size change
 uniform vec3 u_camera_pos;
 uniform mat3 u_camera_rot;
 uniform float u_fov;
@@ -5647,8 +5649,8 @@ void main() {
 
     float t_start = max(t_hit.x, 0.0);
     float t_end = t_hit.y;
-    float base_step = 1.0 / float(u_size);
-    int max_steps = u_size * 3;
+    float base_step = u_inv_size;
+    int max_steps = u_max_steps;
 
     // Jitter
     t_start += ign_hash(vec2(pixel), u_frame_id) * base_step;
@@ -5758,6 +5760,8 @@ out vec4 fragColor;
 
 uniform sampler3D u_volume;
 uniform int u_size;
+uniform float u_inv_size;     // 1.0 / float(u_size), set from Python on size change
+uniform int u_max_steps;      // u_size * 3, set from Python on size change
 uniform vec3 u_camera_pos;
 uniform mat3 u_camera_rot;
 uniform float u_fov;
@@ -6021,8 +6025,8 @@ void main() {
 
     float t_start = max(t_hit.x, 0.0);
     float t_end = t_hit.y;
-    float base_step = 1.0 / float(u_size);
-    int max_steps = u_size * 3;
+    float base_step = u_inv_size;
+    int max_steps = u_max_steps;
 
     // ── Interleaved Gradient Noise jitter (breaks banding) ──────────
     vec2 pixel = gl_FragCoord.xy;
@@ -9508,6 +9512,12 @@ class Simulator:
         # Pre-rendered text overlay (RGBA PNG generated once at record start).
         # Replaces 4-5 per-frame drawtext filters with a single overlay blit.
         self._rec_overlay_path = None
+        # Dynamic stats: a small textfile that ffmpeg's drawtext reads each
+        # frame (reload=1). Updated from _record_frame, throttled to ~10 Hz.
+        # Set CA_RECORDING_LIVE_STATS=0 to disable.
+        self._rec_live_textfile = None
+        self._rec_live_last_write = 0.0
+        self._rec_live_update_interval = 0.1
         self._rec_dropped_frames = 0
 
         # Quick-access element palette
@@ -9596,6 +9606,8 @@ class Simulator:
         # reads from u_view_tex).
         self._rp_u_volume = rp.get('u_volume', None)
         self._rp_u_size = rp.get('u_size', None)
+        self._rp_u_inv_size = rp.get('u_inv_size', None)
+        self._rp_u_max_steps = rp.get('u_max_steps', None)
         self._rp_u_camera_pos = rp['u_camera_pos']
         self._rp_u_camera_rot = rp['u_camera_rot']
         self._rp_u_fov = rp['u_fov']
@@ -9810,6 +9822,8 @@ class Simulator:
         self._cr_u_output = cr.get('u_output', None)
         self._cr_u_volume = cr.get('u_volume', None)
         self._cr_u_size = cr.get('u_size', None)
+        self._cr_u_inv_size = cr.get('u_inv_size', None)
+        self._cr_u_max_steps = cr.get('u_max_steps', None)
         self._cr_u_camera_pos = cr.get('u_camera_pos', None)
         self._cr_u_camera_rot = cr.get('u_camera_rot', None)
         self._cr_u_fov = cr.get('u_fov', None)
@@ -10068,6 +10082,14 @@ class Simulator:
         # Match shader image format to texture format
         if self._tex_glsl_fmt != 'rgba32f':
             source = source.replace('rgba32f', self._tex_glsl_fmt)
+        # Bake grid size as a compile-time constant. Lets the GLSL compiler
+        # constant-fold modulo-by-pow2 to bitwise AND, hoist 1.0/u_size out
+        # of per-fragment loops, and unroll bounds. The cached uniform ref
+        # (_cu_size) becomes None and the per-step assignment is no-op'd by
+        # the existing None-guard in _step_sim.
+        source = source.replace(
+            'uniform int u_size;',
+            f'const int u_size = {self.size};')
         if hasattr(self, 'compute_prog'):
             self.compute_prog.release()
         self.compute_prog = self.ctx.compute_shader(source)
@@ -10800,10 +10822,13 @@ class Simulator:
         self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
             _tex_format_for_size(new_size)
         self._alloc_voxel_buffer(new_size)
-        # Recompile shaders if texture format changed (e.g. rgba32f ↔ rgba16f)
+        # Recompile the active CA shader to bake the new grid size as a
+        # compile-time const (unlocks modulo->AND, constant 1/size, etc.).
+        # The cull/metrics shaders use u_size as a true uniform so they
+        # only need recompile on format change.
+        self._compile_compute()
+        self._cache_compute_uniforms()
         if self._tex_glsl_fmt != old_fmt:
-            self._compile_compute()
-            self._cache_compute_uniforms()
             self._compile_cull()
             self._compile_metrics()
         # Always update dispatch group count (even without recompile)
@@ -11476,6 +11501,10 @@ class Simulator:
             self._rp_u_volume.value = 0
         if self._rp_u_size is not None:
             self._rp_u_size.value = self.size
+        if self._rp_u_inv_size is not None:
+            self._rp_u_inv_size.value = 1.0 / float(self.size)
+        if self._rp_u_max_steps is not None:
+            self._rp_u_max_steps.value = self.size * 3
         self._rp_u_camera_pos.value = tuple(cam_pos)
         self._rp_u_camera_rot.value = tuple(cam_rot.T.flatten())
         self._rp_u_fov.value = fov
@@ -11856,6 +11885,8 @@ class Simulator:
             if u is not None:
                 u.value = v
         _su(self._cr_u_size, self.size)
+        _su(self._cr_u_inv_size, 1.0 / float(self.size))
+        _su(self._cr_u_max_steps, self.size * 3)
         _su(self._cr_u_camera_pos, tuple(cam_pos))
         _su(self._cr_u_camera_rot, tuple(cam_rot.T.flatten()))
         _su(self._cr_u_fov, 1.0)
@@ -12934,13 +12965,42 @@ class Simulator:
             f"fontcolor=white:fontsize={info_fs}:x=w-tw-{margin}:y={bottom_y}:"
             f"borderw={border_w}:bordercolor=black@0.8")
         # Discovery score (top-right, if viewing a discovery)
-        if self.discovery_index >= 0 and self.discovery_index < len(self.discoveries):
+        has_static_score = (self.discovery_index >= 0 and
+                            self.discovery_index < len(self.discoveries))
+        if has_static_score:
             score = self.discoveries[self.discovery_index].get('score', 0)
             score_str = f'Score\\: {score:.2f}'
             drawtext_parts.append(
                 f"drawtext=fontfile='{fontb}':text='{score_str}':"
                 f"fontcolor=yellow:fontsize={score_fs}:x=w-tw-{margin}:y={top_y}:"
                 f"borderw={border_w}:bordercolor=black@0.8")
+
+        # --- Live stats: a small dynamic block under (or in place of) the
+        #     static Score line. Updated each frame via reload=1.
+        live_drawtext = None
+        if os.environ.get('CA_RECORDING_LIVE_STATS', '1') != '0':
+            try:
+                fd, self._rec_live_textfile = tempfile.mkstemp(
+                    suffix='.txt', prefix='ca_live_')
+                os.close(fd)
+                self._write_live_stats()  # initial content
+                live_fs = max(10, int(round(22 * s)))
+                # Sit below the static Score line if present, else at the top.
+                live_y = (top_y + max(28, int(round(40 * s)))
+                          if has_static_score else top_y)
+                line_sp = max(2, int(round(4 * s)))
+                # ffmpeg textfile path: escape ':' and '\\'.
+                tf_esc = self._rec_live_textfile.replace(
+                    '\\', '\\\\').replace(':', '\\:')
+                live_drawtext = (
+                    f"drawtext=fontfile='{font}':textfile='{tf_esc}':"
+                    f"reload=1:fontcolor=white:fontsize={live_fs}:"
+                    f"x=w-tw-{margin}:y={live_y}:line_spacing={line_sp}:"
+                    f"borderw={border_w}:bordercolor=black@0.8")
+            except Exception as e:
+                sys.stderr.write(f"[recording] live-stats setup failed ({e})\n")
+                self._rec_live_textfile = None
+                live_drawtext = None
 
         # --- Pre-render overlay to a transparent PNG (one ffmpeg invocation,
         #     synchronous, takes ~50-100 ms; saves ~3-5 ms per recorded frame).
@@ -12992,14 +13052,17 @@ class Simulator:
         if self._rec_overlay_path is not None:
             # `movie` source filter loads the static overlay PNG inside
             # the filter graph, so the input-stream count stays at 1.
-            cmd += [
-                '-filter_complex',
-                f'[0:v]vflip[bg];movie={self._rec_overlay_path}[ovl];'
-                f'[bg][ovl]overlay=0:0',
-            ]
+            fc = (f'[0:v]vflip[bg];movie={self._rec_overlay_path}[ovl];'
+                  f'[bg][ovl]overlay=0:0')
+            if live_drawtext is not None:
+                fc += f'[base];[base]{live_drawtext}'
+            cmd += ['-filter_complex', fc]
         else:
             # Fallback: per-frame drawtext (vflip + all drawtext filters)
-            cmd += ['-vf', ','.join(['vflip', *drawtext_parts])]
+            parts = ['vflip', *drawtext_parts]
+            if live_drawtext is not None:
+                parts.append(live_drawtext)
+            cmd += ['-vf', ','.join(parts)]
 
         cmd += enc_args + ['-movflags', '+faststart', self._rec_filename]
         self._rec_process = subprocess.Popen(
@@ -13080,6 +13143,13 @@ class Simulator:
             try: os.unlink(self._rec_overlay_path)
             except Exception: pass
             self._rec_overlay_path = None
+        # Clean up the live-stats textfile (best effort).
+        if self._rec_live_textfile:
+            try: os.unlink(self._rec_live_textfile)
+            except Exception: pass
+            try: os.unlink(self._rec_live_textfile + '.tmp')
+            except Exception: pass
+            self._rec_live_textfile = None
 
         # Close ffmpeg stdin after writer thread has finished (avoids BrokenPipeError).
         # Bounded wait + escalating SIGTERM/SIGKILL so a hung ffmpeg cannot
@@ -13193,6 +13263,48 @@ class Simulator:
 
         self._rec_pbo_pending = True
         self._rec_pbo_idx = prev  # swap for next frame
+
+        # Refresh the dynamic stats textfile (throttled). ffmpeg's drawtext
+        # picks it up on the next frame thanks to reload=1.
+        if self._rec_live_textfile is not None:
+            now = time.time()
+            if now - self._rec_live_last_write >= self._rec_live_update_interval:
+                self._rec_live_last_write = now
+                self._write_live_stats()
+
+    def _write_live_stats(self):
+        """Write current sim stats to the live-overlay textfile (atomic).
+
+        Read by ffmpeg's drawtext filter (reload=1) every frame. We use
+        os.replace for atomicity so ffmpeg never sees a half-written file.
+        """
+        path = self._rec_live_textfile
+        if not path:
+            return
+        lines = []
+        try:
+            dt = float(getattr(self, 'dt', 1.0))
+            lines.append(f"Step {self.step_count}  t={self.step_count * dt:.2f}")
+            lines.append(f"Score {self._score:.2f}")
+            snap = self._debug_history[-1] if self._debug_history else None
+            if snap is not None:
+                af = snap.get('active_frac', 0.0)
+                lines.append(f"Active {100.0 * af:.1f}%")
+                means = snap.get('mean')
+                if means:
+                    m0 = means[0]
+                    if m0 == m0:  # not NaN
+                        lines.append(f"Mean {m0:.3f}")
+        except Exception:
+            return
+        text = '\n'.join(lines)
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except Exception:
+            pass
 
     def _render_overlay_png(self, w, h, drawtext_parts):
         """Render the static text overlay to a transparent RGBA PNG.
