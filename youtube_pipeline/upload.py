@@ -32,9 +32,81 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 QUEUE_DIR = REPO_ROOT / 'recordings' / 'upload_queue'
 UPLOADED_DIR = REPO_ROOT / 'recordings' / 'uploaded'
 LOG_PATH = REPO_ROOT / 'recordings' / 'upload_log.jsonl'
+# Persistent flag so a per-process invocation (e.g. `for f in ...;
+# do python -m youtube_pipeline --file "$f"; done`) doesn't re-spam the
+# API after the limit has already been hit. Delete the file by hand to
+# resume; this script never clears it automatically.
+LIMIT_MARKER = REPO_ROOT / 'recordings' / '.upload_limit'
 
 # ── chunked resumable upload (handles bad networks gracefully) ─────────
 CHUNK_SIZE = 8 * 1024 * 1024
+
+# YouTube API error reasons that mean "stop trying, this won't get better by
+# retrying the next file". Hitting any of these aborts the rest of the
+# queue instead of spamming a doomed attempt for every file.
+# See: https://developers.google.com/youtube/v3/docs/errors
+_FATAL_QUOTA_REASONS = frozenset({
+    'quotaExceeded',
+    'uploadLimitExceeded',
+    'dailyLimitExceeded',
+    'rateLimitExceeded',
+    'userRequestsExceedRateLimit',
+    'youtubeSignupRequired',
+    'channelClosed',
+    'channelSuspended',
+    'authenticatedUserAccountSuspended',
+    'authenticatedUserAccountClosed',
+})
+
+
+class UploadLimitReached(Exception):
+    """Raised when the API tells us further uploads cannot succeed today
+    (quota, daily upload count, suspended channel, etc.). Aborts the
+    remaining queue."""
+
+
+def _classify_http_error(e: HttpError) -> tuple[str | None, str]:
+    """Return (reason, message) parsed from a googleapiclient HttpError.
+    `reason` is None when we can't extract one."""
+    reason = None
+    message = str(e)
+    try:
+        body = json.loads(e.content.decode('utf-8', 'replace'))
+        err = body.get('error', {})
+        message = err.get('message', message)
+        errors = err.get('errors') or []
+        if errors:
+            reason = errors[0].get('reason')
+    except Exception:
+        pass
+    return reason, message
+
+
+def _write_limit_marker(reason: str | None, message: str) -> None:
+    """Persist the limit hit so subsequent processes bail fast. The user
+    deletes the file by hand when they want uploads to resume."""
+    payload = {
+        'hit_at': datetime.now().isoformat(timespec='seconds'),
+        'reason': reason,
+        'message': message,
+    }
+    try:
+        LIMIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        LIMIT_MARKER.write_text(json.dumps(payload, indent=2))
+    except OSError as e:
+        print(f'  (could not write limit marker: {e})', file=sys.stderr)
+
+
+def _read_limit_marker() -> dict | None:
+    """Return marker payload if it exists, else None. Never auto-clears."""
+    if not LIMIT_MARKER.exists():
+        return None
+    try:
+        return json.loads(LIMIT_MARKER.read_text())
+    except (OSError, json.JSONDecodeError):
+        # Corrupt file still counts as "limit hit" — fail safe.
+        return {'hit_at': 'unknown', 'reason': 'unknown',
+                'message': '(unreadable marker file)'}
 
 
 def _find_jobs(queue_dir: Path) -> list[Path]:
@@ -110,6 +182,13 @@ def upload_one(youtube, mp4_path: Path, privacy: str,
         try:
             status, response = request.next_chunk()
         except HttpError as e:
+            reason, message = _classify_http_error(e)
+            # Stop the whole queue if the account/quota is the problem —
+            # spamming the next file would just hit the same error.
+            if reason in _FATAL_QUOTA_REASONS or e.resp.status == 401:
+                _write_limit_marker(reason, message)
+                raise UploadLimitReached(
+                    f'{e.resp.status} {reason or "auth"}: {message}') from e
             # Retry transient 5xx errors a couple of times before giving up.
             if e.resp.status in (500, 502, 503, 504):
                 print(f'  transient error {e.resp.status}, retrying…')
@@ -139,9 +218,22 @@ def upload_one(youtube, mp4_path: Path, privacy: str,
     return response
 
 
-def run_once(privacy: str, dry_run: bool, only: Path | None) -> int:
+def run_once(privacy: str, dry_run: bool, only: Path | None,
+             force: bool = False) -> int:
     """Process the queue once. Returns process exit code."""
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    # Bail early if a previous run hit a quota/limit error. Marker
+    # persists until the user removes it by hand; --force ignores it.
+    if not dry_run and not force:
+        marker = _read_limit_marker()
+        if marker is not None:
+            print(
+                f'Upload limit marker present (hit at {marker.get("hit_at")}, '
+                f'reason: {marker.get("reason") or "unknown"}). Skipping.\n'
+                f'  delete  {LIMIT_MARKER}  (or pass --force) to resume.',
+                file=sys.stderr,
+            )
+            return 2
     if only is not None:
         if not only.exists():
             print(f'No such file: {only}', file=sys.stderr)
@@ -156,12 +248,32 @@ def run_once(privacy: str, dry_run: bool, only: Path | None) -> int:
 
     youtube = None if dry_run else get_youtube_service()
     failures = 0
+    aborted = False
     for mp4 in jobs:
         try:
             upload_one(youtube, mp4, privacy, dry_run=dry_run)
+        except UploadLimitReached as e:
+            remaining = len(jobs) - jobs.index(mp4) - 1
+            print(f'  ✗ upload limit reached: {e}', file=sys.stderr)
+            if remaining > 0:
+                print(f'  aborting queue: {remaining} file(s) left untouched.',
+                      file=sys.stderr)
+            failures += 1
+            aborted = True
+            break
+        except HttpError as e:
+            # Non-fatal API error on one file: log and move on.
+            reason, message = _classify_http_error(e)
+            print(f'  ✗ failed ({e.resp.status} {reason or ""}): {message}',
+                  file=sys.stderr)
+            failures += 1
         except Exception as e:  # noqa: BLE001 — surface anything to user
             print(f'  ✗ failed: {e}', file=sys.stderr)
             failures += 1
+    # rc=2 lets --watch back off instead of polling every 30 s into the
+    # same quota error.
+    if aborted:
+        return 2
     return 1 if failures else 0
 
 
@@ -176,14 +288,23 @@ def main(argv: list[str] | None = None) -> int:
                    help='Upload one specific file instead of scanning queue.')
     p.add_argument('--watch', action='store_true',
                    help='Daemon mode: poll queue every 30 s.')
+    p.add_argument('--force', action='store_true',
+                   help='Ignore the .upload_limit cooldown marker.')
     args = p.parse_args(argv)
 
     if args.watch:
         try:
             while True:
-                run_once(args.privacy, args.dry_run, args.file)
+                rc = run_once(args.privacy, args.dry_run, args.file,
+                              force=args.force)
+                if rc == 2:
+                    # Limit marker is set — don't poll. User clears it
+                    # manually when ready.
+                    print('  (limit marker set — exiting watch mode; '
+                          f'delete {LIMIT_MARKER} to resume)')
+                    return 2
                 time.sleep(30)
         except KeyboardInterrupt:
             print('\n(stopped)')
             return 0
-    return run_once(args.privacy, args.dry_run, args.file)
+    return run_once(args.privacy, args.dry_run, args.file, force=args.force)
