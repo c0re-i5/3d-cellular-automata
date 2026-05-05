@@ -388,3 +388,122 @@ ELEMENT_GPU_DATA = np.array([
 WALL_ID = 119
 NUM_ELEMENTS = 119  # 118 real + 1 wall
 FLOATS_PER_ELEMENT = 16
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Electron configuration / valence data
+# Used by the quantum_element CA init to render real molecular orbital
+# clouds for each periodic-table element.
+#
+# VALENCE[Z] = (n, l, occupancy)
+#   n          — principal quantum number of highest occupied subshell
+#   l          — angular momentum (0=s, 1=p, 2=d, 3=f)
+#   occupancy  — number of electrons in that subshell
+#
+# For superpositions we emit the |m| degenerate set with random complex
+# weights; the result looks like the element's characteristic valence
+# orbital cloud (s = sphere, p = dumbbell trio, d = clover, f = lobed).
+#
+# Source: standard aufbau filling order matched against periodic-table
+# repo electronConfig strings ([He] 2s² 2p², etc.).
+# ─────────────────────────────────────────────────────────────────────
+# fmt: off
+VALENCE = {
+    # Period 1
+    1:  (1, 0, 1),  2:  (1, 0, 2),
+    # Period 2
+    3:  (2, 0, 1),  4:  (2, 0, 2),
+    5:  (2, 1, 1),  6:  (2, 1, 2),  7:  (2, 1, 3),
+    8:  (2, 1, 4),  9:  (2, 1, 5), 10:  (2, 1, 6),
+    # Period 3
+    11: (3, 0, 1), 12: (3, 0, 2),
+    13: (3, 1, 1), 14: (3, 1, 2), 15: (3, 1, 3),
+    16: (3, 1, 4), 17: (3, 1, 5), 18: (3, 1, 6),
+    # Period 4 — 4s, 3d, 4p
+    19: (4, 0, 1), 20: (4, 0, 2),
+    21: (3, 2, 1), 22: (3, 2, 2), 23: (3, 2, 3),
+    24: (3, 2, 5),  # Cr: 4s¹ 3d⁵ anomaly — show the 3d⁵ which dominates
+    25: (3, 2, 5), 26: (3, 2, 6), 27: (3, 2, 7),
+    28: (3, 2, 8), 29: (3, 2, 10),  # Cu: 4s¹ 3d¹⁰
+    30: (3, 2, 10),
+    31: (4, 1, 1), 32: (4, 1, 2), 33: (4, 1, 3),
+    34: (4, 1, 4), 35: (4, 1, 5), 36: (4, 1, 6),
+    # Period 5 — 5s, 4d, 5p
+    37: (5, 0, 1), 38: (5, 0, 2),
+    39: (4, 2, 1), 40: (4, 2, 2), 41: (4, 2, 4),
+    42: (4, 2, 5), 43: (4, 2, 5), 44: (4, 2, 7),
+    45: (4, 2, 8), 46: (4, 2, 10), 47: (4, 2, 10),
+    48: (4, 2, 10),
+    49: (5, 1, 1), 50: (5, 1, 2), 51: (5, 1, 3),
+    52: (5, 1, 4), 53: (5, 1, 5), 54: (5, 1, 6),
+    # Period 6 — 6s, 4f, 5d, 6p (lanthanides + transition metals)
+    55: (6, 0, 1), 56: (6, 0, 2),
+    57: (5, 2, 1),
+    # Lanthanides Ce-Lu — 4f filling
+    58: (4, 3, 2), 59: (4, 3, 3), 60: (4, 3, 4), 61: (4, 3, 5),
+    62: (4, 3, 6), 63: (4, 3, 7), 64: (4, 3, 7), 65: (4, 3, 9),
+    66: (4, 3, 10), 67: (4, 3, 11), 68: (4, 3, 12), 69: (4, 3, 13),
+    70: (4, 3, 14), 71: (5, 2, 1),
+    # 5d transition metals
+    72: (5, 2, 2), 73: (5, 2, 3), 74: (5, 2, 4), 75: (5, 2, 5),
+    76: (5, 2, 6), 77: (5, 2, 7), 78: (5, 2, 9), 79: (5, 2, 10),
+    80: (5, 2, 10),
+    # 6p
+    81: (6, 1, 1), 82: (6, 1, 2), 83: (6, 1, 3),
+    84: (6, 1, 4), 85: (6, 1, 5), 86: (6, 1, 6),
+    # Period 7 — 7s, 5f, 6d, 7p (actinides + transactinides)
+    87: (7, 0, 1), 88: (7, 0, 2),
+    89: (6, 2, 1),
+    # Actinides
+    90: (5, 3, 2), 91: (5, 3, 2), 92: (5, 3, 3), 93: (5, 3, 4),
+    94: (5, 3, 6), 95: (5, 3, 7), 96: (5, 3, 7), 97: (5, 3, 9),
+    98: (5, 3, 10), 99: (5, 3, 11), 100: (5, 3, 12), 101: (5, 3, 13),
+    102: (5, 3, 14), 103: (6, 2, 1),
+    # 6d transactinides
+    104: (6, 2, 2), 105: (6, 2, 3), 106: (6, 2, 4), 107: (6, 2, 5),
+    108: (6, 2, 6), 109: (6, 2, 7), 110: (6, 2, 8), 111: (6, 2, 9),
+    112: (6, 2, 10),
+    # 7p
+    113: (7, 1, 1), 114: (7, 1, 2), 115: (7, 1, 3),
+    116: (7, 1, 4), 117: (7, 1, 5), 118: (7, 1, 6),
+}
+# fmt: on
+
+
+def slater_zeff(Z: int, n: int, l: int, occ: int) -> float:
+    """Slater's rules — effective nuclear charge for the (n,l) electron.
+
+    Crude but standard. Used to scale the visualization potential so that
+    valence orbital sizes are roughly comparable across the periodic table
+    (otherwise high-Z atoms collapse to a single voxel).
+
+    Returns Z_eff in units of e.
+    """
+    if Z <= 1:
+        return float(Z)
+    # Other electrons in the same group (n,l): screen by 0.35 each (0.30 for 1s)
+    same_group = max(0, occ - 1)
+    s_same = 0.30 if (n == 1 and l == 0) else 0.35
+    sigma = same_group * s_same
+    # Electrons in (n-1) shell screen by 0.85 (s,p) or 1.00 (d,f)
+    if l <= 1:
+        # s/p valence: count all electrons in n-1 shell
+        n_minus1_count = sum(o for zz, (nn, ll, o) in VALENCE.items()
+                             if zz < Z and nn == n - 1)
+        # That's wrong (counts only valence) — use a closed-shell estimate:
+        # electrons in shell n-1 = 2*n_minus1*n_minus1 if filled (rough)
+        # Simpler: subtract valence_count from Z, that's all inner electrons
+        # then attribute (n-1) shell size to 2(n-1)² typical capacity.
+        valence_count = occ
+        inner = Z - valence_count
+        # Assume shell n-1 holds up to 2(n-1)² electrons; rest is in deeper shells (full screening)
+        cap_n1 = 2 * (n - 1) * (n - 1)
+        in_n1 = min(cap_n1, inner)
+        in_deeper = inner - in_n1
+        sigma += 0.85 * in_n1 + 1.00 * in_deeper
+    else:
+        # d/f valence: all electrons with lower n OR same n with lower l screen 1.0
+        inner = Z - occ
+        sigma += 1.00 * inner
+    z_eff = float(Z) - sigma
+    return max(0.5, z_eff)  # guard against negatives for weird configs
