@@ -28,6 +28,7 @@ Usage:
 import sys, os, json, time, argparse
 import warnings
 import numpy as np
+import entity_arena
 
 try:
     from OpenGL import GL  # type: ignore
@@ -112,6 +113,195 @@ def _profile_print():
     print(f"  {'WALL':<10} {t['wall']:>10.3f} {t['wall']/n*1000:>14.3f}  100.0%")
 
 
+# ── Live status emission (opt-out via CA_HARNESS_STATUS=0) ───────────
+# Each search worker writes a small JSON snapshot to runs/.status/<pid>.json
+# after every trial. A separate dashboard process (TUI / web) can poll the
+# directory to render live progress without touching the search code.
+# Per-PID files keep concurrent batch_*.sh workers from clobbering each other.
+# Atomic writes via tmpfile + os.replace; failures are swallowed so status
+# emission can never break a running search.
+_STATUS_ENABLED = os.environ.get('CA_HARNESS_STATUS', '1') == '1'
+_STATUS_DIR = os.path.join(os.path.dirname(__file__), 'runs', '.status')
+_STATUS_HOST = None  # populated lazily; cheap but only needed if enabled
+
+
+def _status_path(pid=None):
+    return os.path.join(_STATUS_DIR, f'{pid or os.getpid()}.json')
+
+
+def _status_write(payload):
+    """Atomically write the worker's status snapshot. Never raises."""
+    if not _STATUS_ENABLED:
+        return
+    try:
+        os.makedirs(_STATUS_DIR, exist_ok=True)
+        path = _status_path()
+        tmp = f'{path}.tmp{os.getpid()}'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, separators=(',', ':'))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _status_clear():
+    """Remove this worker's status file on exit. Never raises."""
+    if not _STATUS_ENABLED:
+        return
+    try:
+        os.unlink(_status_path())
+    except OSError:
+        pass
+
+
+def _status_host():
+    global _STATUS_HOST
+    if _STATUS_HOST is None:
+        import socket
+        try:
+            _STATUS_HOST = socket.gethostname()
+        except Exception:
+            _STATUS_HOST = '?'
+    return _STATUS_HOST
+
+
+# ── Live preview thumbnails ─────────────────────────────────────────
+# After every trial we generate a tiny RGB thumbnail from the final grid
+# and stash it in the worker's status JSON. The dashboard renders the
+# thumbnails as Unicode half-block art for OBS-friendly streaming.
+#
+# Cost: one numpy reduce + a 32x32x3 base64 encode on the CPU side, on
+# data we already had to read back anyway for analyze_structure(). Zero
+# additional GPU work, ~3-4 KB extra in the status JSON. Disabled when
+# CA_HARNESS_PREVIEW=0.
+_PREVIEW_ENABLED = os.environ.get('CA_HARNESS_PREVIEW', '1') == '1'
+_PREVIEW_SIZE = 32   # output is _PREVIEW_SIZE × _PREVIEW_SIZE RGB
+
+# Inferno-style 8-stop colormap. RGB triples in [0,1]. Indexing via
+# fractional-bin lookup with linear interpolation (numpy handles it).
+_PREVIEW_CMAP = np.array([
+    [0.001, 0.000, 0.014],
+    [0.121, 0.046, 0.236],
+    [0.330, 0.060, 0.430],
+    [0.557, 0.110, 0.404],
+    [0.781, 0.215, 0.301],
+    [0.929, 0.411, 0.146],
+    [0.984, 0.661, 0.117],
+    [0.988, 0.998, 0.645],
+], dtype=np.float32)
+
+
+def _grid_signature(grid, channel=0, n_bins=32):
+    """Compact rotation-invariant fingerprint of a 3D field.
+
+    Returns a unit-normalised radial power spectrum of the chosen
+    channel: bin |F[ψ]|² by |k|. Cheap (O(N³ log N) for the FFT, O(N³)
+    for the binning) and rotation-invariant in the bulk, so two
+    visually-equivalent solutions don't appear distant just because they
+    are translated/rotated. Returned as a length-`n_bins` float64 array
+    that sums to 1.
+
+    Used by the lite inverse-design path: save a target grid's signature
+    once, then have search runs minimise L2 distance to it.
+    """
+    if grid is None or grid.ndim != 4:
+        return np.zeros(n_bins, dtype=np.float64)
+    ch = grid[..., channel].astype(np.float32)
+    if not np.all(np.isfinite(ch)):
+        ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0)
+    # FFT power; subtract mean so DC doesn't dominate.
+    ch = ch - ch.mean()
+    F = np.fft.fftn(ch)
+    P = (F.real**2 + F.imag**2).astype(np.float64)
+    # Radial bin grid in fft-shift convention.
+    n = ch.shape[0]
+    k = np.fft.fftfreq(n) * n  # cycles in {-n/2,...,n/2-1}
+    KX, KY, KZ = np.meshgrid(k, k, k, indexing='ij')
+    R = np.sqrt(KX*KX + KY*KY + KZ*KZ).ravel()
+    P_flat = P.ravel()
+    r_max = float(R.max()) if R.size else 1.0
+    bins = np.linspace(0.0, r_max + 1e-9, n_bins + 1)
+    sig, _ = np.histogram(R, bins=bins, weights=P_flat)
+    s = sig.sum()
+    if s > 0.0:
+        sig = sig / s
+    return sig.astype(np.float64)
+
+
+def _make_preview(grid, channel=0, mode='continuous'):
+    """Render a 32x32 RGB thumbnail of the final state, base64-encoded.
+
+    Uses max-projection along z of the chosen measurement channel,
+    coloured by an inferno-like ramp. Works for any rule because we
+    just normalise per-frame to its observed [min, max] range before
+    colormapping.
+
+    Returns a dict {'w', 'h', 'cmap', 'b64'} or None on failure.
+    """
+    if not _PREVIEW_ENABLED:
+        return None
+    try:
+        if grid is None or grid.ndim != 4:
+            return None
+        ch = grid[..., channel]
+        if not np.all(np.isfinite(ch)):
+            ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Mode-aware reduction: wave fields show |v| (kink walls + spikes
+        # both visible); deviation modes subtract the field mean so flat
+        # backgrounds don't wash out structure.
+        if mode == 'wave':
+            ch = np.abs(ch)
+        elif mode == 'deviation':
+            ch = np.abs(ch - ch.mean())
+
+        # Max-projection along z gives a more "structural" view than a
+        # middle slice (catches off-centre solitons, gliders, etc.).
+        proj = ch.max(axis=2).astype(np.float32)
+
+        # Block-mean downsample to PREVIEW_SIZE × PREVIEW_SIZE.
+        H, W = proj.shape
+        ps = _PREVIEW_SIZE
+        # Crop to a multiple of ps then reshape-and-mean. Cheap and
+        # correct for the typical 32/64/96/128/192/256 grids.
+        H2 = (H // ps) * ps if H >= ps else H
+        W2 = (W // ps) * ps if W >= ps else W
+        proj = proj[:H2, :W2]
+        if H2 >= ps and W2 >= ps:
+            proj = proj.reshape(ps, H2 // ps, ps, W2 // ps).mean(axis=(1, 3))
+        else:
+            # Grid smaller than thumbnail: nearest-neighbour upsample.
+            ys = np.linspace(0, H2 - 1, ps).astype(int)
+            xs = np.linspace(0, W2 - 1, ps).astype(int)
+            proj = proj[ys][:, xs]
+
+        # Per-frame normalise to [0, 1].
+        v_lo = float(proj.min())
+        v_hi = float(proj.max())
+        if v_hi - v_lo < 1e-6:
+            norm = np.zeros_like(proj)
+        else:
+            norm = (proj - v_lo) / (v_hi - v_lo)
+
+        # Colormap lookup with linear interpolation between stops.
+        n_stops = _PREVIEW_CMAP.shape[0]
+        idx = np.clip(norm * (n_stops - 1), 0.0, n_stops - 1 - 1e-6)
+        i0 = idx.astype(np.int32)
+        frac = (idx - i0).astype(np.float32)[..., None]
+        rgb = (1.0 - frac) * _PREVIEW_CMAP[i0] + frac * _PREVIEW_CMAP[i0 + 1]
+        rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+        import base64
+        return {
+            'w':    int(ps),
+            'h':    int(ps),
+            'cmap': 'inferno',
+            'b64':  base64.b64encode(rgb_u8.tobytes()).decode('ascii'),
+        }
+    except Exception:
+        return None
+
+
 # ── GPU-side metrics (opt-out via CA_HARNESS_GPU_METRICS=0) ──────────
 # Replaces compute_metrics()'s 6+ whole-grid CPU passes with one (or two)
 # compute dispatches plus a tiny ~96-byte SSBO readback. At size=256 the
@@ -121,6 +311,15 @@ def _profile_print():
 # > thr) because the mean is needed before thresholding. All other modes
 # fit in a single dispatch.
 _GPU_METRICS_ENABLED = os.environ.get('CA_HARNESS_GPU_METRICS', '1') == '1'
+
+# One-shot warning dedupe for rules whose preset asks for a larger grid than
+# the search is running at. Set: rule_name strings already warned about.
+_undersize_warned: set = set()
+# Set CA_HARNESS_ALLOW_UNDERSIZE=1 to opt out of the auto-bump (search will then
+# run at the requested size even when the preset specifies default_size, which
+# was the legacy behaviour and is known to produce false-extinction reports for
+# kernel-radius-large rules — quantum_*, lenia_multi).
+_ALLOW_UNDERSIZE = os.environ.get('CA_HARNESS_ALLOW_UNDERSIZE', '0') == '1'
 
 # Mode IDs (must match GLSL switch in HARNESS_METRICS_SHADER):
 _MODE_ID = {
@@ -386,14 +585,40 @@ class HeadlessRunner:
         from simulator import (
             RULE_PRESETS, COMPUTE_HEADER, CA_RULES,
             ELEMENT_COMPUTE_HEADER, ELEMENT_CA_RULE, INIT_FUNCS,
-            init_random_sparse, _tex_format_for_size
+            AGENT_COMPUTE_HEADER, AGENT_RULES, AGENT_INIT_FUNCS,
+            agent_init_langton_center,
+            init_random_sparse, _tex_format_for_size,
+            _resolve_composed_preset,
         )
+        import entity_arena
 
         self.ctx = ctx
-        self.size = size
         self.rule_name = rule_name
-        self.preset = RULE_PRESETS[rule_name]
+        # Composed presets (`compose: [...]`) are flattened here so the
+        # harness sees a single concatenated `passes` list and a flat
+        # `params` dict (with prefixed keys). The flagship `dual_lenia`
+        # preset and any future composition lives through this path.
+        self.preset = _resolve_composed_preset(rule_name)
         self.is_element_ca = self.preset.get('is_element_ca', False)
+
+        # Honour preset's preferred grid size when the caller asked for less.
+        # Quantum rules + Lenia variants have wavefunction tails / kernel radii
+        # that simply don't fit in small boxes — a search at size=32 against
+        # quantum_orbital (default_size=192) reports spurious extinction.
+        # Opt out via CA_HARNESS_ALLOW_UNDERSIZE=1.
+        # Search-only minimum (`search_size`) overrides `default_size` here so
+        # batch search can run at a manageable resolution while the GUI still
+        # opens at the larger showroom size. Falls back to default_size when
+        # search_size is absent.
+        pref_size = self.preset.get('search_size') or self.preset.get('default_size')
+        if pref_size and size < pref_size and not _ALLOW_UNDERSIZE:
+            if rule_name not in _undersize_warned:
+                print(f"[harness] '{rule_name}' requires size>={pref_size} "
+                      f"(got {size}); auto-bumping. Set "
+                      f"CA_HARNESS_ALLOW_UNDERSIZE=1 to override.")
+                _undersize_warned.add(rule_name)
+            size = pref_size
+        self.size = size
 
         # Rule-type-aware measurement config
         shader = self.preset['shader']
@@ -427,6 +652,16 @@ class HeadlessRunner:
             self.measure_mode = 'wave'  # PDE: use abs(value), avoids blinker penalties
             self.alive_threshold = 0.3  # raised: abs(Re(A)) > 0.3 catches active wave regions
             self.change_threshold = 0.01
+        elif shader == 'bz_scroll_3d':
+            # New 3-D Barkley scroll-wave rule: u ∈ [0,1].  The B
+            # channel (filament strength) is what's most "alive" — it
+            # marks the 1-D defect cores explicitly.  Track the wave
+            # itself (channel 0) since it's denser and gives a stable
+            # measure across rotation cycles.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.4
+            self.change_threshold = 0.02
         elif shader == 'morphogen_3d':
             self.measure_channel = 0  # activator: Turing patterns show as spatial variation
             self.measure_mode = 'deviation'  # "alive" = cells deviating from spatial mean
@@ -442,6 +677,12 @@ class HeadlessRunner:
             self.measure_mode = 'deviation'  # detect flock clusters vs voids
             self.alive_threshold = 0.15
             self.change_threshold = 0.005
+        elif shader == 'flocking_reynolds_3d':
+            # New Reynolds boids share the density layout.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.005
         elif shader == 'cahn_hilliard':
             self.measure_channel = 0  # order parameter c ∈ [-1,1]
             self.measure_mode = 'deviation'  # interesting = deviation from mean (domain walls)
@@ -452,8 +693,21 @@ class HeadlessRunner:
             self.measure_mode = 'deviation'  # detect carved vs uncarved terrain
             self.alive_threshold = 0.15
             self.change_threshold = 0.005
+        elif shader == 'erosion_hydraulic_3d':
+            # New channelized erosion: same solid layout; carved channels
+            # show up as deviation from the bulk terrain block.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.005
         elif shader == 'mycelium_3d':
             self.measure_channel = 0  # biomass
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.01
+        elif shader == 'mycelium_directed_3d':
+            # New directional mycelium uses same biomass channel.
+            self.measure_channel = 0
             self.measure_mode = 'continuous'
             self.alive_threshold = 0.1
             self.change_threshold = 0.01
@@ -462,7 +716,14 @@ class HeadlessRunner:
             self.measure_mode = 'wave'
             self.alive_threshold = 0.01
             self.change_threshold = 0.001
-        elif shader == 'viscous_fingers_3d':
+        elif shader == 'em_yee_E_3d':
+            # New Yee Maxwell layout: pair 1 = (Ex, Ey, Ez, medium).
+            # Ez carries the dipole drive; metric tracks |Ez|.
+            self.measure_channel = 2
+            self.measure_mode = 'wave'
+            self.alive_threshold = 0.01
+            self.change_threshold = 0.001
+        elif shader in ('viscous_fingers_3d', 'viscous_transport_3d'):
             self.measure_channel = 0  # saturation
             self.measure_mode = 'deviation'  # detect finger fronts vs uniformly saturated
             self.alive_threshold = 0.30  # raised: field fills grid, need larger deviation
@@ -472,20 +733,50 @@ class HeadlessRunner:
             self.measure_mode = 'deviation'  # detect active fire front vs burned/unburned
             self.alive_threshold = 0.25  # raised: fire fills grid, need bigger deviation
             self.change_threshold = 0.01
+        elif shader == 'fire_chem_3d':
+            # New fluid fire layout: pair 1 = (T, soot, ember, fuel).
+            # Track temperature deviation to detect the active flame front.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.25
+            self.change_threshold = 0.01
         elif shader == 'physarum_3d':
             self.measure_channel = 0  # trail
             self.measure_mode = 'deviation'  # trail fills everywhere; detect network structure
             self.alive_threshold = 0.2
             self.change_threshold = 0.01
+        elif shader == 'physarum_adaptive_3d':
+            # New flux-based physarum: G channel ρ is the tube structure
+            # (sparse and salient). Trail R is |Q| which fills broadly.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.10
+            self.change_threshold = 0.005
         elif shader == 'fracture_3d':
             self.measure_channel = 2  # integrity
             self.measure_mode = 'deviation'  # detect crack network (broken vs intact)
             self.alive_threshold = 0.25  # raised: integrity fills grid after fracture
             self.change_threshold = 0.01
+        elif shader == 'peridyn_disp_3d':
+            # Peridynamic fracture: integrity (channel 3) is the crack
+            # network — detect deviation between broken (0) and intact
+            # (1) cells.  After loading, the displacement field also
+            # carries the crack signature, but integrity is cleaner.
+            self.measure_channel = 3
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.25
+            self.change_threshold = 0.01
         elif shader == 'galaxy_3d':
             self.measure_channel = 0  # density
             self.measure_mode = 'deviation'  # detect density contrast (cosmic web filaments vs voids)
             self.alive_threshold = 0.005  # very low: density field has tiny deviations (~0.01-0.05)
+            self.change_threshold = 0.002
+        elif shader == 'galaxy_dynamics_3d':
+            # New Poisson-solved galaxy: same density channel, larger
+            # contrasts than the legacy multi-scale stencil.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.05
             self.change_threshold = 0.002
         elif shader == 'lichen_3d':
             self.measure_channel = 0  # species A
@@ -502,6 +793,129 @@ class HeadlessRunner:
             self.measure_mode = 'wave'  # PDE: use value directly (already ≥0)
             self.alive_threshold = 0.0001  # very sensitive: probability is normalized, sparse
             self.change_threshold = 0.00005
+        elif shader == 'ising_3d':
+            # Spin = 1.0 (up) or 0.0 (down). 'discrete' with threshold 0.5
+            # counts up-spins; below T_c those should clump into a giant
+            # connected domain, above T_c stay as ~50% noise.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
+        elif shader == 'eden_3d':
+            # Solid voxels are persistent. Discrete with low change_threshold
+            # so the score notices the slowly advancing growth front; once
+            # the bounding box stops expanding the trial is "done".
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.005
+        elif shader == 'hodgepodge_3d':
+            # State 0 = healthy background, >0 = excited. Threshold 0.5
+            # in normalised units catches state>=1 (the integer encoding
+            # divides by N-1, and the smallest nonzero state encodes to
+            # >=1/(N-1) >= ~0.004; threshold 0.05 stays well below that
+            # while excluding floating-point quantisation noise).
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.01
+        elif shader == 'margolus_3d':
+            # Particle channel is binary {0,1}. Conservation laws mean
+            # global counts won't budge — score should reflect spatial
+            # rearrangement, hence the low change_threshold.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.005
+        elif shader == 'stable_fluids_3d':
+            # Dye channel (A=index 3) is the visually meaningful field
+            # and tracks the smoke plume. Treat as continuous.
+            self.measure_channel = 3
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.005
+        elif shader == 'causal_ca':
+            # Wavefront (channel 0) is sparse — a thin shell. The Arrival
+            # latch (channel 1) accumulates the discrete light cone over
+            # time and is the visually meaningful structure.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.001
+            self.change_threshold = 0.001
+        elif shader == 'hopfion_3d':
+            # Channel A holds energy density; bright tubes mark the
+            # Hopf-linked vortex cores.
+            self.measure_channel = 3
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.02
+            self.change_threshold = 0.005
+        elif shader == 'genome_state_3d':
+            # FitzHugh-Nagumo excitation channel u oscillates around 0 with
+            # amplitude up to ~2; use 'deviation' so the score rewards
+            # spatial structure (fronts/spirals) over uniform saturation.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.02
+        elif shader == 'q_relax_3d':
+            # Q-tensor components are small (~0.1 at equilibrium); use
+            # deviation so disclination filaments stand out from
+            # uniformly-ordered bulk.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.002
+        elif shader == 'sandpile_3d':
+            # Grain count varies 0..T. Deviation catches avalanche fronts
+            # against the bulk near-critical background.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.1
+        elif shader == 'greenberg_hastings_3d':
+            # State / (N-1). Any non-zero state = active wave cell.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.01
+        elif shader == 'wireworld_3d':
+            # 4-state encoding /3.0. Anything > 0 (not empty) is a wire
+            # element; activity is the change channel.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.01
+        elif shader == 'forest_fire_3d':
+            # 3 states {0, 0.5, 1.0}. Threshold 0.25 catches trees+burning.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.25
+            self.change_threshold = 0.1
+        elif shader == 'sine_gordon_3d':
+            # Continuous wave field; soliton walls show as |u| spikes.
+            self.measure_channel = 0
+            self.measure_mode = 'wave'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.01
+        elif shader == 'larger_than_life_3d':
+            # Binary alive/dead, like Game of Life.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
+        elif shader == 'prisoners_dilemma_3d':
+            # Binary cooperator/defector strategy.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
+        elif shader == 'xy_spin_3d':
+            # Continuous angle field θ/(2π) ∈ [0,1]; vortex cores show
+            # as deviation defects from locally-uniform domains.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.005
         else:
             # Discrete CAs (game_of_life_3d)
             self.measure_channel = 0
@@ -517,37 +931,182 @@ class HeadlessRunner:
                     self.params[k] = v
         self.dt = dt if dt is not None else self.preset['dt']
 
-        # Compile compute shader (with caching)
-        shader_key = self.preset['shader']
+        # Compile compute shader(s) (with caching). Supports both single-pass
+        # rules (preset['shader']) and multi-pass rules (preset['passes']).
+        # Pass entries can be either a string shader key or a dict
+        # {"shader": str, "writes": ["p1"|"p2", ...]}. Strings default to
+        # writes=["p1"], matching legacy behaviour.
+        # NOTE: this headless runner does NOT yet allocate a second texture
+        # pair, so multi-pass rules that need pair 2 are not supported here.
+        # Use the full simulator (--rule X) for those.
+        shader_key = self.preset.get('shader')
+        if 'passes' in self.preset:
+            raw_passes = list(self.preset['passes'])
+        else:
+            raw_passes = [shader_key]
+        pass_param_map = self.preset.get('pass_params', {})
+        self._pass_specs = []
+        for entry in raw_passes:
+            if isinstance(entry, str):
+                spec = {"shader": entry, "writes": ("p1",), "kind": "voxel"}
+            else:
+                spec = {"shader": entry["shader"],
+                        "writes": tuple(entry.get("writes", ("p1",))),
+                        "kind": entry.get("kind", "voxel")}
+            override = pass_param_map.get(spec["shader"])
+            if override is not None:
+                spec["param_names"] = list(override)
+            self._pass_specs.append(spec)
+        # Detect whether any pass needs the second texture pair.
+        self._needs_p2 = any('p2' in s['writes'] for s in self._pass_specs)
+        # Detect agent passes.
+        self._has_agents = self.preset.get('agent_count', 0) > 0
+        # Detect entity-arena passes.
+        self._has_arena = 'entity_arena' in self.preset
         self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
             _tex_format_for_size(size)
-        if shader_key == 'element_ca':
-            source = ELEMENT_COMPUTE_HEADER + ELEMENT_CA_RULE
-        else:
-            source = COMPUTE_HEADER + CA_RULES[shader_key]
-        if self._tex_glsl_fmt != 'rgba32f':
-            source = source.replace('rgba32f', self._tex_glsl_fmt)
 
-        cache_key = (id(ctx), hash(source))
-        if cache_key in _shader_cache:
-            self.compute_prog = _shader_cache[cache_key]
-        else:
-            self.compute_prog = ctx.compute_shader(source)
-            _shader_cache[cache_key] = self.compute_prog
+        self.compute_progs = []
+        for pass_idx, spec in enumerate(self._pass_specs):
+            key = spec['shader']
+            kind = spec.get('kind', 'voxel')
+            if kind == 'agent':
+                source = AGENT_COMPUTE_HEADER + AGENT_RULES[key]
+            elif kind in ('entity_clear_hash', 'entity_build_hash',
+                          'entity_step', 'entity_paint', 'entity_paint_clear',
+                          'entity_field'):
+                if kind == 'entity_clear_hash':
+                    body = entity_arena.SHADER_CLEAR_HASH
+                elif kind == 'entity_build_hash':
+                    body = entity_arena.SHADER_BUILD_HASH
+                elif kind == 'entity_paint':
+                    body = self.preset.get('entity_paint_shader',
+                                           entity_arena.SHADER_PAINT)
+                elif kind == 'entity_paint_clear':
+                    body = entity_arena.SHADER_PAINT_CLEAR
+                elif kind == 'entity_field':
+                    # 3D voxel-style pass: full COMPUTE_HEADER. Body comes
+                    # from preset['entity_shaders']; uses standard u_src/u_dst.
+                    shaders = self.preset.get('entity_shaders', {})
+                    if key not in shaders:
+                        raise KeyError(
+                            f"Pass {pass_idx} kind=entity_field references unknown "
+                            f"shader {key!r}; declare it in preset['entity_shaders']")
+                    source = COMPUTE_HEADER + shaders[key]
+                    source = source.replace(
+                        '#version 430',
+                        f'#version 430\n#define PASS_INDEX {pass_idx}')
+                    if self._tex_glsl_fmt != 'rgba32f':
+                        source = source.replace('rgba32f', self._tex_glsl_fmt)
+                    source = source.replace(
+                        'uniform int u_size;',
+                        f'const int u_size = {size};')
+                    cache_key = (id(ctx), hash(source))
+                    if cache_key in _shader_cache:
+                        prog = _shader_cache[cache_key]
+                    else:
+                        prog = ctx.compute_shader(source)
+                        _shader_cache[cache_key] = prog
+                    self.compute_progs.append(prog)
+                    continue
+                else:
+                    shaders = self.preset.get('entity_shaders', {})
+                    if key not in shaders:
+                        raise KeyError(
+                            f"Pass {pass_idx} kind=entity_step references unknown "
+                            f"shader {key!r}; declare it in preset['entity_shaders']")
+                    body = shaders[key]
+                source = (entity_arena.ENTITY_LAYOUT_HEADER
+                          + entity_arena.ENTITY_GLSL_HEADER
+                          + body)
+            elif key == 'element_ca':
+                source = ELEMENT_COMPUTE_HEADER + ELEMENT_CA_RULE
+            else:
+                source = COMPUTE_HEADER + CA_RULES[key]
+            source = source.replace(
+                '#version 430',
+                f'#version 430\n#define PASS_INDEX {pass_idx}')
+            if self._tex_glsl_fmt != 'rgba32f':
+                source = source.replace('rgba32f', self._tex_glsl_fmt)
+            # Inline u_size as a const so entity passes that need it work
+            # (the shared simulator path does the same substitution).
+            source = source.replace(
+                'uniform int u_size;',
+                f'const int u_size = {size};')
 
-        # Cache uniform handles: `'u_foo' in prog` hashes the source every
-        # step otherwise (tens of thousands of string hashes per search run).
-        prog = self.compute_prog
-        self._u_size     = prog.get('u_size', None)
-        self._u_dt       = prog.get('u_dt', None)
-        self._u_boundary = prog.get('u_boundary', None)
-        self._u_frame    = prog.get('u_frame', None)
-        self._u_params   = [prog.get(f'u_param{i}', None) for i in range(4)]
+            cache_key = (id(ctx), hash(source))
+            if cache_key in _shader_cache:
+                prog = _shader_cache[cache_key]
+            else:
+                prog = ctx.compute_shader(source)
+                _shader_cache[cache_key] = prog
+            self.compute_progs.append(prog)
+
+        # Backward-compat alias for any code that still touches `compute_prog`.
+        self.compute_prog = self.compute_progs[0]
+
+        # Cache uniform handles per pass: `'u_foo' in prog` hashes the source
+        # every step otherwise (tens of thousands of string hashes per search run).
+        self._u_per_pass = []
+        for prog in self.compute_progs:
+            self._u_per_pass.append({
+                'size': prog.get('u_size', None),
+                'dt': prog.get('u_dt', None),
+                'boundary': prog.get('u_boundary', None),
+                'frame': prog.get('u_frame', None),
+                'pass': prog.get('u_pass', None),
+                'params': [prog.get(f'u_param{i}', None) for i in range(4)],
+            })
+        # Legacy aliases.
+        first = self._u_per_pass[0]
+        self._u_size = first['size']
+        self._u_dt = first['dt']
+        self._u_boundary = first['boundary']
+        self._u_frame = first['frame']
+        self._u_params = first['params']
 
         # Init volume
         rng = np.random.RandomState(seed)
         init_name = init_override if init_override else self.preset['init']
-        init_func = INIT_FUNCS.get(init_name, init_random_sparse)
+        # Special init schemes that don't live in INIT_FUNCS — `lsystem:...`
+        # rasterises a turtle-graphics L-system into the volume; `mesh:...`
+        # voxelises a built-in or .obj/.glb mesh. Both are used by the
+        # flagship presets so the harness needs to support them; otherwise
+        # the search would silently fall back to `init_random_sparse` and
+        # measure entirely the wrong dynamics.
+        special_init = None
+        if isinstance(init_name, str) and '+' in init_name:
+            # Compound init: 'baseA+baseB+lsystem:foo+mesh:bar'. Each part
+            # is resolved as either a key in INIT_FUNCS or a special spec
+            # (lsystem:/mesh:); the parts' arrays are summed and clipped
+            # to [0,1]. Lets flagships layer an L-system seed on top of a
+            # full-substrate background (e.g. coral on morphogen field).
+            from simulator import (init_lsystem_from_spec,
+                                   init_mesh_from_spec)
+            parts = [p.strip() for p in init_name.split('+') if p.strip()]
+            def _resolve_one(p):
+                if p.startswith('lsystem:'):
+                    return lambda sz, r: init_lsystem_from_spec(p, sz, r)
+                if p.startswith('mesh:'):
+                    return lambda sz, r: init_mesh_from_spec(p, sz, r)
+                return INIT_FUNCS.get(p, init_random_sparse)
+            funcs = [_resolve_one(p) for p in parts]
+            def _compound(sz, r):
+                acc = funcs[0](sz, r)
+                for f in funcs[1:]:
+                    acc = acc + f(sz, r)
+                return np.clip(acc, 0.0, 1.0).astype(np.float32)
+            special_init = _compound
+        elif isinstance(init_name, str) and init_name.startswith('lsystem:'):
+            from simulator import init_lsystem_from_spec
+            special_init = lambda sz, _rng: init_lsystem_from_spec(
+                init_name, sz, _rng)
+        elif isinstance(init_name, str) and init_name.startswith('mesh:'):
+            from simulator import init_mesh_from_spec
+            special_init = lambda sz, _rng: init_mesh_from_spec(
+                init_name, sz, _rng)
+        init_func = special_init if special_init is not None else \
+            INIT_FUNCS.get(init_name, init_random_sparse)
         # If init_density is specified and this is a discrete CA, override init
         # with a random field at the requested density
         if init_density is not None and not self.is_element_ca and \
@@ -630,51 +1189,193 @@ class HeadlessRunner:
         self.tex_a, self.tex_b = _acquire_textures(
             ctx, size, self._tex_dtype, self._tex_bpt, init_bytes)
         self.ping = 0
+        self.ping2 = 0
+
+        # Optional second texture pair for multi-pass scratch (e.g., Stable
+        # Fluids pressure projection). Allocated fresh each time (no pool)
+        # since these rules are rare and the alloc cost is negligible vs the
+        # multi-pass dispatch cost.
+        self.tex_a2 = None
+        self.tex_b2 = None
+        if self._needs_p2:
+            init2 = self._make_field2_init(size, seed)
+            init2_bytes = np.ascontiguousarray(
+                init2.astype(self._tex_np_dtype)).tobytes()
+            self.tex_a2 = ctx.texture3d((size, size, size), 4, init2_bytes,
+                                         dtype=self._tex_dtype)
+            self.tex_b2 = ctx.texture3d((size, size, size), 4, init2_bytes,
+                                         dtype=self._tex_dtype)
+
+        # Optional agent buffer for agent-kind passes (e.g., Langton's ant).
+        self.agent_ssbo = None
+        self.agent_count = 0
+        if self._has_agents:
+            count = int(self.preset['agent_count'])
+            init_name = self.preset.get('agent_init', 'langton_center')
+            init_func = AGENT_INIT_FUNCS.get(init_name, agent_init_langton_center)
+            rec = init_func(size, count, rng).astype(np.int32, copy=False)
+            self.agent_count = count
+            self.agent_ssbo = ctx.buffer(data=rec.tobytes())
+
+        # Optional entity arena substrate.
+        self.arena = None
+        if self._has_arena:
+            cfg = dict(self.preset['entity_arena'])
+            self.arena = entity_arena.EntityArena(
+                ctx, size,
+                max_entities=int(cfg.pop('max_entities', entity_arena.DEFAULT_MAX_ENTITIES)),
+                max_teams=int(cfg.pop('max_teams', entity_arena.DEFAULT_MAX_TEAMS)),
+                max_goals=int(cfg.pop('max_goals', entity_arena.DEFAULT_MAX_GOALS)),
+                hash_cell=int(cfg.pop('hash_cell', entity_arena.DEFAULT_HASH_CELL)))
+            self.arena.alloc_gpu()
+            on_init = self.preset.get('on_init')
+            if on_init is not None:
+                on_init(self.arena, size, rng, self.params)
+            self.arena.push_all()
 
         # Element SSBO (shared across trials)
         self.element_ssbo = _acquire_element_ssbo(ctx)
 
+    def _make_field2_init(self, size, seed):
+        """Initial state for the second physics field. Mirrors the same
+        method on simulator.PhysicsSimulator: defaults to zeros, but a
+        few rules need a non-trivial init (crystal solute, genome
+        weights). Without this match, multi-pass rules whose dynamics
+        depend on pair 2 silently degenerate to the trivial zero state."""
+        init_name = self.preset.get('field2_init')
+        if init_name is None and self.preset.get('shader') == 'crystal_growth':
+            init_name = 'crystal_solute'
+        arr = np.zeros((size, size, size, 4), dtype=np.float32)
+        if init_name == 'crystal_solute':
+            arr[..., 0] = 1.0
+        elif init_name == 'genome_random':
+            rng = np.random.default_rng(seed if seed is not None else 0)
+            r = rng.random((size, size, size, 4), dtype=np.float32)
+            arr[..., 0] = (r[..., 0] - 0.5) * 0.6
+            arr[..., 1] = 0.7 + r[..., 1] * 0.6
+            arr[..., 2] = (r[..., 2] - 0.5) * 0.6
+            arr[..., 3] = r[..., 3]
+        return arr
+
     def step(self):
-        src = self.tex_a if self.ping == 0 else self.tex_b
-        dst = self.tex_b if self.ping == 0 else self.tex_a
-
-        src.bind_to_image(0, read=True, write=False)
-        dst.bind_to_image(1, read=False, write=True)
-
-        if self.is_element_ca:
-            self.element_ssbo.bind_to_storage_buffer(2)
-
-        # Use cached uniform handles: avoids the per-step hash lookup against
-        # the shader's uniform table (significant in tight search loops).
-        if self._u_size is not None:
-            self._u_size.value = self.size
-        if self._u_dt is not None:
-            self._u_dt.value = self.dt
-        if self._u_boundary is not None:
-            # Match the simulator's mapping: toroidal=0, clamped=1, mirror=2.
-            b = self.preset.get('boundary', 'toroidal')
-            self._u_boundary.value = {'clamped': 1, 'mirror': 2,
-                                       'neumann': 2, 'reflect': 2,
-                                       'zero_flux': 2}.get(b, 0)
-        if self._u_frame is not None:
-            if not hasattr(self, '_frame'):
-                self._frame = 0
-            self._u_frame.value = self._frame
-            self._frame += 1
-
+        """One logical CA step. For multi-pass rules this dispatches all
+        passes in sequence with ping-pong between them."""
+        if not hasattr(self, '_frame'):
+            self._frame = 0
         param_values = list(self.params.values())
-        for i, cu in enumerate(self._u_params):
-            if cu is not None:
-                cu.value = float(param_values[i]) if i < len(param_values) else 0.0
-
         groups = (self.size + 7) // 8
-        self.compute_prog.run(groups, groups, groups)
-        try:
-            GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
-        except Exception:
-            self.ctx.memory_barrier()
+        b = self.preset.get('boundary', 'toroidal')
+        boundary_val = {'clamped': 1, 'mirror': 2, 'neumann': 2,
+                        'reflect': 2, 'zero_flux': 2}.get(b, 0)
 
-        self.ping = 1 - self.ping
+        for pass_idx, prog in enumerate(self.compute_progs):
+            spec = self._pass_specs[pass_idx]
+            kind = spec.get('kind', 'voxel')
+            is_entity_pass = kind.startswith('entity_')
+
+            if pass_idx == 0 and self.arena is not None:
+                on_tick = self.preset.get('on_tick')
+                if on_tick is not None:
+                    on_tick(self.arena, self._frame, self.params)
+                    self.arena.push_all()
+
+            if kind == 'agent':
+                # In-place: bind current src texture to BOTH image units so
+                # the agent shader can read+write the same voxel grid.
+                cur = self.tex_a if self.ping == 0 else self.tex_b
+                cur.bind_to_image(0, read=True, write=True)
+                cur.bind_to_image(1, read=True, write=True)
+            elif is_entity_pass:
+                if kind in ('entity_paint', 'entity_paint_clear', 'entity_field'):
+                    src = self.tex_a if self.ping == 0 else self.tex_b
+                    dst = self.tex_b if self.ping == 0 else self.tex_a
+                    src.bind_to_image(0, read=True, write=False)
+                    dst.bind_to_image(1, read=False, write=True)
+                elif kind == 'entity_step':
+                    cur = self.tex_a if self.ping == 0 else self.tex_b
+                    cur.bind_to_image(0, read=True, write=True)
+                else:
+                    cur = self.tex_a if self.ping == 0 else self.tex_b
+                    cur.bind_to_image(0, read=True, write=False)
+            else:
+                src = self.tex_a if self.ping == 0 else self.tex_b
+                dst = self.tex_b if self.ping == 0 else self.tex_a
+                src.bind_to_image(0, read=True, write=False)
+                dst.bind_to_image(1, read=False, write=True)
+
+                if self.tex_a2 is not None:
+                    src2 = self.tex_a2 if self.ping2 == 0 else self.tex_b2
+                    dst2 = self.tex_b2 if self.ping2 == 0 else self.tex_a2
+                    src2.bind_to_image(2, read=True, write=False)
+                    dst2.bind_to_image(3, read=False, write=True)
+
+            if self.is_element_ca:
+                self.element_ssbo.bind_to_storage_buffer(2)
+            if self.agent_ssbo is not None:
+                self.agent_ssbo.bind_to_storage_buffer(8)
+            if self.arena is not None:
+                self.arena.bind_all()
+                self.arena.set_uniforms(prog)
+
+            u = self._u_per_pass[pass_idx]
+            if u['size'] is not None:
+                u['size'].value = self.size
+            if u['dt'] is not None:
+                u['dt'].value = self.dt
+            if u['boundary'] is not None:
+                u['boundary'].value = boundary_val
+            if u['frame'] is not None:
+                u['frame'].value = self._frame
+            if u['pass'] is not None:
+                u['pass'].value = pass_idx
+            for i, cu in enumerate(u['params']):
+                if cu is None:
+                    continue
+                names = spec.get('param_names')
+                if names is not None:
+                    if i < len(names):
+                        cu.value = float(self.params.get(names[i], 0.0))
+                    else:
+                        cu.value = 0.0
+                else:
+                    cu.value = float(param_values[i]) if i < len(param_values) else 0.0
+
+            if kind == 'agent':
+                ag_groups = (self.agent_count + 63) // 64
+                prog.run(ag_groups, 1, 1)
+            elif is_entity_pass:
+                if kind == 'entity_clear_hash':
+                    g = entity_arena.hash_groups(self.arena.hash_total)
+                    prog.run(g, 1, 1)
+                elif kind == 'entity_paint_clear':
+                    total = self.size * self.size * self.size
+                    prog.run((total + 63) // 64, 1, 1)
+                elif kind == 'entity_field':
+                    prog.run(groups, groups, groups)
+                else:
+                    g = entity_arena.entity_groups(self.arena.max_entities)
+                    prog.run(g, 1, 1)
+            else:
+                prog.run(groups, groups, groups)
+            try:
+                GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
+            except Exception:
+                self.ctx.memory_barrier()
+
+            # Ping-pong only the pairs voxel passes wrote to. Agent passes
+            # mutate in place and don't advance any ping bit. Entity passes
+            # only advance ping when they actually write the field.
+            if kind == 'agent':
+                pass
+            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field'):
+                pass
+            else:
+                if 'p1' in spec['writes']:
+                    self.ping = 1 - self.ping
+                if 'p2' in spec['writes'] and self.tex_a2 is not None:
+                    self.ping2 = 1 - self.ping2
+
+        self._frame += 1
 
     def read_grid(self):
         src = self.tex_a if self.ping == 0 else self.tex_b
@@ -912,6 +1613,22 @@ class HeadlessRunner:
             self._metrics_ssbo = None
         _return_textures(self.ctx, self.size, self._tex_dtype,
                          self.tex_a, self.tex_b)
+        if self.tex_a2 is not None:
+            try: self.tex_a2.release()
+            except Exception: pass
+            self.tex_a2 = None
+        if self.tex_b2 is not None:
+            try: self.tex_b2.release()
+            except Exception: pass
+            self.tex_b2 = None
+        if self.agent_ssbo is not None:
+            try: self.agent_ssbo.release()
+            except Exception: pass
+            self.agent_ssbo = None
+        if getattr(self, 'arena', None) is not None:
+            try: self.arena.release()
+            except Exception: pass
+            self.arena = None
 
 
 # ── Metrics ───────────────────────────────────────────────────────────
@@ -974,6 +1691,18 @@ def compute_metrics(grid, prev_grid, runner):
     else:
         v_mean = v_std = v_min = v_max = 0.0
 
+    # Sign-preserving spatial mean — only meaningful for sign-bearing fields.
+    # Used by score_interestingness to detect coherent oscillation: a
+    # standing wave swings signed_mean through ±A; chaos averages near 0.
+    # Only emitted for 'wave' mode (other modes already report signed mean
+    # in 'mean'). Note: GPU metrics path does not populate this; coherence
+    # bonus is therefore CPU-only.
+    if mode == 'wave':
+        ch_finite = ch[np.isfinite(ch)]
+        signed_mean = float(np.mean(ch_finite)) if ch_finite.size > 0 else 0.0
+    else:
+        signed_mean = v_mean
+
     # Activity: cells that changed since last step
     activity = 0.0
     if prev_grid is not None:
@@ -1013,6 +1742,7 @@ def compute_metrics(grid, prev_grid, runner):
         'has_nan': has_nan,
         'has_inf': has_inf,
         'measure_mode': mode,
+        'signed_mean': signed_mean,
     }
 
 
@@ -1145,6 +1875,26 @@ def score_interestingness(metric_history):
 
     # Apply saturation taper from the 0.70-0.95 band (computed above).
     score *= saturation_factor
+
+    # Wave-coherence bonus (sign-bearing fields only). When per-step
+    # signed_mean is available (CPU metrics path), measure how strongly the
+    # signed spatial mean swings relative to the magnitude. A coherent
+    # standing wave / orbital phase rotation gives ratio ≈ O(1); chaotic
+    # fields and pure dissipation give ratio ≈ 0. Bonus capped at +0.10
+    # so it doesn't dominate the existing score components.
+    if continuous_field and mode in ('wave',):
+        signed_means = [m.get('signed_mean') for m in metric_history]
+        abs_means = [m.get('mean', 0.0) for m in metric_history]
+        if all(s is not None for s in signed_means) and len(signed_means) >= 4:
+            sm = np.asarray(signed_means, dtype=np.float64)
+            am = np.asarray(abs_means, dtype=np.float64)
+            denom = float(np.mean(np.abs(am)))
+            if denom > 1e-9:
+                coherence = float(np.std(sm)) / denom
+                # Squash to [0, 1] with soft knee at ratio ~0.7 (a perfect
+                # cosine plane wave gives ~1.11 → squashes to ~0.84).
+                coh_bonus = 0.10 * (1.0 - np.exp(-coherence / 0.7))
+                score = min(1.0, score + coh_bonus)
 
     return max(min(score, 1.0), 0.0)
 
@@ -1741,7 +2491,7 @@ def analyze_dynamics(grid_snapshots, metric_history, channel=0, threshold=0.5):
 
 def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
               params=None, dt=None, verbose=False, capture_dynamics=False,
-              init_density=None, init_override=None):
+              init_density=None, init_override=None, target_signature=None):
     """Run a CA for N steps, sample metrics every interval, return summary.
 
     If capture_dynamics=True, stores grid snapshots every sample_interval
@@ -1920,6 +2670,33 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
         result['init_density'] = init_density
     result.update(structure)
 
+    # Live-stream thumbnail (CPU reduce on a grid we already had to read
+    # back; never raises, returns None on failure).
+    preview = _make_preview(grid, channel=channel, mode=measure_mode)
+    if preview is not None:
+        result['preview'] = preview
+
+    # Optional target-signature distance (lite inverse design).
+    # When a 1-D power-spectrum target is provided, compute the same
+    # signature on the final grid and store the L2 distance + a [0,1]
+    # match score (1 - distance). Lets MAP-Elites optimise toward a
+    # reference final state without changing the search wiring.
+    if target_signature is not None:
+        try:
+            sig = _grid_signature(grid, channel=channel)
+            tgt = np.asarray(target_signature, dtype=np.float64)
+            if sig.shape == tgt.shape:
+                # L2 on unit-normalised power spectra → distance in [0, √2].
+                d = float(np.linalg.norm(sig - tgt))
+                result['target_distance'] = d
+                result['target_match'] = max(0.0, 1.0 - d / np.sqrt(2.0))
+            else:
+                result['target_distance'] = float('inf')
+                result['target_match'] = 0.0
+        except Exception:
+            result['target_distance'] = float('inf')
+            result['target_match'] = 0.0
+
     # Advanced dynamics analysis
     if capture_dynamics and grid_snapshots:
         if _PROFILE_ENABLED:
@@ -1979,8 +2756,30 @@ def cmd_test(ctx, args):
     """Test a single rule with verbose output."""
     print(f"Testing: {args.rule} (size={args.size}, steps={args.steps}, seed={args.seed})")
     print()
+    overrides = {}
+    for spec in getattr(args, 'param', []) or []:
+        if '=' not in spec:
+            print(f"  ! ignoring malformed --param '{spec}' (need NAME=VALUE)")
+            continue
+        k, v = spec.split('=', 1)
+        try:
+            overrides[k.strip()] = float(v)
+        except ValueError:
+            overrides[k.strip()] = v
+    # Merge with preset defaults so the rule still gets every required key.
+    from simulator import RULE_PRESETS  # local import to avoid cycles at import time
+    base = dict(RULE_PRESETS.get(args.rule, {}).get('params', {}))
+    base.update(overrides)
+    init_override = getattr(args, 'init', None)
+    if init_override:
+        print(f"  init override: {init_override}")
+    if overrides:
+        print(f"  param overrides: {overrides}")
     result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                      seed=args.seed, verbose=True)
+                      seed=args.seed, verbose=True,
+                      params=base if base else None,
+                      dt=getattr(args, 'dt', None),
+                      init_override=init_override)
     print()
     print(f"Score: {result['score']:.3f}")
     print(f"Params: {result['params']}")
@@ -1992,15 +2791,24 @@ def randomize_params(preset, rng):
 
     Uses log-uniform sampling for params with >10x range spread to properly
     explore both small and large regimes (e.g., diffusion 0.001-1.0).
+
+    Defensive against malformed presets: a (lo, hi) pair with lo > hi is
+    silently normalised (swapped); lo == hi yields the constant value.
     """
     params = {}
     ranges = preset['param_ranges']
     for name, (lo, hi) in ranges.items():
+        # Normalise reversed ranges so a typo in a preset can't crash a search.
+        if lo > hi:
+            lo, hi = hi, lo
         if isinstance(lo, int) and isinstance(hi, int):
-            params[name] = int(rng.randint(lo, hi + 1))
+            # randint(lo, hi+1) crashes when hi+1 <= lo; with lo<=hi this is safe.
+            params[name] = int(rng.randint(lo, hi + 1)) if hi > lo else int(lo)
         else:
-            # Log-uniform for wide ranges where both ends are positive
-            if lo > 0 and hi / lo > 10.0:
+            if hi == lo:
+                params[name] = float(lo)
+            elif lo > 0 and hi / lo > 10.0:
+                # Log-uniform for wide ranges where both ends are positive
                 params[name] = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
             else:
                 params[name] = float(rng.uniform(lo, hi))
@@ -2119,6 +2927,8 @@ def _get_metric(result, metric_name):
         if alive > 0.05 and lcf > 0.5:
             raw -= min(0.30, (lcf - 0.5) * 0.6)  # up to -0.30 at lcf=1.0
         return max(0.0, raw)
+    elif metric_name == 'target_match':
+        return result.get('target_match', 0.0)
     elif metric_name == 'period':
         return result.get('period_score', 0)
     elif metric_name == 'glider':
@@ -2329,6 +3139,13 @@ def _make_discovery(r):
     }
     if 'init_density' in r:
         d['init_density'] = r['init_density']
+    # Persist the init variant so the simulator GUI can replay the
+    # discovery with the correct initial topology, not just the preset
+    # default.  Without this, two discoveries that share params but
+    # differ purely in IC (e.g. fracture_double_notch vs fracture_penny_crack)
+    # collapse to the same default-init replay in the simulator.
+    if 'init_variant' in r and r['init_variant']:
+        d['init_variant'] = r['init_variant']
     # Include dynamics metrics if present
     for key in ('period', 'period_score', 'translation_score', 'translation_speed',
                 'growth_score', 'growth_rate', 'growth_type',
@@ -2389,8 +3206,8 @@ def _is_quality(result, min_score=0.15):
 
 def cmd_sweep(ctx, args):
     """Random parameter sweep — find interesting parameter combinations."""
-    from simulator import RULE_PRESETS
-    preset = RULE_PRESETS[args.rule]
+    from simulator import RULE_PRESETS, _resolve_composed_preset
+    preset = _resolve_composed_preset(args.rule)
 
     metric = getattr(args, 'metric', 'score')
     dynamics = _needs_dynamics(metric)
@@ -2633,8 +3450,8 @@ def cmd_search(ctx, args):
     """Diversity-aware search: explores parameter space broadly, varies init density,
     and uses novelty bonus to favor discoveries in unexplored regions.
     All results above quality threshold are kept — rare finds are never discarded."""
-    from simulator import RULE_PRESETS
-    preset = RULE_PRESETS[args.rule]
+    from simulator import RULE_PRESETS, _resolve_composed_preset
+    preset = _resolve_composed_preset(args.rule)
 
     metric = getattr(args, 'metric', 'score')
     dynamics = _needs_dynamics(metric)
@@ -2658,6 +3475,19 @@ def cmd_search(ctx, args):
     init_variants = preset.get('init_variants')
     if init_variants and len(init_variants) > 1:
         print(f"  (init variants: {', '.join(init_variants)})")
+
+    # Optional target signature for lite inverse design.
+    target_sig = None
+    target_path = getattr(args, 'target', None)
+    if target_path:
+        try:
+            target_sig = np.load(target_path).astype(np.float64)
+            print(f"  (target signature: {target_path}, shape={target_sig.shape})")
+            if metric != 'target_match':
+                print(f"  (note: --metric=target_match is recommended when --target is set)")
+        except Exception as e:
+            print(f"  (failed to load target {target_path}: {e})")
+            target_sig = None
     print()
 
     rng = np.random.RandomState(args.seed)
@@ -2724,9 +3554,17 @@ def cmd_search(ctx, args):
         if not dt_range:
             return None
         if parent_dt is not None:
-            # Joint mutation: stay in parent's regime, +-25%
-            lo = max(dt_range[0], parent_dt * 0.75)
-            hi = min(dt_range[1] * 1.5, parent_dt * 1.25)
+            # Joint mutation: stay in parent's regime, +-25%.
+            # Defensive: if parent_dt sits outside dt_range (can happen when
+            # an edge-of-stability probe fed a parent), the naive lo/hi can
+            # invert (lo > hi), which np.random.uniform officially treats as
+            # undefined behaviour. Clamp parent_dt into the range first.
+            pdt = float(np.clip(parent_dt, dt_range[0], dt_range[1] * 1.5))
+            lo = max(dt_range[0], pdt * 0.75)
+            hi = min(dt_range[1] * 1.5, pdt * 1.25)
+            if hi <= lo:
+                # Degenerate (parent at exact boundary); return the boundary.
+                return float(lo)
             return float(rng.uniform(lo, hi))
         if rng.random() < 0.15:
             # Edge-of-stability probe
@@ -2745,7 +3583,7 @@ def cmd_search(ctx, args):
         r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
                       seed=trial_seed, params=params, dt=trial_dt, verbose=False,
                       capture_dynamics=dynamics, init_density=init_density,
-                      init_override=trial_init)
+                      init_override=trial_init, target_signature=target_sig)
         if trial_init:
             r['init_variant'] = trial_init
         if init_density is not None:
@@ -2765,6 +3603,82 @@ def cmd_search(ctx, args):
     print(f"  BD grid: {GRID}x{GRID}x{GRID} = {GRID**3} cells "
           f"(alive log, activity log, largest_cluster_frac linear)")
 
+    # Live status snapshot (read by ca_dashboard / external monitors).
+    # Per-PID file so concurrent batch_*.sh workers don't clobber each other.
+    # atexit ensures the file is removed on normal exit; readers also treat
+    # files older than ~30 s as stale, so a hard kill won't mislead them.
+    import atexit
+    _status_started = time.time()
+    _status_best = 0.0
+    _status_recent: list[dict] = []  # last N placed elites for live dashboards
+    _status_state = {
+        'pid':           os.getpid(),
+        'host':          _status_host(),
+        'rule':          args.rule,
+        'metric':        metric,
+        'size':          args.size,
+        'trials_total':  args.trials,
+        'trial':         0,
+        'phase':         'boot',
+        'elites_filled': 0,
+        'elites_max':    GRID ** 3,
+        'last_score':    0.0,
+        'last_placed':   False,
+        'best_score':    0.0,
+        'started_at':    _status_started,
+        'updated_at':    _status_started,
+        'recent_top':    _status_recent,
+    }
+    _status_write(_status_state)
+    atexit.register(_status_clear)
+
+    # ── Stratified variant sampling ──────────────────────────────────
+    # Without this, init_variants are drawn uniformly per-trial, so for
+    # a preset with 5 variants and 800 trials each variant gets ~160
+    # samples *in expectation* — but with random clumping some variants
+    # routinely get <80 trials in practice, and with parent-inheritance
+    # the elite grid quickly locks onto whichever variant got lucky in
+    # the bootstrap.  Stratification guarantees every declared variant
+    # gets a fair share of the budget.
+    has_strat_variants = bool(init_variants) and len(init_variants) > 1
+    # Build a deterministic-shuffled round-robin schedule for bootstrap.
+    if has_strat_variants:
+        boot_variant_queue = []
+        # Round-robin: cycle through the variants until we have enough
+        # for the bootstrap, with a per-cycle shuffle so two consecutive
+        # trials of the same variant don't pile up parameter-collinear
+        # results.
+        while len(boot_variant_queue) < n_bootstrap:
+            cycle = list(init_variants)
+            rng.shuffle(cycle)
+            boot_variant_queue.extend(cycle)
+        boot_variant_queue = boot_variant_queue[:n_bootstrap]
+        # Tracker for elite-grid representation per variant — used to
+        # bias post-bootstrap resampling toward under-represented ones.
+        variant_elite_counts = {v: 0 for v in init_variants}
+    else:
+        boot_variant_queue = None
+        variant_elite_counts = None
+
+    def stratified_resample_variant():
+        """Post-bootstrap variant pick that prefers under-represented
+        variants in the elite grid.  70% biased pick / 30% uniform for
+        diversity."""
+        if not has_strat_variants:
+            return None
+        # Recount from current elites (cheap: O(grid))
+        counts = {v: 0 for v in init_variants}
+        for el in elites.values():
+            v = el.get('init_variant')
+            if v in counts:
+                counts[v] += 1
+        if rng.random() < 0.3:
+            return init_variants[rng.randint(len(init_variants))]
+        # Pick variant with the fewest elites (ties broken randomly).
+        min_n = min(counts.values())
+        candidates = [v for v, n in counts.items() if n == min_n]
+        return candidates[rng.randint(len(candidates))]
+
     for trial in range(args.trials):
         # Decide: bootstrap (random) or mutate-from-elite?
         use_random = (trial < n_bootstrap) or (not elites)
@@ -2772,7 +3686,12 @@ def cmd_search(ctx, args):
             params = _gen_params(preset, rng)
             init_density = sample_init_density()
             trial_dt = sample_dt()
-            trial_init = sample_init(params)
+            # Stratified variant pick during bootstrap so every variant
+            # gets a guaranteed share of the parameter-space sweep.
+            if boot_variant_queue is not None and trial < len(boot_variant_queue):
+                trial_init = boot_variant_queue[trial]
+            else:
+                trial_init = sample_init(params)
             parent_key = None
         else:
             # Pick parent uniformly at random from filled cells -- this is
@@ -2799,13 +3718,44 @@ def cmd_search(ctx, args):
             else:
                 init_density = sample_init_density()
             # Init variant: usually inherit, sometimes resample.
-            if init_variants and len(init_variants) > 1 and rng.random() < 0.2:
-                trial_init = sample_init(params)
+            # Resample now uses stratified picking so under-represented
+            # variants in the elite grid get explored more.
+            if has_strat_variants and rng.random() < 0.2:
+                trial_init = stratified_resample_variant()
             else:
                 trial_init = parent.get('init_variant')
 
         result, base_val = evaluate(params, init_density, trial_dt, trial_init)
         placed = try_insert(result, base_val)
+
+        # Update live status snapshot (cheap: ~few hundred bytes, atomic).
+        if base_val > _status_best:
+            _status_best = base_val
+        if placed:
+            _status_recent.append({
+                'score': float(base_val),
+                'rule':  args.rule,
+                'seed':  result.get('seed', '?'),
+                'trial': trial + 1,
+                't':     time.time(),
+            })
+            # Keep only the last 16; dashboards typically show 8.
+            if len(_status_recent) > 16:
+                del _status_recent[:-16]
+        _status_state.update({
+            'trial':         trial + 1,
+            'phase':         'boot' if use_random else 'mut',
+            'elites_filled': len(elites),
+            'last_score':    float(base_val),
+            'last_placed':   bool(placed),
+            'best_score':    float(_status_best),
+            'updated_at':    time.time(),
+        })
+        # Live preview (last frame of this trial). Cheap: ~4 KB of base64
+        # in the status JSON. Skipped silently if disabled / unavailable.
+        if 'preview' in result:
+            _status_state['preview'] = result['preview']
+        _status_write(_status_state)
 
         if base_val >= 0.3 or (trial + 1) % 50 == 0:
             tag = "***" if base_val >= 0.5 else "  *" if base_val >= 0.3 else "   "
@@ -2899,10 +3849,15 @@ def cmd_search(ctx, args):
 
 
 def _mutate_params(params, ranges, rng, scale=0.15):
-    """Mutate parameters by small random amounts within valid ranges."""
+    """Mutate parameters by small random amounts within valid ranges.
+
+    Defensive against reversed (lo > hi) ranges in malformed presets.
+    """
     mutated = {}
     for name, val in params.items():
         lo, hi = ranges[name]
+        if lo > hi:
+            lo, hi = hi, lo
         if isinstance(lo, int) and isinstance(hi, int):
             delta = max(1, int((hi - lo) * scale))
             new_val = int(val + rng.randint(-delta, delta + 1))
@@ -2927,11 +3882,125 @@ def _fmt_params(params):
     return ", ".join(parts)
 
 
+def cmd_save_target(ctx, args):
+    """Run a rule once and save its final-grid radial signature.
+
+    The resulting .npy file can be passed to `search --target=...` to drive
+    a lite inverse-design search for parameters whose final state matches.
+    """
+    from simulator import RULE_PRESETS
+    if args.rule not in RULE_PRESETS:
+        print(f"Unknown rule: {args.rule}")
+        return
+    print(f"save-target: running {args.rule} (size={args.size}, steps={args.steps}, seed={args.seed})")
+    runner = HeadlessRunner(ctx, args.rule, size=args.size, seed=args.seed,
+                            init_override=args.init)
+    for _ in range(args.steps):
+        runner.step()
+    grid = runner.read_grid()
+    runner.release()
+    sig = _grid_signature(grid, channel=runner.measure_channel)
+    np.save(args.out, sig)
+    print(f"  wrote {args.out}  shape={sig.shape}  sum={sig.sum():.6f}")
+
+
+def cmd_promote(ctx, args):
+    """Re-evaluate prescreen discoveries at a larger grid size + more steps.
+
+    Reads discoveries from --input, filters to one rule, replays each entry's
+    (params, dt, init_density, init_variant) at args.size / args.steps, keeps
+    results that pass the quality bar, and appends them to --save.
+
+    Used as the second phase of the size-16 prescreen workflow: cheap broad
+    search at small size, then slow re-confirmation at viewing size.
+    """
+    from simulator import RULE_PRESETS
+
+    if args.rule not in RULE_PRESETS:
+        print(f"Unknown rule: {args.rule}")
+        return
+
+    in_path = args.input
+    if not os.path.isabs(in_path):
+        in_path = os.path.join(os.path.dirname(__file__), in_path)
+    if not os.path.exists(in_path):
+        print(f"Input not found: {in_path}")
+        return
+    with open(in_path) as f:
+        all_disc = json.load(f)
+
+    candidates = [d for d in all_disc if d.get('rule') == args.rule]
+    # Sort by prescreen score; take top-K
+    candidates.sort(key=lambda d: d.get('score', 0.0), reverse=True)
+    candidates = candidates[:args.top]
+    if not candidates:
+        print(f"No prescreen entries for {args.rule} in {in_path}")
+        return
+
+    metric = getattr(args, 'metric', 'score')
+    dynamics = _needs_dynamics(metric)
+    print(f"Promoting {len(candidates)} prescreen entries for {args.rule} "
+          f"(size={args.size}, steps={args.steps}, metric={metric})")
+
+    survivors = []
+    min_q = getattr(args, 'min_quality', 0.20)
+    for i, d in enumerate(candidates):
+        params      = dict(d.get('params', {}))
+        dt          = d.get('dt')
+        init_dens   = d.get('init_density')
+        init_var    = d.get('init_variant')
+        seed        = int(d.get('seed', i))
+        try:
+            r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                          seed=seed, params=params, dt=dt,
+                          init_density=init_dens, init_override=init_var,
+                          capture_dynamics=dynamics, verbose=False)
+        except Exception as e:
+            print(f"  [{i+1}/{len(candidates)}] FAIL: {e}")
+            continue
+        if init_var:
+            r['init_variant'] = init_var
+        if init_dens is not None:
+            r['init_density'] = init_dens
+        bv = _get_metric(r, metric)
+        keep = _is_quality(r, min_score=min_q) and bv >= min_q
+        flag = 'KEEP' if keep else 'drop'
+        print(f"  [{i+1:3d}/{len(candidates)}] pre={d.get('score',0):.3f} "
+              f"-> post={r['score']:.3f} {metric}={bv:.3f} {flag}  "
+              f"{_fmt_params(r['params'])}")
+        if keep:
+            survivors.append(_make_discovery(r))
+
+    if args.save and survivors:
+        save_path = args.save
+        if not os.path.isabs(save_path):
+            save_path = os.path.join(os.path.dirname(__file__), save_path)
+        existing = []
+        if os.path.exists(save_path):
+            with open(save_path) as f:
+                existing = json.load(f)
+        existing.extend(survivors)
+        with open(save_path, 'w') as f:
+            json.dump(existing, f, indent=2)
+        print(f"\nKept {len(survivors)}/{len(candidates)}; saved to {save_path}")
+    elif args.save:
+        # Touch an empty list so downstream merge tools always find the file.
+        save_path = args.save
+        if not os.path.isabs(save_path):
+            save_path = os.path.join(os.path.dirname(__file__), save_path)
+        if not os.path.exists(save_path):
+            with open(save_path, 'w') as f:
+                json.dump([], f)
+        print(f"\nKept 0/{len(candidates)} (no survivors above quality {min_q:.2f})")
+    else:
+        print(f"\nKept {len(survivors)}/{len(candidates)} (no --save target)")
+
+
 def cmd_explore(ctx, args):
     """Search for interesting CAs then launch the simulator on the best find."""
     import subprocess
-    from simulator import RULE_PRESETS
-    preset = RULE_PRESETS[args.rule]
+    from simulator import RULE_PRESETS, _resolve_composed_preset
+    preset = _resolve_composed_preset(args.rule)
     metric = getattr(args, 'metric', 'combined')
     dynamics = _needs_dynamics(metric)
 
@@ -3026,6 +4095,13 @@ def main():
     # test: test one rule
     p_test = sub.add_parser('test', help='Test a single rule')
     p_test.add_argument('rule', type=str, help='Rule name')
+    p_test.add_argument('--init', type=str, default=None,
+                        help='Override init variant (e.g. one_source, h1, blob)')
+    p_test.add_argument('--param', action='append', default=[],
+                        metavar='NAME=VALUE',
+                        help='Override one preset parameter; can repeat')
+    p_test.add_argument('--dt', type=float, default=None,
+                        help='Override dt')
 
     # sweep: random parameter sweep
     p_sweep = sub.add_parser('sweep', help='Random parameter sweep')
@@ -3052,10 +4128,12 @@ def main():
                           choices=['score', 'gol_coherence', 'projection', 'structure',
                                    'slice_mi', 'combined', 'period', 'glider',
                                    'growth', 'clusters', 'symmetry', 'elegance',
-                                   'gol_like'],
+                                   'gol_like', 'target_match'],
                           help='Metric to optimize (default: score)')
     p_search.add_argument('--min_quality', type=float, default=0.25,
                           help='Minimum score to save a discovery (default: 0.25)')
+    p_search.add_argument('--target', type=str, default=None,
+                          help='Path to .npy radial power-spectrum signature for inverse design')
 
     # explore: search + auto-launch simulator on best result
     p_explore = sub.add_parser('explore', help='Search then launch simulator on best result')
@@ -3072,6 +4150,33 @@ def main():
                            help='Metric to optimize (default: combined)')
     p_explore.add_argument('--view-size', type=int, default=64,
                            help='Grid size for viewing (default: 64)')
+
+    # promote: re-evaluate prescreen discoveries at full size
+    p_promote = sub.add_parser('promote',
+        help='Re-evaluate prescreen discoveries at larger grid')
+    p_promote.add_argument('rule', type=str, help='Rule name to promote')
+    p_promote.add_argument('--input', type=str, required=True,
+                           help='Prescreen discoveries JSON to read from')
+    p_promote.add_argument('--top', type=int, default=20,
+                           help='Top N prescreen entries per rule to retest')
+    p_promote.add_argument('--save', type=str, default=None,
+                           help='Append survivors to this JSON')
+    p_promote.add_argument('--metric', type=str, default='combined',
+                           choices=['score', 'gol_coherence', 'projection', 'structure',
+                                    'slice_mi', 'combined', 'period', 'glider',
+                                    'growth', 'clusters', 'symmetry', 'elegance',
+                                    'gol_like'])
+    p_promote.add_argument('--min_quality', type=float, default=0.20,
+                           help='Minimum post-rerun score to keep (default: 0.20)')
+
+    p_target = sub.add_parser('save-target',
+        help='Run a rule once and save its final-grid radial signature for inverse design')
+    p_target.add_argument('rule', type=str)
+    p_target.add_argument('--out', type=str, required=True, help='.npy path to write')
+    p_target.add_argument('--size', type=int, default=64)
+    p_target.add_argument('--steps', type=int, default=300)
+    p_target.add_argument('--seed', type=int, default=42)
+    p_target.add_argument('--init', type=str, default=None)
 
     args = parser.parse_args()
 
@@ -3091,6 +4196,10 @@ def main():
             cmd_search(ctx, args)
         elif args.command == 'explore':
             cmd_explore(ctx, args)
+        elif args.command == 'promote':
+            cmd_promote(ctx, args)
+        elif args.command == 'save-target':
+            cmd_save_target(ctx, args)
     finally:
         destroy_context(window)
 

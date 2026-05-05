@@ -4,3 +4,4 @@ moderngl>=5.8
 PyOpenGL>=3.1
 imgui-bundle>=1.6
 scipy>=1.10
+trimesh>=4.0

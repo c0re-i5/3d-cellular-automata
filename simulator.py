@@ -19,7 +19,7 @@ Usage:
     python3 simulator.py --size 64 --rule reaction_diffusion_3d
 """
 
-import sys, math, time, argparse, json, os, re, random, subprocess, shutil, tempfile, threading
+import sys, math, time, argparse, json, os, re, random, subprocess, shutil, tempfile, textwrap, threading
 import queue as _queue
 import numpy as np
 import glfw
@@ -28,6 +28,7 @@ from OpenGL import GL
 from imgui_bundle import imgui
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 from element_data import ELEMENT_GPU_DATA, SYMBOLS, NAMES, NUM_ELEMENTS, FLOATS_PER_ELEMENT, WALL_ID
+import entity_arena
 
 # Per-allocation size limit for a single rgba32f 3D texture, above which
 # the grid falls back to rgba16f. The default is conservative (1 GiB) so
@@ -77,11 +78,121 @@ _BOUNDARY_NAME_TO_MODE = {
 }
 
 
+# Multi-channel transfer-function modes baked into the view-tex.
+# See VIEW_TEX_BUILD_SHADER for the per-mode formulae. The integer
+# value is the GLSL u_vis_mode.
+VIS_MODE_DENSITY      = 0   # legacy: single channel via apply_colormap
+VIS_MODE_RGB_CHANNELS = 1   # R=ch0 G=ch1 B=ch2, density = length / sqrt(3)
+VIS_MODE_HSV_PHASE    = 2   # hue=atan2(ch1,ch0), val=length(ch0,ch1)
+VIS_MODE_BIPOLAR      = 3   # signed ch0 → diverging blue/white/red
+VIS_MODE_RGBA_BLEND   = 4   # R=ch0 G=ch1 B=ch2, density=ch3
+_VIS_MODE_NAMES = {
+    'density':       VIS_MODE_DENSITY,
+    'rgb_channels':  VIS_MODE_RGB_CHANNELS,
+    'rgb':           VIS_MODE_RGB_CHANNELS,
+    'hsv_phase':     VIS_MODE_HSV_PHASE,
+    'phase':         VIS_MODE_HSV_PHASE,
+    'bipolar':       VIS_MODE_BIPOLAR,
+    'signed':        VIS_MODE_BIPOLAR,
+    'rgba_blend':    VIS_MODE_RGBA_BLEND,
+    'rgba':          VIS_MODE_RGBA_BLEND,
+}
+_VIS_MODE_LABELS = ['Density (ch0)', 'RGB channels', 'HSV phase',
+                    'Bipolar (signed)', 'RGBA blend']
+
+
+def _vis_mode_to_int(v) -> int:
+    if isinstance(v, int):
+        return max(0, min(int(v), len(_VIS_MODE_LABELS) - 1))
+    if isinstance(v, str):
+        return _VIS_MODE_NAMES.get(v.lower().strip(), VIS_MODE_DENSITY)
+    return VIS_MODE_DENSITY
+
+
 def _tex_format_for_size(size):
-    """Return (moderngl_dtype, numpy_dtype, bytes_per_texel, glsl_format) for a grid of `size`."""
+    """Return (moderngl_dtype, numpy_dtype, bytes_per_texel, glsl_format) for a grid of `size`.
+
+    Auto-fallback: rgba32f → rgba16f at the size that exceeds the per-texture
+    allocation budget. u8 is opt-in only (per-rule via preset['precision']
+    or via --force-precision) since rgba8 normalised clamps writes to [0,1]
+    and would silently corrupt rules whose state range exceeds that. The
+    audit at /memories/session/u8_value_range_audit identifies which rules
+    naturally fit u8.
+    """
     if size ** 3 * 16 > _TEX_ALLOC_LIMIT:
         return 'f2', np.float16, 8, 'rgba16f'
     return 'f4', np.float32, 16, 'rgba32f'
+
+# Format spec lookup for the precision string.
+# 'u8' = rgba8 normalised — values in [0,1], 4 bytes/texel (one byte/channel).
+#        Driver normalises uint8 [0,255] ↔ shader vec4 [0,1] automatically.
+#        Rules opting into 'u8' must keep ALL state values in [0,1] (writes
+#        outside the range get clipped to 0 or 1 with no warning).
+_PRECISION_SPECS = {
+    'fp32': ('f4', np.float32, 16, 'rgba32f'),
+    'fp16': ('f2', np.float16,  8, 'rgba16f'),
+    'u8':   ('f1', np.uint8,    4, 'rgba8'),
+}
+
+# ── Anisotropic shader rewrite ──────────────────────────────────────
+# CA shaders historically use `u_size` (scalar = max(W,H,D)) for periodic
+# wrap and bounds checks: `(p + u_size) % u_size`, `ivec3(u_size)`, etc.
+# That is correct only for cubic grids; on non-cubic grids the short axes
+# wrap into uninitialised texels.
+#
+# This rewrite pass converts the canonical patterns to per-axis form using
+# the `u_dims` const (ivec3(W,H,D)) that's injected alongside `u_size`.
+# When W=H=D, `u_dims = ivec3(u_size, u_size, u_size)` so every per-axis
+# op evaluates identically to the original scalar form — cubic regression
+# is bit-identical. On non-cubic, each axis wraps/bounds against its own
+# extent, fixing the short-axis correctness bug.
+def _anisotropize_glsl(src: str) -> str:
+    # ── Specific nested-paren cases (em_field shader) ──
+    # ((pos + ivec3( N, N, N)) + u_size) % u_size
+    for offset in ('ivec3( 1, 0, 0)', 'ivec3(-1, 0, 0)',
+                   'ivec3( 0, 1, 0)', 'ivec3( 0,-1, 0)',
+                   'ivec3( 0, 0, 1)', 'ivec3( 0, 0,-1)'):
+        src = src.replace(
+            f'((pos + {offset}) + u_size) % u_size',
+            f'((pos + {offset}) + u_dims) % u_dims')
+
+    # (NAME + ivec3(u_size)) % ivec3(u_size)  — alternative form (compute_raymarch)
+    src = re.sub(
+        r'\(([a-zA-Z_]\w*)\s*\+\s*ivec3\(u_size\)\s*\)\s*%\s*ivec3\(u_size\)',
+        r'(\1 + u_dims) % u_dims', src)
+
+    # ((NAME % u_size) + u_size) % u_size  — signed-safe wrap (modular_arithmetic helpers)
+    src = re.sub(
+        r'\(\(\s*([a-zA-Z_]\w*)\s*%\s*u_size\s*\)\s*\+\s*u_size\s*\)\s*%\s*u_size',
+        r'((\1 % u_dims) + u_dims) % u_dims', src)
+
+    # (NAME + u_size) % u_size  — the canonical pattern (16+ sites)
+    src = re.sub(
+        r'\(\s*([a-zA-Z_]\w*)\s*\+\s*u_size\s*\)\s*%\s*u_size',
+        r'(\1 + u_dims) % u_dims', src)
+
+    # ivec3(u_size - 1) → (u_dims - 1)  — must precede the `ivec3(u_size)` pass
+    src = re.sub(r'ivec3\(\s*u_size\s*-\s*1\s*\)', '(u_dims - 1)', src)
+    # vec3(u_size - 1) → vec3(u_dims - 1)
+    src = re.sub(r'vec3\(\s*u_size\s*-\s*1\s*\)', 'vec3(u_dims - 1)', src)
+    # ivec3(u_size) → u_dims  — bounds checks `greaterThanEqual(p, ivec3(u_size))`
+    src = re.sub(r'ivec3\(\s*u_size\s*\)', 'u_dims', src)
+
+    # Per-axis scalar comparisons + min-clamps:
+    #   pos.x == u_size-1  ->  pos.x == u_dims.x-1
+    #   min(q.y + 1, u_size - 1)  ->  min(q.y + 1, u_dims.y - 1)
+    for ax in 'xyz':
+        src = re.sub(rf'(\.{ax})\s*==\s*u_size\s*-\s*1\b',
+                     rf'\1 == u_dims.{ax} - 1', src)
+        src = re.sub(rf'(\.{ax}\s*\+\s*1)\s*,\s*u_size\s*-\s*1\b',
+                     rf'\1, u_dims.{ax} - 1', src)
+
+    # Entity physics single-axis bounce bounds (nx/ny/nz vs float(u_size-1))
+    for var, ax in (('nx', 'x'), ('ny', 'y'), ('nz', 'z')):
+        src = src.replace(f'{var} > float(u_size-1)', f'{var} > float(u_dims.{ax}-1)')
+        src = src.replace(f'{var} = float(u_size-1)', f'{var} = float(u_dims.{ax}-1)')
+
+    return src
 
 # ── Shader sources ────────────────────────────────────────────────────
 
@@ -137,6 +248,10 @@ vec4 fetch(ivec3 p) {
     return imageLoad(u_src, p);
 }
 
+// Reciprocal of UINT32_MAX — multiplying is ~2x faster than dividing on GPU.
+// Used to normalise Wang-hashed uint seeds to [0,1).
+const float INV_U32_MAX = 1.0 / 4294967295.0;
+
 // Temporal hash: changes every frame (unlike position-only fract(sin(...)))
 // Uses Wang hash on (pos + frame) for high-quality pseudo-random numbers
 float hash_temporal(ivec3 p, int channel) {
@@ -145,7 +260,7 @@ float hash_temporal(ivec3 p, int channel) {
     seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
     seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
     seed = seed ^ (seed >> 16u);
-    return float(seed) / 4294967295.0;
+    return float(seed) * INV_U32_MAX;
 }
 
 // Quenched (frozen) hash: depends on position only — same value every frame.
@@ -158,7 +273,7 @@ float hash_static(ivec3 p, int channel) {
     seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
     seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
     seed = seed ^ (seed >> 16u);
-    return float(seed) / 4294967295.0;
+    return float(seed) * INV_U32_MAX;
 }
 
 // SMOOTH VALUE NOISE on a unit-spaced lattice (8-corner trilinear interp,
@@ -364,7 +479,10 @@ void main() {
         result = (alive >= s1 && alive <= s2) ? 1.0 : 0.0;
     }
 
-    imageStore(u_dst, pos, vec4(result, 0.0, 0.0, 0.0));
+    // ch1 = local Moore-26 density, ch2 = signed delta (born=+1, died=-1, mapped to [0,1])
+    float density26 = float(alive) * (1.0/26.0);
+    float delta = abs(result - self);
+    imageStore(u_dst, pos, vec4(result, density26, delta, 0.0));
 }
 """,
 
@@ -516,7 +634,9 @@ void main() {
     // 0.005 floor never affects living structure but kills sub-visible fog.
     if (result < 0.005) result = 0.0;
 
-    imageStore(u_dst, pos, vec4(result, 0.0, 0.0, 0.0));
+    // ch1 = outer-annulus mean n (kernel response), ch2 = growth signal (already [0,1]),
+    // ch3 = |delta| (reaction magnitude). Use 'rgb_channels' / 'rgba_blend' vis_mode.
+    imageStore(u_dst, pos, vec4(result, n, growth, abs(result - self)));
 }
 """,
 
@@ -620,6 +740,184 @@ void main() {
     float new_V = clamp(V + dV * dt_eff, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "schnakenberg_3d": """
+// 3D Schnakenberg Reaction-Diffusion — the canonical "two-species
+// activator-substrate" Turing system that produces clean spotty/striped
+// patterns with a much smaller useful parameter window than Gray-Scott
+// (so it's nice for teaching the Turing instability without getting
+// lost in the F/k regime map).
+//
+//   dU/dt = Du * lap(U) + a - U + U^2 * V        (substrate)
+//   dV/dt = Dv * lap(V) + b     - U^2 * V        (activator)
+//
+// At the homogeneous fixed point U* = a+b, V* = b/(a+b)^2, the system
+// is Turing-unstable when Dv/Du is small enough relative to b/a.
+// Default a=0.1, b=0.9, Du=0.05, Dv=1.0 gives spots (period ~ 8 cells).
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float U = self_val.r;
+    float V = self_val.g;
+
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_U = lap_v4.r;
+    float lap_V = lap_v4.g;
+
+    float a  = u_param0;
+    float b  = u_param1;
+    float Du = u_param2;
+    float Dv = u_param3;
+
+    float D_max    = max(Du, Dv);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float UUV = U * U * V;
+    float dU  = Du * lap_U + a - U + UUV;
+    float dV  = Dv * lap_V + b     - UUV;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 4.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 4.0);
+
+    imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "fitzhugh_nagumo_3d": """
+// 3D FitzHugh-Nagumo — simplified Hodgkin-Huxley nerve-impulse model.
+// Two channels: V (excitable membrane potential), W (slow recovery
+// variable). Produces travelling pulses, spiral waves, and scroll
+// rings — the "BZ chemistry" of neuroscience.
+//
+//   dV/dt = D * lap(V) + V - V^3/3 - W + I_ext
+//   dW/dt = epsilon * (V + a - b * W)
+//
+// epsilon controls timescale separation (small = sharp pulses);
+// (a, b) sets excitability. Default a=0.7, b=0.8, eps=0.08, I=0.0
+// is the classical "excitable but quiescent" regime — perturbations
+// trigger pulses that propagate and annihilate on collision.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float V = self_val.r;
+    float W = self_val.g;
+
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_V = lap_v4.r;
+
+    float a       = u_param0;
+    float b       = u_param1;
+    float epsilon = u_param2;
+    float D       = u_param3;
+
+    float dt_limit = 0.9 / 6.0 / max(D * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float dV = D * lap_V + V - V * V * V / 3.0 - W;
+    float dW = epsilon * (V + a - b * W);
+
+    float new_V = clamp(V + dV * dt_eff, -3.0, 3.0);
+    float new_W = clamp(W + dW * dt_eff, -3.0, 3.0);
+
+    imageStore(u_dst, pos, vec4(new_V, new_W, 0.0, 0.0));
+}
+""",
+
+    "brusselator_3d": """
+// 3D Brusselator — Prigogine's autocatalytic oscillator. The textbook
+// example of a thermodynamically-open system that admits limit-cycle
+// oscillations and Turing patterns.
+//
+//   dU/dt = Du * lap(U) + A - (B+1)*U + U^2 * V
+//   dV/dt = Dv * lap(V)     + B*U     - U^2 * V
+//
+// Hopf bifurcation at B = 1 + A^2 (well-mixed): below → fixed point,
+// above → uniform oscillation. Adding diffusion with Dv/Du ratio in the
+// Turing window gives stationary patterns; outside it, travelling waves
+// or chaos. Default A=1.0, B=3.0, Du=2.0, Dv=8.0 sits in the spot regime.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float U = self_val.r;
+    float V = self_val.g;
+
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_U = lap_v4.r;
+    float lap_V = lap_v4.g;
+
+    float A  = u_param0;
+    float B  = u_param1;
+    float Du = u_param2;
+    float Dv = u_param3;
+
+    float D_max    = max(Du, Dv);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float UUV = U * U * V;
+    float dU  = Du * lap_U + A - (B + 1.0) * U + UUV;
+    float dV  = Dv * lap_V     + B * U         - UUV;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 6.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 6.0);
+
+    imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "cyclic_ca_3d": """
+// 3D Cyclic Cellular Automaton (Griffeath / RPS-N). Each cell holds
+// one of N states 0..N-1 arranged in a cycle. A cell in state s
+// "infects" neighbours in state s-1 (mod N) when enough of its
+// neighbours are in state s+1 (mod N). Produces beautiful rotating
+// spiral waves and demoiselles in 3D.
+//
+// State stored in R-channel as int-cast float (0..N-1). G-channel
+// is a free visualization slot (e.g. local cycle phase).
+//
+// u_param0 = N states (3..16, rounded)
+// u_param1 = threshold (1..6, # of "next state" neighbours required)
+// u_param2 = unused
+// u_param3 = unused
+//
+// Uses 6-neighbour von Neumann to keep transitions sharp.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int N      = clamp(int(u_param0 + 0.5), 3, 16);
+    int thresh = clamp(int(u_param1 + 0.5), 1, 6);
+
+    int s = int(fetch(pos).r + 0.5);
+    s = ((s % N) + N) % N;
+    int next = (s + 1) % N;
+
+    int count = 0;
+    int n0 = int(fetch(pos + ivec3( 1, 0, 0)).r + 0.5); n0 = ((n0 % N) + N) % N; if (n0 == next) count++;
+    int n1 = int(fetch(pos + ivec3(-1, 0, 0)).r + 0.5); n1 = ((n1 % N) + N) % N; if (n1 == next) count++;
+    int n2 = int(fetch(pos + ivec3( 0, 1, 0)).r + 0.5); n2 = ((n2 % N) + N) % N; if (n2 == next) count++;
+    int n3 = int(fetch(pos + ivec3( 0,-1, 0)).r + 0.5); n3 = ((n3 % N) + N) % N; if (n3 == next) count++;
+    int n4 = int(fetch(pos + ivec3( 0, 0, 1)).r + 0.5); n4 = ((n4 % N) + N) % N; if (n4 == next) count++;
+    int n5 = int(fetch(pos + ivec3( 0, 0,-1)).r + 0.5); n5 = ((n5 % N) + N) % N; if (n5 == next) count++;
+
+    int new_s = (count >= thresh) ? next : s;
+    // Visualise as normalised phase 0..1 in G so the standard colour
+    // ramp shows the cycle as a smooth gradient.
+    float phase = float(new_s) / float(N);
+    imageStore(u_dst, pos, vec4(float(new_s), phase, 0.0, 0.0));
 }
 """,
 
@@ -1888,7 +2186,10 @@ void main() {
     // chosen below the visualisation cutoff but above the noise floor.
     if (result < 0.005) result = 0.0;
 
-    imageStore(u_dst, pos, vec4(result, 0.0, 0.0, 0.0));
+    // ch1 = kernel potential (neighbour weighted mean), ch2 = remapped growth
+    // ([-1,1] -> [0,1]), ch3 = |delta|. Pairs with 'rgb_channels' vis_mode.
+    float growth01 = 0.5 + 0.5 * growth;
+    imageStore(u_dst, pos, vec4(result, potential, growth01, abs(result - self)));
 }
 """,
 
@@ -2311,6 +2612,97 @@ void main() {
 }
 """,
 
+    "bz_scroll_3d": """
+// BZ — 3D scroll waves with explicit filament-core tracking.
+// Bespoke replacement for the legacy bz_3d on the bz_turbulence preset.
+//
+// Excitable Barkley dynamics (faster, sharper fronts than CGLE):
+//   ∂u/∂t = (1/ε) u (1-u) (u - (v+b)/a) + D ∇²u
+//   ∂v/∂t = u - v
+// Channel layout:
+//   R = activator u
+//   G = inhibitor v
+//   B = filament strength S = |∇u × ∇v| · (window around half-rise)
+//        — concentrated on scroll-wave core lines (defect filaments)
+//   A = phase φ = atan2(v - 0.5, u - 0.5) / 2π + 0.5 (visualisation)
+//
+// The B channel is the "bespoke" payload: in 3D the singular set of a
+// rotating wave is a 1D filament rather than a point.  Computing
+// |∇u × ∇v| picks out exactly that filament (zero-dimensional topology
+// means the two gradients align except at the core where they're
+// orthogonal).  Multiplying by a window centred at u≈0.5 keeps the
+// signal sharp and suppresses the broad bulk noise.
+//
+// u_param0 = Excitability a       (lower = more break-up)
+// u_param1 = Threshold     b
+// u_param2 = Epsilon       ε      (timescale separation; small = stiff)
+// u_param3 = Diffusion     D
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float u = self_val.r;
+    float v = self_val.g;
+
+    float a   = max(0.05, u_param0);
+    float b   = u_param1;
+    float eps = max(0.001, u_param2);
+    float D   = u_param3;
+
+    // 19-point isotropic Laplacian for u (rotationally symmetric error
+    // — keeps scroll filaments curved instead of axis-aligned).
+    vec4 lap_u = lap19_v4(pos, self_val);
+
+    // Reaction (Barkley) — saturated to keep u bounded under stiff ε.
+    float thr = (v + b) / a;
+    float du_react = (1.0 / eps) * u * (1.0 - u) * (u - thr);
+    // Cubic recovery: dv/dt = u³ - v.  This is the "soft" form that
+    // delays v's chase of u long enough for the wavefront to keep
+    // moving — using linear u-v makes v saturate at u and the medium
+    // never recovers between rotations of a scroll.
+    float dv_react = u * u * u - v;
+
+    // Stable explicit step with a soft cap on |du| (otherwise small ε
+    // can blow up).  The cap acts only when the explicit step would
+    // overshoot the [0,1] basin of u.
+    float du = du_react * u_dt + D * lap_u.r * u_dt;
+    float dv = dv_react * u_dt;
+    du = clamp(du, -0.45, 0.45);
+
+    float new_u = clamp(u + du, 0.0, 1.0);
+    float new_v = clamp(v + dv, 0.0, 1.0);
+
+    // ---- Filament strength S = |∇u × ∇v| at the wave half-rise ----
+    // Read 6 face neighbours for both u and v (central differences).
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+
+    vec3 grad_u = vec3(nxp.r - nxm.r, nyp.r - nym.r, nzp.r - nzm.r) * 0.5;
+    vec3 grad_v = vec3(nxp.g - nxm.g, nyp.g - nym.g, nzp.g - nzm.g) * 0.5;
+    vec3 cross_uv = cross(grad_u, grad_v);
+    float Sraw = length(cross_uv);
+
+    // Window: only register filament where the wave is at mid-rise
+    // (u ≈ 0.5) AND v is in its excited band — that's where the spiral
+    // tip / scroll core actually lives.
+    float win_u = 4.0 * new_u * (1.0 - new_u);          // peak at u=0.5
+    float win_v = exp(-pow((new_v - 0.3) * 4.0, 2.0));  // peak at v≈0.3
+    float S = Sraw * win_u * win_v * 50.0;
+    S = clamp(S, 0.0, 1.0);
+
+    // Phase from (u, v) — spiral wave isophase contours visualise nicely.
+    float phase = atan(new_v - 0.5, new_u - 0.5) / 6.283185 + 0.5;
+
+    imageStore(u_dst, pos, vec4(new_u, new_v, S, phase));
+}
+""",
+
     "barkley_3d": """
 // Barkley excitable medium — propagating waves with refractory period
 // Models BZ reaction, cardiac tissue, neural excitation, forest fire waves.
@@ -2647,6 +3039,202 @@ void main() {
 }
 """,
 
+    "flocking_reynolds_3d": """
+// 3D Flocking — Reynolds boids with unit-velocity constraint and a
+// dynamic predator/fear field.  Bespoke replacement for the legacy
+// "viscous-fluid" flocking_3d in which velocity was unbounded and
+// nothing ever scared the flock.
+//
+// Pair 1 (visualised):  R = density, GBA = velocity (target |v| = v0)
+// Pair 2 (predator):    R = fear scalar, others unused
+//
+// Reynolds rules (radius-1 Moore neighbourhood):
+//   Alignment   — steer toward the average heading of neighbours
+//   Cohesion    — steer toward the local centre of mass
+//   Separation  — steer away from very close, dense neighbours
+// Plus:
+//   Flee        — accelerate against ∇F (away from rising fear)
+//   Self-propel — soft unit-velocity drift toward |v| = v0
+//
+// The fear field F is updated by a paired predator pass: it grows
+// where local density exceeds a threshold (the "predator" is attracted
+// to dense flocks), diffuses, and decays.  The result is a chase /
+// scatter / re-coalesce limit cycle that's visually distinctive.
+//
+// u_param0 = alignment
+// u_param1 = self-propulsion target speed  v0
+// u_param2 = density diffusion
+// u_param3 = separation (close-range repulsion)
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float rho = self_val.r;
+    vec3  vel = self_val.gba;
+
+    float alignment = u_param0;
+    float v0        = u_param1;     // target speed (unit-velocity scale)
+    float diffusion = u_param2;
+    float separation = u_param3;
+
+    // Neighbour scan: average velocity (alignment), centre-of-mass
+    // (cohesion), close-neighbour repulsion (separation), density sum.
+    float sum_rho = 0.0;
+    vec3  sum_vel = vec3(0.0);
+    vec3  com_off = vec3(0.0);   // density-weighted offset = COM - me
+    vec3  sep     = vec3(0.0);
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        ivec3 d = ivec3(dx, dy, dz);
+        vec4 nb = fetch(pos + d);
+        float w = nb.r;
+        sum_rho += w;
+        sum_vel += nb.gba * w;
+        com_off += vec3(d) * w;
+        // Separation: close, dense neighbours push back inversely with
+        // distance.  Cells at offset 1 contribute more than diagonal 3.
+        float r2 = dot(vec3(d), vec3(d));
+        sep -= vec3(d) * w / r2;
+    }
+    float avg_rho = sum_rho / 26.0;
+
+    // Reynolds steering vectors.
+    vec3 align_dir = (length(sum_vel) > 1e-4) ? normalize(sum_vel) : vec3(0.0);
+    vec3 cohes_dir = (length(com_off) > 1e-4) ? normalize(com_off) : vec3(0.0);
+    vec3 sep_dir   = sep;  // already weighted; not normalised
+
+    // Fear gradient: read F from pair 2 to get a fleeing direction.
+    float Fxp = fetch2(pos + ivec3( 1, 0, 0)).r;
+    float Fxm = fetch2(pos + ivec3(-1, 0, 0)).r;
+    float Fyp = fetch2(pos + ivec3( 0, 1, 0)).r;
+    float Fym = fetch2(pos + ivec3( 0,-1, 0)).r;
+    float Fzp = fetch2(pos + ivec3( 0, 0, 1)).r;
+    float Fzm = fetch2(pos + ivec3( 0, 0,-1)).r;
+    vec3  flee = -0.5 * vec3(Fxp - Fxm, Fyp - Fym, Fzp - Fzm);
+
+    // Combine forces.  Cohesion is gated by some local density —
+    // boids in vacuum shouldn't pull toward isolated other voxels.
+    float cohes_gate = smoothstep(0.05, 0.20, avg_rho);
+    vec3 force = align_dir * alignment
+               + cohes_dir * (alignment * 0.4 * cohes_gate)
+               + sep_dir   * separation
+               + flee      * 4.0;
+
+    vec3 new_vel = vel + force * u_dt;
+
+    // Soft unit-velocity drift: pull |v| toward v0 each step.  The Vicsek
+    // model uses hard normalisation; soft is gentler and keeps very
+    // low-density regions from suddenly accelerating from rest.
+    float spd = length(new_vel);
+    if (spd > 1e-4) {
+        float target = v0;
+        float blend  = clamp(2.0 * u_dt, 0.0, 0.5);
+        new_vel = new_vel * (1.0 + blend * (target / spd - 1.0));
+    }
+
+    // Tiny stochastic kick for ongoing exploration.
+    float h1 = hash_temporal(pos, 0);
+    float h2 = hash_temporal(pos, 1);
+    float h3 = hash_temporal(pos, 2);
+    new_vel += (vec3(h1, h2, h3) - 0.5) * 0.1 * u_dt;
+
+    // Velocity cap (Reynolds boids never moved at supersonic speeds).
+    spd = length(new_vel);
+    if (spd > v0 * 1.5) new_vel *= (v0 * 1.5) / spd;
+
+    // Density transport: semi-Lagrangian advection of ρ + diffusion.
+    vec3 back  = vec3(pos) - vel * u_dt;
+    float adv  = fetch_interp(back).r;
+    float lap  = (sum_rho - 26.0 * rho) / 26.0;
+    float new_rho = adv + diffusion * lap * u_dt;
+    new_rho = clamp(new_rho, 0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_rho, new_vel));
+}
+""",
+
+    "flocking_predator_3d": """
+// Flocking — predator/fear field update.  Writes pair 2.
+//
+// Pair 2 R = fear scalar F.  F grows where local density exceeds a
+// threshold (predator is drawn to dense flocks), diffuses, and decays.
+// The Reynolds pass reads ∇F to make boids flee.
+//
+// u_param0..3 are reused but only the 4th matters here:
+//   u_param3 = (unused)
+// We hard-code the predator's responses inside this pass — these are
+// dynamics constants, not user-tunable, since the visual character
+// depends on the right ratios.
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float F = fetch2(pos).r;
+    float rho = fetch(pos).r;
+
+    // Diffuse F (long-range awareness).
+    float sumF = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        sumF += fetch2(pos + ivec3(dx, dy, dz)).r;
+    }
+    float lapF = (sumF - 26.0 * F) / 26.0;
+    float diff_F = 0.6;     // strong — fear travels fast
+    float decay_F = 0.05;   // slow decay
+
+    // Source: dense flocks attract the predator, generating fear.  The
+    // smoothstep makes this a clean threshold so isolated boids don't
+    // create panics.
+    float source = smoothstep(0.30, 0.60, rho) * 0.30;
+
+    float newF = F + (diff_F * lapF + source - decay_F * F) * u_dt;
+    newF = clamp(newF, 0.0, 1.5);
+
+    imageStore(u_dst2, pos, vec4(newF, 0.0, 0.0, 0.0));
+}
+""",
+
     "cahn_hilliard": """
 // Cahn-Hilliard phase separation (spinodal decomposition)
 // Produces interconnected sponge-like structures from a mixed binary fluid.
@@ -2902,6 +3490,178 @@ void main() {
 }
 """,
 
+    "erosion_hydraulic_3d": """
+// Erosion — channelized hydraulic flow with carry-capacity sediment.
+// Bespoke replacement for the legacy isotropic-diffusion erosion_3d.
+//
+// Key physics differences from the old version:
+//   * Water flows DOWN the surface-height gradient, not by symmetric
+//     diffusion.  Surface height H = solid + fluid.  This is the
+//     mechanism that channelizes flow into valleys.
+//   * Local velocity v ∝ |∇H| · √fluid (Manning/Chezy-flavoured).
+//   * Sediment carrying capacity C = Kc · v² (Hjulström-style).
+//     Erosion when C > sediment, deposition when C < sediment.
+//     Positive feedback (more flow → deeper channel → more flow)
+//     produces dendritic drainage networks instead of uniform thinning.
+//   * Vertical gravity drainage stays, so caves/overhangs can form.
+//
+// R = solid density [0,1]   (rock)
+// G = fluid (water) [0,1]
+// B = sediment carried by water [0,1]
+// A = flow speed (visualisation/diagnostic)
+//
+// u_param0 = erosion coefficient   Ke
+// u_param1 = deposition coefficient Kd
+// u_param2 = capacity coefficient   Kc  (sediment per unit v²)
+// u_param3 = gravity strength       g
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+
+    float solid    = self_data.r;
+    float fluid    = self_data.g;
+    float sediment = self_data.b;
+
+    float Ke = u_param0;     // erosion coefficient
+    float Kd = u_param1;     // deposition coefficient
+    float Kc = u_param2;     // carry-capacity coefficient
+    float g  = u_param3;     // gravity
+
+    // ---- Surface heights H = solid + fluid (free-surface flow) ----
+    float H   = solid + fluid;
+    float Hxp = nxp.r + nxp.g;
+    float Hxm = nxm.r + nxm.g;
+    float Hyp = nyp.r + nyp.g;
+    float Hym = nym.r + nym.g;
+    float Hzp = nzp.r + nzp.g;
+    float Hzm = nzm.r + nzm.g;
+
+    // ---- Outflow to lower neighbours, weighted by ΔH (positive only)
+    // Water leaving each face is ∝ max(0, H - H_nb).
+    // This gives directional flow toward steepest descent.
+    float dxp = max(0.0, H - Hxp);
+    float dxm = max(0.0, H - Hxm);
+    float dyp = max(0.0, H - Hyp);
+    float dym = max(0.0, H - Hym);
+    float dzp = max(0.0, H - Hzp);
+    float dzm = max(0.0, H - Hzm);
+
+    // Vertical gravity bias: water prefers to flow down (-y).
+    dym += g * fluid;
+
+    // Available water at this cell limits total outflow.
+    float total_out = dxp + dxm + dyp + dym + dzp + dzm + 1e-6;
+    float scale = min(1.0, fluid / (total_out * u_dt + 1e-6));
+    float out_xp = dxp * scale;
+    float out_xm = dxm * scale;
+    float out_yp = dyp * scale;
+    float out_ym = dym * scale;
+    float out_zp = dzp * scale;
+    float out_zm = dzm * scale;
+    float out_total = out_xp + out_xm + out_yp + out_ym + out_zp + out_zm;
+
+    // ---- Inflow from neighbours: each neighbour's outflow toward us.
+    // By symmetry: their (H_nb - H) > 0 contribution scaled by their
+    // available water.  We approximate by reading the neighbour's own
+    // ΔH toward us.
+    float nH;
+    nH = nxp.r + nxp.g; float in_xp = max(0.0, nH - H) * nxp.g
+        / (max(0.0, nH - H) + nxp.g + 1e-3);
+    nH = nxm.r + nxm.g; float in_xm = max(0.0, nH - H) * nxm.g
+        / (max(0.0, nH - H) + nxm.g + 1e-3);
+    nH = nyp.r + nyp.g; float in_yp = (max(0.0, nH - H) + g * nyp.g) * nyp.g
+        / (max(0.0, nH - H) + g * nyp.g + nyp.g + 1e-3);
+    nH = nym.r + nym.g; float in_ym = max(0.0, nH - H) * nym.g
+        / (max(0.0, nH - H) + nym.g + 1e-3);
+    nH = nzp.r + nzp.g; float in_zp = max(0.0, nH - H) * nzp.g
+        / (max(0.0, nH - H) + nzp.g + 1e-3);
+    nH = nzm.r + nzm.g; float in_zm = max(0.0, nH - H) * nzm.g
+        / (max(0.0, nH - H) + nzm.g + 1e-3);
+    float in_total = in_xp + in_xm + in_yp + in_ym + in_zp + in_zm;
+
+    float new_fluid = fluid + (in_total - out_total) * u_dt;
+
+    // ---- Velocity proxy: how fast water is moving through this cell.
+    // Use Σ|outflows| / fluid as a flux density.
+    float velocity = out_total / max(fluid, 0.01);
+
+    // ---- Sediment transport: advect with outflows + carry-capacity.
+    // First move sediment with the water (proportional split).
+    float sed_xp = sediment * out_xp / (fluid + 1e-3);
+    float sed_xm = sediment * out_xm / (fluid + 1e-3);
+    float sed_yp = sediment * out_yp / (fluid + 1e-3);
+    float sed_ym = sediment * out_ym / (fluid + 1e-3);
+    float sed_zp = sediment * out_zp / (fluid + 1e-3);
+    float sed_zm = sediment * out_zm / (fluid + 1e-3);
+    float sed_out = sed_xp + sed_xm + sed_yp + sed_ym + sed_zp + sed_zm;
+
+    // Sediment inflow: each neighbour sends its sediment proportionally
+    // to its own outflow toward us.  Use simple advection symmetric to
+    // outflow estimate above.
+    float sed_in =
+          nxp.b * in_xp / (nxp.g + 1e-3)
+        + nxm.b * in_xm / (nxm.g + 1e-3)
+        + nyp.b * in_yp / (nyp.g + 1e-3)
+        + nym.b * in_ym / (nym.g + 1e-3)
+        + nzp.b * in_zp / (nzp.g + 1e-3)
+        + nzm.b * in_zm / (nzm.g + 1e-3);
+
+    float new_sed = sediment + (sed_in - sed_out) * u_dt;
+
+    // ---- Carrying-capacity-driven erosion / deposition.
+    // Capacity C grows with v² and water amount.  Only meaningful when
+    // there's actually water moving (gate by fluid).
+    float capacity = Kc * velocity * velocity * smoothstep(0.02, 0.20, fluid);
+
+    // Solid presence here (or below — for scour against the bed).
+    float bed = max(solid, nym.r);
+    float new_solid = solid;
+
+    if (capacity > new_sed) {
+        // Under-loaded → erode the bed if there is one nearby.
+        float erode = Ke * (capacity - new_sed) * smoothstep(0.05, 0.5, bed) * u_dt;
+        erode = min(erode, solid * 0.5);   // can't erode more than half the cell per step
+        new_solid -= erode;
+        new_sed   += erode;
+    } else {
+        // Over-loaded → deposit excess.
+        float deposit = Kd * (new_sed - capacity) * u_dt;
+        deposit = min(deposit, new_sed);
+        new_sed   -= deposit;
+        new_solid += deposit;
+    }
+
+    // ---- Rain: replenish water at top boundary, focused into a few
+    // patches so flow has somewhere to converge.
+    if (pos.y >= u_size - 2) {
+        // Three "storm cells" so dendritic networks have multiple sources.
+        vec3 fp = vec3(pos) / float(u_size);
+        float r1 = length(fp.xz - vec2(0.30, 0.30));
+        float r2 = length(fp.xz - vec2(0.70, 0.40));
+        float r3 = length(fp.xz - vec2(0.45, 0.75));
+        float rain = max(max(smoothstep(0.18, 0.05, r1),
+                             smoothstep(0.18, 0.05, r2)),
+                                  smoothstep(0.18, 0.05, r3));
+        new_fluid = max(new_fluid, 0.7 * rain);
+    }
+
+    new_solid = clamp(new_solid, 0.0, 1.0);
+    new_fluid = clamp(new_fluid, 0.0, 1.0);
+    new_sed   = clamp(new_sed,   0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_solid, new_fluid, new_sed, velocity));
+}
+""",
+
     "mycelium_3d": """
 // Mycelium / Fungal Network
 // Hyphal tips explore, branch, fuse on contact, transport nutrients.
@@ -3052,6 +3812,224 @@ void main() {
 }
 """,
 
+    "mycelium_directed_3d": """
+// Mycelium / Fungal Network — directional version with anastomosis.
+//
+// Bespoke replacement for the isotropic legacy mycelium_3d.  Two real-
+// world features the original was missing:
+//
+//   1. Hyphal *persistence* — a real growing tip remembers the
+//      direction it's heading.  Without that, growth is isotropic and
+//      the simulation produces blobs instead of filaments.
+//
+//   2. *Anastomosis* — when two tips approaching from different
+//      directions meet, they fuse and stop extending.  This is what
+//      forms loops (closed cycles in the network), not just trees.
+//
+// Pair 1 (visualised): R=biomass, G=nutrient, B=signal, A=tip strength
+// Pair 2 (hidden):     R=dx, G=dy, B=dz, A=age
+//   The direction is the unit vector the local tip was last moving
+//   along.  Established hyphae keep the direction they had as a tip
+//   (visualisable as a mycelial "grain").
+//
+// Single pass writes BOTH p1 and p2 — biology and orientation are
+// updated coherently from the same neighbourhood scan.
+//
+// u_param0 = growth rate
+// u_param1 = branching (jitter angle on new tips)
+// u_param2 = nutrient consumption rate
+// u_param3 = nutrient diffusion
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+// Cheap deterministic hash → unit vector on the sphere.
+vec3 hash_dir(ivec3 p, int seed) {
+    float u = hash_temporal(p, seed * 31 + 1);
+    float v = hash_temporal(p, seed * 31 + 2);
+    float phi   = 6.2831853 * u;
+    float theta = acos(2.0 * v - 1.0);
+    float st = sin(theta);
+    return vec3(st * cos(phi), st * sin(phi), cos(theta));
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    vec4 self_dir  = fetch2(pos);
+
+    float biomass  = self_data.r;
+    float nutrient = self_data.g;
+    float signal   = self_data.b;
+    float tip      = self_data.a;
+    vec3  my_dir   = self_dir.xyz;
+    float age      = self_dir.a;
+
+    float growth      = u_param0;
+    float branch_jit  = u_param1;
+    float consumption = u_param2;
+    float diffusion   = u_param3;
+
+    // ── Neighbour scan: gather diffusion sums + best parent for empty
+    //    cells + anastomosis check for tip cells. ─────────────────────
+    float sum_nut = 0.0, sum_sig = 0.0;
+    int   bio_count = 0;
+
+    // Best parent tip (for colonisation): maximises projection of
+    // (toward_me) onto the parent's direction, weighted by tip
+    // strength.  This is what makes growth directional.
+    float best_score = -1e9;
+    vec3  best_offset = vec3(0.0);
+    vec3  best_parent_dir = vec3(0.0);
+    float best_parent_tip = 0.0;
+
+    // Anastomosis: count tip neighbours whose direction is anti-aligned
+    // with mine — i.e. they are extending toward me from the far side.
+    int anti_neighbours = 0;
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        ivec3 npos = pos + ivec3(dx, dy, dz);
+        vec4  nb   = fetch(npos);
+        vec4  nd   = fetch2(npos);
+
+        sum_nut += nb.g;
+        sum_sig += nb.b;
+        if (nb.r > 0.1) bio_count++;
+
+        // Vector from neighbour toward me (unit-ish).
+        vec3 to_me = -vec3(dx, dy, dz);
+        float inv_len = inversesqrt(dot(to_me, to_me));
+        to_me *= inv_len;
+
+        // Candidate parent: must be a tip with some direction memory.
+        if (nb.a > 0.2 && nb.r > 0.05) {
+            float align = dot(to_me, normalize(nd.xyz + vec3(1e-6)));
+            // Forward-biased score; small base so even side-extension
+            // still happens but back-extension is heavily suppressed.
+            float score = (0.2 + 0.8 * max(align, 0.0)) * nb.a;
+            if (score > best_score) {
+                best_score = score;
+                best_offset = -to_me;  // direction self → neighbour
+                best_parent_dir = nd.xyz;
+                best_parent_tip = nb.a;
+            }
+        }
+
+        // Anastomosis check (only meaningful if I'm a tip myself).
+        if (tip > 0.2 && nb.a > 0.2) {
+            vec3 nd_unit = normalize(nd.xyz + vec3(1e-6));
+            // Two tips approaching each other are characterised by:
+            //   (a) my_dir points toward neighbour
+            //   (b) neighbour's dir points toward me
+            // → my_dir · (-to_me) > 0  AND  nd_unit · to_me > 0
+            //   AND we're roughly anti-aligned: my_dir · nd_unit < 0
+            float meeting = float(dot(my_dir, -to_me) > 0.4
+                               && dot(nd_unit, to_me) > 0.4
+                               && dot(my_dir, nd_unit) < -0.2);
+            anti_neighbours += int(meeting);
+        }
+    }
+
+    // Diffusion (26-stencil approximation).
+    float lap_nut = (sum_nut - 26.0 * nutrient) / 26.0;
+    float lap_sig = (sum_sig - 26.0 * signal)   / 26.0;
+
+    float new_bio = biomass;
+    float new_nut = nutrient + diffusion * lap_nut * u_dt;
+    float new_sig = signal + diffusion * 0.5 * lap_sig * u_dt
+                    - signal * 0.05 * u_dt;
+    float new_tip = tip;
+    vec3  new_dir = my_dir;
+    float new_age = age;
+
+    float h = hash_temporal(pos, 0);
+
+    if (biomass > 0.5) {
+        // Established hypha: consume + maintenance.
+        new_nut -= consumption * biomass * u_dt;
+        new_sig += biomass * 0.02 * u_dt;
+        if (nutrient < 0.01) new_bio -= 0.02 * u_dt;
+        new_tip = 0.0;  // established cells are not tips
+    } else if (biomass > 0.01) {
+        // Growing tip — solidify when it has matured a bit.
+        new_bio += growth * nutrient * u_dt;
+        new_nut -= consumption * 0.5 * u_dt;
+        new_age += u_dt;
+        if (nutrient < 0.01) new_bio -= 0.01 * u_dt;
+        if (new_bio > 0.5) { new_bio = 1.0; new_tip = 0.0; }
+
+        // Anastomosis: meeting another tip from a different filament
+        // immediately solidifies both ends → forms a loop instead of a
+        // crossing.  Without this all networks would be trees.
+        if (anti_neighbours > 0) {
+            new_bio = 1.0;
+            new_tip = 0.0;
+        }
+    } else {
+        // Empty cell: try to be colonised by the best-aligned parent.
+        if (best_parent_tip > 0.2 && nutrient > 0.05 && best_score > 0.0) {
+            // Probability scales with (a) growth rate, (b) parent tip
+            // strength, (c) directional alignment, (d) timestep.
+            // Branching is implicit: tips that turned a corner have
+            // lower alignment scores → lower colonisation probability,
+            // but they still occasionally colonise → side branches.
+            float prob = growth * best_score * u_dt;
+
+            // Discourage filling solid volumes: if I have many bio
+            // neighbours already, don't colonise (real hyphae extend
+            // into open space, not into the network's interior).
+            if (bio_count >= 3) prob *= 0.05;
+            else if (bio_count == 2) prob *= 0.4;
+
+            if (h < prob) {
+                new_bio = 0.10;
+                new_tip = 1.0;
+                // Inherit parent direction with branching jitter.
+                vec3 jitter = hash_dir(pos, 7) * branch_jit * 0.4;
+                new_dir = normalize(best_parent_dir + best_offset * 0.6 + jitter
+                                    + vec3(1e-6));
+                new_age = 0.0;
+            }
+        }
+    }
+
+    // Tips that have many bio neighbours (e.g., the network has
+    // grown around them) are no longer "tips".
+    if (new_tip > 0.0 && bio_count >= 5) new_tip = 0.0;
+
+    new_bio = clamp(new_bio, 0.0, 1.0);
+    new_nut = clamp(new_nut, 0.0, 1.0);
+    new_sig = clamp(new_sig, 0.0, 1.0);
+    new_tip = clamp(new_tip, 0.0, 1.0);
+
+    // Empty cells lose direction memory (they'll get a fresh one on
+    // colonisation); established cells keep theirs (the "grain").
+    if (new_bio < 0.005) new_dir = vec3(0.0);
+
+    imageStore(u_dst,  pos, vec4(new_bio, new_nut, new_sig, new_tip));
+    imageStore(u_dst2, pos, vec4(new_dir, new_age));
+}
+""",
+
     "em_wave_3d": """
 // Electromagnetic wave propagation (simplified Maxwell)
 // Uses E and B fields packed into RGBA:
@@ -3170,6 +4148,157 @@ void main() {
     new_By = clamp(new_By, -2.0, 2.0);
 
     imageStore(u_dst, pos, vec4(new_Ez, new_Bx, new_By, medium));
+}
+""",
+
+    "em_yee_E_3d": """
+// EM (Yee leapfrog) — E-field update.  Writes pair 1.
+//
+// Full 3D Maxwell vector fields:
+//   Pair 1 = (Ex, Ey, Ez, eps_r)          electric field + relative permittivity
+//   Pair 2 = (Bx, By, Bz, sigma)          magnetic field + local conductivity
+//
+// ∂E/∂t = (c²/εr) ∇×B − (σ/εr) E    (Ampère-Maxwell in inhomogeneous media)
+//
+// Paired with em_yee_B_3d the two passes form a leapfrog scheme that is
+// energy-conserving in vacuum (up to discretisation error), supports a
+// proper light cone (waves propagate at c/√εr with no DC instability),
+// and reproduces transverse polarisation — a thing the legacy single-
+// pass "TE-like" stencil (Ez,Bx,By only) could not do.
+//
+// εr = max(1, pair1.alpha) so pair1.alpha = 0 means vacuum (back-compat
+// with all old init functions). σ = max(0, pair2.alpha) so pair2.alpha = 0
+// is lossless. Painting eps_r > 1 in a region creates a dielectric
+// (slows light, refracts, traps modes); painting σ > 0 creates a lossy
+// conductor (absorbs).
+//
+// u_param0 = c             (vacuum wave speed)
+// u_param1 = sigma_global  (uniform damping baseline; per-cell σ adds)
+// u_param2 = source freq
+// u_param3 = source amplitude
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float c            = u_param0;
+    float sigma_global = u_param1;
+    float freq         = u_param2;
+    float amp          = u_param3;
+
+    vec4 self  = fetch(pos);
+    vec3 E     = self.xyz;
+    float eps_r = max(1.0, self.a);          // 0 → vacuum (back-compat)
+    float sigma_local = max(0.0, fetch2(pos).a);
+
+    // ∇×B at cell centre via central differences on B (pair 2).
+    vec3 Bxp = fetch2(pos + ivec3( 1, 0, 0)).xyz;
+    vec3 Bxm = fetch2(pos + ivec3(-1, 0, 0)).xyz;
+    vec3 Byp = fetch2(pos + ivec3( 0, 1, 0)).xyz;
+    vec3 Bym = fetch2(pos + ivec3( 0,-1, 0)).xyz;
+    vec3 Bzp = fetch2(pos + ivec3( 0, 0, 1)).xyz;
+    vec3 Bzm = fetch2(pos + ivec3( 0, 0,-1)).xyz;
+
+    vec3 curlB;
+    curlB.x = 0.5 * ((Byp.z - Bym.z) - (Bzp.y - Bzm.y));
+    curlB.y = 0.5 * ((Bzp.x - Bzm.x) - (Bxp.z - Bxm.z));
+    curlB.z = 0.5 * ((Bxp.y - Bxm.y) - (Byp.x - Bym.x));
+
+    // Wave equation in dielectric: c_local² = c²/εr → light slows in
+    // high-permittivity media (refraction, total internal reflection,
+    // photonic-crystal band gaps all emerge for free).
+    vec3 newE = E + (c * c / eps_r) * curlB * u_dt;
+
+    // Per-cell + global conductivity damping (Beer-Lambert in time).
+    float sigma_total = sigma_global + sigma_local;
+    if (sigma_total > 0.0) newE *= exp(-(sigma_total / eps_r) * u_dt);
+
+    // Tiny vacuum loss to suppress reflections from the box edge.
+    newE *= (1.0 - 0.002 * u_dt);
+
+    // Hertzian dipole source at centre — drives Ez sinusoidally.
+    int mid = u_size / 2;
+    if (abs(pos.x - mid) <= 1 && abs(pos.y - mid) <= 1 && abs(pos.z - mid) <= 1) {
+        float t = float(u_frame) * u_dt;
+        newE.z = amp * sin(6.2831853 * freq * t);
+    }
+
+    newE = clamp(newE, vec3(-2.0), vec3(2.0));
+    imageStore(u_dst, pos, vec4(newE, self.a));
+}
+""",
+
+    "em_yee_B_3d": """
+// EM (Yee leapfrog) — B-field update.  Writes pair 2.
+//
+// ∂B/∂t = -∇×E
+//
+// Reads the freshly-updated E from pair 1 (the E pass ran first this
+// step), giving the half-step staggering that makes the Yee scheme
+// second-order accurate in time despite using collocated storage.
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch2(pos);
+    vec3 B    = self.xyz;
+    float spare = self.a;
+
+    // ∇×E at cell centre via central differences on E (pair 1).
+    vec3 Exp = fetch(pos + ivec3( 1, 0, 0)).xyz;
+    vec3 Exm = fetch(pos + ivec3(-1, 0, 0)).xyz;
+    vec3 Eyp = fetch(pos + ivec3( 0, 1, 0)).xyz;
+    vec3 Eym = fetch(pos + ivec3( 0,-1, 0)).xyz;
+    vec3 Ezp = fetch(pos + ivec3( 0, 0, 1)).xyz;
+    vec3 Ezm = fetch(pos + ivec3( 0, 0,-1)).xyz;
+
+    vec3 curlE;
+    curlE.x = 0.5 * ((Eyp.z - Eym.z) - (Ezp.y - Ezm.y));
+    curlE.y = 0.5 * ((Ezp.x - Ezm.x) - (Exp.z - Exm.z));
+    curlE.z = 0.5 * ((Exp.y - Exm.y) - (Eyp.x - Eym.x));
+
+    vec3 newB = B - curlE * u_dt;
+
+    // Tiny vacuum loss (matches the E pass).
+    newB *= (1.0 - 0.002 * u_dt);
+
+    newB = clamp(newB, vec3(-2.0), vec3(2.0));
+    imageStore(u_dst2, pos, vec4(newB, spare));
 }
 """,
 
@@ -3329,6 +4458,188 @@ void main() {
 }
 """,
 
+    "viscous_pressure_3d": """
+// Viscous fingers — pressure projection sweep (run 8× per step).
+//
+// Solves ∇·(λ ∇p) = 0 (steady-state Darcy pressure for an
+// incompressible two-phase flow) by Jacobi iteration with HARMONIC-
+// MEAN face mobilities — this is the standard finite-volume scheme
+// that preserves flux continuity at sharp viscosity contrasts.
+//
+// Mobility:    λ(s) = k / μ(s)
+//   μ(s) = 1 / ( (1-s)/μ_d  +  s/μ_i )       (Brooks-Corey-style)
+//   μ_i = 1 (invader, low viscosity)
+//   μ_d = visc_ratio (defender, high viscosity)
+// Face mobility:    λ_f = 2 λ λ_nb / (λ + λ_nb)   (harmonic mean)
+//
+// Boundary conditions are enforced by pinning:
+//   • central injection ball (radius L/16): p = inject_p, s = 1
+//   • domain faces:                          p = 0           (drain)
+//
+// Layout (R,G,B,A) = (saturation s, pressure p, permeability k, iface)
+//   This pass writes ONLY pressure (G).  Saturation, permeability,
+//   and interface are passed through unchanged.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    float s    = self_data.r;
+    float p    = self_data.g;
+    float perm = self_data.b;
+    float ifac = self_data.a;
+
+    float inject_p   = u_param0;
+    float visc_ratio = u_param1;
+
+    int   inj_thickness = max(1, u_size / 16);
+    bool  in_inj  = (pos.y < inj_thickness);
+    bool  on_drain = (pos.y >= u_size - inj_thickness);
+    bool  on_face = (pos.x == 0 || pos.x == u_size-1 ||
+                     pos.z == 0 || pos.z == u_size-1);
+
+    // Self mobility.
+    float mu_self = 1.0 / max((1.0 - s) / max(visc_ratio, 1.0) + s / 1.0, 1e-4);
+    float lam_self = perm / max(mu_self, 1e-4);
+
+    float sum_p_lam = 0.0;
+    float sum_lam   = 0.0;
+    for (int i = 0; i < 6; i++) {
+        ivec3 off = ivec3(0);
+        int axis = i / 2; int dir = (i % 2) * 2 - 1;
+        off[axis] = dir;
+        vec4 nb = fetch(pos + off);
+        float mu_nb  = 1.0 / max((1.0 - nb.r) / max(visc_ratio, 1.0) + nb.r / 1.0, 1e-4);
+        float lam_nb = nb.b / max(mu_nb, 1e-4);
+        // Harmonic mean — preserves flux continuity at viscosity jumps.
+        float lam_f = 2.0 * lam_self * lam_nb / max(lam_self + lam_nb, 1e-6);
+        sum_p_lam += lam_f * nb.g;
+        sum_lam   += lam_f;
+    }
+    float new_p = (sum_lam > 1e-6) ? (sum_p_lam / sum_lam) : p;
+
+    // Pin sources / drains.
+    if (in_inj)   new_p = inject_p;
+    if (on_drain) new_p = 0.0;
+    if (on_face)  new_p = mix(0.0, inject_p,
+                              clamp(1.0 - float(pos.y) / float(u_size), 0.0, 1.0));
+
+    imageStore(u_dst, pos, vec4(s, new_p, perm, ifac));
+}
+""",
+
+    "viscous_transport_3d": """
+// Viscous fingers — saturation transport + permeability evolution.
+// Run ONCE per logical step, after the pressure relaxation has
+// converged.  Writes p1 (saturation/permeability/interface).
+//
+// Two physical updates:
+//
+// 1. Saturation advection by Darcy velocity:
+//        v_face = -λ_f * (p_nb - p) / h
+//    Upwind donor cell: s_face = (v>0 from neighbour)? s_nb : s_self.
+//    Then  ds/dt = -Σ (v_face * s_face) * fractional_flow_correction.
+//    Using the fractional-flow function
+//        f(s) = (s/μ_i) / ((s/μ_i) + ((1-s)/μ_d))
+//    is what produces the Saffman-Taylor instability — at the
+//    interface the invader's higher mobility makes any tiny
+//    perturbation grow into a finger.
+//
+// 2. Permeability evolution: in the partially-invaded zone the
+//    invading fluid dissolves the medium, increasing k.  This
+//    positive feedback (invasion → dissolution → more flow) is what
+//    sustains the fingers as they grow.
+//
+// Pseudo-noise multiplier on permeability creates pre-existing
+// heterogeneity that breaks symmetry and seeds finger nucleation.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    float s    = self_data.r;
+    float p    = self_data.g;
+    float perm = self_data.b;
+
+    float inject_p   = u_param0;
+    float visc_ratio = u_param1;
+    float noise_str  = u_param2;
+    float surf_t     = u_param3;
+
+    // Mobility helpers.
+    float mu_self = 1.0 / max((1.0 - s) / max(visc_ratio, 1.0) + s / 1.0, 1e-4);
+    float lam_self = perm / max(mu_self, 1e-4);
+    // Fractional flow of invading phase.
+    float ff_self = (s / 1.0) / max(s / 1.0 + (1.0 - s) / max(visc_ratio, 1.0), 1e-6);
+
+    float net_flux  = 0.0;   // ∂s/∂t contribution from advection
+    float lap_s     = 0.0;
+    for (int i = 0; i < 6; i++) {
+        ivec3 off = ivec3(0);
+        int axis = i / 2; int dir = (i % 2) * 2 - 1;
+        off[axis] = dir;
+        vec4 nb = fetch(pos + off);
+        float mu_nb  = 1.0 / max((1.0 - nb.r) / max(visc_ratio, 1.0) + nb.r / 1.0, 1e-4);
+        float lam_nb = nb.b / max(mu_nb, 1e-4);
+        float lam_f  = 2.0 * lam_self * lam_nb / max(lam_self + lam_nb, 1e-6);
+
+        // Face Darcy velocity (positive = inflow into self from neighbour).
+        float v_face = lam_f * (nb.g - p);
+
+        // Donor-cell upwind: take f(s) from upstream side.
+        float ff_nb = (nb.r / 1.0) / max(nb.r / 1.0 + (1.0 - nb.r) / max(visc_ratio, 1.0), 1e-6);
+        float ff_face = (v_face > 0.0) ? ff_nb : ff_self;
+
+        // Net inflow of invading saturation.
+        net_flux += v_face * ff_face;
+        lap_s    += nb.r;
+    }
+    lap_s -= 6.0 * s;
+
+    // Heterogeneity multiplier from a hash — fixed in space so it
+    // really seeds nucleation rather than oscillating each step.
+    float hash = fract(sin(dot(vec3(pos) * 0.17,
+                               vec3(12.9898, 78.233, 45.5432))) * 43758.5453);
+    float het = 1.0 + (hash - 0.5) * noise_str;
+
+    // ds = (advected inflow + capillary smoothing) * dt
+    float new_s = s + (het * net_flux + surf_t * lap_s) * u_dt;
+
+    // Permeability dissolution: peaks at the interface s*(1-s)*4
+    float at_iface = s * (1.0 - s) * 4.0;
+    float new_perm = perm + 0.05 * at_iface * u_dt;
+    // Slow diffusion of k.
+    float lap_perm = 0.0;
+    for (int i = 0; i < 6; i++) {
+        ivec3 off = ivec3(0);
+        int axis = i / 2; int dir = (i % 2) * 2 - 1;
+        off[axis] = dir;
+        lap_perm += fetch(pos + off).b;
+    }
+    lap_perm -= 6.0 * perm;
+    new_perm += 0.005 * lap_perm * u_dt;
+    new_perm = clamp(new_perm, 0.1, 1.0);
+
+    // Inject source (after advection so it overrides).
+    int inj_thickness = max(1, u_size / 16);
+    if (pos.y < inj_thickness) {
+        new_s = 1.0;
+        new_perm = 1.0;
+    }
+    if (pos.y >= u_size - inj_thickness) {
+        // Drain: defender outflow region — clamp to 0 to keep contrast.
+        new_s = 0.0;
+    }
+
+    new_s = clamp(new_s, 0.0, 1.0);
+    float new_iface = (new_s > 0.1 && new_s < 0.9) ? 1.0 : 0.0;
+
+    imageStore(u_dst, pos, vec4(new_s, p, new_perm, new_iface));
+}
+""",
+
     "fire_3d": """
 // Fire / Combustion front propagation
 // R = fuel [0,1] (1=unburned, 0=ash)
@@ -3465,6 +4776,312 @@ void main() {
 }
 """,
 
+    "fire_chem_3d": """
+// Fire — combustion chemistry pass.  Writes pair 1.
+//
+// Pair 1 (visualised): R=temperature, G=soot, B=ember, A=fuel
+// Pair 2 (hidden):     R=vx, G=vy, B=vz, A=oxygen
+//
+// This pass:
+//   1. Semi-Lagrangian advect (T, soot, ember, fuel) along the velocity
+//      field stored in pair 2.
+//   2. Combustion: fuel + O2 + (T > T_ignition)  →  ΔT + soot + ember,
+//      consuming fuel.  Burn rate uses an Arrhenius-style hot-zone
+//      product so the reaction switches on sharply at the flame front
+//      and not gradually in the warm-but-not-burning region.
+//   3. Stefan–Boltzmann-style radiative cooling  T -= σ * T^4 dt.
+//      The T^4 term is what gives a real flame its sharp tongue tip:
+//      the very hot core dumps heat much faster than the cooler skirt,
+//      sculpting the characteristic teardrop.
+//   4. Ember relighting: a hot ember on fresh fuel boosts T (so the
+//      Lagrangian-tracer embers from the flow pass can ignite spot fires).
+//
+// u_param0 = T_ignition          (ignition threshold)
+// u_param1 = heat_release        (exothermic gain per unit burn)
+// u_param2 = soot_yield          (soot generated per unit burn)
+// u_param3 = radiative_cooling   (Stefan–Boltzmann coefficient)
+//
+// `kappa` (thermal conductivity) is hard-coded — it has to be small but
+// nonzero, otherwise the ignition ball can never light a neighbouring
+// fuel cell when the velocity field is still zero at startup.
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+// Trilinear sample of pair 1 at non-integer pos (for semi-Lagrangian).
+vec4 sample_chem(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float T_ign      = u_param0;
+    float heat_rel   = u_param1;
+    float soot_yield = u_param2;
+    float sigma_rad  = u_param3;
+
+    // Semi-Lagrangian backtrace using the velocity field from pair 2.
+    vec3 vel = fetch2(pos).xyz;
+    vec3 fpos = vec3(pos);
+    vec3 back = fpos - vel * u_dt;
+    vec4 chem = sample_chem(back);
+
+    float temp  = chem.r;
+    float soot  = chem.g;
+    float ember = chem.b;
+    float fuel  = chem.a;
+    float oxy   = fetch2(pos).a;  // oxygen lives in pair 2
+
+    // Thermal conduction (small Laplacian on T).  Without this term the
+    // ignition source can never light an adjacent fuel cell while the
+    // velocity field is still zero — the flame would just sit and cool.
+    // kappa is small because most heat transport in flames is convective,
+    // but the conductive seed is essential for the front to start moving.
+    float Tc = temp;
+    float lap_T = (fetch(pos + ivec3( 1,0,0)).r + fetch(pos + ivec3(-1,0,0)).r
+                 + fetch(pos + ivec3(0, 1,0)).r + fetch(pos + ivec3(0,-1,0)).r
+                 + fetch(pos + ivec3(0,0, 1)).r + fetch(pos + ivec3(0,0,-1)).r
+                 - 6.0 * Tc);
+    const float kappa = 0.50;
+    temp += kappa * lap_T * u_dt;
+
+    // Combustion rate.  Multiplying by smoothstep(T_ign, T_ign + 0.05, T)
+    // gives a sharper switch than the linear (T - T_ign) of the legacy
+    // shader — visually this shows up as a clean blue-to-orange flame
+    // edge instead of a gradient haze of reaction.
+    float gate = smoothstep(T_ign, T_ign + 0.05, temp)
+               * smoothstep(0.02, 0.10, fuel)
+               * smoothstep(0.02, 0.10, oxy);
+    float burn_rate = gate * fuel * oxy * heat_rel;
+
+    float new_fuel  = fuel  - burn_rate * u_dt;
+    float new_temp  = temp  + burn_rate * 4.0 * u_dt;
+    float new_soot  = soot  + burn_rate * soot_yield * u_dt;
+    float new_ember = ember;
+
+    // Stochastic spark generation at the flame front.
+    if (burn_rate > 0.05) {
+        float h = hash_temporal(pos, 17);
+        if (h < burn_rate * 0.05 * u_dt) new_ember = max(new_ember, 1.0);
+    }
+
+    // Embers re-ignite fresh fuel they're carried into.
+    if (new_ember > 0.30 && new_fuel > 0.40) {
+        new_temp += new_ember * 0.50 * u_dt;
+    }
+
+    // Radiative cooling: T^4.  Strong at the bright core, gentle in the
+    // smoke skirt.  This sculpts the teardrop tongue.
+    new_temp -= sigma_rad * new_temp * new_temp * new_temp * new_temp * u_dt;
+
+    // Ember slow decay.
+    new_ember -= 0.04 * u_dt;
+
+    // Soot is *not* consumed by anything — it just rises and slowly
+    // dissipates.  This is what makes the dark column above a flame.
+    new_soot *= (1.0 - 0.005 * u_dt);
+
+    new_temp  = clamp(new_temp,  0.0, 1.5);
+    new_soot  = clamp(new_soot,  0.0, 1.0);
+    new_ember = clamp(new_ember, 0.0, 1.0);
+    new_fuel  = clamp(new_fuel,  0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_temp, new_soot, new_ember, new_fuel));
+}
+""",
+
+    "fire_flow_3d": """
+// Fire — flow / buoyancy pass.  Writes pair 2.
+//
+// Pair 1 (visualised): R=temperature, G=soot, B=ember, A=fuel
+// Pair 2 (hidden):     R=vx, G=vy, B=vz, A=oxygen
+//
+// Builds the velocity field that carries the chemistry pass.  Uses the
+// Steinhoff–Underhill formulation (semi-Lagrangian advection + buoyancy
+// body force + vorticity confinement + viscous diffusion).  We do *not*
+// pressure-project: a flame is a hot expanding gas, not an incompressible
+// fluid, and vorticity confinement is what gives the characteristic
+// "alive" curling tongue that pressure-projected smoke smooths out.
+//
+// u_param0 = buoyancy_alpha     (body force coefficient on temperature)
+// u_param1 = vorticity_eps      (Steinhoff–Underhill confinement strength)
+// u_param2 = viscosity          (small velocity Laplacian smoothing)
+// u_param3 = wind               (ambient horizontal drift, optional)
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0, 0.0, 0.0, 1.0);  // boundary supplies fresh O2
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+vec4 sample_flow(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch2(i + ivec3(0,0,0));
+    vec4 c100 = fetch2(i + ivec3(1,0,0));
+    vec4 c010 = fetch2(i + ivec3(0,1,0));
+    vec4 c110 = fetch2(i + ivec3(1,1,0));
+    vec4 c001 = fetch2(i + ivec3(0,0,1));
+    vec4 c101 = fetch2(i + ivec3(1,0,1));
+    vec4 c011 = fetch2(i + ivec3(0,1,1));
+    vec4 c111 = fetch2(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float alpha   = u_param0;
+    float eps     = u_param1;
+    float visc    = clamp(u_param2, 0.0, 0.05);
+    float wind    = u_param3;
+
+    vec3 v_self    = fetch2(pos).xyz;
+    float oxy_self = fetch2(pos).a;
+
+    // ── 1. Semi-Lagrangian advect (velocity AND oxygen). ───────────
+    vec3 fpos = vec3(pos);
+    vec3 back = fpos - v_self * u_dt;
+    vec4 advected = sample_flow(back);
+    vec3  v_new   = advected.xyz;
+    float oxy_new = advected.a;
+
+    // ── 2. Buoyancy body force from temperature.  We read pair 1's
+    //      R channel (temperature) — the hotter the cell, the stronger
+    //      the upward push.  Tiny ambient also drifts horizontally
+    //      with `wind`, which lets the user create a side-lean flame.
+    vec4 chem = fetch(pos);
+    float T   = chem.r;
+    v_new.y += alpha * T * u_dt;
+    v_new.x += wind  * u_dt;
+
+    // ── 3. Vorticity confinement (Steinhoff–Underhill). ────────────
+    //      omega = curl(v); N = grad(|omega|); f = eps * (N x omega).
+    //      Adds energy back into small-scale vortices that the
+    //      semi-Lagrangian advection step damps out.  This is the
+    //      "alive" term — without it the plume is a fat rising blob.
+    if (eps > 0.0) {
+        vec3 vxp = fetch2(pos + ivec3( 1, 0, 0)).xyz;
+        vec3 vxm = fetch2(pos + ivec3(-1, 0, 0)).xyz;
+        vec3 vyp = fetch2(pos + ivec3( 0, 1, 0)).xyz;
+        vec3 vym = fetch2(pos + ivec3( 0,-1, 0)).xyz;
+        vec3 vzp = fetch2(pos + ivec3( 0, 0, 1)).xyz;
+        vec3 vzm = fetch2(pos + ivec3( 0, 0,-1)).xyz;
+        vec3 omega = 0.5 * vec3(
+            (vyp.z - vym.z) - (vzp.y - vzm.y),
+            (vzp.x - vzm.x) - (vxp.z - vxm.z),
+            (vxp.y - vxm.y) - (vyp.x - vym.x)
+        );
+        // |omega| at 6 neighbours, then central-difference grad.
+        float ox_p = length(0.5 * vec3(
+            (fetch2(pos + ivec3(2, 0, 0)).y - fetch2(pos                  ).y) -
+            (fetch2(pos + ivec3(1, 1, 0)).z - fetch2(pos + ivec3(1,-1, 0)).z),
+            (fetch2(pos + ivec3(1, 0, 1)).x - fetch2(pos + ivec3(1, 0,-1)).x) -
+            (fetch2(pos + ivec3(2, 0, 0)).z - fetch2(pos                  ).z),
+            (fetch2(pos + ivec3(1, 1, 0)).y - fetch2(pos + ivec3(1,-1, 0)).y) -
+            (fetch2(pos + ivec3(1, 0, 1)).x - fetch2(pos + ivec3(1, 0,-1)).x)
+        ));
+        // Cheap gradient: just |omega| at me vs +X.  The cross-product
+        // direction matters more than the gradient magnitude precision.
+        float om_self = length(omega);
+        vec3 N = vec3(ox_p - om_self, 0.0, 0.0);
+        // Crude but cheap: re-use omega direction for N when grad is tiny.
+        if (length(N) < 1e-4) N = normalize(omega + vec3(1e-6));
+        else N = normalize(N + vec3(1e-6));
+        v_new += eps * cross(N, omega) * u_dt;
+    }
+
+    // ── 4. Viscous diffusion (small Laplacian on velocity). ────────
+    if (visc > 0.0) {
+        vec3 lap = (fetch2(pos + ivec3( 1,0,0)).xyz + fetch2(pos + ivec3(-1,0,0)).xyz
+                  + fetch2(pos + ivec3(0, 1,0)).xyz + fetch2(pos + ivec3(0,-1,0)).xyz
+                  + fetch2(pos + ivec3(0,0, 1)).xyz + fetch2(pos + ivec3(0,0,-1)).xyz
+                  - 6.0 * v_self);
+        v_new += visc * lap * u_dt;
+    }
+
+    // ── 5. Combustion oxygen consumption (mirror of fire_chem_3d). ─
+    float fuel  = chem.a;
+    float T_ign = 0.20;  // matches default; not exposed as flow param
+    float gate  = smoothstep(T_ign, T_ign + 0.05, T)
+                * smoothstep(0.02, 0.10, fuel)
+                * smoothstep(0.02, 0.10, oxy_self);
+    float burn  = gate * fuel * oxy_self;
+    oxy_new -= burn * 0.5 * u_dt;
+
+    // ── 6. Oxygen replenishment at boundaries. ─────────────────────
+    if (pos.x == 0 || pos.x == u_size-1 ||
+        pos.y == 0 || pos.y == u_size-1 ||
+        pos.z == 0 || pos.z == u_size-1) {
+        oxy_new = mix(oxy_new, 1.0, 0.10 * u_dt);
+    }
+    // Slow ambient O2 diffusion towards 1.0 (otherwise a sealed box
+    // depletes and the fire suffocates).
+    oxy_new = mix(oxy_new, 1.0, 0.002 * u_dt);
+
+    // Light global damping so the velocity field can't run away.
+    v_new *= (1.0 - 0.002);
+
+    float vmax = 0.5 * float(u_size);
+    v_new   = clamp(v_new,   vec3(-vmax), vec3(vmax));
+    oxy_new = clamp(oxy_new, 0.0, 1.0);
+
+    imageStore(u_dst2, pos, vec4(v_new, oxy_new));
+}
+""",
+
     "physarum_3d": """
 // Physarum / Slime Mold (3D chemotaxis network)
 // Agents deposit trail, sense trail gradient, move toward strongest signal.
@@ -3596,6 +5213,299 @@ void main() {
     new_food = clamp(new_food, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_trail, new_agents, new_food, 0.0));
+}
+""",
+
+    "physarum_pressure_3d": """
+// Physarum — single Jacobi sweep of pressure with conductivity weights.
+// Used multiple times per logical step so the pressure field has a
+// chance to propagate from food sources to drains before adaptation
+// reads it.
+//
+// Reads/writes pair 1 in-place (R = trail, G = ρ, B = food, A = p).
+// Only the A channel is updated; everything else is passed through.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    vec4 nxp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nxm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 nyp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 nym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nzp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nzm = fetch(pos + ivec3( 0, 0,-1));
+
+    float trail = self_data.r;
+    float rho   = self_data.g;
+    float food  = self_data.b;
+    float p     = self_data.a;
+
+    // Harmonic-mean conductivity at each face.
+    float w_xp = 2.0 * rho * nxp.g / (rho + nxp.g + 1e-3);
+    float w_xm = 2.0 * rho * nxm.g / (rho + nxm.g + 1e-3);
+    float w_yp = 2.0 * rho * nyp.g / (rho + nyp.g + 1e-3);
+    float w_ym = 2.0 * rho * nym.g / (rho + nym.g + 1e-3);
+    float w_zp = 2.0 * rho * nzp.g / (rho + nzp.g + 1e-3);
+    float w_zm = 2.0 * rho * nzm.g / (rho + nzm.g + 1e-3);
+    float wsum = w_xp + w_xm + w_yp + w_ym + w_zp + w_zm + 1e-4;
+
+    float p_solve = (w_xp * nxp.a + w_xm * nxm.a +
+                     w_yp * nyp.a + w_ym * nym.a +
+                     w_zp * nzp.a + w_zm * nzm.a) / wsum;
+
+    float new_p;
+    if (food > 0.05) {
+        // Pin pressure at food sources (Dirichlet BC).
+        new_p = food;
+    } else if (pos.y <= 1) {
+        // Drain rim (Dirichlet BC = 0).
+        new_p = 0.0;
+    } else {
+        // Jacobi update (over-relaxation isn't safe for parallel Jacobi —
+        // ω > 1 with non-Gauss-Seidel ordering can diverge).
+        new_p = p_solve;
+    }
+
+    imageStore(u_dst, pos, vec4(trail, rho, food, new_p));
+}
+""",
+
+    "physarum_adaptive_3d": """
+// Physarum — adaptation pass.  Run AFTER several pressure-relax passes.
+// Reads the (now-converging) pressure field A and adapts ρ + trail.
+//
+// Layout (pair 1):
+//   R = trail (visualisation: low-pass of |Q|)
+//   G = ρ    (tube conductivity)
+//   B = food (passed through)
+//   A = p    (passed through; updated by physarum_pressure_3d)
+//
+// u_param0 = (unused at adaptation step — pressure pass uses SOR ω=1.5)
+// u_param1 = adaptation rate α
+// u_param2 = pruning rate    β
+// u_param3 = re-growth γ × 1e-3
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    float trail = self_data.r;
+    float rho   = self_data.g;
+    float food  = self_data.b;
+    float p     = self_data.a;
+
+    float alpha = u_param1;
+    float beta  = u_param2;
+    float gamma = u_param3 * 1e-3;
+
+    float pxp = fetch(pos + ivec3( 1, 0, 0)).a;
+    float pxm = fetch(pos + ivec3(-1, 0, 0)).a;
+    float pyp = fetch(pos + ivec3( 0, 1, 0)).a;
+    float pym = fetch(pos + ivec3( 0,-1, 0)).a;
+    float pzp = fetch(pos + ivec3( 0, 0, 1)).a;
+    float pzm = fetch(pos + ivec3( 0, 0,-1)).a;
+
+    // Flux magnitude |Q| = ρ |∇p|.
+    float gx = (pxp - pxm) * 0.5;
+    float gy = (pyp - pym) * 0.5;
+    float gz = (pzp - pzm) * 0.5;
+    float gradp = sqrt(gx*gx + gy*gy + gz*gz);
+    float Q  = rho * gradp;
+
+    // Murray-correct adaptation: dρ/dt = α ρ |∇p| - β ρ² + γ.
+    // Equilibrium ρ_eq = α|∇p|/β  scales linearly with the local
+    // pressure gradient — high-flux paths grow into distinct tubes,
+    // low-gradient regions stay near baseline √(γ/β).
+    //
+    // Solved semi-implicitly to prevent overshoot when dt is large:
+    //   ρ_{n+1} = (ρ_n + γ dt) / (1 + dt (β ρ_n - α |∇p|))
+    // This is unconditionally stable and respects the logistic shape.
+    float denom = 1.0 + u_dt * max(0.0, beta * rho - alpha * gradp);
+    float new_rho = (rho + gamma * u_dt) / denom;
+    // If α|∇p| > β ρ (still growing) we revert to explicit:
+    if (alpha * gradp > beta * rho) {
+        new_rho = rho + (alpha * Q - beta * rho * rho + gamma) * u_dt;
+    }
+    new_rho = clamp(new_rho, 0.0, 2.0);
+
+    // Trail = low-pass filter of |Q| for stable visualisation.
+    float new_trail = mix(trail, min(Q * 4.0, 1.0), clamp(2.0 * u_dt, 0.0, 1.0));
+
+    imageStore(u_dst, pos, vec4(new_trail, new_rho, food, p));
+}
+""",
+
+    "peridyn_force_3d": """
+// Peridynamic fracture — force/velocity update (writes p2).
+//
+// Bond-based peridynamics: each cell carries a 3-D displacement
+// vector u, and bonds to its 26 neighbours act as breakable springs.
+// The bond between cells i and j carries force
+//
+//     F_ij = c * s_ij * ξ̂_ij  * χ_i * χ_j
+//   s_ij = (u_j - u_i) · ξ̂_ij / |ξ_ij|     (linearised stretch)
+//
+// where χ is a per-cell integrity (1 intact, 0 broken).  When χ→0 a
+// cell stops transmitting force (cracks form a stress-free surface).
+//
+// Total force on i is the sum over all 26 neighbours; this is what
+// gives peridynamics its near-isotropic crack propagation on the
+// cubic lattice (strict 6-neighbour stencils produce visible
+// axis-aligned cracks).
+//
+// Layout:
+//   p1 = (u_x, u_y, u_z, integrity)         (input)
+//   p2 = (v_x, v_y, v_z, max_stretch)       (this pass writes)
+//
+// max_stretch tracks the largest |s_ij| at this cell over its 26
+// bonds — pass 2 uses it to break the cell when it exceeds the
+// critical strain.
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_p1 = fetch(pos);
+    vec4 self_p2 = fetch2(pos);
+    vec3 u_self  = self_p1.rgb;
+    float chi_self = self_p1.a;
+    vec3 v_self  = self_p2.rgb;
+
+    float c_bond     = u_param0;   // bond micromodulus
+    // u_param1 = critical stretch (used in pass 2)
+    float damping    = u_param2;   // velocity damping (0..1)
+    // u_param3 = applied load (used in pass 2)
+
+    vec3  total_force = vec3(0.0);
+    float max_abs_s   = 0.0;
+
+    // Sum over 26 neighbours.
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        vec3 xi = vec3(dx, dy, dz);
+        float r = length(xi);                // 1, √2, or √3
+        vec3  xi_hat = xi / r;
+
+        vec4 nb_p1 = fetch(pos + ivec3(dx, dy, dz));
+        vec3 u_nb  = nb_p1.rgb;
+        float chi_nb = nb_p1.a;
+
+        vec3 eta = u_nb - u_self;
+        float s = dot(eta, xi_hat) / r;      // linearised stretch
+        float chi_bond = chi_self * chi_nb;
+
+        // 1/r weighting matches peridynamic kernel ω(ξ) = 1/|ξ| so
+        // far/edge bonds contribute less than face bonds.
+        float w = 1.0 / r;
+        total_force += c_bond * s * xi_hat * chi_bond * w;
+        max_abs_s    = max(max_abs_s, abs(s) * chi_bond);
+    }
+
+    // Newton: a = F / ρ (ρ = 1 in scaled units).
+    vec3 v_new = v_self + total_force * u_dt;
+    v_new *= (1.0 - damping * u_dt);
+
+    // Velocity sanity clamp prevents the explicit time-step from
+    // diverging when a single bond breaks and releases energy.
+    v_new = clamp(v_new, vec3(-2.0), vec3(2.0));
+
+    imageStore(u_dst2, pos, vec4(v_new, max_abs_s));
+}
+""",
+
+    "peridyn_disp_3d": """
+// Peridynamic fracture — displacement integration + bond breaking
+// (writes p1).
+//
+// Reads:  p1 = (u, integrity)   from previous step
+//         p2 = (v_new, max_stretch_this_step)  from pass 1
+//
+// Update:
+//    u_new   = u + v_new * dt          (symplectic Euler)
+//    chi_new = (max_stretch > s_crit) ? 0 : chi    (irreversible)
+//
+// Boundary load (mode I tensile):
+//    cells in the bottom slab (y < t)       are pinned to u_y = -L
+//    cells in the top    slab (y > N - t)   are pinned to u_y = +L
+//    L grows linearly during a brief loading window then holds —
+//    instantaneous loading would launch a stress-wave that confuses
+//    the crack pattern.
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_p1 = fetch(pos);
+    vec4 self_p2 = fetch2(pos);
+    vec3 u_self  = self_p1.rgb;
+    float chi    = self_p1.a;
+    vec3 v_new   = self_p2.rgb;
+    float maxs   = self_p2.a;
+
+    // u_param0 unused in this pass.
+    float s_crit  = u_param1;   // critical bond stretch
+    // u_param2 unused.
+    float load    = u_param3;   // peak applied displacement (load)
+
+    vec3 u_new = u_self + v_new * u_dt;
+
+    // Break if any bond stretched beyond critical.  Once broken,
+    // chi cannot recover.
+    float chi_new = (maxs > s_crit) ? 0.0 : chi;
+
+    // Tensile loading: the grip slabs are *displacement-controlled*
+    // boundary conditions held at ±load throughout the simulation.
+    // The init field is already at the linear-strain equilibrium so
+    // there is no impact transient — the medium starts in static
+    // equilibrium and the notch tip is the only place where the
+    // bond stretch exceeds the critical value.
+    int slab = max(1, u_size / 24);
+    if (pos.y < slab) {
+        u_new = vec3(0.0, -load, 0.0);
+    } else if (pos.y >= u_size - slab) {
+        u_new = vec3(0.0, +load, 0.0);
+    }
+
+    imageStore(u_dst, pos, vec4(u_new, chi_new));
 }
 """,
 
@@ -3826,6 +5736,189 @@ void main() {
     // Clamp velocity
     float spd = length(new_vel);
     if (spd > 2.0) new_vel = new_vel / spd * 2.0;
+
+    imageStore(u_dst, pos, vec4(new_rho, new_vel));
+}
+""",
+
+    "galaxy_poisson_3d": """
+// Galaxy — Poisson relaxation pass.  Solves ∇²Φ = G ρ for the
+// gravitational potential Φ via weighted Jacobi.  Multiple of these
+// passes run per timestep; with warm-start from the previous frame
+// (Φ persists in pair 2 across timesteps) only a few sweeps are
+// needed to track the potential as the density evolves.
+//
+// Pair 1 (read-only here): R=ρ, G/B/A = velocity (untouched)
+// Pair 2 (relaxed):        R=Φ, others unused
+//
+// Discretisation (h=1 cell unit):
+//     ∇²Φ ≈ (Σ Φ_neigh - 6 Φ_self) = G ρ
+//   → Φ_jacobi = (Σ Φ_neigh - G ρ) / 6
+// Then weighted update: Φ_new = (1-ω) Φ_old + ω Φ_jacobi.
+//
+// With toroidal boundaries the constant mode has no restoring force
+// (Σ Φ = const adds no source) so the mean of Φ would drift.  We
+// subtract a fixed baseline density (matches init mean ≈ 0.1) so the
+// effective source has zero mean over the box; this stabilises Φ.
+//
+// u_param0 = G_grav  (must match dynamics pass)
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float G_grav = u_param0;
+    float rho    = fetch(pos).r;
+
+    // Mean-subtracted source so the constant Φ mode is non-resonant
+    // under periodic BCs.  rho_baseline ≈ initial mean density.
+    const float rho_baseline = 0.1;
+    float source = G_grav * (rho - rho_baseline);
+
+    float phi_xp = fetch2(pos + ivec3( 1, 0, 0)).r;
+    float phi_xm = fetch2(pos + ivec3(-1, 0, 0)).r;
+    float phi_yp = fetch2(pos + ivec3( 0, 1, 0)).r;
+    float phi_ym = fetch2(pos + ivec3( 0,-1, 0)).r;
+    float phi_zp = fetch2(pos + ivec3( 0, 0, 1)).r;
+    float phi_zm = fetch2(pos + ivec3( 0, 0,-1)).r;
+
+    float phi_jacobi = (phi_xp + phi_xm + phi_yp + phi_ym + phi_zp + phi_zm
+                        - source) / 6.0;
+
+    // Weighted Jacobi (ω=0.8) — under-relaxed for stability with
+    // multi-sweep ping-pong dispatch.  ω>1 (SOR) is unstable for pure
+    // Jacobi, only Gauss-Seidel.
+    float phi_old = fetch2(pos).r;
+    float phi_new = mix(phi_old, phi_jacobi, 0.8);
+
+    // Mild bound to prevent unbounded drift from any residual mean source.
+    phi_new = clamp(phi_new, -50.0, 50.0);
+
+    imageStore(u_dst2, pos, vec4(phi_new, 0.0, 0.0, 0.0));
+}
+""",
+
+    "galaxy_dynamics_3d": """
+// Galaxy — dynamics pass.  Reads the Poisson-solved potential Φ from
+// pair 2 to compute true long-range gravity g = -∇Φ, then advances
+// density (semi-Lagrangian advection + flux-form compressibility) and
+// velocity (gravity + pressure + viscosity + cosmological expansion).
+//
+// Pair 1 (written): R=ρ, GBA=velocity
+// Pair 2 (read):    R=Φ
+//
+// u_param0 = G_grav      (informational; gravity already encoded in Φ)
+// u_param1 = pressure    (resists collapse below the Jeans length)
+// u_param2 = viscosity   (numerical damping on velocity)
+// u_param3 = expansion   (Hubble-like outward push)
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+vec4 sample_p1(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float pressure = u_param1;
+    float visc     = u_param2;
+    float expand   = u_param3;
+
+    vec4 self = fetch(pos);
+    float rho = self.r;
+    vec3  vel = self.gba;
+
+    // Long-range gravity: g = -∇Φ from the relaxed potential.
+    float phi_xp = fetch2(pos + ivec3( 1, 0, 0)).r;
+    float phi_xm = fetch2(pos + ivec3(-1, 0, 0)).r;
+    float phi_yp = fetch2(pos + ivec3( 0, 1, 0)).r;
+    float phi_ym = fetch2(pos + ivec3( 0,-1, 0)).r;
+    float phi_zp = fetch2(pos + ivec3( 0, 0, 1)).r;
+    float phi_zm = fetch2(pos + ivec3( 0, 0,-1)).r;
+    vec3  grav   = -0.5 * vec3(phi_xp - phi_xm, phi_yp - phi_ym, phi_zp - phi_zm);
+
+    // Local field (for pressure, viscosity, divergence).
+    vec4 xp = fetch(pos + ivec3( 1,0,0)); vec4 xm = fetch(pos + ivec3(-1,0,0));
+    vec4 yp = fetch(pos + ivec3(0, 1,0)); vec4 ym = fetch(pos + ivec3(0,-1,0));
+    vec4 zp = fetch(pos + ivec3(0,0, 1)); vec4 zm = fetch(pos + ivec3(0,0,-1));
+
+    // Pressure force: P ∇ρ / ρ — sets the Jeans length below which
+    // collapse is halted by self-pressure (this is what stops every
+    // overdensity from collapsing to a point).
+    vec3 grad_rho   = 0.5 * vec3(xp.r - xm.r, yp.r - ym.r, zp.r - zm.r);
+    vec3 press_force = -pressure * grad_rho / max(rho, 0.01);
+
+    // Numerical viscosity (small Laplacian on velocity).
+    vec3 lap_v = (xp.gba + xm.gba + yp.gba + ym.gba + zp.gba + zm.gba - 6.0 * vel);
+
+    // Cosmological Hubble expansion.
+    vec3 from_centre = (vec3(pos) - 0.5 * vec3(u_size)) / float(u_size);
+
+    vec3 new_vel = vel + (grav + press_force) * u_dt
+                       + visc * lap_v * u_dt
+                       + expand * from_centre * 0.01 * u_dt;
+
+    // Mass transport: semi-Lagrangian advection of ρ + flux divergence.
+    vec3 back     = vec3(pos) - vel * u_dt;
+    float adv_rho = sample_p1(back).r;
+    float div_v   = 0.5 * ((xp.g - xm.g) + (yp.b - ym.b) + (zp.a - zm.a));
+    float new_rho = adv_rho - rho * div_v * u_dt;
+    new_rho = clamp(new_rho, 0.001, 10.0);
+
+    // Velocity speed cap (keeps CFL bounded under runaway collapse).
+    float spd = length(new_vel);
+    if (spd > 3.0) new_vel *= 3.0 / spd;
 
     imageStore(u_dst, pos, vec4(new_rho, new_vel));
 }
@@ -4189,6 +6282,2485 @@ void main() {
     imageStore(u_dst, pos, vec4(psi_r, psi_i, V, prob));
 }
 """,
+
+    "ising_3d": """
+// 3D Ising / binary-spin model with Metropolis-Glauber dynamics.
+//
+// Spins live in channel R as {0.0, 1.0} (encoding s = -1 / +1 internally).
+// Energy of a cell with spin s and 6 face-neighbour sum Sn:
+//     E = -J * s * Sn - h * s
+// On a synchronous-update grid you cannot simply Metropolis-flip every cell
+// every step (it violates detailed balance and the system enters period-2
+// cycles instead of equilibrating). We use the standard fix: a SPATIAL
+// CHECKERBOARD restricted by frame parity. At frame f, only cells with
+// (x+y+z) parity == (f & 1) are eligible to flip. Two passes make a sweep,
+// matching the classic red-black Gauss-Seidel pattern.
+//
+// u_param0 = Temperature kT  (critical T_c ~ 4.51 J for 3D NN cubic Ising)
+// u_param1 = External field h
+// u_param2 = J coupling      (positive = ferromagnetic; negative = antiferromag.)
+// u_param3 = Update prob p   (per eligible cell; <1 slows annealing without
+//                              breaking detailed balance)
+
+float spin_at(ivec3 p) {
+    return fetch(p).r > 0.5 ? 1.0 : -1.0;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float self = fetch(pos).r;  // 0.0 or 1.0
+    float s = self > 0.5 ? 1.0 : -1.0;
+
+    // Always compute neighbour sum so all cells get a populated alignment
+    // channel (otherwise inactive-parity cells render as flat colour).
+    float Sn_all = spin_at(pos + ivec3( 1, 0, 0)) + spin_at(pos + ivec3(-1, 0, 0))
+                 + spin_at(pos + ivec3( 0, 1, 0)) + spin_at(pos + ivec3( 0,-1, 0))
+                 + spin_at(pos + ivec3( 0, 0, 1)) + spin_at(pos + ivec3( 0, 0,-1));
+    // ch1 = signed alignment (Sn/6) remapped to [0,1]; 0.5 = disordered.
+    float align01 = (Sn_all + 6.0) * (1.0/12.0);
+
+    int parity = (pos.x + pos.y + pos.z + u_frame) & 1;
+    if (parity != 0) {
+        // Not eligible this sub-step: pass through unchanged. ch2/ch3 = 0
+        // (no flip event); ch1 still carries fresh alignment.
+        imageStore(u_dst, pos, vec4(self, align01, 0.0, 0.0));
+        return;
+    }
+
+    float Sn = Sn_all;
+
+    float T = max(u_param0, 1e-3);
+    float h = u_param1;
+    float J = u_param2;
+    float pflip = clamp(u_param3, 0.0, 1.0);
+
+    // Energy change for s -> -s:  dE = 2*s*(J*Sn + h)
+    float dE = 2.0 * s * (J * Sn + h);
+
+    // Metropolis acceptance: always accept dE<=0; else accept with exp(-dE/T)
+    float accept = dE <= 0.0 ? 1.0 : exp(-dE / T);
+
+    float r1 = hash_temporal(pos, 0);
+    float r2 = hash_temporal(pos, 1);
+
+    float new_s = s;
+    if (r1 < pflip && r2 < accept) {
+        new_s = -s;
+    }
+    float new_val = new_s > 0.0 ? 1.0 : 0.0;
+    // ch2 = flip event (1 if this cell flipped), ch3 = acceptance probability.
+    float flipped = (new_s != s) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(new_val, align01, flipped, accept));
+}
+""",
+
+    "eden_3d": """
+// 3D Eden growth / DLA-flavoured aggregation.
+//
+// Channel R: 0.0 = empty, 1.0 = solid. Once filled, never emptied.
+// Update rule (per empty cell): if any of its 6 face-neighbours is solid,
+// it is filled with probability p, biased per axis by the anisotropy
+// vector. This produces a continuum from compact balls (p=1, no
+// anisotropy) through fractal dendrites (low p) to needle/plate growth
+// (strong axis bias).
+//
+// u_param0 = Sticking probability p_base (0.05 .. 1.0)
+// u_param1 = X-axis bias  (-1 .. +1; positive = grow faster along +/- x)
+// u_param2 = Y-axis bias  (-1 .. +1)
+// u_param3 = Z-axis bias  (-1 .. +1)
+//
+// Per-axis effective probability:  p_axis = p_base * (1 + bias_axis).
+// Bias values clamp p_axis into [0, 1] inside the kernel.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float self = fetch(pos).r;
+    if (self > 0.5) {
+        // Already solid: persistent. ch1 = 1.0 (saturated growth pressure),
+        // ch2 = 0 (no change this step), ch3 = 0.
+        imageStore(u_dst, pos, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
+
+    float p_base = clamp(u_param0, 0.0, 1.0);
+    float bx = clamp(u_param1, -1.0, 1.0);
+    float by = clamp(u_param2, -1.0, 1.0);
+    float bz = clamp(u_param3, -1.0, 1.0);
+    float px = clamp(p_base * (1.0 + bx), 0.0, 1.0);
+    float py = clamp(p_base * (1.0 + by), 0.0, 1.0);
+    float pz = clamp(p_base * (1.0 + bz), 0.0, 1.0);
+
+    // Each filled face-neighbour gets ONE independent attempt with its
+    // axis-specific probability. Mathematically: cell stays empty with
+    // probability  prod_over_filled_neighbours (1 - p_axis).
+    // We compute the "filled" mask per axis and the fail-probability product.
+    float fail = 1.0;
+    if (fetch(pos + ivec3( 1, 0, 0)).r > 0.5) fail *= (1.0 - px);
+    if (fetch(pos + ivec3(-1, 0, 0)).r > 0.5) fail *= (1.0 - px);
+    if (fetch(pos + ivec3( 0, 1, 0)).r > 0.5) fail *= (1.0 - py);
+    if (fetch(pos + ivec3( 0,-1, 0)).r > 0.5) fail *= (1.0 - py);
+    if (fetch(pos + ivec3( 0, 0, 1)).r > 0.5) fail *= (1.0 - pz);
+    if (fetch(pos + ivec3( 0, 0,-1)).r > 0.5) fail *= (1.0 - pz);
+
+    if (fail >= 1.0) {
+        // No solid neighbour at all (or all axes have zero prob).
+        imageStore(u_dst, pos, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    float p_fill = 1.0 - fail;
+
+    float r = hash_temporal(pos, 0);
+    float new_val = r < p_fill ? 1.0 : 0.0;
+    // ch1 = local growth pressure (probability of fill this step),
+    // ch2 = is_newly_grown (1 if this voxel just became solid).
+    imageStore(u_dst, pos, vec4(new_val, p_fill, new_val, 0.0));
+}
+""",
+
+    "hodgepodge_3d": """
+// 3D Hodgepodge machine (Gerhardt-Schuster cyclic CA, BZ-style).
+//
+// Each cell has an integer state in [0, N-1]:
+//   0           = "healthy" / quiescent
+//   1 .. N-2    = "infected" (infection level)
+//   N-1         = "ill" / refractory
+//
+// One Moore-neighbourhood (26 neighbours) update step:
+//   - If healthy:  count infected neighbours A and ill neighbours B.
+//     New state = floor(A/k1) + floor(B/k2). Capped at N-1.
+//   - If infected: new state = floor(S_inf / (A_self_infected_count))
+//                  + g, where S_inf is the sum of infected-neighbour
+//                  state values plus self. (Standard Gerhardt formula.)
+//   - If ill:      reset to 0 (heal).
+//
+// Channel R stores state / (N-1) in [0,1] so the renderer's colormap maps
+// neatly. Param 0 (N) is read as int.
+//
+// u_param0 = N (number of states; 8 .. 256)
+// u_param1 = g (advance increment when infected; 1 .. 8)
+// u_param2 = k1 (healthy infection susceptibility; 1 .. 8)
+// u_param3 = k2 (healthy ill-induced infection susceptibility; 1 .. 8)
+
+int read_state(ivec3 p, int N) {
+    float v = fetch(p).r;
+    int s = int(round(v * float(N - 1)));
+    return clamp(s, 0, N - 1);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int N  = clamp(int(u_param0), 4, 256);
+    int g  = max(1, int(u_param1));
+    int k1 = max(1, int(u_param2));
+    int k2 = max(1, int(u_param3));
+
+    int s = read_state(pos, N);
+
+    int A = 0;        // count of infected neighbours
+    int B = 0;        // count of ill neighbours
+    int sum_inf = s;  // sum of "self + infected neighbours" for averaging
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        int sn = read_state(pos + ivec3(dx, dy, dz), N);
+        if (sn == N - 1) {
+            B += 1;
+        } else if (sn > 0) {
+            A += 1;
+            sum_inf += sn;
+        }
+    }
+
+    int new_s;
+    if (s == 0) {
+        new_s = (A / k1) + (B / k2);
+    } else if (s == N - 1) {
+        new_s = 0;  // heal
+    } else {
+        // Self counts as infected for averaging — A + 1 ensures non-zero.
+        new_s = (sum_inf / (A + 1)) + g;
+    }
+    new_s = clamp(new_s, 0, N - 1);
+
+    float out_v = float(new_s) / float(max(N - 1, 1));
+    // ch1 = infected-neighbour fraction (A/26), ch2 = ill-neighbour fraction (B/26),
+    // ch3 = |delta| in normalised state.
+    float a01 = float(A) * (1.0/26.0);
+    float b01 = float(B) * (1.0/26.0);
+    float self_v = float(s) / float(max(N - 1, 1));
+    imageStore(u_dst, pos, vec4(out_v, a01, b01, abs(out_v - self_v)));
+}
+""",
+
+    "margolus_3d": """
+// 3D Margolus block-partition CA — a reversible, particle-conserving
+// lattice gas.
+//
+// Key idea (Margolus, 1984): instead of each cell looking at its
+// neighbours, partition the grid into disjoint 2x2x2 blocks and apply
+// a permutation INSIDE each block. The blocks shift by (1,1,1) on
+// alternate frames so that information eventually leaks across block
+// boundaries.
+//
+// Because every step is a permutation of cells within a block, the rule
+// is exactly reversible (run it backwards and you get the prior state)
+// and conserves particle count (the sum of channel R is invariant).
+//
+// Channel R: 0.0 = empty, 1.0 = particle.
+//
+// Per-block permutation: rotate the block 90° around an axis chosen
+// per-block from a hash of (block coords, frame). With drift bias
+// (u_param1 != 0) the rotation direction prefers one sign, producing
+// macroscopic flow on top of the diffusion.
+//
+// u_param0 = Rotation probability   (0 = no motion, 1 = every block rotates)
+// u_param1 = Drift bias            (-1 = strong -axis flow, 0 = symmetric, +1 = +axis)
+// u_param2 = Mixing strength        (0..1; extra random pair-swap inside block)
+// u_param3 = Axis preference       (-1 = X, 0 = uniform, +1 = Z)
+
+uint block_hash(ivec3 b, int frame) {
+    uint h = uint(b.x * 73856093) ^ uint(b.y * 19349663) ^ uint(b.z * 83492791)
+           ^ uint(frame * 2654435761u);
+    h = (h ^ (h >> 16u)) * 0x45d9f3bu;
+    h = (h ^ (h >> 16u)) * 0x45d9f3bu;
+    return h ^ (h >> 16u);
+}
+
+// Inverse of a rotation: where in the block does my OUTPUT cell read
+// FROM? Returns the source local coordinate (each component 0 or 1)
+// given my own local coordinate.
+ivec3 rotation_source(ivec3 local, int axis, bool reverse) {
+    // Block-local coordinates lie in {0,1}^3. We rotate the unit cube
+    // by 90° around the axis. The map below is the explicit inverse
+    // of a forward rotation; for axis==0 (X) the cube spins in the YZ
+    // plane, etc.
+    if (axis == 0) {
+        // YZ-plane rotation. Forward: (x,y,z) -> (x, 1-z, y).
+        // Inverse:                    (x,y,z) -> (x, z, 1-y).
+        return reverse
+            ? ivec3(local.x, 1 - local.z, local.y)
+            : ivec3(local.x, local.z, 1 - local.y);
+    } else if (axis == 1) {
+        // XZ-plane rotation.
+        return reverse
+            ? ivec3(local.z, local.y, 1 - local.x)
+            : ivec3(1 - local.z, local.y, local.x);
+    } else {
+        // XY-plane rotation.
+        return reverse
+            ? ivec3(1 - local.y, local.x, local.z)
+            : ivec3(local.y, 1 - local.x, local.z);
+    }
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int off = u_frame & 1;  // Margolus partition: alternate offset
+
+    // For Margolus to work on a toroidal grid the lattice size MUST be
+    // even (so the 2x2x2 partition tiles the whole grid). All practical
+    // sizes here are powers of two so this holds.
+    ivec3 shifted = pos - ivec3(off);
+    // Wrap into [0, u_size) before integer-dividing by 2 so the block
+    // index is well-defined when off==1 and pos is at the origin.
+    ivec3 wrapped = (shifted + u_size) % u_size;
+    ivec3 block   = wrapped >> 1;
+    ivec3 local   = wrapped & ivec3(1);
+
+    uint h = block_hash(block, u_frame);
+    float u01 = float(h) * INV_U32_MAX;
+
+    if (u01 >= clamp(u_param0, 0.0, 1.0)) {
+        // This block does not rotate this frame: identity permutation.
+        // Optionally mix two diagonally-opposite cells with prob u_param2.
+        float mix_p = clamp(u_param2, 0.0, 1.0);
+        float u02 = float(h ^ 0x9e3779b9u) * INV_U32_MAX;
+        if (u02 < mix_p && all(equal(local, ivec3(0)))) {
+            // Swap (0,0,0) and (1,1,1) — pair conservation.
+            ivec3 partner = block * 2 + ivec3(1) + ivec3(off);
+            partner = (partner + u_size) % u_size;
+            float v = imageLoad(u_src, partner).r;
+            // ch1 = block hash (block fingerprint), ch2 = mix flag, ch3 = 0.
+            imageStore(u_dst, pos, vec4(v, u01, 1.0, 0.0));
+            return;
+        }
+        if (u02 < mix_p && all(equal(local, ivec3(1)))) {
+            ivec3 partner = block * 2 + ivec3(off);
+            partner = (partner + u_size) % u_size;
+            float v = imageLoad(u_src, partner).r;
+            imageStore(u_dst, pos, vec4(v, u01, 1.0, 0.0));
+            return;
+        }
+        // Identity: read from self.
+        float v = imageLoad(u_src, pos).r;
+        // No rotation, no mix. ch1 still carries the block fingerprint so
+        // even quiescent blocks paint a multi-colour mosaic.
+        imageStore(u_dst, pos, vec4(v, u01, 0.0, 0.0));
+        return;
+    }
+
+    // Pick rotation axis. u_param3 biases toward X (-1) or Z (+1).
+    float ax_bias = clamp(u_param3, -1.0, 1.0);
+    int axis;
+    float r_axis = float(h >> 8) * INV_U32_MAX;
+    if (ax_bias < -0.33 + 0.66 * r_axis) {
+        axis = 0;
+    } else if (ax_bias < 0.33 + 0.66 * r_axis) {
+        axis = 1;
+    } else {
+        axis = 2;
+    }
+
+    // Direction biased by drift parameter.
+    float drift = clamp(u_param1, -1.0, 1.0);
+    float r_dir = float(h >> 17) * INV_U32_MAX;
+    bool reverse = r_dir < (0.5 - 0.5 * drift);
+
+    ivec3 src_local = rotation_source(local, axis, reverse);
+    ivec3 src_pos = block * 2 + src_local + ivec3(off);
+    src_pos = (src_pos + u_size) % u_size;
+
+    float val = imageLoad(u_src, src_pos).r;
+    // ch1 = block hash, ch2 = rotation-axis (0,0.5,1 for X,Y,Z),
+    // ch3 = is-rotated (always 1 in this branch).
+    float axis01 = float(axis) * 0.5;
+    imageStore(u_dst, pos, vec4(val, u01, axis01, 1.0));
+}
+""",
+
+    "stable_fluids_3d": """
+// 3D Smoke Plume — TRUE incompressible Helmholtz-projected solver.
+//
+// This is the FIRST PASS of a multi-pass pipeline (advect + add sources).
+// The full pipeline:
+//
+//   pass 0: stable_fluids_3d        (this file) — advect velocity + density,
+//                                                 inject source, light viscous
+//                                                 diffusion. Writes pair 1.
+//   pass 1: stable_fluids_div       — write div(v) and zero pressure to pair 2.
+//   pass 2..K-1: stable_fluids_jacobi — Jacobi relax pressure on pair 2.
+//   pass K: stable_fluids_project   — subtract grad(pressure) from velocity.
+//                                                 Writes pair 1.
+//
+// Pair 1 (image units 0/1, R=vx G=vy B=vz A=density) is the user-visible
+// state. Pair 2 (image units 2/3, R=divergence G=pressure) is scratch only.
+//
+// u_param0 = Viscosity        (0..0.05; light Laplacian smoothing)
+// u_param1 = Source strength  (0..1; dye + buoyancy injection rate)
+// u_param2 = Damping          (0..0.02; tiny global damping; can stay near 0
+//                              now that projection enforces incompressibility)
+// u_param3 = Vorticity        (0..3; vorticity confinement boost)
+
+vec4 sample_tex(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    vec3 v = self.xyz;
+
+    float visc      = clamp(u_param0, 0.0, 0.1);
+    float src_amp   = clamp(u_param1, 0.0, 1.0);
+    float damp      = clamp(u_param2, 0.0, 0.05);
+    float curl_amp  = clamp(u_param3, 0.0, 5.0);
+
+    // ── 1. Semi-Lagrangian backward trace (advect both v and dye). ──
+    vec3 fpos = vec3(pos);
+    vec3 back = fpos - v * u_dt;
+    vec4 advected = sample_tex(back);
+    vec3 v_new = advected.xyz;
+    float dye_new = advected.w;
+
+    // ── 2. Persistent source near bottom-centre. ────────────────────
+    // Source size, buoyancy and velocity cap are kept ROUGHLY
+    // INDEPENDENT of u_size (with mild scaling) so that running on a
+    // larger grid actually buys you a longer plume rather than just a
+    // higher-resolution version of the same short plume.  Buoyancy is
+    // in cells/step; if it scaled with u_size the plume would always
+    // hit the ceiling in the same number of steps.
+    vec3 src_centre = vec3(float(u_size) * 0.5,
+                            float(u_size) * 0.10,
+                            float(u_size) * 0.5);
+    float r2 = dot(fpos - src_centre, fpos - src_centre);
+    float src_radius = max(2.0, float(u_size) / 32.0);
+    if (r2 < src_radius * src_radius) {
+        dye_new = clamp(dye_new + src_amp * u_dt * 4.0, 0.0, 4.0);
+        v_new.y += src_amp * u_dt * 1.5;
+        v_new.x += (hash_temporal(pos, 0) - 0.5) * src_amp * u_dt * 0.8;
+        v_new.z += (hash_temporal(pos, 1) - 0.5) * src_amp * u_dt * 0.8;
+    }
+
+    // Ceiling drag: gradually kill upward velocity in the top 20% of
+    // the box so the plume cannot blast through the lid even if it
+    // builds up momentum over many steps.  This forms the
+    // "stratosphere" of a real plume — the head spreads horizontally
+    // when buoyancy can no longer push it up.
+    float y_norm = float(pos.y) / float(u_size);
+    if (y_norm > 0.80) {
+        float t = (y_norm - 0.80) / 0.20;          // 0..1 in top slab
+        v_new.y *= (1.0 - 0.5 * t * u_dt);          // exponential brake
+        if (v_new.y > 0.0) v_new.y *= (1.0 - t);    // hard cap on upward
+    }
+
+    // ── 3. Light viscous diffusion of velocity (optional). ──────────
+    if (visc > 0.0) {
+        vec3 lap = (fetch(pos + ivec3( 1,0,0)).xyz + fetch(pos + ivec3(-1,0,0)).xyz
+                  + fetch(pos + ivec3(0, 1,0)).xyz + fetch(pos + ivec3(0,-1,0)).xyz
+                  + fetch(pos + ivec3(0,0, 1)).xyz + fetch(pos + ivec3(0,0,-1)).xyz
+                  - 6.0 * v);
+        v_new += visc * lap * u_dt;
+    }
+
+    // ── 4. Vorticity confinement (cheap version). ───────────────────
+    if (curl_amp > 0.0) {
+        vec3 vxp = fetch(pos + ivec3( 1, 0, 0)).xyz;
+        vec3 vxm = fetch(pos + ivec3(-1, 0, 0)).xyz;
+        vec3 vyp = fetch(pos + ivec3( 0, 1, 0)).xyz;
+        vec3 vym = fetch(pos + ivec3( 0,-1, 0)).xyz;
+        vec3 vzp = fetch(pos + ivec3( 0, 0, 1)).xyz;
+        vec3 vzm = fetch(pos + ivec3( 0, 0,-1)).xyz;
+        // omega = curl(v) = (dvz/dy - dvy/dz, dvx/dz - dvz/dx, dvy/dx - dvx/dy)
+        vec3 omega = 0.5 * vec3(
+            (vyp.z - vym.z) - (vzp.y - vzm.y),
+            (vzp.x - vzm.x) - (vxp.z - vxm.z),
+            (vxp.y - vxm.y) - (vyp.x - vym.x)
+        );
+        v_new += curl_amp * u_dt * 0.05 * omega;
+    }
+
+    // ── 5. Tiny global damping. ─────────────────────────────────────
+    v_new *= (1.0 - damp);
+    // Faster dye decay so the plume DISSIPATES as it rises instead of
+    // always reaching the ceiling.  At 0.99/step the dye half-life is
+    // ~70 steps; combined with ~0.5 cells/step rise that gives a
+    // ~35-cell e-folding distance — bright base, fading head.
+    dye_new *= 0.99;
+
+    // Velocity cap: keep speeds bounded by an absolute, modestly
+    // size-aware ceiling rather than scaling with u_size.  Otherwise
+    // a 256³ grid lets velocities reach 128 cells/step and the plume
+    // shoots through the box in two frames.
+    float vmax = max(8.0, float(u_size) * 0.08);
+    v_new = clamp(v_new, vec3(-vmax), vec3(vmax));
+    dye_new = clamp(dye_new, 0.0, 4.0);
+
+    imageStore(u_dst, pos, vec4(v_new, dye_new));
+}
+""",
+
+    "stable_fluids_div": """
+// Stable Fluids pass 2: compute divergence of the freshly advected velocity
+// field (in pair 1) and write it to pair 2 R. Also zero the pressure guess
+// (pair 2 G) for the next round of Jacobi iterations.
+//
+// Pair 1 image binding 0 = u_src holds advected velocity (read).
+// Pair 2 image binding 3 = u_dst2 receives (div, 0, 0, 0).
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec3 vxp = fetch(pos + ivec3( 1, 0, 0)).xyz;
+    vec3 vxm = fetch(pos + ivec3(-1, 0, 0)).xyz;
+    vec3 vyp = fetch(pos + ivec3( 0, 1, 0)).xyz;
+    vec3 vym = fetch(pos + ivec3( 0,-1, 0)).xyz;
+    vec3 vzp = fetch(pos + ivec3( 0, 0, 1)).xyz;
+    vec3 vzm = fetch(pos + ivec3( 0, 0,-1)).xyz;
+
+    // Central-difference divergence at a unit-spaced grid.
+    float div = 0.5 * ((vxp.x - vxm.x) + (vyp.y - vym.y) + (vzp.z - vzm.z));
+
+    imageStore(u_dst2, pos, vec4(div, 0.0, 0.0, 0.0));
+}
+""",
+
+    "stable_fluids_jacobi": """
+// Stable Fluids pressure Jacobi iteration. Reads previous pressure from
+// pair 2 G and divergence from pair 2 R, writes new pressure (and
+// passes divergence through unchanged) to pair 2 dst.
+//
+//   p_new(i,j,k) = ( sum_neighbours_p  -  div(i,j,k) ) / 6
+//
+// Solves the discrete Poisson equation  Lap(p) = div(v)  /  h^2  with
+// a unit cell spacing (h = 1).
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 me  = fetch2(pos);
+    float div = me.x;
+
+    float p_xp = fetch2(pos + ivec3( 1, 0, 0)).y;
+    float p_xm = fetch2(pos + ivec3(-1, 0, 0)).y;
+    float p_yp = fetch2(pos + ivec3( 0, 1, 0)).y;
+    float p_ym = fetch2(pos + ivec3( 0,-1, 0)).y;
+    float p_zp = fetch2(pos + ivec3( 0, 0, 1)).y;
+    float p_zm = fetch2(pos + ivec3( 0, 0,-1)).y;
+
+    float p_new = (p_xp + p_xm + p_yp + p_ym + p_zp + p_zm - div) / 6.0;
+
+    // Preserve divergence in R; write new pressure in G.
+    imageStore(u_dst2, pos, vec4(div, p_new, 0.0, 0.0));
+}
+""",
+
+    "stable_fluids_project": """
+// Stable Fluids pass N: subtract grad(pressure) from velocity to enforce
+// incompressibility. Reads pressure from pair 2 G, velocity from pair 1.
+// Writes corrected velocity (and density unchanged) to pair 1 dst.
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+float pressure(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return 0.0;
+        return imageLoad(u_src2, p).y;
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p).y;
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p).y;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    vec3 v = self.xyz;
+
+    float p_xp = pressure(pos + ivec3( 1, 0, 0));
+    float p_xm = pressure(pos + ivec3(-1, 0, 0));
+    float p_yp = pressure(pos + ivec3( 0, 1, 0));
+    float p_ym = pressure(pos + ivec3( 0,-1, 0));
+    float p_zp = pressure(pos + ivec3( 0, 0, 1));
+    float p_zm = pressure(pos + ivec3( 0, 0,-1));
+
+    vec3 grad_p = 0.5 * vec3(p_xp - p_xm, p_yp - p_ym, p_zp - p_zm);
+    v -= grad_p;
+
+    float vmax = 0.5 * float(u_size);
+    v = clamp(v, vec3(-vmax), vec3(vmax));
+
+    imageStore(u_dst, pos, vec4(v, self.w));
+}
+""",
+
+    "copy_voxel": """
+// Trivial pass-through: copy the entire voxel grid from u_src to u_dst.
+// Used as a "preserve" stage before an agent pass mutates a few cells in
+// place — without it, the cells the agents DON'T touch would not be
+// propagated forward to the next frame.
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    imageStore(u_dst, pos, fetch(pos));
+}
+""",
+
+    # ── Smoke / vapor variants of stable_fluids ────────────────────────
+    # These three shaders are drop-in replacements for the FIRST pass of
+    # the smoke pipeline.  div / jacobi / project are reused unchanged.
+
+    "smoke_wind_3d": """
+// 3D Wind-Blown Smoke — identical to stable_fluids_3d except for a
+// constant horizontal wind field that bends the plume downwind.
+//
+// u_param0 = Viscosity        (0..0.05)
+// u_param1 = Source strength  (0..1)
+// u_param2 = Wind speed       (0..3; +X direction, in cells/step)
+// u_param3 = Vorticity        (0..3)
+
+vec4 sample_tex(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    vec3 v = self.xyz;
+
+    float visc      = clamp(u_param0, 0.0, 0.1);
+    float src_amp   = clamp(u_param1, 0.0, 1.0);
+    float wind_x    = clamp(u_param2, -5.0, 5.0);
+    float curl_amp  = clamp(u_param3, 0.0, 5.0);
+
+    // Semi-Lagrangian backward trace (uses TOTAL velocity = self + wind).
+    vec3 fpos = vec3(pos);
+    vec3 v_total = v + vec3(wind_x, 0.0, 0.0);
+    vec3 back = fpos - v_total * u_dt;
+    vec4 advected = sample_tex(back);
+    vec3 v_new = advected.xyz;
+    float dye_new = advected.w;
+
+    // Source: low-left edge so plume bends across most of the box.
+    vec3 src_centre = vec3(float(u_size) * 0.20,
+                            float(u_size) * 0.10,
+                            float(u_size) * 0.5);
+    float r2 = dot(fpos - src_centre, fpos - src_centre);
+    float src_radius = max(2.0, float(u_size) / 32.0);
+    if (r2 < src_radius * src_radius) {
+        dye_new = clamp(dye_new + src_amp * u_dt * 4.0, 0.0, 4.0);
+        v_new.y += src_amp * u_dt * 1.5;
+        v_new.z += (hash_temporal(pos, 1) - 0.5) * src_amp * u_dt * 0.8;
+    }
+
+    // Ceiling drag: brake upward velocity in top 20% of box.
+    // (Wind is already applied as an advection bias in v_total above —
+    // adding it as a body force too would explode the velocity.)
+    float y_norm = float(pos.y) / float(u_size);
+    if (y_norm > 0.80) {
+        float t = (y_norm - 0.80) / 0.20;
+        v_new.y *= (1.0 - 0.5 * t * u_dt);
+        if (v_new.y > 0.0) v_new.y *= (1.0 - t);
+    }
+
+    if (visc > 0.0) {
+        vec3 lap = (fetch(pos + ivec3( 1,0,0)).xyz + fetch(pos + ivec3(-1,0,0)).xyz
+                  + fetch(pos + ivec3(0, 1,0)).xyz + fetch(pos + ivec3(0,-1,0)).xyz
+                  + fetch(pos + ivec3(0,0, 1)).xyz + fetch(pos + ivec3(0,0,-1)).xyz
+                  - 6.0 * v);
+        v_new += visc * lap * u_dt;
+    }
+
+    if (curl_amp > 0.0) {
+        vec3 vxp = fetch(pos + ivec3( 1, 0, 0)).xyz;
+        vec3 vxm = fetch(pos + ivec3(-1, 0, 0)).xyz;
+        vec3 vyp = fetch(pos + ivec3( 0, 1, 0)).xyz;
+        vec3 vym = fetch(pos + ivec3( 0,-1, 0)).xyz;
+        vec3 vzp = fetch(pos + ivec3( 0, 0, 1)).xyz;
+        vec3 vzm = fetch(pos + ivec3( 0, 0,-1)).xyz;
+        vec3 omega = 0.5 * vec3(
+            (vyp.z - vym.z) - (vzp.y - vzm.y),
+            (vzp.x - vzm.x) - (vxp.z - vxm.z),
+            (vxp.y - vxm.y) - (vyp.x - vym.x)
+        );
+        v_new += curl_amp * u_dt * 0.05 * omega;
+    }
+
+    dye_new *= 0.99;
+    float vmax = max(8.0, float(u_size) * 0.08);
+    v_new = clamp(v_new, vec3(-vmax), vec3(vmax));
+    dye_new = clamp(dye_new, 0.0, 4.0);
+    imageStore(u_dst, pos, vec4(v_new, dye_new));
+}
+""",
+
+    "volcanic_3d": """
+// 3D Volcanic Plume — wide hot column with dense ash that falls back
+// down once buoyancy dies.  Produces a mushroom-cap stratification
+// and a pyroclastic ground surge.
+//
+// u_param0 = Viscosity        (0..0.05)
+// u_param1 = Source strength  (0..1; controls eruption violence)
+// u_param2 = Ash gravity      (0..0.3; how fast cold ash falls)
+// u_param3 = Vorticity        (0..3)
+
+vec4 sample_tex(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    vec3 v = self.xyz;
+
+    float visc      = clamp(u_param0, 0.0, 0.1);
+    float src_amp   = clamp(u_param1, 0.0, 1.0);
+    float ash_grav  = clamp(u_param2, 0.0, 0.5);
+    float curl_amp  = clamp(u_param3, 0.0, 5.0);
+
+    vec3 fpos = vec3(pos);
+    vec3 back = fpos - v * u_dt;
+    vec4 advected = sample_tex(back);
+    vec3 v_new = advected.xyz;
+    float dye_new = advected.w;
+
+    // WIDE source: 3x the radius of normal smoke, and HIGH buoyancy.
+    vec3 src_centre = vec3(float(u_size) * 0.5,
+                            float(u_size) * 0.05,
+                            float(u_size) * 0.5);
+    float r2 = dot(fpos - src_centre, fpos - src_centre);
+    float src_radius = max(4.0, float(u_size) / 10.0);
+    if (r2 < src_radius * src_radius) {
+        dye_new = clamp(dye_new + src_amp * u_dt * 6.0, 0.0, 4.0);
+        v_new.y += src_amp * u_dt * 4.0;
+        v_new.x += (hash_temporal(pos, 0) - 0.5) * src_amp * u_dt * 1.5;
+        v_new.z += (hash_temporal(pos, 1) - 0.5) * src_amp * u_dt * 1.5;
+    }
+
+    // Ash gravity: cold, dense dye sinks.  Acts on dye PROPORTIONAL to
+    // its concentration, applied as downward acceleration.  This is
+    // what creates the mushroom cap (rising buoyant column) AND the
+    // pyroclastic surge (cold ash falling and spreading sideways).
+    v_new.y -= ash_grav * dye_new * u_dt;
+
+    // Strong ceiling drag: lid-shaped umbrella cloud.
+    float y_norm = float(pos.y) / float(u_size);
+    if (y_norm > 0.70) {
+        float t = (y_norm - 0.70) / 0.30;
+        v_new.y *= (1.0 - 0.7 * t * u_dt);
+        if (v_new.y > 0.0) v_new.y *= (1.0 - t);
+    }
+
+    if (visc > 0.0) {
+        vec3 lap = (fetch(pos + ivec3( 1,0,0)).xyz + fetch(pos + ivec3(-1,0,0)).xyz
+                  + fetch(pos + ivec3(0, 1,0)).xyz + fetch(pos + ivec3(0,-1,0)).xyz
+                  + fetch(pos + ivec3(0,0, 1)).xyz + fetch(pos + ivec3(0,0,-1)).xyz
+                  - 6.0 * v);
+        v_new += visc * lap * u_dt;
+    }
+
+    if (curl_amp > 0.0) {
+        vec3 vxp = fetch(pos + ivec3( 1, 0, 0)).xyz;
+        vec3 vxm = fetch(pos + ivec3(-1, 0, 0)).xyz;
+        vec3 vyp = fetch(pos + ivec3( 0, 1, 0)).xyz;
+        vec3 vym = fetch(pos + ivec3( 0,-1, 0)).xyz;
+        vec3 vzp = fetch(pos + ivec3( 0, 0, 1)).xyz;
+        vec3 vzm = fetch(pos + ivec3( 0, 0,-1)).xyz;
+        vec3 omega = 0.5 * vec3(
+            (vyp.z - vym.z) - (vzp.y - vzm.y),
+            (vzp.x - vzm.x) - (vxp.z - vxm.z),
+            (vxp.y - vxm.y) - (vyp.x - vym.x)
+        );
+        v_new += curl_amp * u_dt * 0.05 * omega;
+    }
+
+    // Slow dye decay — ash persists for a long time.
+    dye_new *= 0.997;
+    float vmax = max(8.0, float(u_size) * 0.10);
+    v_new = clamp(v_new, vec3(-vmax), vec3(vmax));
+    dye_new = clamp(dye_new, 0.0, 4.0);
+    imageStore(u_dst, pos, vec4(v_new, dye_new));
+}
+""",
+
+    "rayleigh_benard_3d": """
+// 3D Rayleigh-Bénard Convection — heated floor + cooled ceiling produce
+// SPONTANEOUS convection cells.  No source: the dye field IS the
+// temperature, and buoyancy is proportional to temperature deviation
+// from neutral.  Above critical Rayleigh number, hexagonal convection
+// patterns emerge from random initial noise.
+//
+// u_param0 = Viscosity              (0..0.05)
+// u_param1 = Heating rate           (0..1; bottom-floor temperature)
+// u_param2 = Thermal diffusivity    (0..0.05)
+// u_param3 = Buoyancy coefficient   (0..2; dT -> upward force)
+
+vec4 sample_tex(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0  = mix(x00, x10, t.y);
+    vec4 y1  = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    vec3 v = self.xyz;
+    float T = self.w;       // dye channel = temperature
+
+    float visc       = clamp(u_param0, 0.0, 0.1);
+    float heat_rate  = clamp(u_param1, 0.0, 1.0);
+    float therm_diff = clamp(u_param2, 0.0, 0.1);
+    float buoy_coef  = clamp(u_param3, 0.0, 3.0);
+
+    vec3 fpos = vec3(pos);
+    vec3 back = fpos - v * u_dt;
+    vec4 advected = sample_tex(back);
+    vec3 v_new = advected.xyz;
+    float T_new = advected.w;
+
+    // ── Boundary thermal forcing ──────────────────────────────────
+    // Hold ONLY the y=0 cell layer at T=+heat_rate and the y=N-1
+    // layer at T=-heat_rate.  Forcing more than one layer creates a
+    // uniform driving jet that overwhelms the instability before
+    // convection cells can nucleate.  Diffusion from these single
+    // boundary layers is what drives the bulk gradient.
+    if (pos.y == 0) {
+        T_new = heat_rate;
+    } else if (pos.y == u_size - 1) {
+        T_new = -heat_rate;
+    }
+
+    // ── Buoyancy: hot fluid rises, cold sinks ─────────────────────
+    v_new.y += buoy_coef * T_new * u_dt;
+
+    // ── Thermal diffusion (smooths sharp gradients) ───────────────
+    if (therm_diff > 0.0) {
+        float lap_T = (fetch(pos + ivec3( 1,0,0)).w + fetch(pos + ivec3(-1,0,0)).w
+                     + fetch(pos + ivec3(0, 1,0)).w + fetch(pos + ivec3(0,-1,0)).w
+                     + fetch(pos + ivec3(0,0, 1)).w + fetch(pos + ivec3(0,0,-1)).w
+                     - 6.0 * T);
+        T_new += therm_diff * lap_T * u_dt;
+    }
+
+    // ── Velocity diffusion ────────────────────────────────────────
+    if (visc > 0.0) {
+        vec3 lap = (fetch(pos + ivec3( 1,0,0)).xyz + fetch(pos + ivec3(-1,0,0)).xyz
+                  + fetch(pos + ivec3(0, 1,0)).xyz + fetch(pos + ivec3(0,-1,0)).xyz
+                  + fetch(pos + ivec3(0,0, 1)).xyz + fetch(pos + ivec3(0,0,-1)).xyz
+                  - 6.0 * v);
+        v_new += visc * lap * u_dt;
+    }
+
+    float vmax = max(8.0, float(u_size) * 0.08);
+    v_new = clamp(v_new, vec3(-vmax), vec3(vmax));
+    T_new = clamp(T_new, -2.0, 2.0);
+    imageStore(u_dst, pos, vec4(v_new, T_new));
+}
+""",
+
+    "smugglers_field_3d": """
+// Smuggler's Standoff — voxel-field decay pass.
+//
+// Channel layout (pair 1, 4 floats per cell):
+//   R = red display    (slow decay toward terrain*baseline; carriers
+//                       and red stash add on top so this channel
+//                       always shows BOTH terrain (dim) AND red
+//                       activity (bright) in a single view.)
+//   G = blue display   (same scheme, blue side.)
+//   B = signed tracer  (fast decay toward zero; red carriers add
+//                       +tracer_amt, blue subtract; sign + magnitude
+//                       drive combat detection.)
+//   A = terrain        (1.0 = wall, 0.0 = open. NEVER decayed.)
+//
+// "baseline" here is the terrain bias added back each step so wall
+// cells stay visible at a low intensity while open arena fades to 0.
+//
+// u_param0 = stash decay rate  (per unit time)
+// u_param1 = tracer decay rate (per unit time, much faster than stash)
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 v = fetch(pos);
+    float stash_decay  = clamp(u_param0 * u_dt, 0.0, 1.0);
+    float tracer_decay = clamp(u_param1 * u_dt, 0.0, 1.0);
+
+    // ── Lateral "bloom" diffusion of the team channels ─────────────
+    // Carriers drop single-cell stamps to avoid multi-writer race
+    // conditions on imageStore.  Without lateral spreading those
+    // pixel-size piles are invisible at typical render scales.  We
+    // diffuse a small fraction of R/G to neighbours each step, which
+    // produces visible blobs around delivery sites while still
+    // letting fresh deposits dominate locally.  Only spreads along
+    // axis-aligned non-wall neighbours (pure terrain stays 0).
+    const float bloom = 0.006;
+    float r_blur = 0.0, g_blur = 0.0;
+    int n_open = 0;
+    for (int axis = 0; axis < 3; axis++) {
+        for (int side = -1; side <= 1; side += 2) {
+            ivec3 q = pos;
+            if      (axis == 0) q.x += side;
+            else if (axis == 1) q.y += side;
+            else                q.z += side;
+            if (any(lessThan(q, ivec3(0))) ||
+                any(greaterThanEqual(q, ivec3(u_size)))) continue;
+            vec4 nv = fetch(q);
+            if (nv.a > 0.5) continue;   // skip walls
+            r_blur += nv.r;
+            g_blur += nv.g;
+            n_open += 1;
+        }
+    }
+    if (n_open > 0) {
+        // Move "bloom" of own value out to neighbours, take same
+        // fraction of average-neighbour back in — effectively a
+        // small-radius Gaussian blur per step.
+        float r_avg = r_blur / float(n_open);
+        float g_avg = g_blur / float(n_open);
+        v.r = mix(v.r, r_avg, bloom);
+        v.g = mix(v.g, g_avg, bloom);
+    }
+
+    // Decay R/G toward the terrain baseline (so walls remain dimly
+    // visible in both team views and open cells fade to 0).
+    float baseline = v.a * 0.15;
+    v.r = mix(baseline, v.r, 1.0 - stash_decay);
+    v.g = mix(baseline, v.g, 1.0 - stash_decay);
+    v.b *= (1.0 - tracer_decay);
+    // v.a (terrain) untouched.
+
+    imageStore(u_dst, pos, v);
+}
+""",
+
+    # ── Causal / light-cone CA ─────────────────────────────────────────
+    #
+    # Information propagates STRICTLY at speed c = 1 cell/step (Manhattan
+    # light cone). Each source pulses periodically; the wavefront from
+    # each source can only ever reach cells at Manhattan distance ≤ steps
+    # since emission. Result: clean, geometrically perfect 3D light cones
+    # — exactly what relativity says you should see — and when two cones
+    # meet they superpose visibly (constructive + destructive
+    # interference, even though propagation is purely causal).
+    #
+    # Channels:
+    #   R  current wavefront amplitude  (active right now)
+    #   G  time-of-arrival   [0,1]      (set ONCE when first lit, never
+    #                                    overwritten; drives the rainbow
+    #                                    "shadow" trail of the cone)
+    #   B  echo / secondary wave        (lazy diffusion within cone)
+    #   A  source intensity (static)    (>0 → this cell pulses; preserved)
+    #
+    # Update rule:
+    #   1. Source cells (A>0) pulse at frequency u_param0:
+    #        R := A * sin(u_frame * pulse_freq)     (positive lobe only)
+    #   2. Non-source cells take a 6-neighbour average of previous R,
+    #      with one-step delay (= the wave moves 1 cell/step), minus
+    #      a small self-decay term:
+    #        R_new = avg6(R) * (1 - decay)
+    #   3. If R_new > eps and G == 0, latch G := frame/MAX_FRAMES (clamped).
+    #   4. B = lazy diffusion of past R within the cone (cosmetic).
+    #
+    # Visualisation: pick channel G ("Arrival") to see the full causal
+    # history as a rainbow-coloured nested-cone structure. Pick R
+    # ("Wavefront") to see only the currently-active shell. Pick A
+    # ("Sources") to see the stationary emitters.
+    "causal_ca": """
+const float MAX_FRAMES_INV = 1.0 / 4096.0;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4  self    = fetch(pos);
+    float src_amp = self.a;            // static source mask
+    float arrival = self.g;            // latched arrival time (or 0)
+    float echo    = self.b;
+
+    float pulse_freq = u_param0 * 0.25;     // 0..0.5 rad/frame
+    float decay      = clamp(u_param1, 0.0, 0.5);
+    float echo_mix   = clamp(u_param2, 0.0, 0.99);
+    float thresh     = max(u_param3, 1e-4);
+
+    float r_new;
+    if (src_amp > 0.001) {
+        // Source: drives a positive-only sinusoidal pulse.
+        float s = sin(float(u_frame) * pulse_freq);
+        r_new = src_amp * max(s, 0.0);
+    } else {
+        // Pure causal propagation: average the 6 face neighbours.
+        // Because we sample u_src (previous frame), the contribution
+        // from any face neighbour is its R value from one step ago,
+        // i.e., information moves exactly 1 cell per step.
+        float sum = fetch(pos + ivec3( 1, 0, 0)).r
+                  + fetch(pos + ivec3(-1, 0, 0)).r
+                  + fetch(pos + ivec3( 0, 1, 0)).r
+                  + fetch(pos + ivec3( 0,-1, 0)).r
+                  + fetch(pos + ivec3( 0, 0, 1)).r
+                  + fetch(pos + ivec3( 0, 0,-1)).r;
+        r_new = (sum / 6.0) * (1.0 - decay);
+    }
+
+    // Latch arrival time the very first frame this cell exceeds threshold.
+    if (arrival <= 0.0 && r_new > thresh) {
+        arrival = clamp(float(u_frame) * MAX_FRAMES_INV, 1e-3, 1.0);
+    }
+
+    // Cosmetic "echo" channel: lagging diffusion of R within the cone.
+    float echo_sum = fetch(pos + ivec3( 1, 0, 0)).b
+                   + fetch(pos + ivec3(-1, 0, 0)).b
+                   + fetch(pos + ivec3( 0, 1, 0)).b
+                   + fetch(pos + ivec3( 0,-1, 0)).b
+                   + fetch(pos + ivec3( 0, 0, 1)).b
+                   + fetch(pos + ivec3( 0, 0,-1)).b;
+    float echo_new = mix(self.b, echo_sum / 6.0, 0.5) * echo_mix
+                   + r_new * (1.0 - echo_mix) * 0.25;
+
+    imageStore(u_dst, pos, vec4(r_new, arrival, echo_new, src_amp));
+}
+""",
+
+    # ── Hopfion field CA ────────────────────────────────────────────────
+    #
+    # Maps each voxel to a unit 3-vector n̂ ∈ S² (R,G,B) and evolves the
+    # field by gradient descent on a Skyrme-like energy
+    #
+    #     E = ∫  (∇n)²  +  κ · |n × (∇n × n)|²    d³x
+    #
+    # The first term is plain elastic energy (would relax to uniform);
+    # the second term is the Skyrme stabiliser that gives finite-size
+    # soliton solutions a non-zero ground state. Topological charge =
+    # Hopf invariant H = link number of preimages of any two points on
+    # S². Initial condition is an analytic H=1 Hopfion (linked tubes).
+    #
+    # Channels: R,G,B = n̂   |   A = energy density (cosmetic, for vis).
+    #
+    # u_param0 = κ (Skyrme coupling, 0.05..2.0)
+    # u_param1 = damping (gradient-descent step size, 0..0.1)
+    # u_param2 = unused
+    # u_param3 = unused
+    "hopfion_3d": """
+vec3 nrm(vec3 v) {
+    float L = length(v);
+    return (L > 1e-8) ? v / L : vec3(0.0, 0.0, 1.0);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec3 n0 = nrm(fetch(pos).rgb);
+
+    // Central-difference gradients of each component of n.
+    vec3 nxp = fetch(pos + ivec3( 1, 0, 0)).rgb;
+    vec3 nxm = fetch(pos + ivec3(-1, 0, 0)).rgb;
+    vec3 nyp = fetch(pos + ivec3( 0, 1, 0)).rgb;
+    vec3 nym = fetch(pos + ivec3( 0,-1, 0)).rgb;
+    vec3 nzp = fetch(pos + ivec3( 0, 0, 1)).rgb;
+    vec3 nzm = fetch(pos + ivec3( 0, 0,-1)).rgb;
+
+    // Discrete Laplacian: drives gradient descent on (∇n)².
+    vec3 lap = (nxp + nxm + nyp + nym + nzp + nzm - 6.0 * n0);
+
+    // Skyrme stabiliser term (cheap approximation): penalise large
+    // gradient magnitudes weighted by κ. The full term is biquadratic in
+    // ∇n which is expensive — using |∇n|² · n as a proxy reproduces
+    // the qualitative effect (resists collapse of the soliton) at a
+    // fraction of the cost.
+    float gnsq = dot(nxp - nxm, nxp - nxm)
+               + dot(nyp - nym, nyp - nym)
+               + dot(nzp - nzm, nzp - nzm);
+    gnsq *= 0.25;
+
+    float kappa = clamp(u_param0, 0.0, 5.0);
+    float step  = clamp(u_param1, 0.0, 0.2);
+
+    // dn/dt = projection_perp_to_n( lap - kappa * gnsq * n )
+    vec3 force = lap - kappa * gnsq * n0;
+    // Project force perpendicular to n to keep |n|=1 to first order.
+    force -= dot(force, n0) * n0;
+
+    vec3 n_new = nrm(n0 + step * force);
+
+    // Energy density for visualisation.
+    float e_dens = 0.5 * gnsq + kappa * gnsq * gnsq * 0.05;
+
+    imageStore(u_dst, pos, vec4(n_new, e_dens));
+}
+""",
+
+    # ── Self-modifying genome CA ───────────────────────────────────────
+    #
+    # Each voxel carries TWO four-component vectors:
+    #   pair 1 (u_src/u_dst, R..A) = STATE  (s0,s1,s2,s3)
+    #   pair 2 (u_src2/u_dst2, R..A) = GENOME (w0,w1,w2,w3)
+    #
+    # Update for the STATE channel s0:
+    #   activity = w0*center + w1*sum6 + w2*sum_diag + w3*bias
+    #   s0_new = tanh(activity)
+    #   other state channels lag s0 (forms a 4-tap "memory").
+    #
+    # Update for the GENOME:
+    #   w_new = w_old + α * (avg_genome_neighbours - w_old)   (diffusion)
+    #         + β * mutation(rand_normal, frame)              (mutation)
+    #         + γ * activity_grad                             (reinforcement)
+    #
+    # The third term is the key mechanism: where activity is high,
+    # pre-existing genomes get amplified slightly. Different genome
+    # values produce different local rules, so spatial regions self-
+    # organise into "cultures" with their own update rule, competing for
+    # territory through their state-pattern coherence.
+    #
+    # Pass 0 (this shader): updates STATE  (writes pair 1)
+    # Pass 1 (genome_evolve_3d):           updates GENOME (writes pair 2)
+    "genome_state_3d": """
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 st = fetch(pos);
+    vec4 g  = imageLoad(u_src2, pos);
+
+    // Two state channels: u (excitatory) and v (recovery). Each voxel runs
+    // a parametric FitzHugh-Nagumo system whose four reaction parameters
+    // are read from the genome:
+    //   du/dt = u - u^3/3 - v + g0 + D*lap(u)
+    //   dv/dt = ε ( u - g1*v + g2 )
+    // Diffusion strength D = max(0, g3) so genome can switch the cell
+    // between diffusive and isolated.
+    float u_c = st.x;
+    float v_c = st.y;
+
+    // Discrete Laplacian of u and v using the 6 face neighbours. Diffusing
+    // BOTH species (with different diffusivities) is what turns the local
+    // bistable FN dynamics into a pattern-forming reaction-diffusion
+    // system: travelling fronts when D_u >> D_v, spirals when comparable.
+    vec4 nx_p = fetch(pos + ivec3( 1, 0, 0));
+    vec4 nx_m = fetch(pos + ivec3(-1, 0, 0));
+    vec4 ny_p = fetch(pos + ivec3( 0, 1, 0));
+    vec4 ny_m = fetch(pos + ivec3( 0,-1, 0));
+    vec4 nz_p = fetch(pos + ivec3( 0, 0, 1));
+    vec4 nz_m = fetch(pos + ivec3( 0, 0,-1));
+    float u_lap = nx_p.x + nx_m.x + ny_p.x + ny_m.x + nz_p.x + nz_m.x - 6.0 * u_c;
+    float v_lap = nx_p.y + nx_m.y + ny_p.y + ny_m.y + nz_p.y + nz_m.y - 6.0 * v_c;
+
+    float drive = clamp(u_param0, 0.5, 2.5);
+    // ε controls the slow recovery timescale; smaller → more oscillation.
+    float eps   = clamp(0.02 + (1.0 - u_param1) * 0.1, 0.01, 0.2);
+    // Per-voxel u diffusivity comes from the genome's 4th gene; v gets a
+    // small fixed diffusivity so the inhibitor can spread enough to break
+    // up uniform bistable noise.
+    float D_u   = max(0.0, g.w) * 1.0 + 0.2;
+    float D_v   = 0.05;
+
+    // Sub-step the FN integrator: the cubic term goes unstable for
+    // |dt_eff * (1 + u^2)| > ~0.5, so cap step size and iterate.
+    float dt_total = drive * u_dt;
+    int   sub      = max(1, int(ceil(dt_total / 0.2)));
+    float dt_eff   = dt_total / float(sub);
+
+    float u_new = u_c;
+    float v_new = v_c;
+    for (int k = 0; k < sub; ++k) {
+        float du = u_new - (u_new * u_new * u_new) / 3.0 - v_new + g.x + D_u * u_lap;
+        float dv = eps * (u_new - g.y * v_new + g.z) + D_v * v_lap;
+        u_new += dt_eff * du;
+        v_new += dt_eff * dv;
+    }
+
+    // Soft clamp prevents runaway from a degenerate genome.
+    u_new = clamp(u_new, -3.0, 3.0);
+    v_new = clamp(v_new, -3.0, 3.0);
+
+    // Memory channels: lag the previous u so the volume renderer shows
+    // wave fronts as a colour gradient.
+    float keep = clamp(u_param1, 0.5, 0.999);
+    vec4 st_new;
+    st_new.x = u_new;
+    st_new.y = v_new;
+    st_new.z = mix(st.z, st.x, 1.0 - keep);
+    st_new.w = mix(st.w, st.z, 1.0 - keep);
+
+    imageStore(u_dst, pos, st_new);
+}
+""",
+
+    "genome_evolve_3d": """
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch_g(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 g = imageLoad(u_src2, pos);
+
+    // 6-face genome average → diffusion / horizontal gene transfer.
+    vec4 nb = fetch_g(pos + ivec3( 1, 0, 0))
+            + fetch_g(pos + ivec3(-1, 0, 0))
+            + fetch_g(pos + ivec3( 0, 1, 0))
+            + fetch_g(pos + ivec3( 0,-1, 0))
+            + fetch_g(pos + ivec3( 0, 0, 1))
+            + fetch_g(pos + ivec3( 0, 0,-1));
+    vec4 g_avg = nb / 6.0;
+
+    float diffusion  = clamp(u_param2, 0.0, 0.5);   // gene flow rate
+    float mutation   = clamp(u_param3, 0.0, 0.05);  // mutation amplitude
+
+    // Mutation: small zero-mean Gaussian-ish perturbation.
+    vec4 mut = vec4(
+        hash_temporal(pos, 1) - 0.5,
+        hash_temporal(pos, 2) - 0.5,
+        hash_temporal(pos, 3) - 0.5,
+        hash_temporal(pos, 4) - 0.5);
+
+    // Reinforcement: where local STATE activity is high, current genome
+    // gets a tiny boost (amplifies whatever rule is producing the activity).
+    float local_activity = abs(fetch(pos).x);
+    vec4 reinforce = g * (local_activity * 0.005);
+
+    vec4 g_new = mix(g, g_avg, diffusion) + mutation * mut + reinforce;
+    g_new = clamp(g_new, vec4(-3.0), vec4(3.0));
+
+    imageStore(u_dst2, pos, g_new);
+}
+""",
+
+    # ── Active Nematic — Q-tensor field with passive-fluid coupling ────
+    #
+    # Order parameter: traceless symmetric Q ∈ ℝ³ˣ³, 5 independent
+    # components stored as
+    #
+    #   pair 1 (R,G,B,A) = (Qxx, Qyy, Qxy, Qxz)
+    #   pair 2 (R,G,B,A) = (Qyz, ux, uy, uz)         (velocity in pair 2)
+    #
+    # Qzz = -(Qxx + Qyy)  (traceless).
+    #
+    # We run a simplified Beris-Edwards-like dynamics:
+    #
+    #   ∂t Q = Γ · H            (relaxation toward energy minimum)
+    #   H    = -A·Q + κ·∇²Q     (Landau–de Gennes molecular field)
+    #   ∂t u = ν·∇²u + ζ·∇·Q   (active stress drives flow from Q gradients)
+    #   Q is then advected by u.
+    #
+    # Defects are 1-D disclination LINES where the order parameter has
+    # |Q|→0; they self-propel under activity ζ.
+    #
+    # Pass 0 (q_relax_3d): relax Q  (writes pair 1)
+    # Pass 1 (q_flow_3d):  update u from ∇·Q  (writes pair 2)
+    # Pass 2 (q_advect_3d): advect Q by u    (writes pair 1)
+    "q_relax_3d": """
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 q1c  = fetch(pos);                    // Qxx, Qyy, Qxy, Qxz
+    vec4 q2c  = imageLoad(u_src2, pos);        // Qyz, ux, uy, uz
+
+    // Laplacian of Q (each component independently).
+    vec4 q1xp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 q1xm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 q1yp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 q1ym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 q1zp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 q1zm = fetch(pos + ivec3( 0, 0,-1));
+    vec4 lap1 = (q1xp + q1xm + q1yp + q1ym + q1zp + q1zm - 6.0 * q1c);
+
+    float qyzc  = q2c.x;
+    float qyzxp = imageLoad(u_src2, ((pos + ivec3( 1, 0, 0)) + u_size) % u_size).x;
+    float qyzxm = imageLoad(u_src2, ((pos + ivec3(-1, 0, 0)) + u_size) % u_size).x;
+    float qyzyp = imageLoad(u_src2, ((pos + ivec3( 0, 1, 0)) + u_size) % u_size).x;
+    float qyzym = imageLoad(u_src2, ((pos + ivec3( 0,-1, 0)) + u_size) % u_size).x;
+    float qyzzp = imageLoad(u_src2, ((pos + ivec3( 0, 0, 1)) + u_size) % u_size).x;
+    float qyzzm = imageLoad(u_src2, ((pos + ivec3( 0, 0,-1)) + u_size) % u_size).x;
+    float lapq5 = (qyzxp + qyzxm + qyzyp + qyzym + qyzzp + qyzzm - 6.0 * qyzc);
+
+    // Landau–de Gennes molecular field with a nonlinear stabiliser:
+    //   H = (a - B·Tr(Q²)) Q + κ·∇²Q     where a = -A
+    // a > 0 (slider value < 0.5) drives ordering; the cubic term in B
+    // saturates |Q| at finite |Q|² ≈ a/B instead of letting it blow up
+    // or decay to zero from a zero-mean random init.
+    float A_coef = u_param0 - 0.5;             // < 0  → ordering
+    float K      = clamp(u_param1, 0.0, 1.0);
+    float gamma  = clamp(u_param2, 0.01, 1.0);
+    const float B = 6.0;                       // nonlinear saturation strength
+
+    // Tr(Q²) = Qxx² + Qyy² + Qzz² + 2(Qxy² + Qxz² + Qyz²),  Qzz=-(Qxx+Qyy)
+    float Qzz = -(q1c.x + q1c.y);
+    float trQ2 = q1c.x * q1c.x + q1c.y * q1c.y + Qzz * Qzz
+               + 2.0 * (q1c.z * q1c.z + q1c.w * q1c.w + qyzc * qyzc);
+    float drive = -A_coef - B * trQ2;          // diagonal effective stiffness
+
+    vec4 H1 = drive * q1c + K * lap1;
+    float H5 = drive * qyzc + K * lapq5;
+
+    vec4 q1_new = q1c + gamma * u_dt * H1;
+    float qyz_new = qyzc + gamma * u_dt * H5;
+
+    // Soft cap so the order parameter doesn't blow up.
+    q1_new = clamp(q1_new, vec4(-1.5), vec4(1.5));
+    qyz_new = clamp(qyz_new, -1.5, 1.5);
+
+    imageStore(u_dst, pos, q1_new);
+    // Preserve velocity components (q2 yzw); only update qyz (q2.x).
+    imageStore(u_dst2, pos, vec4(qyz_new, q2c.yzw));
+}
+""",
+
+    "q_flow_3d": """
+// Update velocity from active stress div(Q) and a small viscous Laplacian.
+// Reads Q (pair 1) + u (pair 2 yzw); writes new u (pair 2 yzw, qyz preserved).
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    p = ((p % u_size) + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 q1c = fetch(pos);
+    vec4 q2c = imageLoad(u_src2, pos);
+    vec3 u = q2c.yzw;
+
+    // Compute -∂_j Q_ij  (one-sided/central diff). With our packing:
+    // Q = [[Qxx, Qxy, Qxz],
+    //      [Qxy, Qyy, Qyz],
+    //      [Qxz, Qyz, Qzz=-Qxx-Qyy]]
+    //
+    // div Q | x = ∂x Qxx + ∂y Qxy + ∂z Qxz
+    // div Q | y = ∂x Qxy + ∂y Qyy + ∂z Qyz
+    // div Q | z = ∂x Qxz + ∂y Qyz + ∂z Qzz
+    vec4 q1xp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 q1xm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 q1yp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 q1ym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 q1zp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 q1zm = fetch(pos + ivec3( 0, 0,-1));
+
+    float qyzxp = fetch2(pos + ivec3( 1, 0, 0)).x;
+    float qyzxm = fetch2(pos + ivec3(-1, 0, 0)).x;
+    float qyzyp = fetch2(pos + ivec3( 0, 1, 0)).x;
+    float qyzym = fetch2(pos + ivec3( 0,-1, 0)).x;
+    float qyzzp = fetch2(pos + ivec3( 0, 0, 1)).x;
+    float qyzzm = fetch2(pos + ivec3( 0, 0,-1)).x;
+
+    float dQxx_dx = 0.5 * (q1xp.x - q1xm.x);
+    float dQxy_dy = 0.5 * (q1yp.z - q1ym.z);
+    float dQxz_dz = 0.5 * (q1zp.w - q1zm.w);
+
+    float dQxy_dx = 0.5 * (q1xp.z - q1xm.z);
+    float dQyy_dy = 0.5 * (q1yp.y - q1ym.y);
+    float dQyz_dz = 0.5 * (qyzzp - qyzzm);
+
+    float dQxz_dx = 0.5 * (q1xp.w - q1xm.w);
+    float dQyz_dy = 0.5 * (qyzyp - qyzym);
+    // Qzz = -(Qxx+Qyy)
+    float dQzz_dz = -0.5 * ((q1zp.x - q1zm.x) + (q1zp.y - q1zm.y));
+
+    vec3 divQ = vec3(dQxx_dx + dQxy_dy + dQxz_dz,
+                     dQxy_dx + dQyy_dy + dQyz_dz,
+                     dQxz_dx + dQyz_dy + dQzz_dz);
+
+    // Viscous Laplacian of u.
+    vec3 lap_u = fetch2(pos + ivec3( 1, 0, 0)).yzw + fetch2(pos + ivec3(-1, 0, 0)).yzw
+               + fetch2(pos + ivec3( 0, 1, 0)).yzw + fetch2(pos + ivec3( 0,-1, 0)).yzw
+               + fetch2(pos + ivec3( 0, 0, 1)).yzw + fetch2(pos + ivec3( 0, 0,-1)).yzw
+               - 6.0 * u;
+
+    float zeta = u_param3;                     // activity (the headline knob)
+    float nu   = clamp(0.05 + u_param1 * 0.1, 0.0, 0.3);
+    float damp = 0.02;
+
+    // Active stress σ^a = -ζ Q  ⇒  body force on fluid = -∂_j σ^a_ij = ζ ∂_j Q_ij.
+    vec3 u_new = u + u_dt * (zeta * divQ + nu * lap_u) * (1.0 - damp);
+
+    float vmax = 0.5 * float(u_size);
+    u_new = clamp(u_new, vec3(-vmax), vec3(vmax));
+
+    imageStore(u_dst2, pos, vec4(q2c.x, u_new));
+    imageStore(u_dst, pos, q1c);   // pass-through pair 1
+}
+""",
+
+    "q_advect_3d": """
+// Semi-Lagrangian advection of Q by u. Reads pair 1 (Q1234) + pair 2.x (Qyz)
+// and pair 2.yzw (u), writes advected Q to pair 1 dst.
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch_q1(vec3 p) {
+    vec3 pf = floor(p);
+    vec3 t  = p - pf;
+    ivec3 i = ivec3(pf);
+    vec4 c000 = fetch(i + ivec3(0,0,0));
+    vec4 c100 = fetch(i + ivec3(1,0,0));
+    vec4 c010 = fetch(i + ivec3(0,1,0));
+    vec4 c110 = fetch(i + ivec3(1,1,0));
+    vec4 c001 = fetch(i + ivec3(0,0,1));
+    vec4 c101 = fetch(i + ivec3(1,0,1));
+    vec4 c011 = fetch(i + ivec3(0,1,1));
+    vec4 c111 = fetch(i + ivec3(1,1,1));
+    vec4 x00 = mix(c000, c100, t.x);
+    vec4 x10 = mix(c010, c110, t.x);
+    vec4 x01 = mix(c001, c101, t.x);
+    vec4 x11 = mix(c011, c111, t.x);
+    vec4 y0 = mix(x00, x10, t.y);
+    vec4 y1 = mix(x01, x11, t.y);
+    return mix(y0, y1, t.z);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec3 u = imageLoad(u_src2, pos).yzw;
+
+    vec3 back = vec3(pos) - u * u_dt;
+    vec4 q1_adv = fetch_q1(back);
+
+    imageStore(u_dst, pos, q1_adv);
+}
+""",
+
+    # ─────────────────────────────────────────────────────────────────
+    # Lattice predator-prey CA. Real cellular automaton (one cell per
+    # voxel, discrete states). Two passes per tick:
+    #
+    #   pp_lattice_move  — movement, eating, metabolism, death
+    #   pp_lattice_repro — reproduction + food regrowth
+    #
+    # State per voxel (encoded in ch0/ch1; ch2/ch3 unused):
+    #   ch0 = kind:    0=empty, 1=food, 2=prey, 3=predator
+    #   ch1 = energy:  [0..1] (food has fixed nominal energy = 1)
+    #
+    # Movement is deterministic per-frame: every non-empty cell picks a
+    # random direction via hash(pos, frame). Each cell P then independently
+    # computes:
+    #   (a) which neighbour, if any, wants to move INTO P (incoming winner
+    #       chosen by lowest priority hash among all neighbours that
+    #       target P and can legally enter);
+    #   (b) whether P's own move out succeeded (P wins iff it is the
+    #       chosen winner among the source's-target's neighbours).
+    # This guarantees consistency across cells with no atomics.
+    #
+    # Eating: when an incoming creature enters a cell whose pre-state
+    # was edible (prey eats food, pred eats prey), the new cell's energy
+    # gets a bonus. If the cell escaped via out_succeeds, no bonus
+    # applies (the food/prey escaped).
+    # ─────────────────────────────────────────────────────────────────
+    "pp_lattice_move": """
+// Encoded state helpers.
+// kind: 0=empty 1=food 2=prey 3=predator
+
+// kind stored normalized so the renderer's [0,1] colormap gives 4
+// distinct hues. Using 0.25 / 0.50 / 0.75 (not 1.0) avoids the voxel
+// shader's "binary CA" branch that paints value~=1 as grayscale AO.
+// Decode as round(c.r * 4).
+uint pp_kind(vec4 c) { return uint(c.r * 4.0 + 0.5); }
+
+uint pp_hash(ivec3 p, uint salt) {
+    uint h = uint(p.x * 73856093) ^ uint(p.y * 19349663) ^ uint(p.z * 83492791)
+           ^ (uint(u_frame) * 2654435761u) ^ salt;
+    h ^= h >> 16; h *= 0x85ebca6bu;
+    h ^= h >> 13; h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+// Picks an offset in {-1,0,1}^3. Bias toward stay so creatures don't
+// thrash every step. Empty/food never move.
+ivec3 pp_pick_dir(ivec3 p, uint kind) {
+    if (kind < 2u) return ivec3(0);
+    uint h = pp_hash(p, 0xA5A5u);
+    uint r = h & 31u;
+    if (r >= 27u) return ivec3(0);     // 5/32 stay-bias
+    int dx = int(r % 3u) - 1;
+    int dy = int((r / 3u) % 3u) - 1;
+    int dz = int((r / 9u) % 3u) - 1;
+    return ivec3(dx, dy, dz);
+}
+
+uint pp_priority(ivec3 p) { return pp_hash(p, 0xC3D5u); }
+
+// Can a creature of kind `src` legally enter a cell of kind `dst`?
+//   prey  -> empty or food
+//   pred  -> empty or prey
+bool pp_can_enter(uint src, uint dst) {
+    if (src == 2u) return (dst == 0u || dst == 1u);
+    if (src == 3u) return (dst == 0u || dst == 2u);
+    return false;
+}
+
+float pp_metab(uint kind) {
+    if (kind == 2u) return u_param0;  // prey metab
+    if (kind == 3u) return u_param1;  // pred metab
+    return 0.0;
+}
+
+float pp_eat_bonus(uint mover, uint victim) {
+    if (mover == 2u && victim == 1u) return u_param2;  // prey ate food
+    if (mover == 3u && victim == 2u) return u_param3;  // pred ate prey
+    return 0.0;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    uint my_kind = pp_kind(self);
+    float my_energy = self.g;
+
+    // ── Find incoming winner ───────────────────────────────────────
+    // The neighbour (if any) that targets me, can legally enter, and
+    // has the lowest priority hash. We resolve this independently here
+    // and at every other cell — same inputs, same answer everywhere.
+    uint best_in_pri = 0xFFFFFFFFu;
+    bool has_incoming = false;
+    uint inc_kind = 0u;
+    float inc_energy = 0.0;
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        ivec3 npos = pos + ivec3(dx, dy, dz);
+        vec4 ns = fetch(npos);
+        uint nk = pp_kind(ns);
+        if (nk < 2u) continue;
+        ivec3 ndir = pp_pick_dir(npos, nk);
+        if (ndir != -ivec3(dx, dy, dz)) continue;
+        if (!pp_can_enter(nk, my_kind)) continue;
+        // Use absolute integer position for hashing (not the wrapped
+        // local offset) so hashes match across cells.
+        uint pri = pp_priority(npos);
+        if (pri < best_in_pri) {
+            best_in_pri = pri;
+            inc_kind = nk;
+            inc_energy = ns.g;
+            has_incoming = true;
+        }
+    }
+
+    // ── Determine if MY move succeeds ──────────────────────────────
+    // Replay the same scan at MY target cell to see who wins entering it.
+    bool out_succeeds = false;
+    if (my_kind >= 2u) {
+        ivec3 my_dir = pp_pick_dir(pos, my_kind);
+        if (my_dir != ivec3(0)) {
+            ivec3 tpos = pos + my_dir;
+            vec4 ts = fetch(tpos);
+            uint tk = pp_kind(ts);
+            if (pp_can_enter(my_kind, tk)) {
+                uint best_pri = 0xFFFFFFFFu;
+                ivec3 winner_off = ivec3(0);
+                for (int ez = -1; ez <= 1; ez++)
+                for (int ey = -1; ey <= 1; ey++)
+                for (int ex = -1; ex <= 1; ex++) {
+                    if (ex == 0 && ey == 0 && ez == 0) continue;
+                    ivec3 spos = tpos + ivec3(ex, ey, ez);
+                    vec4 ss = fetch(spos);
+                    uint sk = pp_kind(ss);
+                    if (sk < 2u) continue;
+                    ivec3 sdir = pp_pick_dir(spos, sk);
+                    if (sdir != -ivec3(ex, ey, ez)) continue;
+                    if (!pp_can_enter(sk, tk)) continue;
+                    uint pri = pp_priority(spos);
+                    if (pri < best_pri) {
+                        best_pri = pri;
+                        winner_off = ivec3(ex, ey, ez);
+                    }
+                }
+                if (winner_off == -my_dir) out_succeeds = true;
+            }
+        }
+    }
+
+    // ── Resolve new cell state ─────────────────────────────────────
+    uint new_kind;
+    float new_energy;
+
+    if (out_succeeds) {
+        // I left this cell. If someone moved in, they get NO eat bonus
+        // (whatever was here escaped before they arrived).
+        if (has_incoming) {
+            new_kind = inc_kind;
+            new_energy = inc_energy - pp_metab(inc_kind) * u_dt;
+        } else {
+            new_kind = 0u;
+            new_energy = 0.0;
+        }
+    } else {
+        // I stayed. Either I get overwritten (and possibly eaten) by
+        // an incoming, or I keep my own state minus metabolism.
+        if (has_incoming) {
+            new_kind = inc_kind;
+            new_energy = inc_energy
+                       + pp_eat_bonus(inc_kind, my_kind)
+                       - pp_metab(inc_kind) * u_dt;
+        } else {
+            new_kind = my_kind;
+            new_energy = my_energy - pp_metab(my_kind) * u_dt;
+        }
+    }
+
+    // Death by starvation.
+    if (new_kind >= 2u && new_energy <= 0.0) {
+        new_kind = 0u;
+        new_energy = 0.0;
+    }
+    new_energy = clamp(new_energy, 0.0, 1.5);
+
+    imageStore(u_dst, pos, vec4(float(new_kind) / 4.0, new_energy, 0.0, 0.0));
+}
+""",
+
+    "pp_lattice_repro": """
+// Reproduction + food regrowth pass.
+//
+// Each parent (prey/predator with energy > repro threshold) deterministically
+// targets ONE face-neighbour as its child slot via hash(parent, frame).
+// Each empty cell scans its 6 face neighbours; if any neighbour is a
+// parent that targets THIS empty cell, the cell becomes offspring of
+// that kind with HALF the parent's energy. Multiple-parent ties resolved
+// by lowest hash priority.
+//
+// Critically: the parent ALSO knows it reproduced (same hash answer)
+// and writes back its own halved energy. Empty cells without a parent
+// claim may regrow as food at low probability if surrounded by food.
+//
+// u_param0 = repro_thresh_prey
+// u_param1 = repro_thresh_pred
+// u_param2 = food_regrow_prob (per empty cell per tick)
+// u_param3 = (unused)
+
+uint ppr_kind(vec4 c) { return uint(c.r * 4.0 + 0.5); }
+
+uint ppr_hash(ivec3 p, uint salt) {
+    uint h = uint(p.x * 73856093) ^ uint(p.y * 19349663) ^ uint(p.z * 83492791)
+           ^ (uint(u_frame) * 2654435761u) ^ salt;
+    h ^= h >> 16; h *= 0x85ebca6bu;
+    h ^= h >> 13; h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+float ppr_repro_thresh(uint kind) {
+    if (kind == 2u) return u_param0;
+    if (kind == 3u) return u_param1;
+    return 1e9;
+}
+
+// Returns the face-neighbour offset this parent targets for reproduction,
+// or ivec3(0) if it doesn't want to reproduce this tick.
+ivec3 ppr_repro_dir(ivec3 p, uint kind, float energy) {
+    if (kind < 2u) return ivec3(0);
+    if (energy < ppr_repro_thresh(kind)) return ivec3(0);
+    uint h = ppr_hash(p, 0x77FAu);
+    uint r = h % 6u;
+    if (r == 0u) return ivec3(+1, 0, 0);
+    if (r == 1u) return ivec3(-1, 0, 0);
+    if (r == 2u) return ivec3(0, +1, 0);
+    if (r == 3u) return ivec3(0, -1, 0);
+    if (r == 4u) return ivec3(0, 0, +1);
+    return        ivec3(0, 0, -1);
+}
+
+uint ppr_priority(ivec3 p) { return ppr_hash(p, 0x9E37u); }
+
+const ivec3 FACES[6] = ivec3[6](
+    ivec3(+1, 0, 0), ivec3(-1, 0, 0),
+    ivec3(0, +1, 0), ivec3(0, -1, 0),
+    ivec3(0, 0, +1), ivec3(0, 0, -1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    uint my_kind = ppr_kind(self);
+    float my_energy = self.g;
+
+    // ── If I'm a parent, halve energy if I successfully reproduce ──
+    // (Whether the child slot is actually empty determines if reproduction
+    // happens. But we read the slot's CURRENT state directly to check.)
+    if (my_kind >= 2u && my_energy >= ppr_repro_thresh(my_kind)) {
+        ivec3 cdir = ppr_repro_dir(pos, my_kind, my_energy);
+        if (cdir != ivec3(0)) {
+            ivec3 cpos = pos + cdir;
+            vec4 cs = fetch(cpos);
+            uint ck = ppr_kind(cs);
+            if (ck == 0u || ck == 1u) {
+                // Child slot is empty/food → reproduction will succeed
+                // (assuming we win the hash tiebreak among other parents
+                // also targeting this cell — but if multiple parents
+                // target the same cell, we don't know here whether we
+                // won. To stay consistent, halve energy regardless: the
+                // "lost" parents simply pay the cost of trying. Cheap
+                // approximation, keeps the math local.)
+                my_energy = my_energy * 0.5;
+            }
+        }
+    }
+
+    // ── If I'm empty/food, see if a neighbour-parent claims me ─────
+    if (my_kind <= 1u) {
+        uint best_pri = 0xFFFFFFFFu;
+        uint child_kind = 0u;
+        float child_energy = 0.0;
+        for (int i = 0; i < 6; ++i) {
+            ivec3 d = FACES[i];
+            ivec3 ppos = pos + d;
+            vec4 ps = fetch(ppos);
+            uint pk = ppr_kind(ps);
+            if (pk < 2u) continue;
+            float pe = ps.g;
+            if (pe < ppr_repro_thresh(pk)) continue;
+            ivec3 prdir = ppr_repro_dir(ppos, pk, pe);
+            if (prdir != -d) continue;  // parent targets a different neighbour
+            uint pri = ppr_priority(ppos);
+            if (pri < best_pri) {
+                best_pri = pri;
+                child_kind = pk;
+                child_energy = pe * 0.5;
+            }
+        }
+        if (best_pri != 0xFFFFFFFFu) {
+            my_kind = child_kind;
+            my_energy = child_energy;
+        }
+        else if (my_kind == 0u) {
+            // Food regrowth: empty cells become food with low prob,
+            // boosted if neighbours already contain food.
+            float regrow_p = u_param2;
+            int food_neighbours = 0;
+            for (int i = 0; i < 6; ++i) {
+                if (ppr_kind(fetch(pos + FACES[i])) == 1u) food_neighbours++;
+            }
+            float local_boost = 1.0 + 0.5 * float(food_neighbours);
+            uint h = ppr_hash(pos, 0xF00Du);
+            float rnd = float(h & 0x00FFFFFFu) / float(0x01000000u);
+            if (rnd < regrow_p * local_boost * u_dt) {
+                my_kind = 1u;
+                my_energy = 1.0;
+            }
+        }
+    }
+
+    imageStore(u_dst, pos, vec4(float(my_kind) / 4.0, my_energy, 0.0, 0.0));
+}
+""",
+
+    # ─────────────────────────────────────────────────────────────────
+    # Discrete CAs added 2026-05 — covers gaps in the existing library:
+    #   sandpile_3d           self-organised criticality
+    #   greenberg_hastings_3d excitable / cyclic n-state CA
+    #   wireworld_3d          programmable 4-state circuit substrate
+    #   forest_fire_3d        SOC + critical percolation phase transition
+    #   sine_gordon_3d        wave PDE with topological soliton kinks
+    #   larger_than_life_3d   generalised Life with adjustable radius
+    #   prisoners_dilemma_3d  spatial game theory (Nowak–May)
+    #   xy_spin_3d            continuous-spin classical magnet
+    # ─────────────────────────────────────────────────────────────────
+    "sandpile_3d": """
+// 3D Abelian sandpile (Bak–Tang–Wiesenfeld) on a face-neighbour cubic lattice.
+//
+// Each cell stores its grain count in channel R (kept as a non-negative
+// float; conceptually integer 0,1,2,...). Critical threshold T (default 6
+// = number of face-neighbours): when count >= T the cell loses T grains
+// and each of its 6 face-neighbours gains 1.
+//
+// Standard SOC dynamics: grains rain down stochastically; topples cascade
+// in avalanches whose sizes follow a power-law distribution. Boundary
+// cells leak grains to "ground" (via Dirichlet boundary), which is what
+// keeps the system at the critical state.
+//
+// Synchronous parallel update is well-defined here because the rule is
+// abelian (the final configuration after any sequence of topples is
+// independent of the order). One synchronous sweep is one "discrete
+// time step" but takes many wall-clock steps to drain a large avalanche.
+//
+// u_param0 = Topple threshold T (4..12; default 6 = critical for 3D cubic)
+// u_param1 = Drop probability per cell per step
+// u_param2 = Drop amount (grains added when a drop fires)
+// u_param3 = Drop region (0=anywhere, 1=center cube only, 2=top face only)
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int T = clamp(int(u_param0 + 0.5), 2, 12);
+    float drop_p = clamp(u_param1, 0.0, 1.0);
+    float drop_amt = max(u_param2, 0.0);
+    int region = clamp(int(u_param3 + 0.5), 0, 2);
+
+    float self = max(fetch(pos).r, 0.0);
+    float Tf = float(T);
+
+    // (1) Topple loss: this cell sheds T grains if at threshold.
+    if (self >= Tf) self -= Tf;
+
+    // (2) Topple gain: each face neighbour at threshold sends 1 grain.
+    if (fetch(pos + ivec3( 1, 0, 0)).r >= Tf) self += 1.0;
+    if (fetch(pos + ivec3(-1, 0, 0)).r >= Tf) self += 1.0;
+    if (fetch(pos + ivec3( 0, 1, 0)).r >= Tf) self += 1.0;
+    if (fetch(pos + ivec3( 0,-1, 0)).r >= Tf) self += 1.0;
+    if (fetch(pos + ivec3( 0, 0, 1)).r >= Tf) self += 1.0;
+    if (fetch(pos + ivec3( 0, 0,-1)).r >= Tf) self += 1.0;
+
+    // (3) Stochastic grain rain.
+    bool in_region = true;
+    if (region == 1) {
+        ivec3 c = ivec3(u_size / 2);
+        ivec3 d = abs(pos - c);
+        in_region = all(lessThan(d, ivec3(u_size / 8)));
+    } else if (region == 2) {
+        in_region = pos.y >= u_size - 4;
+    }
+    if (in_region && hash_temporal(pos, 0) < drop_p) {
+        self += drop_amt;
+    }
+
+    // ch1 = is-supercritical (this cell will topple next step), ch2 = local-slope
+    // magnitude (rough avalanche pressure), ch3 = normalised height.
+    float supercrit = self >= Tf ? 1.0 : 0.0;
+    // Local slope: count face-neighbours strictly less than self (crude descent).
+    float lower = 0.0;
+    if (fetch(pos + ivec3( 1, 0, 0)).r < self) lower += 1.0;
+    if (fetch(pos + ivec3(-1, 0, 0)).r < self) lower += 1.0;
+    if (fetch(pos + ivec3( 0, 1, 0)).r < self) lower += 1.0;
+    if (fetch(pos + ivec3( 0,-1, 0)).r < self) lower += 1.0;
+    if (fetch(pos + ivec3( 0, 0, 1)).r < self) lower += 1.0;
+    if (fetch(pos + ivec3( 0, 0,-1)).r < self) lower += 1.0;
+    float slope = lower * (1.0/6.0);
+    float height01 = clamp(self / Tf, 0.0, 1.0);
+    imageStore(u_dst, pos, vec4(self, supercrit, slope, height01));
+}
+""",
+
+    "greenberg_hastings_3d": """
+// Greenberg–Hastings excitable medium — n-state cyclic CA.
+//
+// A rest cell (state 0) becomes excited (state 1) iff at least k of its
+// face-neighbours are in state 1. Excited cells (states 1..N-2) advance
+// deterministically: state s -> state s+1. The last "refractory" state
+// (N-1) returns to rest (0) after one step. This is a classical model
+// of cardiac tissue / cortical waves — produces target patterns,
+// rotating spirals (in 2D), and scroll waves / scroll rings (in 3D).
+//
+// Neighbourhood is the 6-cell von Neumann face neighbourhood (sharper
+// fronts than Moore; more authentic excitable-medium dynamics).
+//
+// Channel R stores state / (N-1) in [0,1].
+//
+// u_param0 = N      number of states (4..32)
+// u_param1 = k      neighbour threshold for excitation (1..6)
+// u_param2 = sp     spontaneous excitation probability per quiescent cell
+// u_param3 = decay  if 1, refractory state decays exponentially; if 0, instant
+
+int gh_state(ivec3 p, int N) {
+    return clamp(int(round(fetch(p).r * float(N - 1))), 0, N - 1);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int N  = clamp(int(u_param0 + 0.5), 4, 32);
+    int k  = clamp(int(u_param1 + 0.5), 1, 6);
+    float sp = clamp(u_param2, 0.0, 1.0);
+    int decay = int(u_param3 + 0.5);
+
+    int s = gh_state(pos, N);
+    int new_s;
+    int n_excited =
+          (gh_state(pos + ivec3( 1, 0, 0), N) == 1 ? 1 : 0)
+        + (gh_state(pos + ivec3(-1, 0, 0), N) == 1 ? 1 : 0)
+        + (gh_state(pos + ivec3( 0, 1, 0), N) == 1 ? 1 : 0)
+        + (gh_state(pos + ivec3( 0,-1, 0), N) == 1 ? 1 : 0)
+        + (gh_state(pos + ivec3( 0, 0, 1), N) == 1 ? 1 : 0)
+        + (gh_state(pos + ivec3( 0, 0,-1), N) == 1 ? 1 : 0);
+
+    if (s == 0) {
+        // Rest: become excited if enough excited face-neighbours, or
+        // spontaneously with small probability (acts as pacemaker noise).
+        bool fire = n_excited >= k;
+        if (!fire && sp > 0.0 && hash_temporal(pos, 0) < sp) fire = true;
+        new_s = fire ? 1 : 0;
+    } else if (s < N - 1) {
+        // Excited or refractory ramp: advance.
+        new_s = s + 1;
+    } else {
+        // Last state: relax to rest (or decay slowly if requested).
+        new_s = (decay == 1 && hash_temporal(pos, 1) > 0.5) ? s : 0;
+    }
+
+    float out_v = float(new_s) / float(max(N - 1, 1));
+    // ch1 = is_just_excited (rest → excited transition this step),
+    // ch2 = excited-neighbour fraction n_excited/6, ch3 = is_refractory (s == N-1).
+    float just_excited = (s == 0 && new_s == 1) ? 1.0 : 0.0;
+    float n_frac = float(n_excited) * (1.0/6.0);
+    float refractory = (s == N - 1) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(out_v, just_excited, n_frac, refractory));
+}
+""",
+
+    "wireworld_3d": """
+// 3D Wireworld — 4-state programmable substrate.
+//
+// Cell states (encoded in R, decoded as round(v*3)):
+//   0 = empty (vacuum, never changes)
+//   1 = electron head
+//   2 = electron tail
+//   3 = conductor (wire)
+//
+// Transition rule (synchronous, Moore-26 neighbourhood):
+//   empty       -> empty
+//   head        -> tail
+//   tail        -> conductor
+//   conductor   -> head iff exactly 1 or 2 head neighbours, else conductor
+//
+// In 3D the standard "1 or 2 heads" rule is a generalisation of Langton's
+// 2D Wireworld; with denser neighbourhoods we tighten the upper bound to
+// keep signal propagation directional.
+//
+// u_param0 = Head-low  (default 1): conductor becomes head if heads in
+//                      [head_low, head_high]. Lower bound clamps at 1.
+// u_param1 = Head-high (default 2): upper bound (1..6 typical).
+// u_param2 = Spontaneous-spark probability for conductor cells (per step).
+//            Useful for self-priming circuits; set to 0 for deterministic
+//            playback of pre-built circuits.
+// u_param3 = Decay rate for unused conductor → empty (0 = none, the
+//            classical rule). Non-zero values let circuits "rust" and
+//            produce evolving wire networks rather than static ones.
+
+int ww_state(ivec3 p) {
+    return clamp(int(round(fetch(p).r * 3.0)), 0, 3);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int s = ww_state(pos);
+    int hi_lo = clamp(int(u_param0 + 0.5), 1, 6);
+    int hi_hi = clamp(int(u_param1 + 0.5), hi_lo, 8);
+    float spark_p = clamp(u_param2, 0.0, 1.0);
+    float decay_p = clamp(u_param3, 0.0, 1.0);
+
+    int new_s = s;
+    if (s == 1) {
+        new_s = 2;          // head -> tail
+    } else if (s == 2) {
+        new_s = 3;          // tail -> conductor
+    } else if (s == 3) {
+        // Count head neighbours in the 26-Moore neighbourhood.
+        int n_head = 0;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0 && dz == 0) continue;
+            if (ww_state(pos + ivec3(dx, dy, dz)) == 1) n_head++;
+        }
+        if (n_head >= hi_lo && n_head <= hi_hi) {
+            new_s = 1;     // conductor + activation -> head
+        } else if (spark_p > 0.0 && hash_temporal(pos, 0) < spark_p) {
+            new_s = 1;     // pacemaker noise
+        } else if (decay_p > 0.0 && hash_temporal(pos, 1) < decay_p) {
+            new_s = 0;     // wire rusts
+        }
+    }
+    // empty (0) stays empty unless adjacent to active circuit -> grow wire
+    // when decay_p > 0 (otherwise stays empty forever, classical rule).
+    if (s == 0 && decay_p > 0.0) {
+        int n_cond = 0;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0 && dz == 0) continue;
+            int sn = ww_state(pos + ivec3(dx, dy, dz));
+            if (sn == 3) n_cond++;
+        }
+        if (n_cond >= 4 && hash_temporal(pos, 2) < decay_p * 0.1) {
+            new_s = 3;
+        }
+    }
+
+    // ch1/ch2/ch3 = one-hot (head, tail, conductor) so 'rgba_blend' renders
+    // each state in a distinct colour. ch0 must remain state/3 because the
+    // kernel reads it back via ww_state() on the next step.
+    float is_head = (new_s == 1) ? 1.0 : 0.0;
+    float is_tail = (new_s == 2) ? 1.0 : 0.0;
+    float is_cond = (new_s == 3) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(float(new_s) / 3.0, is_head, is_tail, is_cond));
+}
+""",
+
+    "forest_fire_3d": """
+// 3D Drossel–Schwabl forest fire (canonical SOC model).
+//
+// 3 states (encoded in R as 0.0 / 0.5 / 1.0):
+//   0   empty   ground
+//   0.5 tree    living biomass
+//   1.0 burning currently on fire
+//
+// One time step:
+//   - burning   -> empty
+//   - tree      -> burning iff any face-neighbour is burning,
+//                  OR with prob f (lightning)
+//   - empty     -> tree   with prob p (regrowth)
+//
+// At p << 1, f << p, the system self-organises to a critical state with
+// power-law fire-cluster sizes. Ratio f/p tunes between two extremes:
+// very low f gives huge synchronised firestorms, high f gives noisy
+// pointwise fires that never spread. p alone controls forest density.
+//
+// u_param0 = p  (regrowth probability per empty cell per step)
+// u_param1 = f  (lightning probability per tree cell per step)
+// u_param2 = mode (0 = face-neighbour ignition, 1 = Moore-26 ignition)
+// u_param3 = immunity (0..1) — fraction of trees that survive a fire
+//            (so completely burned ground is replaced with chance of
+//            "young trees" persisting). 0 = classical rule.
+
+int ff_state(ivec3 p) {
+    float v = fetch(p).r;
+    if (v > 0.75) return 2;       // burning
+    if (v > 0.25) return 1;       // tree
+    return 0;                     // empty
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float p_grow = clamp(u_param0, 0.0, 1.0);
+    float p_lite = clamp(u_param1, 0.0, 1.0);
+    int   moore  = int(u_param2 + 0.5);
+    float p_imm  = clamp(u_param3, 0.0, 1.0);
+
+    int s = ff_state(pos);
+    int new_s = s;
+
+    if (s == 2) {
+        // Burning -> ash, with a small chance of leaving a young tree.
+        new_s = (p_imm > 0.0 && hash_temporal(pos, 3) < p_imm) ? 1 : 0;
+    } else if (s == 1) {
+        // Tree: ignite if any neighbour is burning, or struck by lightning.
+        bool ignite = false;
+        if (moore == 1) {
+            for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                if (ff_state(pos + ivec3(dx, dy, dz)) == 2) { ignite = true; break; }
+            }
+        } else {
+            ignite =
+               ff_state(pos + ivec3( 1, 0, 0)) == 2
+            || ff_state(pos + ivec3(-1, 0, 0)) == 2
+            || ff_state(pos + ivec3( 0, 1, 0)) == 2
+            || ff_state(pos + ivec3( 0,-1, 0)) == 2
+            || ff_state(pos + ivec3( 0, 0, 1)) == 2
+            || ff_state(pos + ivec3( 0, 0,-1)) == 2;
+        }
+        if (!ignite && p_lite > 0.0 && hash_temporal(pos, 1) < p_lite) ignite = true;
+        new_s = ignite ? 2 : 1;
+    } else {
+        // Empty: regrow into a tree.
+        if (hash_temporal(pos, 2) < p_grow) new_s = 1;
+    }
+
+    float out_v = float(new_s) * 0.5;   // 0, 0.5, 1.0
+    // ch1 = is_burning (was state 2 last step), ch2 = is_tree (state 1 last step),
+    // ch3 = just_ignited (transition to fire). Use 'rgba_blend' / 'rgb_channels'.
+    float was_burning = (s == 2) ? 1.0 : 0.0;
+    float was_tree    = (s == 1) ? 1.0 : 0.0;
+    float just_ignite = (s == 1 && new_s == 2) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(out_v, was_burning, was_tree, just_ignite));
+}
+""",
+
+    "sine_gordon_3d": """
+// 3D sine–Gordon equation:    ∂²u/∂t² = c² ∇²u − sin(u)
+//
+// A nonlinear wave equation that admits topological soliton solutions —
+// "kinks" connecting vacua at u = 0 and u = 2π. In 3D these become
+// 2D wall-like surfaces ("π-walls") that move, collide, and reconnect.
+// The sin nonlinearity creates a periodic potential V(u) = 1 − cos(u)
+// that traps the field between integer multiples of 2π.
+//
+// State layout (re-uses the wave-equation channel scheme):
+//   ch0 = u       field value  (in radians; wraps mod 2π for vis)
+//   ch1 = v       ∂u/∂t        (velocity)
+//   ch2/3        unused
+//
+// Time integration: explicit second-order leapfrog (Velocity Verlet).
+//   v_{n+1/2} = v_{n−1/2} + (c² ∇²u_n − sin(u_n) − γ v_{n−1/2}) Δt
+//   u_{n+1}   = u_n + v_{n+1/2} Δt
+// γ is an optional damping term — small γ removes high-freq numerical
+// noise while leaving solitons largely intact.
+//
+// u_param0 = c² wave speed squared (default 1.0; CFL: c²·dt² < 0.5)
+// u_param1 = γ  damping coefficient (0..0.1)
+// u_param2 = nonlinearity strength m² (default 1.0; m²=0 → linear waves)
+// u_param3 = drive amplitude — sinusoidal forcing at the centre (0..0.5)
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self = fetch(pos);
+    float u_val = self.r;
+    float v_val = self.g;
+
+    float c2 = max(u_param0, 0.0);
+    float gamma = clamp(u_param1, 0.0, 0.5);
+    float m2 = u_param2;
+    float drive = u_param3;
+
+    // 6-point Laplacian (sufficient for soliton dynamics; 19-point would
+    // be smoother but 2× slower on this rule which already does sin()).
+    float lap = (
+          fetch(pos + ivec3( 1, 0, 0)).r + fetch(pos + ivec3(-1, 0, 0)).r
+        + fetch(pos + ivec3( 0, 1, 0)).r + fetch(pos + ivec3( 0,-1, 0)).r
+        + fetch(pos + ivec3( 0, 0, 1)).r + fetch(pos + ivec3( 0, 0,-1)).r
+        - 6.0 * u_val) * h_sq;
+
+    // Force = c² ∇²u − m² sin(u) − γ v
+    float force = c2 * lap - m2 * sin(u_val) - gamma * v_val;
+
+    // Optional periodic drive at the geometric centre.
+    if (drive > 0.0) {
+        ivec3 c = ivec3(u_size / 2);
+        ivec3 d = abs(pos - c);
+        if (all(lessThan(d, ivec3(2)))) {
+            force += drive * sin(0.2 * float(u_frame));
+        }
+    }
+
+    float v_new = v_val + force * u_dt;
+    float u_new = u_val + v_new * u_dt;
+
+    imageStore(u_dst, pos, vec4(u_new, v_new, 0.0, 0.0));
+}
+""",
+
+    "larger_than_life_3d": """
+// Larger Than Life (LtL) — generalised 3D Game of Life with arbitrary
+// neighbourhood radius R. Bays (1987) and Evans (1996) showed that LtL
+// at radius 5 supports unique gliders that don't exist at radius 1.
+//
+// Neighbourhood is a cube of size (2R+1)³ minus the centre cell.
+// Birth iff (alive count in [B_min, B_max]); survival iff in [S_min, S_max].
+// Counts are integers up to ((2R+1)³ - 1) — at R=4 that's 728 neighbours,
+// so birth/survival ranges live in [0..N).
+//
+// Performance note: R=4 means 728 fetches/cell. We cap R at 4 and use the
+// direct fetch loop; shared-memory tiling would help but the tile
+// (8+2R)³ exceeds GPU shared-mem at R>3 so we skip it for simplicity.
+//
+// u_param0 = R         neighbourhood radius (1..4)
+// u_param1 = B_low     birth lower bound  (raw count)
+// u_param2 = B_high    birth upper bound  (raw count)
+// u_param3 = S_window  survival window centred on B_low: cells survive
+//                      iff alive count in [B_low − S_window, B_high + S_window].
+//                      Encoded this way to keep the rule to 4 params.
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int R = clamp(int(u_param0 + 0.5), 1, 4);
+    int B_low  = max(int(u_param1 + 0.5), 0);
+    int B_high = max(int(u_param2 + 0.5), B_low);
+    int S_win  = max(int(u_param3 + 0.5), 0);
+    int S_low  = max(B_low  - S_win, 0);
+    int S_high = B_high + S_win;
+
+    int alive = 0;
+    float self = fetch(pos).r;
+    for (int dz = -R; dz <= R; dz++)
+    for (int dy = -R; dy <= R; dy++)
+    for (int dx = -R; dx <= R; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        if (fetch(pos + ivec3(dx, dy, dz)).r > 0.5) alive++;
+    }
+
+    float result;
+    if (self < 0.5) {
+        result = (alive >= B_low && alive <= B_high) ? 1.0 : 0.0;
+    } else {
+        result = (alive >= S_low && alive <= S_high) ? 1.0 : 0.0;
+    }
+    // ch1 = neighbour-density normalised by max (variable with R), ch2 = |delta|.
+    int max_neigh = (2 * R + 1) * (2 * R + 1) * (2 * R + 1) - 1;
+    float density = float(alive) / float(max(max_neigh, 1));
+    imageStore(u_dst, pos, vec4(result, density, abs(result - self), 0.0));
+}
+""",
+
+    "prisoners_dilemma_3d": """
+// Spatial Prisoner's Dilemma (Nowak & May, 1992) on a 3D lattice.
+//
+// Each cell is a player with strategy s ∈ {0=defector, 1=cooperator}.
+// In each round, every cell plays one PD with each of its 26 Moore
+// neighbours and accumulates a payoff. The PD payoff matrix is
+// simplified to the canonical 1-parameter form:
+//
+//                       opp coop   opp defect
+//   self cooperate:        1            0
+//   self defect:           b            0
+//
+// where b > 1 is the "temptation". When b ∈ (1, 2) a defector beats a
+// neighbouring cooperator but two cooperators do better than two
+// defectors. After scoring, every cell adopts the strategy of the
+// highest-scoring cell in its own 27-cell Moore neighbourhood (incl.
+// self). This produces beautiful chaotic boundary patterns of evolving
+// cooperator clusters at b≈1.85.
+//
+// u_param0 = b         temptation payoff (1.0..2.5)
+// u_param1 = mut       mutation rate (0..0.05); chance to flip strategy
+// u_param2 = tie_keep  on payoff ties, keep own strategy (1) or random (0)
+// u_param3 = mode      0 = self-included neighbourhood, 1 = exclude self
+//                       (lit tradition is 0; 1 makes invasion easier).
+
+float pd_strat(ivec3 p) {
+    return fetch(p).r > 0.5 ? 1.0 : 0.0;
+}
+
+// Score for a single cell q given temptation b: each Moore neighbour
+// contributes (1 if self_coop && nb_coop) + (b if self_def && nb_coop).
+float pd_score(ivec3 q, float b) {
+    float s = pd_strat(q);
+    float total = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        float n = pd_strat(q + ivec3(dx, dy, dz));
+        if (s > 0.5 && n > 0.5) total += 1.0;
+        if (s < 0.5 && n > 0.5) total += b;
+    }
+    return total;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float b      = clamp(u_param0, 1.0, 3.0);
+    float mut    = clamp(u_param1, 0.0, 1.0);
+    int   tieKeep = int(u_param2 + 0.5);
+    int   excl   = int(u_param3 + 0.5);
+
+    float self_s = pd_strat(pos);
+    float best_score = (excl == 1) ? -1.0 : pd_score(pos, b);
+    float best_strat = self_s;
+    float self_score = pd_score(pos, b);
+    float coop_neigh = 0.0;
+
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        if (excl == 1 && dx == 0 && dy == 0 && dz == 0) continue;
+        ivec3 q = pos + ivec3(dx, dy, dz);
+        float sc = pd_score(q, b);
+        float st = pd_strat(q);
+        if (!(dx == 0 && dy == 0 && dz == 0)) coop_neigh += st;
+        if (sc > best_score) {
+            best_score = sc;
+            best_strat = st;
+        } else if (sc == best_score && st != best_strat) {
+            // Tie: prefer keeping our current strategy (tieKeep=1) or
+            // pick deterministically by hash for reproducibility (=0).
+            if (tieKeep == 0 && hash_temporal(pos, 0) < 0.5) best_strat = st;
+        }
+    }
+
+    if (mut > 0.0 && hash_temporal(pos, 1) < mut) {
+        best_strat = 1.0 - best_strat;
+    }
+    // ch1 = self payoff normalised by max-possible (b * 26 for an all-coop
+    // neighbourhood as a defector), ch2 = local cooperation fraction,
+    // ch3 = strategy-changed flag.
+    float score01 = clamp(self_score / (b * 26.0), 0.0, 1.0);
+    float coop01 = coop_neigh * (1.0/26.0);
+    float changed = (best_strat != self_s) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(best_strat, score01, coop01, changed));
+}
+""",
+
+    "xy_spin_3d": """
+// 3D classical XY model — continuous-spin generalisation of Ising.
+//
+// Each cell holds a 2D spin angle θ ∈ [0, 2π). Energy with one face
+// neighbour having angle θ' is E = −J cos(θ − θ'). Total local energy
+// is the sum over the 6 face-neighbours.
+//
+// Parallel Metropolis update on a 4-colouring of the lattice (the
+// natural extension of the 2-colour Ising checkerboard to 3D — using
+// only 2 colours here would still couple opposite faces of a 2x2x2
+// block on synchronous update). We use sublattice (x + 2y + 4z + 4f) % 8
+// for an 8-colouring which trivially avoids any neighbour conflict.
+//
+// State: ch0 holds θ / (2π) ∈ [0,1].  ch1..3 unused.
+//
+// u_param0 = T      temperature kT (0.1..5.0; T_KT ≈ 2.20 in 3D)
+// u_param1 = J      coupling (positive = ferromagnetic alignment)
+// u_param2 = h      external field along x-axis: −h cos(θ)
+// u_param3 = sigma  proposal width in radians (0.1..π); smaller = more
+//                   acceptance, larger = better mixing
+
+const float TWO_PI = 6.283185307179586;
+
+float xy_theta(ivec3 p) { return fetch(p).r * TWO_PI; }
+
+float xy_local_energy(ivec3 pos, float theta, float J, float h) {
+    float E = 0.0;
+    E -= J * cos(theta - xy_theta(pos + ivec3( 1, 0, 0)));
+    E -= J * cos(theta - xy_theta(pos + ivec3(-1, 0, 0)));
+    E -= J * cos(theta - xy_theta(pos + ivec3( 0, 1, 0)));
+    E -= J * cos(theta - xy_theta(pos + ivec3( 0,-1, 0)));
+    E -= J * cos(theta - xy_theta(pos + ivec3( 0, 0, 1)));
+    E -= J * cos(theta - xy_theta(pos + ivec3( 0, 0,-1)));
+    E -= h * cos(theta);
+    return E;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float theta = xy_theta(pos);
+
+    // 8-colouring: (x mod 2) + 2*(y mod 2) + 4*(z mod 2), advanced by frame.
+    int colour = (pos.x & 1) + 2 * (pos.y & 1) + 4 * (pos.z & 1);
+    int active_colour = u_frame & 7;
+    if (colour != active_colour) {
+        // Inactive sub-step: still emit cos/sin so the volume gets a phase
+        // colour everywhere (otherwise 7/8 of cells render flat).
+        imageStore(u_dst, pos, vec4(theta / TWO_PI, 0.5 + 0.5 * cos(theta),
+                                     0.5 + 0.5 * sin(theta), 0.0));
+        return;
+    }
+
+    float T = max(u_param0, 1e-3);
+    float J = u_param1;
+    float h = u_param2;
+    float sigma = clamp(u_param3, 0.05, 3.14);
+
+    float r1 = hash_temporal(pos, 0);
+    float r2 = hash_temporal(pos, 1);
+    float r3 = hash_temporal(pos, 2);
+
+    // Symmetric proposal in (-sigma, sigma).
+    float dtheta = (r1 - 0.5) * 2.0 * sigma;
+    float new_theta = theta + dtheta;
+
+    float E_old = xy_local_energy(pos, theta,    J, h);
+    float E_new = xy_local_energy(pos, new_theta, J, h);
+    float dE    = E_new - E_old;
+
+    bool accept = (dE <= 0.0) || (r2 < exp(-dE / T));
+    float out_theta = accept ? new_theta : theta;
+
+    // Wrap to [0, 2π).
+    out_theta = mod(out_theta, TWO_PI);
+    if (out_theta < 0.0) out_theta += TWO_PI;
+
+    // ch1 = 0.5+0.5*cos(θ), ch2 = 0.5+0.5*sin(θ) for an RGB phase wheel.
+    // ch3 = |Δθ| / π (Metropolis acceptance event magnitude).
+    float dtheta_eff = accept ? abs(dtheta) : 0.0;
+    imageStore(u_dst, pos, vec4(out_theta / TWO_PI,
+                                 0.5 + 0.5 * cos(out_theta),
+                                 0.5 + 0.5 * sin(out_theta),
+                                 clamp(dtheta_eff * (1.0/3.14159265), 0.0, 1.0)));
+}
+""",
 }
 
 # ── Element CA: separate compute header with SSBO for element properties ──
@@ -4496,6 +9068,676 @@ void main() {
 """
 
 
+# ── Agent CA: separate compute header with SSBO for mobile agents ─────────
+#
+# Agent rules implement Langton's-ant-style mobile turtles that walk over a
+# voxel grid, reading and modifying the cells they visit. The voxel grid is
+# bound to image units 0/1 (read+write SAME texture in place). The agent
+# state lives in an SSBO at binding 8.
+#
+# Dispatch is 1D over the agent count: workgroup (64,1,1), groups
+# ceil(N/64). Each thread handles one agent (thread i → agents[i]).
+#
+# Agent record (32 bytes, std430-aligned):
+#   ivec4 pos_dir;   // .xyz = grid position; .w = direction id (0..5)
+#   ivec4 state;     // reserved (per-rule scratch)
+#
+# Direction encoding (matches AGENT_DIRS in the host code):
+#   0=+X  1=-X  2=+Y  3=-Y  4=+Z  5=-Z
+
+AGENT_COMPUTE_HEADER = """
+#version 430
+layout(local_size_x=64, local_size_y=1, local_size_z=1) in;
+
+// Voxel grid bound IN PLACE: same texture on both image units, agents
+// read-modify-write the cells they visit.
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;
+
+struct Agent {
+    ivec4 pos_dir;   // .xyz = pos, .w = dir id (0..5)
+    ivec4 state;     // reserved per-rule
+};
+layout(std430, binding=8) buffer AgentBuf {
+    Agent agents[];
+};
+
+uniform int u_size;
+uniform float u_dt;
+uniform int u_boundary;
+uniform int u_frame;
+uniform int u_pass;
+uniform float u_param0;
+uniform float u_param1;
+uniform float u_param2;
+uniform float u_param3;
+
+// 6 axis-aligned direction vectors. Order MUST match AGENT_DIRS in host.
+// Interleaved so consecutive entries are PERPENDICULAR (each +1 step is a
+// 90° turn around some axis, never a 180° axis flip). Opposites are
+// always 3 apart, so dir^3 (XOR with bit 0b11... actually +3 mod 6) is
+// the reverse direction.
+const ivec3 DIR[6] = ivec3[6](
+    ivec3( 1, 0, 0), ivec3( 0, 1, 0), ivec3( 0, 0, 1),
+    ivec3(-1, 0, 0), ivec3( 0,-1, 0), ivec3( 0, 0,-1)
+);
+
+ivec3 wrap_pos(ivec3 p) {
+    return ((p % u_size) + u_size) % u_size;
+}
+"""
+
+
+AGENT_RULES = {
+    "langton_ant_3d": """
+// 3D Langton's ant.
+//
+// Voxel grid: R channel holds a binary colour (0 or 1).
+// Agent state.x = no. of right-turns accumulated (debug only).
+//
+// Per agent per step:
+//   1. Read colour at agent.pos.
+//   2. If colour==0 (white): turn "right" (next direction in cycle),
+//      flip cell to 1.
+//      If colour==1 (black): turn "left" (previous direction in cycle),
+//      flip cell to 0.
+//   3. Move forward one cell in the new direction (with wraparound).
+//
+// "Right"/"left" in 3D is just a permutation on the 6-direction set —
+// the rule isn't a faithful 3D extension of the 2D Langton's ant (no
+// canonical one exists), but it preserves the key property that
+// EXACTLY ONE cell flips per agent per step, which is what we validate.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(agents.length())) return;
+
+    Agent a = agents[i];
+    ivec3 pos = wrap_pos(a.pos_dir.xyz);
+    int  dir  = a.pos_dir.w;
+
+    // Read current colour (R channel).
+    float colour = imageLoad(u_grid_r, pos).x;
+    int  c       = int(round(colour));
+
+    int new_c;
+    int new_dir;
+    if (c == 0) {
+        // White → flip to black, turn "right" (cycle forward in DIR table).
+        new_c   = 1;
+        new_dir = (dir + 1) % 6;
+        a.state.x += 1;
+    } else {
+        // Black → flip to white, turn "left" (cycle backward).
+        new_c   = 0;
+        new_dir = (dir + 5) % 6;
+    }
+
+    // Write the flipped cell. Preserve other channels (G/B/A) for any
+    // downstream visualisation.
+    vec4 cell = imageLoad(u_grid_r, pos);
+    cell.x = float(new_c);
+    imageStore(u_grid_w, pos, cell);
+
+    // Advance to the next cell.
+    ivec3 new_pos = wrap_pos(pos + DIR[new_dir]);
+
+    a.pos_dir = ivec4(new_pos, new_dir);
+    agents[i] = a;
+}
+""",
+
+    "smugglers_carriers_3d": """
+// Smuggler's Standoff — carrier (agent) pass.
+//
+// Two teams of carriers (red, blue) ferry packages from their own home
+// to the enemy's home across a procedurally-generated terrain.
+// Carriers have FINITE LIFETIMES — too long in transit and they
+// expire.  Combat with the opposing team also kills.  On death (or on
+// successful delivery), the agent enters a respawn delay whose length
+// scales with home contamination: a contaminated home has fewer
+// active carriers, so the disadvantage compounds.
+//
+// Agent record (8 ints):
+//   pos_dir.x = float position.x   (intBitsToFloat)
+//   pos_dir.y = float position.y
+//   pos_dir.z = float position.z
+//   pos_dir.w = team (0 = red, 1 = blue)
+//   state.x   = float velocity.x
+//   state.y   = float velocity.y
+//   state.z   = float velocity.z
+//   state.w   = packed status:
+//                 bit  0    = alive   (1 = active, 0 = respawning)
+//                 bit  1    = carrying cargo (only meaningful if alive)
+//                 bits 2-15 = respawn timer (steps until next spawn)
+//                 bits 16-31= lifetime remaining (steps until expiry)
+//
+// Voxel grid (in-place — the smugglers_field_3d decay pass ran first):
+//   R = red stash   (carriers ADD on delivery / cargo-drop)
+//   G = blue stash
+//   B = signed tracer  (red ADD +tracer_amt, blue ADD -tracer_amt;
+//                       enemy-detection looks at sign + magnitude)
+//   A = terrain        (1.0 = wall, 0.0 = open; READ ONLY here)
+//
+// u_param0 = carrier speed
+// u_param1 = base respawn delay  (steps; scaled up by home contamination)
+// u_param2 = combat threshold    (|tracer| level that kills carrier)
+// u_param3 = contamination scale (multiplies respawn delay)
+
+// Each team's "home" is a thin slab along one X edge of the box.
+// Carriers spawn and deliver across the FULL Z extent of their
+// team's edge wall, not bunched at a single midpoint, so the action
+// fills the arena instead of forming one congested midfield lane.
+//
+// Within the slab, each carrier owns a deterministic Z-lane keyed by
+// agent id — that's its personal spawn point AND the point on the
+// enemy edge it delivers to.  Per-agent lanes mean delivery piles
+// fan out along the full enemy edge and individual carriers don't
+// fight each other for the same delivery cell.
+//
+// Y is GROUND (=2) + ~10% of size, just above the cleared spawn slab
+// carved by _smugglers_terrain.
+float agent_hash(uint seed);   // forward decl
+
+float home_y()     { return 2.0 + float(u_size) * 0.10; }
+float home_x_red() { return float(u_size) * 0.05; }
+float home_x_blue(){ return float(u_size) * 0.95; }
+float home_radius(){ return float(u_size) * 0.10; }
+const int LIFETIME_MAX = 480;   // ~120 unit-time at dt=0.25
+
+vec3 own_home_for(uint i, int team, bool large) {
+    // Paired carriers (large packages) share a single Z-lane so the
+    // two halves of the pair spawn next to each other and walk in
+    // lockstep.  Use the even sibling's id as the lane key.
+    uint lane_key = large ? (i & ~1u) : i;
+    float margin = float(u_size) * 0.08;
+    float zlane  = margin + agent_hash(lane_key * 0xDEADBEEFu)
+                          * (float(u_size) - 2.0 * margin);
+    float x = (team == 0) ? home_x_red() : home_x_blue();
+    return vec3(x, home_y(), zlane);
+}
+vec3 enemy_home_for(uint i, int team, bool large) {
+    return own_home_for(i, 1 - team, large);
+}
+// Centerline reference (for contamination sampling — averages over
+// the whole edge slab implicitly via radius).
+vec3 red_home_center()  { return vec3(home_x_red(),  home_y(), float(u_size) * 0.50); }
+vec3 blue_home_center() { return vec3(home_x_blue(), home_y(), float(u_size) * 0.50); }
+
+// Package pickup point.  Each team has its own pickup zone biased
+// toward its side of midfield (red x ≈ 0.40, blue x ≈ 0.60) so the
+// pickup phase is short and most travel is the delivery leg into
+// enemy territory.  The two zones overlap at the centre band where
+// carriers from both teams can clash.
+//
+// Each carrier id has a deterministic pickup slot keyed by (id,
+// large).  Paired carriers share a slot so the two halves of a
+// co-op pair arrive at the same package and meet to lift it.
+vec3 pickup_for(uint i, int team, bool large) {
+    uint key = large ? (i & ~1u) : i;
+    float margin = float(u_size) * 0.10;
+    // Z spreads across ~80% of the arena — lots of distinct slots.
+    float zlane = margin + agent_hash(key * 0xCAFEBABEu)
+                          * (float(u_size) - 2.0 * margin);
+    // X centred on team's side of midfield with ±10% jitter — zones
+    // overlap in the central [≈0.50] band where teams clash.
+    float x_center = (team == 0) ? float(u_size) * 0.40
+                                 : float(u_size) * 0.60;
+    float xjit = (agent_hash(key * 0xBEEFFACEu) - 0.5)
+                  * float(u_size) * 0.20;
+    return vec3(x_center + xjit, home_y(), zlane);
+}
+float pickup_radius() { return float(u_size) * 0.07; }
+
+float agent_hash(uint seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15);
+    return float(seed & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+bool is_wall(ivec3 c) {
+    c = clamp(c, ivec3(0), ivec3(u_size - 1));
+    return imageLoad(u_grid_r, c).a > 0.5;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(agents.length())) return;
+
+    Agent a = agents[i];
+
+    // ── Decode state ───────────────────────────────────────────────
+    vec3 p   = vec3(intBitsToFloat(a.pos_dir.x),
+                    intBitsToFloat(a.pos_dir.y),
+                    intBitsToFloat(a.pos_dir.z));
+    int  team_raw = a.pos_dir.w;
+    int  team     =  team_raw & 0x1;
+    bool large    = (team_raw & 0x2) != 0;     // large-package pair
+    uint partner  = i ^ 1u;                    // valid only if large
+    vec3 v   = vec3(intBitsToFloat(a.state.x),
+                    intBitsToFloat(a.state.y),
+                    intBitsToFloat(a.state.z));
+    int status   = a.state.w;
+    int alive    =  status        & 0x1;
+    int carrying = (status >> 1)  & 0x1;
+    int respawn  = (status >> 2)  & 0x3FFF;     // 14 bits
+    int lifetime = (status >> 16) & 0xFFFF;     // 16 bits
+
+    vec3 own_home = own_home_for(i, team, large);
+    vec3 enemy    = enemy_home_for(i, team, large);
+    // Large packages move slower (heavier load) — both halves of
+    // the pair scale equally so they stay synchronised.
+    float speed   = u_param0 * (large ? 0.6 : 1.0);
+    float r_home  = home_radius();
+
+    // ── Partner-link sync (large-package pairs only) ──────────────
+    // Read partner state through the SSBO.  If the partner is dead
+    // while we're still carrying, the package is too heavy for one
+    // carrier — drop it (carrying=0) but stay alive so this carrier
+    // can plod home empty-handed.  The decay shader will eventually
+    // mop up any partial deposits we made along the way.
+    bool partner_alive  = false;
+    bool partner_in_home= false;
+    vec3 partner_pos    = vec3(0.0);
+    if (large && int(partner) < agents.length()) {
+        Agent ap = agents[partner];
+        partner_alive = (ap.state.w & 0x1) == 1;
+        partner_pos   = vec3(intBitsToFloat(ap.pos_dir.x),
+                             intBitsToFloat(ap.pos_dir.y),
+                             intBitsToFloat(ap.pos_dir.z));
+        partner_in_home = (distance(partner_pos, enemy) < r_home);
+        if (alive == 1 && carrying == 1 && !partner_alive) {
+            carrying = 0;     // package dropped, partner gone
+        }
+    }
+
+    // ── DEAD branch: tick respawn timer, no movement, no tracer ───
+    if (alive == 0) {
+        respawn = max(respawn - 1, 0);
+        if (respawn == 0) {
+            // Spawn at a random open cell inside own home.  Try a
+            // handful of jittered candidates; if all are walls, fall
+            // back to the home centre (worst case the carrier is
+            // briefly stuck and bounces out next step).
+            vec3 sp = own_home;
+            for (int attempt = 0; attempt < 8; attempt++) {
+                float h1 = agent_hash(i * 131u + uint(u_frame) + uint(attempt) * 17u);
+                float h2 = agent_hash(i * 977u + uint(u_frame) + uint(attempt) * 31u);
+                float h3 = agent_hash(i * 313u + uint(u_frame) + uint(attempt) * 53u);
+                vec3 cand = own_home + (vec3(h1, h2, h3) - 0.5) * (r_home * 1.4);
+                cand = clamp(cand, vec3(0.0), vec3(u_size - 1));
+                if (!is_wall(ivec3(cand + 0.5))) { sp = cand; break; }
+            }
+            p = sp;
+            // Initial heading: at the package pickup, not the enemy.
+            vec3 dir = pickup_for(i, team, large) - p;
+            float L = length(dir);
+            v = (L > 1e-3) ? dir / L * speed : vec3(0.0, 0.0, speed);
+            alive    = 1;
+            carrying = 0;        // empty-handed — must collect a package
+            lifetime = LIFETIME_MAX;
+        }
+        // Park dead agents at their respawn-anchor (own_home) so they
+        // don't pile up at their death location and clutter the view.
+        if (alive == 0) p = own_home;
+        // Pack and write — skip movement and tracer deposit.
+        status = (alive & 0x1)
+               | ((carrying & 0x1) << 1)
+               | ((max(respawn,  0) & 0x3FFF) << 2)
+               | ((max(lifetime, 0) & 0xFFFF) << 16);
+        a.pos_dir = ivec4(floatBitsToInt(p.x), floatBitsToInt(p.y),
+                          floatBitsToInt(p.z), team_raw);
+        a.state   = ivec4(floatBitsToInt(v.x), floatBitsToInt(v.y),
+                          floatBitsToInt(v.z), status);
+        agents[i] = a;
+        return;
+    }
+
+    // ── ALIVE branch: tick lifetime, may die from timeout ─────────
+    lifetime -= 1;
+
+    // Read field at current cell.
+    ivec3 cell = clamp(ivec3(p + 0.5), ivec3(0), ivec3(u_size - 1));
+    vec4 here  = imageLoad(u_grid_r, cell);
+    // Enemy tracer: red sees blue (b < 0), blue sees red (b > 0).
+    float enemy_tracer = (team == 0) ? -here.b : here.b;
+
+    // ── Death conditions ──────────────────────────────────────────
+    bool died_combat  = (enemy_tracer > u_param2);
+    bool died_timeout = (lifetime <= 0);
+
+    // ── Package pickup ────────────────────────────────────────────
+    // Empty-handed carriers walk to a midfield pickup point.  When
+    // close enough they collect the package (carrying = 1).  Co-op
+    // pairs must arrive together: both halves must be inside the
+    // pickup radius before either picks up.  This forces pairs to
+    // physically meet at the package before lifting it.
+    vec3 pickup_pt = pickup_for(i, team, large);
+    float pkup_r   = pickup_radius();
+    if (carrying == 0) {
+        bool self_at_pickup = (distance(p, pickup_pt) < pkup_r);
+        if (large) {
+            bool partner_at_pickup = partner_alive
+                && (distance(partner_pos, pickup_pt) < pkup_r);
+            if (self_at_pickup && partner_at_pickup) carrying = 1;
+        } else if (self_at_pickup) {
+            carrying = 1;
+        }
+    }
+
+    // Single-carrier delivery: only when self is in the enemy home.
+    // Co-op delivery: large packages need BOTH halves of the pair to
+    // be in the enemy home simultaneously.  An unpaired large
+    // carrier (partner already dead, package dropped) cannot
+    // deliver.
+    bool self_in_home = (distance(p, enemy) < r_home);
+    bool delivered;
+    if (large) {
+        delivered = (carrying == 1) && self_in_home && partner_alive
+                    && partner_in_home;
+    } else {
+        delivered = (carrying == 1) && self_in_home;
+    }
+
+    if (died_combat || died_timeout || delivered) {
+        // Deposit at a per-carrier-unique cell to avoid imageStore
+        // race conditions.  RGBA32F image stores have no atomic add,
+        // so concurrent writers to the same cell wipe each other out.
+        // For deliveries we offset from the enemy home centre by a
+        // deterministic agent-id-based jitter so each carrier hits a
+        // distinct slot in a small bounding box, building up a
+        // visible pile via cell-coverage rather than per-cell value.
+        if (delivered) {
+            // Co-op pairs: only the EVEN-indexed half deposits, so a
+            // pair never double-stamps (and never races itself).  The
+            // odd half just consumes its lifetime / triggers respawn
+            // alongside the depositor.
+            bool is_depositor = (!large) || ((i & 1u) == 0u);
+            // Use the pair's shared lane id so the two halves of the
+            // pair would have written to the same offset anyway \u2014
+            // and so co-op piles cluster at the lane endpoint.
+            uint hash_id = large ? (i & ~1u) : i;
+            ivec3 hc = ivec3(enemy + 0.5);
+            int dx = int(agent_hash(hash_id * 1664525u)    * 7.0) - 3;
+            int dy = int(agent_hash(hash_id * 1013904223u) * 5.0) - 2;
+            int dz = int(agent_hash(hash_id * 2654435761u) * 7.0) - 3;
+            ivec3 q = clamp(hc + ivec3(dx, dy, dz),
+                            ivec3(0), ivec3(u_size - 1));
+            // Walk down to the first non-wall cell so deposits land
+            // on top of the terrain rather than buried inside it.
+            for (int up = 0; up < 6; up++) {
+                if (!is_wall(q)) break;
+                q.y = min(q.y + 1, u_size - 1);
+            }
+            // Large packages drop a 3\u00d7 payload; small a 1\u00d7.
+            float own_amt   = large ? 24.0 : 8.0;
+            float shadow_amt= large ?  6.0 : 2.0;
+            if (is_depositor) {
+                vec4 qv = imageLoad(u_grid_r, q);
+                if (team == 0) {
+                    qv.r = min(qv.r + own_amt,    30.0);
+                    qv.g = min(qv.g + shadow_amt, 30.0);
+                } else {
+                    qv.g = min(qv.g + own_amt,    30.0);
+                    qv.r = min(qv.r + shadow_amt, 30.0);
+                }
+                imageStore(u_grid_w, q, qv);
+            }
+        } else if (carrying == 1) {
+            // Death-with-cargo: small debris at the death cell.
+            vec4 cur = imageLoad(u_grid_r, cell);
+            if (team == 0) {
+                cur.r = min(cur.r + 0.6, 8.0);
+                cur.g = min(cur.g + 0.2, 8.0);
+            } else {
+                cur.g = min(cur.g + 0.6, 8.0);
+                cur.r = min(cur.r + 0.2, 8.0);
+            }
+            imageStore(u_grid_w, cell, cur);
+        }
+
+        // Compute respawn delay based on current home contamination.
+        // Sample MAX enemy-stash density in the home box (stride-2
+        // sweep keeps cost manageable) — peaks register strongly.
+        ivec3 hc = clamp(ivec3(own_home + 0.5),
+                         ivec3(0), ivec3(u_size - 1));
+        float cont_max = 0.0;
+        int R = max(1, int(home_radius()));
+        for (int dz = -R; dz <= R; dz += 2)
+        for (int dy = -R; dy <= R; dy += 2)
+        for (int dx = -R; dx <= R; dx += 2) {
+            ivec3 q = clamp(hc + ivec3(dx, dy, dz),
+                            ivec3(0), ivec3(u_size - 1));
+            cont_max = max(cont_max,
+                (team == 0) ? imageLoad(u_grid_r, q).g
+                            : imageLoad(u_grid_r, q).r);
+        }
+        float jitter = 0.5 + agent_hash(i + 0xABCDu);   // 0.5..1.5
+        float scaled = u_param1 * (1.0 + u_param3 * cont_max) * jitter;
+        // Co-op partners share the EVEN sibling's respawn jitter so
+        // both halves of a pair come back at the same time.
+        if (large) {
+            float jeven = 0.5 + agent_hash((i & ~1u) + 0xABCDu);
+            scaled = u_param1 * (1.0 + u_param3 * cont_max) * jeven;
+        }
+
+        alive    = 0;
+        carrying = 0;
+        respawn  = clamp(int(scaled), 1, 0x3FFF);
+        // Park at home anchor while dead (see DEAD branch comment).
+        p = own_home;
+        v = vec3(0.0);
+        lifetime = 0;
+
+        status = (alive & 0x1)
+               | ((carrying & 0x1) << 1)
+               | ((max(respawn,  0) & 0x3FFF) << 2)
+               | ((max(lifetime, 0) & 0xFFFF) << 16);
+        a.pos_dir = ivec4(floatBitsToInt(p.x), floatBitsToInt(p.y),
+                          floatBitsToInt(p.z), team_raw);
+        a.state   = ivec4(floatBitsToInt(v.x), floatBitsToInt(v.y),
+                          floatBitsToInt(v.z), status);
+        agents[i] = a;
+        return;
+    }
+
+    // ── Steering (XZ horizontal only — gravity owns Y) ────────────
+    // Carriers are ground-bound: they push themselves toward the
+    // target in the XZ plane and let gravity pull them down.  When
+    // they hit an obstacle, they jump (apply an upward impulse) so
+    // they can climb hills and clear short fences.
+    //
+    // Each carrier gets a personal Z-lane offset (deterministic per
+    // agent id) so they spread out across a wide front instead of
+    // bunching into a single corridor and slaughtering each other at
+    // midfield.  The offset shrinks as the carrier gets closer to the
+    // target so the final approach actually reaches the home sphere.
+    // Carrying a package → take it to the enemy home.
+    // Empty-handed → walk to the midfield pickup point.
+    vec3 target    = (carrying == 1) ? enemy : pickup_pt;
+    float lane_amp = (agent_hash(i * 2654435761u) - 0.5) * float(u_size) * 0.45;
+    float dx_norm  = clamp(abs(target.x - p.x) / float(u_size), 0.0, 1.0);
+    float lane_off = lane_amp * smoothstep(0.10, 0.45, dx_norm);
+    vec3 lane_tgt  = vec3(target.x, target.y, target.z + lane_off);
+    vec2 toward2   = vec2(lane_tgt.x - p.x, lane_tgt.z - p.z);
+    float L2       = length(toward2);
+    if (L2 > 1e-3) {
+        vec2 desired = toward2 / L2 * speed;
+        float k = clamp(4.0 * u_dt, 0.0, 1.0);
+        v.x = mix(v.x, desired.x, k);
+        v.z = mix(v.z, desired.y, k);
+    }
+
+    // Per-step horizontal noise wiggle — each carrier finds its own
+    // route through the obstacle field.
+    uint seed = i * 1664525u + uint(u_frame) * 1013904223u;
+    float n1 = agent_hash(seed)         - 0.5;
+    float n3 = agent_hash(seed + 257u)  - 0.5;
+    v.x += n1 * speed * 0.5 * u_dt;
+    v.z += n3 * speed * 0.5 * u_dt;
+
+    // Clamp horizontal speed; vertical handled separately by gravity.
+    float h_spd = length(vec2(v.x, v.z));
+    float h_max = speed * 1.5;
+    if (h_spd > h_max) { v.x *= h_max / h_spd; v.z *= h_max / h_spd; }
+
+    // ── Gravity + obstacle jumping ─────────────────────────────────
+    // Constant downward acceleration.  Tunable via a hard-coded
+    // constant (kept off the param list — feels like a physics
+    // attribute of the world rather than a knob to tweak).
+    const float GRAVITY  = 9.0;
+    const float JUMP_VEL = 11.0;    // ~6 cells of clearance vs gravity
+    v.y -= GRAVITY * u_dt;
+    // Terminal-velocity clamp so they don't accumulate to absurdity.
+    v.y = clamp(v.y, -12.0, 12.0);
+
+    // Look one cell ahead in the direction of horizontal motion.  If
+    // there's a wall there AND our feet are on the ground (cell
+    // immediately below is a wall), apply an upward impulse — this is
+    // how carriers climb hills and hop fences.  When the cell ahead
+    // is more than one cell tall (a fence rather than a hill), give
+    // up on jumping and add a Z-axis lateral kick to encourage the
+    // carrier to slide along the fence and find the gap.
+    ivec3 base    = ivec3(p + 0.5);
+    ivec3 below   = ivec3(base.x, base.y - 1, base.z);
+    bool on_ground = (base.y <= 0) || is_wall(below);
+    if (on_ground) {
+        int fx = (abs(v.x) > abs(v.z))
+                 ? (v.x > 0.0 ? 1 : -1) : 0;
+        int fz = (abs(v.z) >= abs(v.x))
+                 ? (v.z > 0.0 ? 1 : -1) : 0;
+        ivec3 ahead = ivec3(base.x + fx, base.y, base.z + fz);
+        if (is_wall(ahead)) {
+            v.y = JUMP_VEL;
+            // If a tall obstacle (also blocked one cell up), bias
+            // sideways so the carrier explores along the fence.
+            ivec3 up_ahead = ivec3(base.x + fx, base.y + 2, base.z + fz);
+            if (is_wall(up_ahead)) {
+                // Pseudo-random sideways nudge keyed by carrier id +
+                // current cell so each carrier picks a consistent
+                // direction at any given fence segment.
+                float h = agent_hash(i + uint(base.x * 73 + base.z * 17));
+                float side = (h > 0.5) ? speed : -speed;
+                v.z += side * 0.8;
+            }
+        }
+    }
+
+    // ── Substepped move with terrain collision ────────────────────
+    // Break the per-step displacement into ~0.5-cell substeps and test
+    // each axis independently against terrain — slide along walls
+    // instead of clipping through them.  Box walls bounce explicitly.
+    vec3 dp = v * u_dt;
+    float dist = length(dp);
+    int   nsub = clamp(int(ceil(dist / 0.5)), 1, 8);
+    vec3  step = dp / float(nsub);
+    for (int s = 0; s < nsub; s++) {
+        // X axis
+        float nx = p.x + step.x;
+        if (nx < 0.0)              { nx = 0.0;             v.x = abs(v.x);  step.x = 0.0; }
+        if (nx > float(u_size-1))  { nx = float(u_size-1); v.x = -abs(v.x); step.x = 0.0; }
+        ivec3 testx = ivec3(int(nx + 0.5), int(p.y + 0.5), int(p.z + 0.5));
+        if (is_wall(testx)) { v.x = -v.x * 0.3; step.x = 0.0; }
+        else                 p.x = nx;
+        // Y axis — gravity dominates; landing on terrain zeroes vy.
+        float ny = p.y + step.y;
+        if (ny < 0.0)              { ny = 0.0;             v.y = abs(v.y) * 0.2; step.y = 0.0; }
+        if (ny > float(u_size-1))  { ny = float(u_size-1); v.y = -abs(v.y) * 0.2; step.y = 0.0; }
+        ivec3 testy = ivec3(int(p.x + 0.5), int(ny + 0.5), int(p.z + 0.5));
+        if (is_wall(testy)) {
+            // Damp vertical velocity heavily on landing — no bouncing.
+            if (v.y < 0.0) v.y = 0.0; else v.y = -v.y * 0.3;
+            step.y = 0.0;
+        } else p.y = ny;
+        // Z axis
+        float nz = p.z + step.z;
+        if (nz < 0.0)              { nz = 0.0;             v.z = abs(v.z);  step.z = 0.0; }
+        if (nz > float(u_size-1))  { nz = float(u_size-1); v.z = -abs(v.z); step.z = 0.0; }
+        ivec3 testz = ivec3(int(p.x + 0.5), int(p.y + 0.5), int(nz + 0.5));
+        if (is_wall(testz)) { v.z = -v.z * 0.3; step.z = 0.0; }
+        else                 p.z = nz;
+    }
+
+    // ── Deposit signed tracer + presence at current cell ──────────
+    // Skip on wall cells (carriers shouldn't be inside walls anyway).
+    //
+    // Each carrier writes to BOTH team channels — bright in its own
+    // colour, dim "shadow" in the opposing colour — so that whichever
+    // single channel the renderer is showing, BOTH teams remain
+    // visible (their characteristic INTENSITIES, plus the dim terrain
+    // baseline, give the colormap three distinct values to paint).
+    ivec3 new_cell = clamp(ivec3(p + 0.5), ivec3(0), ivec3(u_size - 1));
+    if (!is_wall(new_cell)) {
+        vec4 nv = imageLoad(u_grid_r, new_cell);
+        // Signed combat tracer (red +, blue -), saturating ±4.0.
+        // Signed combat tracer (red +, blue -), saturating ±4.0.
+        // Empty-handed carriers paint LESS tracer than carrying ones —
+        // a courier with cargo is the actual threat; scouts shouldn't
+        // saturate midfield with kill-zone tracer just by walking.
+        float trace_amt = (carrying == 1) ? 0.5 : 0.10;
+        float delta = (team == 0) ? trace_amt : -trace_amt;
+        nv.b = clamp(nv.b + delta, -4.0, 4.0);
+        // Team display deposit: bright self + dim shadow.  CRITICAL:
+        // use max(nv, min(nv+d, cap)) instead of plain min(nv+d, cap)
+        // so we never DECREASE an existing value.  A naive
+        // `min(nv+0.6, 4.0)` would silently chop a delivery pile of
+        // 8.0 down to 4.0 the moment any carrier walked across it,
+        // which is precisely how stash piles were vanishing.
+        if (team == 0) {
+            nv.r = max(nv.r, min(nv.r + 0.6, 4.0));
+            nv.g = max(nv.g, min(nv.g + 0.2, 4.0));
+        } else {
+            nv.g = max(nv.g, min(nv.g + 0.6, 4.0));
+            nv.r = max(nv.r, min(nv.r + 0.2, 4.0));
+        }
+        imageStore(u_grid_w, new_cell, nv);
+    }
+
+    // ── Package marker paint (visible "package available" stamp) ──
+    // Empty-handed carriers paint a marker at their pickup point so
+    // the user can SEE where each agent is heading.  Once carrying,
+    // the package is "claimed and en route" so the marker stops
+    // (it will reappear next time this slot's carrier respawns and
+    // walks back here to pick up another).  Pairs paint only from
+    // the even sibling so two writers never race the same cell.
+    if (carrying == 0 && (!large || (i & 1u) == 0u)) {
+        ivec3 pkc = clamp(ivec3(pickup_pt + 0.5),
+                          ivec3(0), ivec3(u_size - 1));
+        // Walk up to the first non-wall cell so packages sit on top
+        // of terrain instead of being buried.
+        for (int up = 0; up < 6; up++) {
+            if (!is_wall(pkc)) break;
+            pkc.y = min(pkc.y + 1, u_size - 1);
+        }
+        if (!is_wall(pkc)) {
+            // Large packages are 2× brighter so the user can spot
+            // co-op packages at a glance.  Paint into BOTH channels
+            // so the marker is visible from either team's view.
+            float amt = large ? 4.0 : 2.0;
+            vec4 pv = imageLoad(u_grid_r, pkc);
+            pv.r = max(pv.r, amt);
+            pv.g = max(pv.g, amt);
+            imageStore(u_grid_w, pkc, pv);
+        }
+    }
+
+    // ── Re-encode and write back ──────────────────────────────────
+    status = (alive & 0x1)
+           | ((carrying & 0x1) << 1)
+           | ((max(respawn,  0) & 0x3FFF) << 2)
+           | ((max(lifetime, 0) & 0xFFFF) << 16);
+    a.pos_dir = ivec4(floatBitsToInt(p.x), floatBitsToInt(p.y),
+                      floatBitsToInt(p.z), team_raw);
+    a.state   = ivec4(floatBitsToInt(v.x), floatBitsToInt(v.y),
+                      floatBitsToInt(v.z), status);
+    agents[i] = a;
+}
+""",
+}
+
+
 # ── Voxel rendering shaders ──────────────────────────────────────────
 
 # GPU-side indirect buffer reset (avoids CPU->GPU write per chunk)
@@ -4522,6 +9764,137 @@ void main() {
 }
 """
 
+# ── Block-sparse compute dispatch shaders ────────────────────────────
+#
+# These build a compact list of "active" 8³ blocks each step, so the
+# rule's compute shader can dispatch only over blocks that contain
+# ANY non-zero voxel (or are adjacent to one — the dilation step
+# guarantees the 1-voxel halo a stencil rule needs).
+#
+# Pipeline:
+#   1. SPARSE_OCC_SHADER     — (size/8)³ workgroups, 1 thread/block:
+#                              writes 1 to _sim_occ_tex if any voxel
+#                              in the 8³ block has channel 0 != 0.
+#   2. SPARSE_DILATE_SHADER  — (size/8)³ workgroups, 1 thread/block:
+#                              writes 1 to _sim_active_tex if self or
+#                              any of 6 face neighbors is occupied.
+#                              (Halo = ±1 block = ±8 voxels, sufficient
+#                              for stencil radii up to 8.)
+#   3. SPARSE_COMPACT_SHADER — flat 1D dispatch over all blocks: every
+#                              active block atomicAdd's its (bx,by,bz)
+#                              into _sparse_blocks_ssbo and bumps the
+#                              X-group-count of _sparse_indirect_buffer.
+#
+# The CA pass shaders (when sparse_dispatch=True for the preset) are
+# textually rewritten to remap gl_WorkGroupID via the SSBO, and
+# dispatched indirectly so the GPU never round-trips the count to CPU.
+#
+# Block size is FIXED at 8 to match the standard local_size_x=8 of the
+# CA shaders. Rules running at size<128 (where the existing _occ_tex
+# uses bs=4) are auto-disabled from sparse dispatch — they're already
+# fast enough and the workgroup/block mismatch would complicate things.
+
+SPARSE_OCC_SHADER = """
+#version 430
+// One workgroup per 8³ block; 512 threads each fetch ONE voxel and
+// OR the result into shared memory. Replaces a previous serial
+// 512-iter per-thread loop that ran ~100× slower at 384³ due to
+// fully sequential texelFetch chains within each warp.
+layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+uniform sampler3D u_volume;
+uniform int u_size;       // voxel grid edge
+layout(r8ui, binding=0) uniform restrict writeonly uimage3D u_occ_out;
+shared uint s_occ;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) s_occ = 0u;
+    barrier();
+
+    ivec3 b = ivec3(gl_WorkGroupID);
+    ivec3 p = b * 8 + ivec3(gl_LocalInvocationID);
+    if (all(lessThan(p, ivec3(u_size)))) {
+        // ANY channel != 0 counts as occupied (covers multi-field rules).
+        vec4 v = texelFetch(u_volume, p, 0);
+        if (any(notEqual(v, vec4(0.0)))) {
+            atomicOr(s_occ, 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        imageStore(u_occ_out, b, uvec4(s_occ, 0u, 0u, 0u));
+    }
+}
+"""
+
+SPARSE_DILATE_SHADER = """
+#version 430
+layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
+uniform int u_occ_dim;
+uniform int u_boundary;   // 0 = clamp, 1 = wrap (toroidal)
+layout(r8ui, binding=0) uniform restrict readonly  uimage3D u_occ_in;
+layout(r8ui, binding=1) uniform restrict writeonly uimage3D u_active_out;
+
+uint sample_block(ivec3 b) {
+    if (u_boundary == 1) {
+        b = ((b % u_occ_dim) + u_occ_dim) % u_occ_dim;
+    } else {
+        if (any(lessThan(b, ivec3(0))) || any(greaterThanEqual(b, ivec3(u_occ_dim))))
+            return 0u;
+    }
+    return imageLoad(u_occ_in, b).r;
+}
+void main() {
+    ivec3 b = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(b, ivec3(u_occ_dim)))) return;
+    uint a = sample_block(b);
+    // 6-neighbour face dilation (axis-aligned, 1 block = 8 voxels)
+    a |= sample_block(b + ivec3(-1, 0, 0));
+    a |= sample_block(b + ivec3( 1, 0, 0));
+    a |= sample_block(b + ivec3( 0,-1, 0));
+    a |= sample_block(b + ivec3( 0, 1, 0));
+    a |= sample_block(b + ivec3( 0, 0,-1));
+    a |= sample_block(b + ivec3( 0, 0, 1));
+    imageStore(u_active_out, b, uvec4(a, 0u, 0u, 0u));
+}
+"""
+
+SPARSE_COMPACT_SHADER = """
+#version 430
+layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
+uniform int u_occ_dim;
+layout(r8ui, binding=0) uniform restrict readonly uimage3D u_active_in;
+// Slot 0..2 = (groupCountX, 1, 1); compact list lives in a separate SSBO.
+layout(std430, binding=10) buffer SparseIndirect {
+    uint sparse_groups_x;
+    uint sparse_groups_y;
+    uint sparse_groups_z;
+};
+layout(std430, binding=11) buffer SparseBlocks {
+    uvec4 sparse_blocks[];   // .xyz = block coord, .w unused (16-byte aligned)
+};
+void main() {
+    ivec3 b = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(b, ivec3(u_occ_dim)))) return;
+    if (imageLoad(u_active_in, b).r == 0u) return;
+    uint slot = atomicAdd(sparse_groups_x, 1u);
+    sparse_blocks[slot] = uvec4(uint(b.x), uint(b.y), uint(b.z), 0u);
+}
+"""
+
+SPARSE_INDIRECT_RESET_SHADER = """
+#version 430
+layout(local_size_x=1) in;
+layout(std430, binding=10) buffer SparseIndirect {
+    uint sparse_groups_x;
+    uint sparse_groups_y;
+    uint sparse_groups_z;
+};
+void main() {
+    sparse_groups_x = 0u;
+    sparse_groups_y = 1u;
+    sparse_groups_z = 1u;
+}
+"""
+
 # Compute shader: extract visible voxel positions into an SSBO
 # A voxel is "visible" if it's alive/non-vacuum AND has at least one dead/vacuum neighbor
 # Uses shared memory tiling (10x10x10 halo) for fast neighbor lookups
@@ -4534,6 +9907,15 @@ void main() {
 VOXEL_CULL_SHADER = """
 #version 430
 layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+
+#ifdef SPARSE_DISPATCH
+// Brick-list cull: one workgroup per ACTIVE 8³ block, fetched from
+// _sparse_blocks_ssbo. Skips traversal of empty / fully-buried regions
+// entirely — dense fields with sparse surfaces win the most.
+layout(std430, binding=11) readonly buffer ActiveBlocks {
+    uvec4 sparse_blocks[];
+};
+#endif
 
 // Read-only sampler for texture-cache-friendly access (vs imageLoad)
 uniform sampler3D u_volume_tex;
@@ -4554,6 +9936,7 @@ layout(std430, binding=6) buffer TotalCounter {
 };
 
 uniform int u_size;
+uniform ivec3 u_dims;       // (W, H, D) — per-axis grid bounds
 uniform float u_threshold;  // visibility threshold for non-element CAs
 uniform int u_is_element_ca; // 1 = element mode, 0 = standard mode
 uniform int u_max_voxels;
@@ -4571,13 +9954,14 @@ float get_alive_value(vec4 c) {
     if (u_is_element_ca == 1) return c.r;
     float v = c[u_channel];
     if (u_use_abs == 1) v = abs(v);
+    else if (u_use_abs == 2) v = abs(v);  // signed bipolar: visibility = magnitude
     return v;
 }
 
 // Fetch alive-test value, returning 0.0 (dead) for out-of-bounds cells.
 // This prevents boundary cells from falsely seeing themselves as neighbors.
 float fetch_alive(ivec3 gp) {
-    if (any(lessThan(gp, ivec3(0))) || any(greaterThanEqual(gp, ivec3(u_size))))
+    if (any(lessThan(gp, ivec3(0))) || any(greaterThanEqual(gp, u_dims)))
         return 0.0;
     return get_alive_value(texelFetch(u_volume_tex, gp, 0));
 }
@@ -4590,7 +9974,13 @@ bool is_alive(float v) {
 void main() {
     ivec3 chunk_size = u_chunk_max - u_chunk_min;
     ivec3 local = ivec3(gl_LocalInvocationID);
+#ifdef SPARSE_DISPATCH
+    // Each workgroup handles one active 8³ block from the compact list.
+    uvec4 b = sparse_blocks[gl_WorkGroupID.x];
+    ivec3 wg_origin = ivec3(b.xyz) * 8;
+#else
     ivec3 wg_origin = ivec3(gl_WorkGroupID) * 8 + u_chunk_min;
+#endif
 
     // ── Load 10x10x10 shared memory tile (8³ core + 1-cell halo) ──
     // Each thread in the 8³ workgroup loads its own cell at offset +1
@@ -4634,8 +10024,10 @@ void main() {
 
     // ── Surface cull using shared memory ──
     ivec3 pos = wg_origin + local;
+#ifndef SPARSE_DISPATCH
     if (any(greaterThanEqual(pos, u_chunk_max))) return;
-    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+#endif
+    if (any(greaterThanEqual(pos, u_dims))) return;
 
     // Read own cell from shared memory (offset +1 for halo)
     ivec3 s = local + 1;  // shared memory coords
@@ -4668,19 +10060,21 @@ void main() {
     if (is_alive(s_tile[s.z - 1][s.y][s.x + 1])) aoc++;
     if (is_alive(s_tile[s.z + 1][s.y][s.x - 1])) aoc++;
     if (is_alive(s_tile[s.z + 1][s.y][s.x + 1])) aoc++;
-    // Cap the AO score in the 5-bit field range (0..31)
-    uint shade_hint = uint(min(aoc, 31));
+    // Cap the AO score in the shade-bit field range
+    uint shade_hint = uint(min(aoc, int(__SHADE_MAX__)));
 
     // Append position only (1 uint = 4 bytes per voxel)
     atomicAdd(totalVisibleCount, 1u);  // frame-level total (not reset per chunk)
     uint idx = atomicAdd(instanceCount, 1u);
     if (idx >= uint(u_max_voxels)) return;
 
-    // Pack: 9 bits x, 9 bits y, 9 bits z (supports up to 512³) + 5-bit shading
-    voxels[idx] = (uint(pos.x) & 0x1FFu)
-                | ((uint(pos.y) & 0x1FFu) <<  9)
-                | ((uint(pos.z) & 0x1FFu) << 18)
-                | ((shade_hint  & 0x1Fu)  << 27);
+    // Pack: __PB__ bits per axis (xyz) + __SB__-bit shading.
+    // Substituted at compile time based on max(W,H,D): 9/5 for size<=512,
+    // 10/2 for size<=1024 (loses smooth AO levels but supports 1024^3).
+    voxels[idx] = (uint(pos.x) & __PMASK__)
+                | ((uint(pos.y) & __PMASK__) << __PB__)
+                | ((uint(pos.z) & __PMASK__) << (2u * __PB__))
+                | ((shade_hint  & __SMASK__) << (3u * __PB__));
 }
 """
 
@@ -5106,6 +10500,553 @@ void main() {
 }
 """
 
+# ─── GPU PARTICLE LAYER ────────────────────────────────────────────────
+# Each particle is 8 floats / 32 bytes:
+#   pos.xyz (grid coords [0..size]), life (>0 = alive),
+#   vel.xyz (per-step delta in grid coords), mass (unused for v1, room
+#   for charge/temperature/etc).
+# Force model is selected per preset:
+#   'none'         — pure ballistic (vel decays by drag)
+#   'velocity_rgb' — sample volume tex; force = scale * (rgb - 0.5)
+#                    treats the field's RGB as a vector field
+#   'gradient_r'   — central-difference gradient of channel R; force
+#                    pushes particles down-gradient (sinks toward bright
+#                    regions). Useful for "follow the chemical".
+#   'gradient_neg_r' — same but pushes UP-gradient (away from sources)
+#   'curl_rgb'     — curl of the RGB vector field; gives swirly motion
+#                    around vorticity tubes (great for aurora/ink).
+PARTICLE_UPDATE_COMPUTE = """
+#version 430
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 9) buffer Particles { vec4 data[]; } P;
+// Particle i occupies P.data[2*i + 0] = (pos, life)
+//                      P.data[2*i + 1] = (vel, mass)
+
+#ifndef NN_HID
+#define NN_HID 0
+#endif
+#ifndef NN_SHARED
+#define NN_SHARED 0
+#endif
+
+#if NN_HID > 0
+// Per-agent brain weight stride (floats):
+//   W1: 6 * NN_HID, b1: NN_HID, W2: NN_HID * 3, b2: 3
+//   total = 10 * NN_HID + 3
+#define NN_STRIDE (10 * NN_HID + 3)
+layout(std430, binding = 13) readonly buffer Brains { float w[]; } B;
+#endif
+
+uniform sampler3D u_field_tex;
+uniform int   u_size;
+uniform int   u_count;
+uniform int   u_force_mode;   // 0=none, 1=velocity_rgb, 2=grad_r, 3=grad_neg_r, 4=curl_rgb, 5=nn_brain
+uniform float u_force_scale;
+uniform float u_dt;
+uniform float u_drag;         // 0..1 fraction of velocity removed per step
+uniform float u_life_decay;   // amount subtracted from life each step
+uniform int   u_respawn;      // 0/1
+uniform uint  u_frame;        // for respawn RNG
+uniform vec3  u_spawn_min;
+uniform vec3  u_spawn_max;
+uniform float u_spawn_speed;  // initial random speed magnitude on respawn
+
+float fs = float(u_size);
+
+vec4 sampleField(vec3 p) {
+    vec3 uv = (p + 0.5) / fs;
+    return texture(u_field_tex, uv);
+}
+
+vec3 gradient_r(vec3 p) {
+    float h = 1.0;
+    float xp = sampleField(p + vec3(h,0,0)).r;
+    float xm = sampleField(p - vec3(h,0,0)).r;
+    float yp = sampleField(p + vec3(0,h,0)).r;
+    float ym = sampleField(p - vec3(0,h,0)).r;
+    float zp = sampleField(p + vec3(0,0,h)).r;
+    float zm = sampleField(p - vec3(0,0,h)).r;
+    return 0.5 * vec3(xp - xm, yp - ym, zp - zm);
+}
+
+vec3 curl_rgb(vec3 p) {
+    float h = 1.0;
+    vec3 xp = sampleField(p + vec3(h,0,0)).rgb;
+    vec3 xm = sampleField(p - vec3(h,0,0)).rgb;
+    vec3 yp = sampleField(p + vec3(0,h,0)).rgb;
+    vec3 ym = sampleField(p - vec3(0,h,0)).rgb;
+    vec3 zp = sampleField(p + vec3(0,0,h)).rgb;
+    vec3 zm = sampleField(p - vec3(0,0,h)).rgb;
+    vec3 dFdx = 0.5 * (xp - xm);
+    vec3 dFdy = 0.5 * (yp - ym);
+    vec3 dFdz = 0.5 * (zp - zm);
+    return vec3(dFdy.z - dFdz.y, dFdz.x - dFdx.z, dFdx.y - dFdy.x);
+}
+
+#if NN_HID > 0
+// Tiny MLP forward pass: 6 inputs → NN_HID hidden (tanh) → 3 outputs (tanh).
+// `agent_id` selects per-agent weights (or 0 if NN_SHARED).
+vec3 nn_eval(uint agent_id, vec3 grad, vec3 vel) {
+    uint base = (NN_SHARED != 0) ? 0u : agent_id * uint(NN_STRIDE);
+    float in_vec[6];
+    in_vec[0] = grad.x; in_vec[1] = grad.y; in_vec[2] = grad.z;
+    in_vec[3] = vel.x;  in_vec[4] = vel.y;  in_vec[5] = vel.z;
+    float hid[NN_HID];
+    // Layer 1: hid[h] = tanh(b1[h] + sum_i W1[i,h] * in[i])
+    uint w1_base = base;                   // W1: 6 × NN_HID, row-major (i*H + h)
+    uint b1_base = base + 6u * uint(NN_HID);
+    for (int h = 0; h < NN_HID; ++h) {
+        float s = B.w[b1_base + uint(h)];
+        for (int i = 0; i < 6; ++i) {
+            s += B.w[w1_base + uint(i) * uint(NN_HID) + uint(h)] * in_vec[i];
+        }
+        hid[h] = tanh(s);
+    }
+    // Layer 2: out[o] = tanh(b2[o] + sum_h W2[h,o] * hid[h])
+    uint w2_base = b1_base + uint(NN_HID); // W2: NN_HID × 3, (h*3 + o)
+    uint b2_base = w2_base + uint(NN_HID) * 3u;
+    vec3 outv;
+    for (int o = 0; o < 3; ++o) {
+        float s = B.w[b2_base + uint(o)];
+        for (int h = 0; h < NN_HID; ++h) {
+            s += B.w[w2_base + uint(h) * 3u + uint(o)] * hid[h];
+        }
+        outv[o] = tanh(s);
+    }
+    return outv;
+}
+#endif
+
+// Cheap hash → uniform [0,1) in 3 components.
+vec3 hash3(uint i, uint salt) {
+    uint h = i * 1664525u + salt * 1013904223u;
+    h ^= (h >> 16); h *= 0x85ebca6bu;
+    h ^= (h >> 13); h *= 0xc2b2ae35u;
+    h ^= (h >> 16);
+    uint h2 = h * 1597334677u + 0x9e3779b9u;
+    uint h3 = h2 * 1597334677u + 0x9e3779b9u;
+    return vec3(float(h & 0xffffffu), float(h2 & 0xffffffu),
+                float(h3 & 0xffffffu)) / 16777215.0;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_count)) return;
+
+    vec4 a = P.data[2u * i + 0u];   // pos.xyz, life
+    vec4 b = P.data[2u * i + 1u];   // vel.xyz, mass
+    vec3 pos = a.xyz;
+    vec3 vel = b.xyz;
+    float life = a.w;
+
+    if (life <= 0.0) {
+        if (u_respawn != 0) {
+            vec3 r = hash3(i, u_frame);
+            pos = mix(u_spawn_min, u_spawn_max, r);
+            vec3 r2 = hash3(i, u_frame + 17u) - 0.5;
+            vel = u_spawn_speed * r2;
+            life = 1.0 + hash3(i, u_frame + 31u).x;
+        } else {
+            // dead and not respawning — write back unchanged
+            P.data[2u * i + 0u] = vec4(pos, life);
+            P.data[2u * i + 1u] = vec4(vel, b.w);
+            return;
+        }
+    }
+
+    // ── Force from field ──
+    vec3 force = vec3(0.0);
+    if (u_force_mode == 1) {
+        vec3 v = sampleField(pos).rgb - 0.5;
+        force = u_force_scale * v;
+    } else if (u_force_mode == 2) {
+        force = u_force_scale * gradient_r(pos);
+    } else if (u_force_mode == 3) {
+        force = -u_force_scale * gradient_r(pos);
+    } else if (u_force_mode == 4) {
+        force = u_force_scale * curl_rgb(pos);
+    }
+#if NN_HID > 0
+    else if (u_force_mode == 5) {
+        // NN brain: inputs = (gradient_r, vel) → outputs = steering force.
+        vec3 g = gradient_r(pos);
+        vec3 act = nn_eval(i, g, vel);
+        force = u_force_scale * act;
+    }
+#endif
+
+    // Semi-implicit Euler with linear drag.
+    vel = vel * (1.0 - u_drag) + force * u_dt;
+    pos = pos + vel * u_dt;
+    life -= u_life_decay;
+
+    // Wrap (periodic) — keeps particles on screen for visual continuity.
+    pos = mod(pos, fs);
+
+    P.data[2u * i + 0u] = vec4(pos, life);
+    P.data[2u * i + 1u] = vec4(vel, b.w);
+}
+"""
+
+# Particle render: instanced screen-aligned billboard (a 6-vertex quad)
+# rebuilt in the vertex shader from gl_VertexID. Radius and color come
+# from uniforms / per-particle attributes.
+PARTICLE_VERTEX_SHADER = """
+#version 430
+
+layout(std430, binding = 9) readonly buffer Particles { vec4 data[]; } P;
+
+uniform mat4  u_view_proj;
+uniform vec3  u_camera_pos;
+uniform vec3  u_camera_right;
+uniform vec3  u_camera_up;
+uniform float u_size_world;     // particle radius in cell units
+uniform vec3  u_world_per_cell; // box_dims/size — grid cell → world coord
+uniform int   u_color_mode;     // 0=fixed, 1=speed, 2=lifetime, 3=position
+uniform vec3  u_color_fixed;
+uniform float u_speed_scale;
+
+out vec2  v_uv;        // [-1..1]² for the quad
+out vec3  v_color;
+out float v_life;
+
+void main() {
+    uint pid = uint(gl_VertexID) / 6u;
+    uint vid = uint(gl_VertexID) % 6u;
+    vec4 a = P.data[2u * pid + 0u];
+    vec4 b = P.data[2u * pid + 1u];
+    vec3 pos = a.xyz;
+    float life = a.w;
+    vec3 vel = b.xyz;
+
+    // 6-vertex quad: two tris covering [-1,1]²
+    vec2 corners[6] = vec2[6](
+        vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2(-1.0,  1.0),
+        vec2( 1.0, -1.0), vec2( 1.0,  1.0), vec2(-1.0,  1.0)
+    );
+    vec2 c = corners[vid];
+
+    // Hide dead particles by collapsing them to a point off-screen.
+    float vis = step(0.001, life);
+    // Particle pos is in grid cell coords [0..size]; convert to world
+    // coords [0..box_dims] before the view-projection transform.
+    vec3 wp_center = pos * u_world_per_cell;
+    float scl = (u_world_per_cell.x + u_world_per_cell.y + u_world_per_cell.z) / 3.0;
+    vec3 world_pos = wp_center + (u_camera_right * c.x + u_camera_up * c.y) * u_size_world * scl;
+    world_pos = mix(vec3(-1e6), world_pos, vis);
+
+    gl_Position = u_view_proj * vec4(world_pos, 1.0);
+    v_uv = c;
+    v_life = life;
+
+    vec3 col;
+    if (u_color_mode == 1) {
+        float s = length(vel) * u_speed_scale;
+        col = mix(vec3(0.1, 0.3, 0.9), vec3(1.0, 0.7, 0.1), clamp(s, 0.0, 1.0));
+    } else if (u_color_mode == 2) {
+        float t = clamp(life, 0.0, 1.0);
+        col = mix(vec3(1.0, 0.2, 0.1), vec3(0.6, 0.9, 1.0), t);
+    } else if (u_color_mode == 3) {
+        col = vec3(0.5) + 0.5 * sin(pos * 0.3 + vec3(0.0, 2.0, 4.0));
+    } else {
+        col = u_color_fixed;
+    }
+    v_color = col;
+}
+"""
+
+PARTICLE_FRAGMENT_SHADER = """
+#version 430
+in vec2 v_uv;
+in vec3 v_color;
+in float v_life;
+out vec4 fragColor;
+
+uniform float u_alpha;
+
+void main() {
+    float r2 = dot(v_uv, v_uv);
+    if (r2 > 1.0) discard;
+    // Soft Gaussian-ish falloff (exp(-3r²) is fine and cheap).
+    float fall = exp(-3.0 * r2);
+    float a = u_alpha * fall * clamp(v_life, 0.0, 1.0);
+    // Pre-multiplied additive: (rgb*a, a)
+    fragColor = vec4(v_color * a, a);
+}
+"""
+
+# ─── VECTOR-FIELD GLYPH RENDERER ──────────────────────────────────────
+# Renders the field as a sparse 3D grid of oriented line segments
+# (base → base + scale*v) sampled from the primary volume tex.
+# A second draw of additive point sprites caps each tip so the
+# arrow direction is unambiguous.
+#
+# Vertex layout: 2 vertices per glyph drawn as GL_LINES. The vertex
+# shader synthesises the (x,y,z) grid coord from gl_VertexID/2 and
+# samples the field there.
+GLYPH_LINE_VERTEX_SHADER = """
+#version 430
+uniform sampler3D u_field_tex;
+uniform mat4  u_view_proj;
+uniform int   u_size;
+uniform vec3  u_world_per_cell; // box_dims/size — grid cell → world coord
+uniform ivec3 u_grid_dim;     // glyphs along each axis
+uniform vec3  u_origin;       // grid origin in cell coords
+uniform vec3  u_step;         // spacing in cell coords
+uniform float u_scale;        // length of unit vector in grid cells
+uniform int   u_source;       // 0 = rgb directly, 1 = grad of R, 2 = curl of rgb
+uniform float u_threshold;    // skip glyphs with |v| below this (avoids forest of noise)
+uniform float u_mag_scale;    // scale factor when colouring by magnitude
+
+out vec3 v_color;
+out float v_alpha;
+
+float fs;
+
+vec4 sampleField(vec3 p) {
+    p = clamp(p, vec3(0.0), vec3(fs - 1.0));
+    return texture(u_field_tex, (p + 0.5) / fs);
+}
+
+vec3 grad_r(vec3 p) {
+    float h = 1.0;
+    return 0.5 * vec3(
+        sampleField(p + vec3(h,0,0)).r - sampleField(p - vec3(h,0,0)).r,
+        sampleField(p + vec3(0,h,0)).r - sampleField(p - vec3(0,h,0)).r,
+        sampleField(p + vec3(0,0,h)).r - sampleField(p - vec3(0,0,h)).r);
+}
+
+vec3 curl_rgb(vec3 p) {
+    float h = 1.0;
+    vec3 xp = sampleField(p + vec3(h,0,0)).rgb;
+    vec3 xm = sampleField(p - vec3(h,0,0)).rgb;
+    vec3 yp = sampleField(p + vec3(0,h,0)).rgb;
+    vec3 ym = sampleField(p - vec3(0,h,0)).rgb;
+    vec3 zp = sampleField(p + vec3(0,0,h)).rgb;
+    vec3 zm = sampleField(p - vec3(0,0,h)).rgb;
+    vec3 dFdx = 0.5 * (xp - xm);
+    vec3 dFdy = 0.5 * (yp - ym);
+    vec3 dFdz = 0.5 * (zp - zm);
+    return vec3(dFdy.z - dFdz.y, dFdz.x - dFdx.z, dFdx.y - dFdy.x);
+}
+
+void main() {
+    fs = float(u_size);
+    int gid = gl_VertexID / 2;
+    int tip = gl_VertexID & 1;
+    int gx = gid % u_grid_dim.x;
+    int gy = (gid / u_grid_dim.x) % u_grid_dim.y;
+    int gz = gid / (u_grid_dim.x * u_grid_dim.y);
+    vec3 base = u_origin + vec3(gx, gy, gz) * u_step;
+
+    vec3 v;
+    if (u_source == 1)      v = grad_r(base);
+    else if (u_source == 2) v = curl_rgb(base);
+    else                    v = sampleField(base).rgb - 0.5;
+
+    float mag = length(v);
+    vec3 dir = mag > 1e-5 ? v / mag : vec3(0.0);
+    vec3 pos = base + dir * (mag * u_scale * float(tip));
+
+    // Cull below-threshold glyphs by collapsing them to a point off-screen.
+    float vis = step(u_threshold, mag);
+    pos = mix(vec3(-1e6), pos, vis);
+
+    // Convert from grid cell coords [0..size] to world coords [0..box_dims].
+    pos = pos * u_world_per_cell;
+
+    gl_Position = u_view_proj * vec4(pos, 1.0);
+
+    // Colour: cool→hot mapped from magnitude. Tips brighter than bases.
+    float t = clamp(mag * u_mag_scale, 0.0, 1.0);
+    vec3 c_low  = vec3(0.15, 0.4, 0.95);
+    vec3 c_high = vec3(1.0, 0.75, 0.15);
+    v_color = mix(c_low, c_high, t);
+    v_alpha = mix(0.45, 0.95, float(tip));   // tip vertex more opaque
+}
+"""
+
+GLYPH_LINE_FRAGMENT_SHADER = """
+#version 430
+in vec3 v_color;
+in float v_alpha;
+out vec4 fragColor;
+uniform float u_global_alpha;
+void main() {
+    float a = v_alpha * u_global_alpha;
+    fragColor = vec4(v_color * a, a);
+}
+"""
+
+# ─── MARCHING CUBES (GPU) ─────────────────────────────────────────────
+# One compute thread per cell. Each cell:
+#   1. Reads its 8 corner field values (channel selectable)
+#   2. Builds a case index from above/below iso comparisons
+#   3. Looks up a tri-table entry (max 5 triangles per cell)
+#   4. For each triangle, interpolates 3 vertices along the active edges,
+#      computes a face normal, and atomically reserves output slots in
+#      a vertex SSBO before writing them.
+#
+# Output vertex layout (32 B / vertex):
+#   vec4 pos   (xyz in grid coords [0..size], w = scalar value at vertex)
+#   vec4 normal (xyz unit face normal, w unused)
+#
+# Worst-case vertex budget caps the buffer; cells that overflow are
+# silently skipped (atomic compare guard). Default cap = 2 M verts
+# = 64 MB, comfortably handles 96³ filled densely.
+MC_COMPUTE_SHADER = """
+#version 430
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+uniform sampler3D u_field_tex;
+uniform int   u_size;
+uniform int   u_channel;     // 0=R, 1=G, 2=B, 3=A
+uniform int   u_use_abs;
+uniform float u_iso;
+uniform int   u_max_verts;
+
+// Vertex output: vec4 pos, vec4 normal — 32 B per vertex.
+layout(std430, binding=10) buffer MCVerts { vec4 verts[]; } V;
+layout(std430, binding=11) buffer MCCounter { uint vert_count; uint pad[3]; } C;
+
+// Triangulation LUT (256 cases × 16 entries, -1 = end).
+layout(std430, binding=12) readonly buffer MCTriTable { int tri_table[]; } T;
+
+float fs;
+
+float sampleScalar(ivec3 p) {
+    p = clamp(p, ivec3(0), ivec3(u_size - 1));
+    vec4 v = texelFetch(u_field_tex, p, 0);
+    float s;
+    if (u_channel == 0) s = v.r;
+    else if (u_channel == 1) s = v.g;
+    else if (u_channel == 2) s = v.b;
+    else s = v.a;
+    if (u_use_abs != 0) s = abs(s);
+    return s;
+}
+
+vec3 vertexInterp(vec3 p1, vec3 p2, float v1, float v2) {
+    float denom = v2 - v1;
+    if (abs(denom) < 1e-6) return 0.5 * (p1 + p2);
+    float t = clamp((u_iso - v1) / denom, 0.0, 1.0);
+    return mix(p1, p2, t);
+}
+
+void main() {
+    fs = float(u_size);
+    ivec3 cell = ivec3(gl_GlobalInvocationID);
+    if (cell.x >= u_size - 1 || cell.y >= u_size - 1 || cell.z >= u_size - 1) return;
+
+    // 8 corners (Lorensen ordering: 0..7 = (0,0,0),(1,0,0),(1,1,0),(0,1,0),
+    //                                       (0,0,1),(1,0,1),(1,1,1),(0,1,1))
+    ivec3 ofs[8] = ivec3[8](
+        ivec3(0,0,0), ivec3(1,0,0), ivec3(1,1,0), ivec3(0,1,0),
+        ivec3(0,0,1), ivec3(1,0,1), ivec3(1,1,1), ivec3(0,1,1)
+    );
+    float val[8];
+    vec3  pos[8];
+    int caseIndex = 0;
+    for (int i = 0; i < 8; ++i) {
+        ivec3 p = cell + ofs[i];
+        val[i] = sampleScalar(p);
+        pos[i] = vec3(p);
+        if (val[i] >= u_iso) caseIndex |= (1 << i);
+    }
+    if (caseIndex == 0 || caseIndex == 255) return;
+
+    // 12 edges, each connects two corners (Lorensen edge ordering).
+    int e_a[12] = int[12](0,1,2,3,4,5,6,7,0,1,2,3);
+    int e_b[12] = int[12](1,2,3,0,5,6,7,4,4,5,6,7);
+
+    // Pre-interpolate the up to 12 active edge vertices.
+    vec3 edge_v[12];
+    for (int e = 0; e < 12; ++e) {
+        int a = e_a[e]; int b = e_b[e];
+        // Cheap to just always compute; tri table picks the ones we need.
+        edge_v[e] = vertexInterp(pos[a], pos[b], val[a], val[b]);
+    }
+
+    int base = caseIndex * 16;
+    for (int t = 0; t < 16; t += 3) {
+        int e0 = T.tri_table[base + t];
+        if (e0 < 0) break;
+        int e1 = T.tri_table[base + t + 1];
+        int e2 = T.tri_table[base + t + 2];
+        vec3 a = edge_v[e0];
+        vec3 b = edge_v[e1];
+        vec3 c = edge_v[e2];
+        vec3 n = cross(b - a, c - a);
+        float nlen = length(n);
+        if (nlen < 1e-8) continue;
+        n /= nlen;
+
+        uint vid = atomicAdd(C.vert_count, 3u);
+        if (vid + 3u > uint(u_max_verts)) return;
+        V.verts[2u*vid    ] = vec4(a, val[0]);
+        V.verts[2u*vid + 1u] = vec4(n, 0.0);
+        V.verts[2u*(vid+1u)    ] = vec4(b, val[0]);
+        V.verts[2u*(vid+1u) + 1u] = vec4(n, 0.0);
+        V.verts[2u*(vid+2u)    ] = vec4(c, val[0]);
+        V.verts[2u*(vid+2u) + 1u] = vec4(n, 0.0);
+    }
+}
+"""
+
+MC_VERTEX_SHADER = """
+#version 430
+layout(std430, binding=10) readonly buffer MCVerts { vec4 verts[]; } V;
+
+uniform mat4 u_view_proj;
+uniform vec3 u_camera_pos;
+uniform vec3 u_world_per_cell; // box_dims/size — grid cell → world coord
+
+out vec3 v_normal;
+out vec3 v_world;
+
+void main() {
+    uint i = uint(gl_VertexID);
+    vec3 p = V.verts[2u * i].xyz * u_world_per_cell;
+    vec3 n = V.verts[2u * i + 1u].xyz;
+    gl_Position = u_view_proj * vec4(p, 1.0);
+    v_normal = n;
+    v_world = p;
+}
+"""
+
+MC_FRAGMENT_SHADER = """
+#version 430
+in vec3 v_normal;
+in vec3 v_world;
+out vec4 fragColor;
+
+uniform vec3  u_camera_pos;
+uniform vec3  u_color;
+uniform float u_alpha;
+uniform int   u_double_sided;
+uniform int   u_size;
+
+void main() {
+    vec3 N = normalize(v_normal);
+    vec3 L = normalize(u_camera_pos - v_world);   // headlight
+    float cosNL = dot(N, L);
+    if (u_double_sided != 0) cosNL = abs(cosNL);
+    else                     cosNL = max(cosNL, 0.0);
+    // Hemispheric ambient (sky/ground tint) + Lambert.
+    vec3 sky    = vec3(0.55, 0.62, 0.75);
+    vec3 ground = vec3(0.12, 0.10, 0.08);
+    float h = 0.5 + 0.5 * N.y;
+    vec3 ambient = mix(ground, sky, h) * 0.35;
+    vec3 col = u_color * (ambient + cosNL * 0.85);
+    // Distance-based subtle desaturation
+    float d = length(u_camera_pos - v_world) / float(u_size);
+    col = mix(col, vec3(dot(col, vec3(0.299, 0.587, 0.114))), clamp(d * 0.05, 0.0, 0.3));
+    fragColor = vec4(col, u_alpha);
+}
+"""
+
+
 # Vertex shader: instanced cube rendering
 VOXEL_VERTEX_SHADER = """
 #version 430
@@ -5122,6 +11063,7 @@ layout(std430, binding=2) buffer ElementTable {
 
 uniform sampler3D u_volume_tex;  // 3D volume texture for color sampling
 uniform int u_size;
+uniform ivec3 u_dims;            // (W, H, D) — per-axis bounds for nb_alive
 uniform mat4 u_view_proj;
 uniform float u_voxel_gap;  // gap between voxels (0 = touching, 0.1 = 10% gap)
 uniform int u_is_element_ca;
@@ -5160,11 +11102,12 @@ out vec3 v_color;
 out float v_value;
 
 bool nb_alive(ivec3 p) {
-    if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size)))) return false;
+    if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, u_dims))) return false;
     vec4 nb = texelFetch(u_volume_tex, p, 0);
     if (u_is_element_ca == 1) return int(round(nb.r)) > 0;
     float v = nb[u_channel];
     if (u_use_abs == 1) v = abs(v);
+    else if (u_use_abs == 2) v = abs(clamp(v, -1.0, 1.0));  // signed: alive if either sign
     return v > u_threshold;
 }
 
@@ -5172,14 +11115,14 @@ void main() {
     int instance_id = gl_InstanceID;
     int vert_id = gl_VertexID;
 
-    // Unpack position from 1 uint (4 bytes) — 9 bits per axis + 5-bit shading
+    // Unpack position from 1 uint (4 bytes) — __PB__ bits per axis + __SB__-bit shading
     uint pdata = voxels[instance_id];
-    uint shade_hint = (pdata >> 27) & 0x1Fu;  // 0..31, smoothed AO score
+    uint shade_hint = (pdata >> (3u * __PB__)) & __SMASK__;
 
     // Sample color from 3D texture at this voxel's grid coordinate (exact texel)
-    ivec3 ipos = ivec3(int(pdata & 0x1FFu),
-                        int((pdata >>  9) & 0x1FFu),
-                        int((pdata >> 18) & 0x1FFu));
+    ivec3 ipos = ivec3(int(pdata & __PMASK__),
+                        int((pdata >>  __PB__) & __PMASK__),
+                        int((pdata >> (2u * __PB__)) & __PMASK__));
 
     // Per-face visibility: degenerate triangles for faces hidden by a neighbor
     int face_id = vert_id / 6;
@@ -5214,6 +11157,7 @@ void main() {
     } else {
         value = cell[u_channel];
         if (u_use_abs == 1) value = abs(value);
+        else if (u_use_abs == 2) value = 0.5 + 0.5 * clamp(value, -1.0, 1.0);  // signed bipolar
         // Normalize value to [0,1] relative to threshold
         value = clamp((value - u_threshold) / max(1.0 - u_threshold, 0.001), 0.0, 1.0);
 
@@ -5221,7 +11165,7 @@ void main() {
         // (5 bits, 0..31) to give 32 smooth darkening levels instead of the
         // previous 4. This eliminates visible posterization on iso-surfaces.
         if (value > 0.99) {
-            float sn = float(shade_hint) / 31.0;  // 5-bit hint, 0..1
+            float sn = float(shade_hint) / float(__SHADE_MAX__);  // shade-bit hint, normalised to [0,1]
             // Map so isolated cells (sn ~ 0) are bright (0.85) and deeply
             // embedded cells (sn ~ 1) are dim (0.30). The exponent shapes
             // the response curve to emphasize edges.
@@ -5304,6 +11248,16 @@ void main() {
         else if (u_colormap == 1) color = colormap_cool(t);
         else if (u_colormap == 3) color = colormap_neon(t);
         else if (u_colormap == 4) color = colormap_discrete(t);
+        else if (u_colormap == 6) {
+            // Diverging blue->white->red (matches volumetric path).
+            float u = clamp(t, 0.0, 1.0);
+            float d = (u - 0.5) * 2.0;
+            float a = abs(d);
+            vec3 cold = vec3(0.10, 0.30, 0.95);
+            vec3 warm = vec3(0.95, 0.20, 0.20);
+            vec3 hue  = (d >= 0.0) ? warm : cold;
+            color = mix(vec3(0.95, 0.95, 0.95), hue, a);
+        }
         else color = vec3(t);
     }
 
@@ -5388,19 +11342,95 @@ VIEW_TEX_BUILD_SHADER = """
 #version 430
 layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
 
-layout(r16f, binding=0) writeonly uniform image3D u_view;
+// RGBA16F view texture:
+//   .r       = scalar density used for occupancy/min-max accel + iso/MIP
+//   .gba     = pre-mapped colour (or zero when u_vis_mode==0)
+// Downstream raymarchers read .r for density and (when u_use_baked_color
+// is set) .gba directly as the per-voxel colour, bypassing apply_colormap.
+layout(rgba16f, binding=0) writeonly uniform image3D u_view;
 uniform sampler3D u_volume;
 uniform int u_size;
-uniform int u_channel;
-uniform int u_use_abs;   // 0=raw, 1=abs, 2=signed→[0,1]
+uniform int u_channel;     // primary channel for density (legacy)
+uniform int u_use_abs;     // 0=raw, 1=abs, 2=signed→[0,1]
+// Optional value-range remap so rules whose channel range exceeds [0,1]
+// (e.g. sandpile grain count 0..12) don't render as a fully-opaque
+// "ghost cube". After the abs/sign step we map (v - lo)/(hi - lo) and
+// clamp to [0,1]. Default lo=0, hi=1 is a no-op (legacy behaviour).
+uniform float u_vis_lo;
+uniform float u_vis_hi;
+// Multi-channel transfer-function mode:
+//   0 = DENSITY      (legacy: only u_channel; .gba=0; raymarcher uses apply_colormap)
+//   1 = RGB_CHANNELS (R=ch0, G=ch1, B=ch2; density=length / sqrt(3))
+//   2 = HSV_PHASE    (hue=atan2(ch1,ch0)/2π, sat=1, val=length(ch0,ch1); density=val)
+//   3 = BIPOLAR      (signed ch0 → diverging blue/white/red; density=|ch0|)
+//   4 = RGBA_BLEND   (R=ch0,G=ch1,B=ch2; density=ch3)
+uniform int u_vis_mode;
+// Per-mode auxiliary range used for normalising vector magnitudes / phase values
+// (defaults set from preset; falls back to (vis_lo, vis_hi) when not specified).
+uniform float u_aux_lo;
+uniform float u_aux_hi;
+
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+vec3 diverging_bwr(float d) {
+    // d in [-1, 1] -> blue (cold) ↔ white ↔ red (warm)
+    float a = clamp(abs(d), 0.0, 1.0);
+    vec3 cold = vec3(0.10, 0.30, 0.95);
+    vec3 warm = vec3(0.95, 0.20, 0.20);
+    vec3 hue  = (d >= 0.0) ? warm : cold;
+    return mix(vec3(0.95, 0.95, 0.95), hue, a);
+}
 
 void main() {
     ivec3 p = ivec3(gl_GlobalInvocationID);
     if (any(greaterThanEqual(p, ivec3(u_size)))) return;
-    float v = texelFetch(u_volume, p, 0)[u_channel];
-    if (u_use_abs == 1)      v = abs(v);
-    else if (u_use_abs == 2) v = v * 0.5 + 0.5;
-    imageStore(u_view, p, vec4(v, 0.0, 0.0, 0.0));
+    vec4 raw = texelFetch(u_volume, p, 0);
+
+    float density = 0.0;
+    vec3  colour  = vec3(0.0);
+    float scale = (u_vis_hi > u_vis_lo) ? (1.0 / (u_vis_hi - u_vis_lo)) : 1.0;
+    float aux_scale = (u_aux_hi > u_aux_lo) ? (1.0 / (u_aux_hi - u_aux_lo)) : 1.0;
+
+    if (u_vis_mode == 1) {
+        // RGB_CHANNELS: each channel mapped through (vis_lo, vis_hi)
+        vec3 rgb = clamp((raw.rgb - vec3(u_vis_lo)) * scale, 0.0, 1.0);
+        density = clamp(length(rgb) * (1.0 / 1.7320508), 0.0, 1.0);
+        colour  = rgb;
+    } else if (u_vis_mode == 2) {
+        // HSV_PHASE: (ch0, ch1) treated as a 2-vector
+        float a = raw.r, b = raw.g;
+        float mag = length(vec2(a, b));
+        float val = clamp((mag - u_aux_lo) * aux_scale, 0.0, 1.0);
+        float hue = atan(b, a) / 6.2831853 + 0.5;  // wrap to [0,1]
+        colour  = hsv2rgb(vec3(hue, 1.0, val));
+        density = val;
+    } else if (u_vis_mode == 3) {
+        // BIPOLAR: signed ch0
+        float v = raw[u_channel];
+        float d = clamp(v * aux_scale, -1.0, 1.0);   // aux_lo unused; aux_hi normalises
+        if (u_aux_hi <= u_aux_lo) d = clamp(v, -1.0, 1.0);
+        density = abs(d);
+        colour  = diverging_bwr(d);
+    } else if (u_vis_mode == 4) {
+        // RGBA_BLEND: explicit per-channel colour, density from ch3
+        vec3 rgb = clamp((raw.rgb - vec3(u_vis_lo)) * scale, 0.0, 1.0);
+        density  = clamp((raw.a - u_aux_lo) * aux_scale, 0.0, 1.0);
+        colour   = rgb;
+    } else {
+        // 0 = DENSITY (legacy single-channel, colormap applied in raymarcher)
+        float v = raw[u_channel];
+        if (u_use_abs == 1)      v = abs(v);
+        else if (u_use_abs == 2) v = v * 0.5 + 0.5;
+        v = clamp((v - u_vis_lo) * scale, 0.0, 1.0);
+        density = v;
+        colour  = vec3(0.0);  // raymarcher will recolour via apply_colormap
+    }
+
+    imageStore(u_view, p, vec4(density, colour));
 }
 """
 
@@ -5511,11 +11541,26 @@ uniform sampler3D u_minmax_mip;
 uniform int u_minmax_size;
 uniform int u_use_minmax;
 
-// Reduced-precision view texture (see FRAGMENT_SHADER for docs)
+// Reduced-precision view texture (see FRAGMENT_SHADER for docs).
+// RGBA16F: .r = density (used by accel/iso/MIP), .gba = baked colour
+// (zero in DENSITY mode → fall back to apply_colormap).
 uniform sampler3D u_view_tex;
+uniform int u_vis_mode;       // 0 = DENSITY (use apply_colormap), >0 = baked colour
+
+// World-space bounding box of the (possibly non-cubic) volume.
+// Voxels are CUBIC in world units (size 1/M, M=max(W,H,D)) so the box
+// spans [0, W/M] x [0, H/M] x [0, D/M]. For cubic grids this is
+// vec3(1.0) and all math collapses to the legacy unit-cube form.
+uniform vec3 u_box_dims;
+uniform vec3 u_inv_box_dims;  // 1.0 / u_box_dims, set per-frame from Python
 
 float sample_vol(vec3 p) {
-    return texture(u_view_tex, p).r;
+    // p is in world space [0, u_box_dims]. Map to texcoord [0,1] per axis.
+    return texture(u_view_tex, p * u_inv_box_dims).r;
+}
+
+vec4 sample_vol4(vec3 p) {
+    return texture(u_view_tex, p * u_inv_box_dims);
 }
 
 // Same colormaps as fragment shader (duplicated for compute path)
@@ -5557,15 +11602,36 @@ vec3 colormap_spectral(float t) {
     else if(wl>700.0)edge=0.3+0.7*(780.0-wl)/80.0;
     return clamp(rgb*edge,0.0,1.0);
 }
+// Diverging blue->white->red. Designed for signed-bipolar data: 0.5 = neutral.
+vec3 colormap_diverging(float t) {
+    float u = clamp(t, 0.0, 1.0);
+    float d = (u - 0.5) * 2.0;       // -1..+1
+    float a = abs(d);                 // saturation away from white
+    vec3 cold = vec3(0.10, 0.30, 0.95);
+    vec3 warm = vec3(0.95, 0.20, 0.20);
+    vec3 hue  = (d >= 0.0) ? warm : cold;
+    return mix(vec3(0.95, 0.95, 0.95), hue, a);
+}
 vec3 apply_colormap(float t) {
     if(u_colormap==0)return colormap_fire(t);if(u_colormap==1)return colormap_cool(t);
     if(u_colormap==3)return colormap_neon(t);if(u_colormap==4)return colormap_discrete(t);
-    if(u_colormap==5)return colormap_spectral(t);return vec3(t);
+    if(u_colormap==5)return colormap_spectral(t);
+    if(u_colormap==6)return colormap_diverging(t);return vec3(t);
+}
+
+// Multi-channel-aware per-voxel colour (mirrors FRAGMENT_SHADER).
+vec3 voxel_color(vec4 sample4) {
+    if (u_vis_mode == 0) return apply_colormap(sample4.r);
+    return sample4.gba;
 }
 
 vec2 intersect_box(vec3 ro, vec3 rd) {
-    vec3 inv_rd=1.0/rd;
-    vec3 t0=(vec3(0.0)-ro)*inv_rd, t1=(vec3(1.0)-ro)*inv_rd;
+    // Defensive: replace |rd[i]| < 1e-20 with +1e-20 so axis-aligned rays
+    // don't propagate Inf/NaN through tmin/tmax. The misclassified axis
+    // produces huge t-values that the subsequent max/min discard.
+    vec3 rd_safe = mix(rd, vec3(1e-20), lessThan(abs(rd), vec3(1e-20)));
+    vec3 inv_rd=1.0/rd_safe;
+    vec3 t0=(vec3(0.0)-ro)*inv_rd, t1=(u_box_dims-ro)*inv_rd;
     vec3 tmin=min(t0,t1), tmax=max(t0,t1);
     return vec2(max(max(tmin.x,tmin.y),tmin.z), min(min(tmax.x,tmax.y),tmax.z));
 }
@@ -5583,12 +11649,15 @@ float ign_hash(vec2 pixel, int frame) {
     return fract(52.9829189*fract(0.06711056*r.x+0.00583715*r.y));
 }
 
+// Branchless tier select via two step() calls — avoids warp divergence
+// in sparse regions (matches adaptive_step_multiplier in fragment shader).
 float adaptive_step(vec3 p) {
     if (u_use_minmax == 0) return 1.0;
     vec2 mm = texture(u_minmax_mip, p).rg;
-    if (mm.g < 0.005) return 4.0;
-    if (mm.g < 0.02) return 2.0;
-    return 1.0;
+    float local_max = mm.g;
+    float t_big = step(local_max, 0.005);  // 1.0 if local_max ≤ 0.005
+    float t_med = step(local_max, 0.02);   // 1.0 if local_max ≤ 0.02
+    return mix(1.0, mix(2.0, 4.0, t_big), t_med);
 }
 
 // ── Occupancy DDA (mirrors FRAGMENT_SHADER::skip_empty_blocks) ─────
@@ -5602,7 +11671,9 @@ float skip_empty_blocks(vec3 ro, vec3 rd, float t_start, float t_end) {
                              vec3(0.0), vec3(float(u_occ_size) - 1.0)));
     if (texelFetch(u_occupancy, cell, 0).r > 0u) return t;
 
-    vec3 inv_rd = 1.0 / rd;
+    // Defensive: guard against axis-aligned rays producing Inf/NaN.
+    vec3 rd_safe = mix(rd, vec3(1e-20), lessThan(abs(rd), vec3(1e-20)));
+    vec3 inv_rd = 1.0 / rd_safe;
     vec3 step_dir = sign(rd);
     vec3 next_boundary = vec3(cell) + max(step_dir, vec3(0.0));
     vec3 t_max_v = (next_boundary / float(u_occ_size) - ro) * inv_rd;
@@ -5671,12 +11742,19 @@ void main() {
 
         for (int i = 0; i < max_steps && t < t_end; i++) {
             vec3 p = ro + rd * t;
-            float val = sample_vol(p);
+            vec4 s4 = sample_vol4(p);
+            float val = s4.r;
 
-            if (val > 0.01) {
+            // In signed-bipolar mode, val is centered at 0.5 (empty cells
+            // ≈ 0.5, team A ≈ 1.0, team B ≈ 0.0). Derive alpha from the
+            // distance-from-center so empty cells are transparent and
+            // BOTH signs are visible at full opacity.
+            float density = (u_vis_abs == 2) ? abs(val - 0.5) * 2.0 : val;
+
+            if (density > 0.01) {
                 empty_run = 0.0;
-                vec3 col = apply_colormap(val);
-                float alpha = val * u_density_scale * base_step;
+                vec3 col = voxel_color(s4);
+                float alpha = density * u_density_scale * base_step;
                 alpha = min(alpha, 0.95);
                 accum_color += col * alpha * (1.0 - accum_alpha) * u_brightness;
                 accum_alpha += alpha * (1.0 - accum_alpha);
@@ -5712,12 +11790,13 @@ void main() {
                     if (sample_vol(ro+rd*t_mid) > u_iso_threshold) t_hi=t_mid; else t_lo=t_mid;
                 }
                 p = ro + rd * t_hi;
-                val = sample_vol(p);
+                vec4 s4 = sample_vol4(p);
+                val = s4.r;
                 vec3 n = compute_gradient_opt(p, base_step, val);
                 vec3 ld = normalize(vec3(0.5,1.0,0.3));
                 float diff = max(dot(n,ld),0.0);
                 float spec = pow(max(dot(reflect(-ld,n),-rd),0.0),32.0);
-                hit_color = apply_colormap(val)*(0.15+diff*0.7)*u_brightness+vec3(spec*0.3);
+                hit_color = voxel_color(s4)*(0.15+diff*0.7)*u_brightness+vec3(spec*0.3);
                 break;
             }
             prev_val = val;
@@ -5788,16 +11867,37 @@ uniform int u_minmax_size;          // mipmap grid dimension
 uniform int u_use_minmax;           // 0=disabled, 1=enabled
 
 // ── Reduced-precision view texture ──────────────────────────────────
-// R16F scalar baked from (u_volume[channel] -> optional abs/signed remap)
-// once per sim step. Sampling this is 8× less bandwidth than sampling
-// the RGBA32F simulation texture, and eliminates the per-sample branch.
+// RGBA16F baked once per sim step:
+//   .r   = scalar density (legacy single-channel value, post-abs/range)
+//   .gba = pre-mapped colour (zero in DENSITY mode → fall back to apply_colormap)
+// Sampling this is 4× the bytes of the old R16F variant but still
+// 2× cheaper than the RGBA32F simulation source, and lets the
+// raymarcher skip apply_colormap on multi-channel rules.
 uniform sampler3D u_view_tex;
+uniform int u_vis_mode;       // 0 = DENSITY (use apply_colormap), >0 = baked colour
+
+// World-space bounding box of the (possibly non-cubic) volume.
+// Voxels are CUBIC in world units (size 1/M, M=max(W,H,D)) so the box
+// spans [0, W/M] x [0, H/M] x [0, D/M]. For cubic grids this is
+// vec3(1.0) and all math collapses to the legacy unit-cube form.
+uniform vec3 u_box_dims;
+uniform vec3 u_inv_box_dims;  // 1.0 / u_box_dims, set per-frame from Python
 
 // ────────────────────────────────────────────────────────────────────
 // Sample the selected visualization channel from the volume
 float sample_vol(vec3 p) {
-    return texture(u_view_tex, p).r;
+    // p is in world space [0, u_box_dims]. Map to texcoord [0,1] per axis.
+    return texture(u_view_tex, p * u_inv_box_dims).r;
 }
+
+// Sample the full RGBA from the view tex (.r=density, .gba=baked colour).
+vec4 sample_vol4(vec3 p) {
+    return texture(u_view_tex, p * u_inv_box_dims);
+}
+
+// Per-voxel colour: in DENSITY mode run apply_colormap on the density;
+// otherwise use the colour the build-pass already mapped from multiple
+// channels. Defined after apply_colormap below.
 
 // ── Colormaps ───────────────────────────────────────────────────────
 vec3 colormap_fire(float t) {
@@ -5874,20 +11974,43 @@ vec3 colormap_spectral(float t) {
     return clamp(rgb * edge, 0.0, 1.0);
 }
 
+// Diverging blue->white->red. Designed for signed-bipolar data: 0.5 = neutral.
+vec3 colormap_diverging(float t) {
+    float u = clamp(t, 0.0, 1.0);
+    float d = (u - 0.5) * 2.0;       // -1..+1
+    float a = abs(d);                 // saturation away from white
+    vec3 cold = vec3(0.10, 0.30, 0.95);
+    vec3 warm = vec3(0.95, 0.20, 0.20);
+    vec3 hue  = (d >= 0.0) ? warm : cold;
+    return mix(vec3(0.95, 0.95, 0.95), hue, a);
+}
 vec3 apply_colormap(float t) {
     if (u_colormap == 0) return colormap_fire(t);
     if (u_colormap == 1) return colormap_cool(t);
     if (u_colormap == 3) return colormap_neon(t);
     if (u_colormap == 4) return colormap_discrete(t);
     if (u_colormap == 5) return colormap_spectral(t);
+    if (u_colormap == 6) return colormap_diverging(t);
     return vec3(t);  // grayscale
+}
+
+// Multi-channel-aware per-voxel colour. In DENSITY mode (vis_mode==0)
+// the build-pass left .gba zero, so we colourise via apply_colormap on
+// the density. In any other mode the build-pass already produced the
+// final colour from multiple sim channels and we use it directly.
+vec3 voxel_color(vec4 sample4) {
+    if (u_vis_mode == 0) return apply_colormap(sample4.r);
+    return sample4.gba;
 }
 
 // ── Ray-AABB intersection ───────────────────────────────────────────
 vec2 intersect_box(vec3 ro, vec3 rd) {
-    vec3 inv_rd = 1.0 / rd;
+    // Defensive: replace |rd[i]| < 1e-20 with +1e-20 so axis-aligned rays
+    // don't propagate Inf/NaN through the slab test.
+    vec3 rd_safe = mix(rd, vec3(1e-20), lessThan(abs(rd), vec3(1e-20)));
+    vec3 inv_rd = 1.0 / rd_safe;
     vec3 t0 = (vec3(0.0) - ro) * inv_rd;
-    vec3 t1 = (vec3(1.0) - ro) * inv_rd;
+    vec3 t1 = (u_box_dims - ro) * inv_rd;
     vec3 tmin = min(t0, t1);
     vec3 tmax = max(t0, t1);
     float t_enter = max(max(tmin.x, tmin.y), tmin.z);
@@ -5931,7 +12054,9 @@ float skip_empty_blocks(vec3 ro, vec3 rd, float t_start, float t_end) {
     if (occ > 0u) return t;
 
     // DDA through occupancy grid
-    vec3 inv_rd = 1.0 / rd;
+    // Defensive: guard against axis-aligned rays producing Inf/NaN.
+    vec3 rd_safe = mix(rd, vec3(1e-20), lessThan(abs(rd), vec3(1e-20)));
+    vec3 inv_rd = 1.0 / rd_safe;
     vec3 step_dir = sign(rd);
     vec3 pos = p * float(u_occ_size);
     ivec3 cell = ivec3(floor(pos));
@@ -5981,6 +12106,11 @@ float skip_empty_blocks(vec3 ro, vec3 rd, float t_start, float t_end) {
 // ── Min/max mipmap adaptive stepping ────────────────────────────────
 // Returns a safe step multiplier: how many voxels can we skip forward
 // knowing the maximum value in the local region is below threshold.
+//
+// Branchless tier select via two step() calls — avoids warp divergence
+// in sparse regions where many lanes would otherwise take different
+// early-return paths. Identical results to the if/return version
+// (boundary equality is meaningless for f16 texture samples).
 float adaptive_step_multiplier(vec3 p) {
     if (u_use_minmax == 0) return 1.0;
 
@@ -5988,11 +12118,12 @@ float adaptive_step_multiplier(vec3 p) {
     vec2 mm = texture(u_minmax_mip, p).rg;
     float local_max = mm.g;
 
-    // If the local max is near zero, we can take a large step (4 voxels)
-    if (local_max < 0.005) return 4.0;
-    // If local max is small, take a 2-voxel step
-    if (local_max < 0.02) return 2.0;
-    return 1.0;
+    //   local_max ≤ 0.005  →  4.0   (large skip in empty space)
+    //   local_max ≤ 0.02   →  2.0   (medium skip in low-density)
+    //   else               →  1.0   (full-resolution near features)
+    float t_big = step(local_max, 0.005);  // 1.0 if local_max ≤ 0.005
+    float t_med = step(local_max, 0.02);   // 1.0 if local_max ≤ 0.02
+    return mix(1.0, mix(2.0, 4.0, t_big), t_med);
 }
 
 void main() {
@@ -6011,7 +12142,8 @@ void main() {
         else p = vec3(v_uv, u_slice_pos);
 
         float val = sample_vol(p);
-        vec3 col = apply_colormap(val);
+        vec4 s4 = sample_vol4(p);
+        vec3 col = voxel_color(s4);
         fragColor = vec4(col * u_brightness, 1.0);
         return;
     }
@@ -6049,12 +12181,18 @@ void main() {
 
         for (int i = 0; i < max_steps && t < t_end; i++) {
             vec3 p = ro + rd * t;
-            float val = sample_vol(p);
+            vec4 s4 = sample_vol4(p);
+            float val = s4.r;
 
-            if (val > 0.01) {
+            // In signed-bipolar mode, val is centered at 0.5 — derive
+            // alpha from distance-from-center so empty cells are
+            // transparent and BOTH signs render at full opacity.
+            float density = (u_vis_abs == 2) ? abs(val - 0.5) * 2.0 : val;
+
+            if (density > 0.01) {
                 empty_run = 0.0;
-                vec3 col = apply_colormap(val);
-                float alpha = val * u_density_scale * base_step;
+                vec3 col = voxel_color(s4);
+                float alpha = density * u_density_scale * base_step;
                 alpha = min(alpha, 0.95);
 
                 accum_color += col * alpha * (1.0 - accum_alpha) * u_brightness;
@@ -6099,7 +12237,8 @@ void main() {
                     else t_lo = t_mid;
                 }
                 p = ro + rd * t_hi;
-                val = sample_vol(p);
+                vec4 s4 = sample_vol4(p);
+                val = s4.r;
 
                 // Gradient from 3 forward differences (reuse center val)
                 vec3 normal = compute_gradient_opt(p, base_step, val);
@@ -6108,7 +12247,7 @@ void main() {
                 float ambient = 0.15;
                 float specular = pow(max(dot(reflect(-light_dir, normal), -rd), 0.0), 32.0);
 
-                vec3 base_col = apply_colormap(val);
+                vec3 base_col = voxel_color(s4);
                 hit_color = base_col * (ambient + diffuse * 0.7) * u_brightness + vec3(specular * 0.3);
                 break;
             }
@@ -6153,6 +12292,272 @@ void main() {
 
 # ── Rule presets ──────────────────────────────────────────────────────
 
+
+def _wandering_voxels_preset():
+    """Validation scenario for the entity_arena substrate.
+
+    Spawns two coloured teams of entities at opposite corners; each
+    entity does brownian motion + a weak attraction to its team's
+    spawn center. Proves the whole pipeline (spawn -> push -> hash ->
+    step -> paint) wires up end-to-end.
+    """
+
+    def on_init(arena, size, rng, params):
+        # Two teams: red on the left, blue on the right.
+        s = float(size)
+        arena.set_team(0, color=(1.0, 0.2, 0.2, 1.0),
+                       spawn_pos=(s * 0.30, s * 0.50, s * 0.50),
+                       spawn_radius=s * 0.12)
+        arena.set_team(1, color=(0.2, 0.4, 1.0, 1.0),
+                       spawn_pos=(s * 0.70, s * 0.50, s * 0.50),
+                       spawn_radius=s * 0.12)
+        # Paint radius scales with world size so blobs stay visible at any
+        # resolution. At size=64 -> r=2.0; at size=128 -> r=4.0.
+        paint_r = max(1.5, s / 32.0)
+        n_per_team = 800
+        for team in (0, 1):
+            spawn = arena.teams['spawn_pr'][team]
+            cx, cy, cz, sr = spawn[0], spawn[1], spawn[2], spawn[3]
+            for _ in range(n_per_team):
+                p = (cx + (rng.random() - 0.5) * sr * 2.0,
+                     cy + (rng.random() - 0.5) * sr * 2.0,
+                     cz + (rng.random() - 0.5) * sr * 2.0)
+                arena.spawn(kind=1, team=team, pos=p, radius=paint_r)
+
+    return {
+        "label": "Wandering Voxels (entity_arena demo)",
+        "shader": "noop",   # not used; passes list overrides
+        "passes": [
+            {"shader": "_clear",       "kind": "entity_paint_clear", "writes": ["p1"]},
+            {"shader": "_chash",       "kind": "entity_clear_hash",  "writes": []},
+            {"shader": "_bhash",       "kind": "entity_build_hash",  "writes": []},
+            {"shader": "wander_step",  "kind": "entity_step",        "writes": []},
+            {"shader": "_paint",       "kind": "entity_paint",       "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 4096,
+            "max_teams": 2,
+            "hash_cell": 8,
+        },
+        "entity_shaders": {
+            "wander_step": entity_arena.SHADER_WANDERING_STEP,
+        },
+        "on_init": on_init,
+        "params": {"Jitter": 0.6, "Pull": 4.0},
+        "param_ranges": {
+            "Jitter": (0.0, 5.0),
+            "Pull":   (0.0, 30.0),
+        },
+        "dt": 0.5,
+        "init": "blank",
+        "vis_channels": ["Teams (signed)", "Team 0 only", "Team 1 only", "Density (alpha)"],
+        "vis_default": 0,
+        "vis_abs": 2,            # signed bipolar: maps [-1,+1] -> [0,1]
+        "colormap": 1,           # cool: blue (team 1) -> magenta (team 0)
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.05,
+        "boundary": "toroidal",
+        "description": (
+            "Validation demo for the entity_arena substrate. "
+            "Two coloured teams of voxel entities wander around a weak "
+            "attractor at their team's home position. If you see two "
+            "blobs (red on the left, blue on the right) that drift and "
+            "blur over time, the substrate is wired up correctly."
+        ),
+        "short_description": "Two coloured entity clouds drifting around home positions.",
+    }
+
+
+def _predator_prey_preset():
+    """Full-scale predator-prey ecosystem.
+
+    Prey graze a regenerating food field (ch3); predators hunt prey via
+    a spatial-hash neighbour query; both reproduce when energy is high
+    and die when energy hits zero. CPU runs reproduction every frame
+    after pulling entities back from the GPU.
+
+    Visual: composite ch0 (vis_abs=2 + diverging colormap) shows food as
+    faint pink background, prey as bright red blobs, predators as bright
+    blue dots. Switch vis channel for "prey only" / "predator only" /
+    "food only" views.
+    """
+
+    # Constants used by both on_init and on_tick.
+    KIND_PREY = 1
+    KIND_PRED = 2
+    PREY_REPRO_ENERGY = 1.5
+    PRED_REPRO_ENERGY = 2.0
+    # Target densities (entities per voxel). Scaling with size³ keeps the
+    # ecosystem behaviour consistent across grid sizes — at fixed
+    # absolute populations a 256³ grid has 8× more food per entity than
+    # 128³, which inverts the dynamics.
+    PREY_DENSITY = 0.0024   # ≈ 5000 prey at size=128
+    PRED_DENSITY = 0.0001   # ≈  200 pred at size=128
+    MAX_PREY = 24000        # cap so 256³ doesn't OOM the arena (32k slots)
+    MAX_PRED = 1000
+    MAX_REPRO_PER_TICK = 400  # cap CPU work per frame
+
+    def _spawn_initial(arena, size, rng):
+        s = float(size)
+        n_voxels = size ** 3
+        n_prey = min(MAX_PREY, int(n_voxels * PREY_DENSITY))
+        n_pred = min(MAX_PRED, int(n_voxels * PRED_DENSITY))
+        # Single team per kind (team is just for display grouping).
+        arena.set_team(0, color=(0.95, 0.20, 0.20, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        arena.set_team(1, color=(0.10, 0.30, 0.95, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        # Fixed small paint radius — entities should look like points,
+        # not chunky cubes. Predators slightly larger so they're visible
+        # at low population.
+        prey_r = 1.2
+        pred_r = 1.8
+        for _ in range(n_prey):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=KIND_PREY, team=0, pos=p, radius=prey_r,
+                        energy=1.0 + rng.random() * 0.5,
+                        genome=(0.6 + rng.random() * 0.3, 0.0, 0.0, 0.0))
+        for _ in range(n_pred):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=KIND_PRED, team=1, pos=p, radius=pred_r,
+                        energy=1.0 + rng.random() * 0.5,
+                        genome=(0.9 + rng.random() * 0.4,   # speed
+                                4.0 + rng.random() * 4.0,   # sight radius
+                                0.0, 0.0))
+
+    def on_init(arena, size, rng, params):
+        _spawn_initial(arena, size, rng)
+
+    def on_tick(arena, frame, params):
+        """Pull entity state, reproduce high-energy survivors, push back.
+
+        Runs every frame BEFORE the GPU passes execute (the simulator
+        calls on_tick → push_all → GPU passes). Reproduction is the only
+        way new entities enter the world after on_init.
+        """
+        arena.pull_entities()
+        ents = arena.entities
+        kinds = ents['ktrf'][:, 0]
+        energy = ents['vel_energy'][:, 3]
+
+        # Find all entities ready to reproduce.
+        prey_ready = np.where((kinds == KIND_PREY) & (energy > PREY_REPRO_ENERGY))[0]
+        pred_ready = np.where((kinds == KIND_PRED) & (energy > PRED_REPRO_ENERGY))[0]
+
+        rng = np.random.default_rng(frame * 1664525 + 1013904223)
+
+        # Cap per-tick reproduction so CPU stays under budget at high pop.
+        # Truncate each list independently — simple and stable.
+        cap_per = MAX_REPRO_PER_TICK // 2
+        if prey_ready.size > cap_per:
+            prey_ready = rng.choice(prey_ready, size=cap_per, replace=False)
+        if pred_ready.size > cap_per:
+            pred_ready = rng.choice(pred_ready, size=cap_per, replace=False)
+
+        n_repro = 0
+        for parent_idx in prey_ready:
+            if not arena._free_slots:
+                break
+            parent = ents[parent_idx]
+            ppos = parent['pos_radius'][:3]
+            offset = (rng.random(3).astype(np.float32) - 0.5) * 2.0
+            child_pos = (ppos + offset) % float(arena.size)
+            speed = float(parent['genome'][0]) * (0.95 + rng.random() * 0.10)
+            arena.spawn(kind=KIND_PREY, team=0,
+                        pos=tuple(child_pos), radius=float(parent['pos_radius'][3]),
+                        energy=0.6,
+                        genome=(speed, 0.0, 0.0, 0.0))
+            # Halve parent energy.
+            ents[parent_idx]['vel_energy'][3] = energy[parent_idx] - 0.6
+            n_repro += 1
+
+        for parent_idx in pred_ready:
+            if not arena._free_slots:
+                break
+            parent = ents[parent_idx]
+            ppos = parent['pos_radius'][:3]
+            offset = (rng.random(3).astype(np.float32) - 0.5) * 3.0
+            child_pos = (ppos + offset) % float(arena.size)
+            speed = float(parent['genome'][0]) * (0.95 + rng.random() * 0.10)
+            sight = float(parent['genome'][1]) * (0.95 + rng.random() * 0.10)
+            arena.spawn(kind=KIND_PRED, team=1,
+                        pos=tuple(child_pos), radius=float(parent['pos_radius'][3]),
+                        energy=0.8,
+                        genome=(speed, sight, 0.0, 0.0))
+            ents[parent_idx]['vel_energy'][3] = energy[parent_idx] - 0.8
+            n_repro += 1
+
+        # Track stats on team SSBO (saskf.y = alive count) so the UI can
+        # show population sizes.
+        prey_alive = int(np.count_nonzero(ents['ktrf'][:, 0] == KIND_PREY))
+        pred_alive = int(np.count_nonzero(ents['ktrf'][:, 0] == KIND_PRED))
+        arena.teams[0]['saskf'][1] = prey_alive
+        arena.teams[1]['saskf'][1] = pred_alive
+        # The simulator pushes via arena.push_all() right after on_tick,
+        # so our edits to ents and arena.teams are persisted.
+
+    return {
+        "label": "Predator-Prey Ecosystem",
+        "shader": "noop",
+        "passes": [
+            {"shader": "food_field",  "kind": "entity_field",      "writes": ["p1"]},
+            {"shader": "_chash",      "kind": "entity_clear_hash", "writes": []},
+            {"shader": "_bhash",      "kind": "entity_build_hash", "writes": []},
+            {"shader": "prey_step",   "kind": "entity_step",       "writes": []},
+            {"shader": "predator_step", "kind": "entity_step",     "writes": []},
+            {"shader": "_paint",      "kind": "entity_paint",      "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 32768,
+            "max_teams": 2,
+            "hash_cell": 6,
+        },
+        "entity_shaders": {
+            "food_field":     entity_arena.SHADER_FOOD_FIELD_UPDATE,
+            "prey_step":      entity_arena.SHADER_PREY_STEP,
+            "predator_step":  entity_arena.SHADER_PREDATOR_STEP,
+        },
+        # Override the default SHADER_PAINT for entity_paint passes.
+        # Compile branch in _build_compute_progs honors this key.
+        "entity_paint_shader": entity_arena.SHADER_ECO_PAINT,
+        "on_init":  on_init,
+        "on_tick":  on_tick,
+        "params": {
+            "Food regrow":  0.4,
+            "Graze rate":   0.6,
+            "Pred sight":   1.0,
+            "Metabolism":   0.20,
+        },
+        "param_ranges": {
+            "Food regrow":  (0.0, 2.0),
+            "Graze rate":   (0.0, 2.0),
+            "Pred sight":   (0.2, 4.0),
+            "Metabolism":   (0.05, 1.0),
+        },
+        "dt": 0.5,
+        "init": "food_seed",
+        "vis_channels": ["Composite (food+entities)", "Prey only", "Predator only", "Food only"],
+        "vis_default": 0,
+        "vis_abs": 2,         # signed bipolar for ch0
+        "colormap": 6,        # Diverging blue->white->red
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.03,
+        "boundary": "toroidal",
+        "description": (
+            "Lotka-Volterra ecosystem in 3D. Prey (red) graze a "
+            "regenerating food field (faint pink) while predators "
+            "(blue) hunt prey via spatial-hash neighbour queries. "
+            "Both species reproduce when energy is high and starve "
+            "when energy hits zero. Watch for population cycles: "
+            "prey boom -> predator boom -> prey crash -> predator "
+            "crash -> repeat."
+        ),
+        "short_description": "Predator-prey ecosystem with food field and Lotka-Volterra cycles.",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -6168,11 +12573,16 @@ RULE_PRESETS = {
         "init": "life_fbm_moderate",
         "init_variants": ["life_fbm_moderate", "life_fbm_dense", "random_dense", "game_of_life_centered"],
         "description": "Classic discrete Life in 3D. B6-7/S5-7 — stable clusters.",
-        "vis_channels": ["Value"],
+        "vis_channels": ["Alive", "Neighbour density", "Δ (just-changed)"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",  # ch0=alive, ch1=alive/26, ch2=|delta|
         "render_mode": "voxel",
         "boundary": "toroidal",
+        # Block-sparse compute dispatch: Life clusters are >90% empty
+        # space; only updating active 8³ blocks gives 5–20× speedup at
+        # 192³+. Auto-disabled at <128³ where dense is already fast.
+        "sparse_dispatch": True,
     },
 
     "445_rule": {
@@ -6191,11 +12601,13 @@ RULE_PRESETS = {
         "init": "game_of_life_centered",
         "init_variants": ["game_of_life_centered", "life_fbm_sparse"],
         "description": "B4/S4 — strict rule grows diamond-like crystals.",
-        "vis_channels": ["Value"],
+        "vis_channels": ["Alive", "Neighbour density", "Δ (just-changed)"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",
         "render_mode": "voxel",
         "boundary": "toroidal",
+        "sparse_dispatch": True,
     },
 
     "smoothlife_3d": {
@@ -6214,10 +12626,15 @@ RULE_PRESETS = {
         "init": "smoothlife_fbm",
         "init_variants": ["smoothlife_fbm", "random_smooth", "smoothlife_sparse"],
         "description": "Continuous analog of Life: cells survive within a density band.",
-        "vis_channels": ["Value"],
+        "vis_channels": ["State", "Outer mean n", "Growth", "|Δ|"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",
         "boundary": "toroidal",
+        # FP16 storage causes max-diff ~1.0 vs FP32 within 80 steps —
+        # the kernel weights average across many cells and small per-cell
+        # rounding errors compound into wholesale state divergence.
+        "precision": "fp32",
     },
     "reaction_diffusion_3d": {
         "label": "3D Gray-Scott (mitosis)",
@@ -6233,6 +12650,7 @@ RULE_PRESETS = {
         "vis_channels": ["U (substrate)", "V (catalyst)"],
         "vis_default": 1,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",  # R=U substrate, G=V catalyst (anti-correlated by design)
         "boundary": "toroidal",
     },
 
@@ -6251,6 +12669,71 @@ RULE_PRESETS = {
         "vis_channels": ["U (substrate)", "V (catalyst)"],
         "vis_default": 1,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "boundary": "toroidal",
+    },
+    "schnakenberg_3d": {
+        "label": "Schnakenberg (Turing spots)",
+        "shader": "schnakenberg_3d",
+        "params": {"a": 0.1, "b": 0.9, "Du": 0.05, "Dv": 1.0},
+        "param_ranges": {"a": (0.02, 0.3), "b": (0.3, 1.5),
+                         "Du": (0.01, 0.3), "Dv": (0.3, 3.0)},
+        "dt": 0.5,
+        "dt_range": (0.1, 2.0),
+        "init": "schnakenberg",
+        "description": "Schnakenberg — the canonical activator-substrate Turing system.",
+        "vis_channels": ["U (substrate)", "V (activator)"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "boundary": "toroidal",
+    },
+    "fitzhugh_nagumo_3d": {
+        "label": "FitzHugh-Nagumo (nerve pulses)",
+        "shader": "fitzhugh_nagumo_3d",
+        "params": {"a": 0.7, "b": 0.8, "ε": 0.08, "D": 1.0},
+        "param_ranges": {"a": (0.0, 1.5), "b": (0.1, 2.0),
+                         "ε": (0.005, 0.5), "D": (0.1, 4.0)},
+        "dt": 0.2,
+        "dt_range": (0.05, 0.5),
+        "init": "fitzhugh_nagumo",
+        "description": "FitzHugh-Nagumo — excitable membrane producing travelling pulses and scroll waves.",
+        "vis_channels": ["V (potential)", "W (recovery)"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "hsv_phase",  # excitable oscillator: phase = atan2(W, V)
+        "boundary": "toroidal",
+    },
+    "brusselator_3d": {
+        "label": "Brusselator (autocatalytic)",
+        "shader": "brusselator_3d",
+        "params": {"A": 1.0, "B": 3.0, "Du": 2.0, "Dv": 8.0},
+        "param_ranges": {"A": (0.3, 3.0), "B": (1.0, 6.0),
+                         "Du": (0.5, 5.0), "Dv": (1.0, 20.0)},
+        "dt": 0.05,
+        "dt_range": (0.005, 0.2),
+        "init": "brusselator",
+        "description": "Brusselator — Prigogine's autocatalytic oscillator with Hopf and Turing regimes.",
+        "vis_channels": ["U", "V"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "boundary": "toroidal",
+    },
+    "cyclic_ca_3d": {
+        "label": "Cyclic CA (RPS spirals)",
+        "shader": "cyclic_ca_3d",
+        "params": {"N states": 10.0, "Threshold": 2.0,
+                   "unused_0": 0.0, "unused_1": 0.0},
+        "param_ranges": {"N states": (4.0, 16.0), "Threshold": (1.0, 4.0),
+                         "unused_0": (0.0, 1.0), "unused_1": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "cyclic_ca",
+        "description": "Cyclic CA — N-state rock-paper-scissors producing 3D spiral waves.",
+        "vis_channels": ["State", "Phase"],
+        "vis_default": 1,
+        "vis_abs": False,
         "boundary": "toroidal",
     },
     "wave_3d": {
@@ -6266,6 +12749,8 @@ RULE_PRESETS = {
         "vis_channels": ["Displacement", "Velocity"],
         "vis_default": 0,
         "vis_abs": True,
+        "vis_mode": "bipolar",  # signed displacement → diverging blue↔red
+        "vis_aux_range": (0.0, 1.0),  # displacement amplitude ~ 1.0
         # Neumann (mirror) boundary preserves mean displacement exactly —
         # critical for cross-grid reproducibility. The previous "clamped"
         # (Dirichlet zero) boundary acted as an absorber that leaked mean
@@ -6535,10 +13020,15 @@ RULE_PRESETS = {
         "init": "lenia_fbm",
         "init_variants": ["lenia_fbm", "lenia_blobs"],
         "description": "Continuous CA with kernel-based growth — alien lifeforms.",
-        "vis_channels": ["Value"],
+        "vis_channels": ["State", "Potential", "Growth", "|Δ|"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",
         "boundary": "toroidal",
+        # FP16 produces max-diff ~0.6 vs FP32 within 80 steps — kernel
+        # convolution averages many cells, so per-cell rounding error
+        # accumulates rapidly. Keep at FP32.
+        "precision": "fp32",
     },
     "lenia_geminium": {
         "label": "Lenia (Geminium)",
@@ -6552,9 +13042,10 @@ RULE_PRESETS = {
         "init": "lenia_fbm",
         "init_variants": ["lenia_fbm", "lenia_blobs"],
         "description": "Wider growth tolerance + large kernel — fat pulsing creatures that divide and merge.",
-        "vis_channels": ["Value"],
+        "vis_channels": ["State", "Potential", "Growth", "|Δ|"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",
         "boundary": "toroidal",
     },
     "lenia_multi": {
@@ -6610,6 +13101,7 @@ RULE_PRESETS = {
         "vis_channels": ["Phase", "Frequency", "Coherence"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "hsv_phase",  # ch0=cos(θ), ch1=sin(θ) for hue ramp
         "boundary": "toroidal",
     },
 
@@ -6628,29 +13120,30 @@ RULE_PRESETS = {
         "vis_channels": ["Re(A)", "Im(A)", "Phase"],
         "vis_default": 2,
         "vis_abs": False,
+        "vis_mode": "hsv_phase",  # ch0=Re(A), ch1=Im(A) → hue = arg(A)
         "boundary": "toroidal",
     },
     "bz_turbulence": {
-        "label": "BZ Amplitude Turbulence",
-        "shader": "bz_3d",
-        # Spatial wavelength of CGLE patterns ~ 2π·sqrt(D/μ). At the
-        # previous defaults (D=0.2, μ=1.2) this was 0.4 reference voxels
-        # — sub-voxel, so the dominant mode aliased onto a checkerboard
-        # in phase (audit caught this as adj_corr=-0.21). D=1.0 gives
-        # wavelength ~6 voxels at REF_SIZE, enough to resolve spiral
-        # defects and amplitude turbulence cleanly.
-        "params": {"Alpha (dispersion)": 3.0, "Beta (nonlinear)": -1.5,
-                   "Diffusion": 1.0, "Growth (mu)": 1.2},
-        "param_ranges": {"Alpha (dispersion)": (1.5, 6.0), "Beta (nonlinear)": (-4.0, -0.5),
-                         "Diffusion": (0.05, 3.0), "Growth (mu)": (0.3, 4.0)},
-        "dt": 0.03,
-        "dt_range": (0.01, 0.1),
-        "init": "bz_reaction",
-        "init_variants": ["bz_reaction", "bz_spiral_seed", "bz_turbulence_high_amp"],
-        "description": "Strongly Benjamin-Feir unstable — amplitude dies to zero, creates defect-mediated turbulence.",
-        "vis_channels": ["Re(A)", "Im(A)", "Phase"],
+        "label": "BZ Scroll Wave Turbulence",
+        "shader": "bz_scroll_3d",
+        # Bespoke 3-D Barkley with explicit scroll-filament tracking.
+        # Excitable (rather than oscillator) regime gives sharper wave
+        # fronts; B channel exposes the 1-D defect filament cores via
+        # |∇u × ∇v| windowed at the wavefront half-rise.
+        "params": {"Excitability a": 0.75, "Threshold b": 0.06,
+                   "Epsilon": 0.08, "Diffusion": 1.5},
+        "param_ranges": {"Excitability a": (0.3, 1.2), "Threshold b": (0.0, 0.20),
+                         "Epsilon": (0.005, 0.20), "Diffusion": (0.05, 3.0)},
+        "dt": 0.02,
+        "dt_range": (0.005, 0.05),
+        "init": "bz_scroll_filament",
+        "init_variants": ["bz_scroll_filament", "bz_spiral_seed",
+                          "bz_reaction", "bz_turbulence_high_amp"],
+        "description": "3-D Barkley excitable medium — closed-loop scroll-wave filaments rotate, knot, break and reconnect. The B channel highlights the 1-D defect cores via |∇u × ∇v|.",
+        "vis_channels": ["Activator u", "Inhibitor v", "Filament S", "Phase"],
         "vis_default": 2,
         "vis_abs": False,
+        "vis_mode": "hsv_phase",
         "boundary": "toroidal",
     },
 
@@ -6675,6 +13168,7 @@ RULE_PRESETS = {
         "vis_channels": ["Excitation u", "Recovery v", "Phase"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "hsv_phase",
         "boundary": "toroidal",
     },
 
@@ -6698,16 +13192,23 @@ RULE_PRESETS = {
 
     "flocking_3d": {
         "label": "3D Flocking",
-        "shader": "flocking_3d",
-        "params": {"Alignment": 2.0, "Self-propel": 0.3,
-                   "Diffusion": 0.0004, "Repulsion": 0.5},
-        "param_ranges": {"Alignment": (0.05, 4.0), "Self-propel": (0.02, 2.0),
-                         "Diffusion": (0.00005, 0.01), "Repulsion": (0.0, 4.0)},
+        "passes": [
+            {"shader": "flocking_reynolds_3d", "writes": ["p1"], "kind": "voxel",
+             "param_names": ["Alignment", "Speed v0", "Diffusion", "Separation"]},
+            {"shader": "flocking_predator_3d", "writes": ["p2"], "kind": "voxel",
+             "param_names": ["Alignment", "Speed v0", "Diffusion", "Separation"]},
+        ],
+        "shader": "flocking_reynolds_3d",
+        "params": {"Alignment": 2.0, "Speed v0": 0.5,
+                   "Diffusion": 0.0004, "Separation": 0.6},
+        "param_ranges": {"Alignment": (0.05, 4.0), "Speed v0": (0.05, 1.5),
+                         "Diffusion": (0.00005, 0.01), "Separation": (0.0, 3.0)},
         "dt": 0.1,
         "dt_range": (0.02, 0.8),
         "init": "flocking",
         "init_variants": ["flocking", "flocking_vortex"],
-        "description": "Vicsek-style active matter — swarms, lanes, and vortex mills emerge.",
+        "field2_init": "fear_seed",
+        "description": "Reynolds boids in 3D — alignment + cohesion + separation, with a predator/fear field driving chase-and-scatter cycles.",
         "vis_channels": ["Density", "Vel X", "Vel Y", "Vel Z"],
         "vis_default": 0,
         "vis_abs": False,
@@ -6800,6 +13301,8 @@ RULE_PRESETS = {
         "vis_channels": ["Order param", "Chemical potential"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "bipolar",  # signed order param ∈ [-1,1]
+        "vis_aux_range": (0.0, 1.0),
         "render_mode": "volumetric",
         "boundary": "toroidal",
     },
@@ -6821,104 +13324,225 @@ RULE_PRESETS = {
     },
     "erosion": {
         "label": "Erosion & Sediment",
-        "shader": "erosion_3d",
-        "params": {"Erosion": 1.0, "Deposition": 0.15, "Diffusion": 0.2, "Gravity": 2.0},
-        "param_ranges": {"Erosion": (0.1, 8.0), "Deposition": (0.005, 3.0),
-                         "Diffusion": (0.02, 2.0), "Gravity": (0.2, 8.0)},
+        "shader": "erosion_hydraulic_3d",
+        "params": {"Erosion Ke": 0.6, "Deposition Kd": 0.4,
+                   "Capacity Kc": 0.6, "Gravity": 1.5},
+        "param_ranges": {"Erosion Ke": (0.05, 4.0), "Deposition Kd": (0.05, 4.0),
+                         "Capacity Kc": (0.05, 4.0), "Gravity": (0.2, 5.0)},
         "dt": 0.5,
-        "dt_range": (0.1, 3.0),
+        "dt_range": (0.1, 2.0),
         "init": "erosion_terrain",
         "init_variants": ["erosion_terrain", "erosion_ridges"],
-        "description": "Fluid erodes solid terrain, carries sediment, deposits — creates canyons and caves.",
+        "description": "Hydraulic flow with carry-capacity sediment transport — water descends terrain, channelizes into dendritic drainage networks, and carves canyons.",
         "vis_channels": ["Solid", "Fluid", "Sediment"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
-        "boundary": "clamped",
+        # Zero-flux walls: water/sediment are conserved diffusing fields,
+        # so Dirichlet-zero would drain mass at the boundary and create
+        # spurious erosion stripes along every face of the cube.
+        "boundary": "mirror",
     },
     "mycelium": {
         "label": "Mycelium Network",
-        "shader": "mycelium_3d",
-        "params": {"Growth": 1.0, "Branching": 0.8, "Consumption": 0.02, "Diffusion": 0.15},
-        "param_ranges": {"Growth": (0.01, 2.0), "Branching": (0.0, 2.0),
-                         "Consumption": (0.005, 0.5), "Diffusion": (0.01, 0.5)},
+        "shader": "mycelium_directed_3d",
+        # Single pass writes both p1 (biology) and p2 (orientation) so
+        # that the colonisation decision and the new tip direction stay
+        # coherent with each other.
+        "passes": [
+            {"shader": "mycelium_directed_3d", "writes": ["p1", "p2"]},
+        ],
+        "extra_fields": 1,
+        "params": {"Growth": 1.0, "Branching": 0.4,
+                   "Consumption": 0.02, "Diffusion": 0.15},
+        "param_ranges": {"Growth": (0.05, 2.0),
+                         "Branching": (0.0, 1.5),
+                         "Consumption": (0.005, 0.3),
+                         "Diffusion": (0.01, 0.5)},
         "dt": 0.1,
         "dt_range": (0.02, 0.3),
         "init": "mycelium",
         "init_variants": ["mycelium", "mycelium_foraging"],
-        "description": "Fungal hyphal network — tips explore, branch, fuse, and transport nutrients.",
-        "vis_channels": ["Biomass", "Nutrient", "Signal"],
+        "description": (
+            "Fungal hyphal network with directional persistence and "
+            "anastomosis.  Each tip remembers the direction it last "
+            "extended along (stored as a unit vector in the hidden "
+            "second field) so growth produces filaments instead of "
+            "isotropic blobs.  Two tips meeting from opposite "
+            "directions fuse into established hyphae — this is what "
+            "creates the closed loops that distinguish a real "
+            "mycelium from a tree."
+        ),
+        "vis_channels": ["Biomass", "Nutrient", "Signal", "Tip"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "voxel",
-        "boundary": "clamped",
+        # Zero-flux walls for the chemoattractant/nutrient field —
+        # clamped-zero acts as a sink that biases growth away from the
+        # walls and erases the colony's outer rim.
+        "boundary": "mirror",
     },
     "em_wave": {
         "label": "EM Wave",
-        "shader": "em_wave_3d",
-        "params": {"Wave speed": 1.0, "Damping": 2.0, "Frequency": 3.0, "Amplitude": 0.5},
-        "param_ranges": {"Wave speed": (0.05, 5.0), "Damping": (0.0, 15.0),
-                         "Frequency": (0.1, 20.0), "Amplitude": (0.01, 5.0)},
+        "shader": "em_yee_E_3d",
+        # Two-pass Yee leapfrog: E gets advanced (using current B), then
+        # B gets advanced (using the freshly-updated E).  This natural
+        # half-step staggering is what makes the scheme energy-
+        # conserving and second-order accurate in time.
+        "passes": [
+            {"shader": "em_yee_E_3d", "writes": ["p1"]},
+            {"shader": "em_yee_B_3d", "writes": ["p2"]},
+        ],
+        "extra_fields": 1,
+        "params": {"Wave speed": 0.7, "Damping": 2.0,
+                   "Frequency": 0.5, "Amplitude": 0.5},
+        "param_ranges": {"Wave speed": (0.05, 1.0),  # CFL: c·dt < h/√3
+                         "Damping": (0.0, 15.0),
+                         "Frequency": (0.05, 5.0),
+                         "Amplitude": (0.01, 5.0)},
         "dt": 0.05,
         "dt_range": (0.01, 0.1),
         "init": "em_wave",
-        "description": "Electromagnetic wave propagation — dipole antenna radiates, reflects off conductors.",
-        "vis_channels": ["Ez field", "Bx field", "By field"],
-        "vis_default": 0,
+        "init_variants": ["em_wave", "em_dipole_pair", "em_plane_wave",
+                          "em_cavity_mode", "em_photonic_crystal",
+                          "em_photonic_cavity", "em_beam_splitter",
+                          "em_negative_index_slab", "em_waveguide"],
+        "description": (
+            "Full 3D Maxwell with vector E and B fields on a Yee "
+            "leapfrog.  The dipole source at the box centre radiates "
+            "transverse waves with a proper light cone (numerical "
+            "speed = c, no DC instability).  Pair 1 carries E = "
+            "(Ex,Ey,Ez); pair 2 carries B = (Bx,By,Bz)."
+        ),
+        "vis_channels": ["Ex", "Ey", "Ez", "ε_r"],
+        "vis_default": 2,
         "vis_abs": True,
+        "vis_mode": "bipolar",  # signed E component → diverging colormap
+        "vis_aux_range": (0.0, 0.5),
         "render_mode": "volumetric",
         "boundary": "clamped",
     },
     "viscous_fingers": {
         "label": "Viscous Fingers",
-        "shader": "viscous_fingers_3d",
-        "params": {"Injection": 1.0, "Viscosity ratio": 10.0, "Noise": 0.8, "Surface tension": 0.01},
+        "shader": "viscous_transport_3d",
+        # Bespoke 2-pass: 8 pressure relaxation sweeps then 1 transport
+        # update.  This separation is what keeps the pressure field
+        # well-converged at sharp viscosity contrasts — the original
+        # single-pass 0.2-mix relaxation barely propagated pressure
+        # past a few cells per step, and the fingers stalled.
+        "passes": [
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_pressure_3d",  "writes": ["p1"]},
+            {"shader": "viscous_transport_3d", "writes": ["p1"]},
+        ],
+        "params": {"Injection": 1.0, "Viscosity ratio": 20.0, "Noise": 0.6, "Surface tension": 0.02},
         "param_ranges": {"Injection": (0.05, 8.0), "Viscosity ratio": (1.0, 100.0),
                          "Noise": (0.0, 4.0), "Surface tension": (0.0, 0.5)},
-        "dt": 0.1,
-        "dt_range": (0.03, 0.2),
+        "dt": 0.05,
+        "dt_range": (0.01, 0.2),
         "init": "viscous_fingers",
+        "init_variants": ["viscous_fingers", "viscous_fingers_radial",
+                          "viscous_fingers_dual", "viscous_fingers_layered"],
         "description": "Saffman-Taylor instability — low-viscosity fluid invades, creating fractal fingers.",
         "vis_channels": ["Saturation", "Pressure", "Permeability", "Interface"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "volumetric",
-        "boundary": "clamped",
+        # Zero-flux walls for the saturation/pressure transport — the
+        # invading fluid should pile up against the far wall, not be
+        # silently absorbed by it (which collapses the finger pattern).
+        "boundary": "mirror",
     },
     "fire": {
         "label": "Fire / Combustion",
-        "shader": "fire_3d",
-        "params": {"Ignition temp": 0.25, "Heat output": 2.0, "Diffusion": 0.4, "Wind": 0.5},
-        "param_ranges": {"Ignition temp": (0.05, 0.5), "Heat output": (0.5, 8.0),
-                         "Diffusion": (0.05, 0.5), "Wind": (0.0, 3.0)},
+        "shader": "fire_chem_3d",
+        "passes": [
+            {"shader": "fire_chem_3d", "writes": ["p1"]},
+            {"shader": "fire_flow_3d", "writes": ["p2"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "fire_oxygen",
+        # Buoyancy α controls plume rise speed (T → upward force).
+        # Vorticity ε is the Steinhoff–Underhill confinement that
+        # restores small-scale curls semi-Lagrangian advection damps;
+        # this is what makes the flame "alive".  Soot yield controls
+        # the dark column above the flame.  T-ignition gates burning.
+        "params": {"Buoyancy α": 4.0, "Vorticity ε": 1.5,
+                   "Heat release": 2.5, "Soot yield": 0.6,
+                   "Radiative σ": 0.20, "Viscosity": 0.005,
+                   "T-ignition": 0.20, "Wind": 0.0},
+        "param_ranges": {"Buoyancy α": (1.0, 30.0),
+                         "Vorticity ε": (0.0, 5.0),
+                         "Heat release": (0.5, 8.0),
+                         "Soot yield": (0.0, 2.0),
+                         "Radiative σ": (0.0, 1.5),
+                         "Viscosity": (0.0, 0.05),
+                         "T-ignition": (0.05, 0.5),
+                         "Wind": (-2.0, 2.0)},
         "dt": 0.1,
-        # dt range was previously (0.2, 1.0) which excluded the validated
-        # default — fire dynamics are stiff (Arrhenius ignition + advection)
-        # so the working sweet spot is well below 0.2.
         "dt_range": (0.02, 0.5),
-        "init": "fire",
-        "init_variants": ["fire", "fire_sparse"],
-        "description": "Combustion front — fire spreads through fuel, heat rises, embers fly.",
-        "vis_channels": ["Fuel", "Temperature", "Oxygen", "Embers"],
-        "vis_default": 1,
+        "init": "fire_fluid",
+        "init_variants": ["fire_fluid", "fire_fluid_sparse"],
+        "description": (
+            "Buoyant combustion plume.  Two-pass pipeline: chemistry "
+            "(Arrhenius-gated combustion + soot/ember production + "
+            "Stefan–Boltzmann T⁴ cooling) and flow (semi-Lagrangian "
+            "advection + temperature-driven buoyancy + Steinhoff–"
+            "Underhill vorticity confinement).  Pressure projection "
+            "is intentionally skipped — fire is hot expanding gas, "
+            "not incompressible, and vorticity confinement is what "
+            "gives the curling tongue rather than a fat smoke blob."
+        ),
+        # Param indices map (param0..3 of the chem pass): T_ign, heat,
+        # soot, sigma_rad.  The flow pass uses (alpha, eps, visc, wind).
+        # The simulator's uniform plumbing currently sends one set of
+        # u_param0..3 — we duplicate the 8 visible params into the right
+        # slots via the per-pass params plumbing.  (See pass_params.)
+        "pass_params": {
+            "fire_chem_3d": ["T-ignition", "Heat release", "Soot yield", "Radiative σ"],
+            "fire_flow_3d": ["Buoyancy α", "Vorticity ε", "Viscosity", "Wind"],
+        },
+        "vis_channels": ["Temperature", "Soot", "Embers", "Fuel"],
+        "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgba_blend",  # R=T G=Soot B=Embers, density=Fuel
         "render_mode": "volumetric",
         "boundary": "clamped",
     },
     "physarum": {
         "label": "Slime Mold (Physarum)",
-        "shader": "physarum_3d",
-        "params": {"Sensor dist": 3.0, "Turn strength": 1.0, "Decay": 0.05, "Diffusion": 0.1},
-        "param_ranges": {"Sensor dist": (1.0, 10.0), "Turn strength": (0.1, 5.0),
-                         "Decay": (0.01, 0.3), "Diffusion": (0.01, 0.5)},
-        "dt": 0.1,
-        # dt range was (0.5, 5.0) — agent advection at dt=0.5 leaps multiple
-        # voxels per step and breaks trail continuity. dt=0.1 is the
-        # validated default; widen range around it.
-        "dt_range": (0.02, 1.0),
+        "shader": "physarum_adaptive_3d",
+        # 8 pressure relaxation sweeps per logical step lets the
+        # global pressure field propagate fast enough that adaptation
+        # has a meaningful flux to react to.
+        "passes": [
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_pressure_3d", "writes": ["p1"], "kind": "voxel"},
+            {"shader": "physarum_adaptive_3d", "writes": ["p1"], "kind": "voxel"},
+        ],
+        "params": {"(unused)": 0.0, "Adaptation α": 0.5,
+                   "Pruning β": 0.5, "Re-growth γ×1e-3": 0.2},
+        "param_ranges": {"(unused)": (0.0, 1.0), "Adaptation α": (0.05, 4.0),
+                         "Pruning β": (0.05, 4.0), "Re-growth γ×1e-3": (0.0, 5.0)},
+        "dt": 0.5,
+        "dt_range": (0.05, 2.0),
         "init": "physarum",
-        "description": "Physarum polycephalum — chemotactic agents form optimal transport networks.",
-        "vis_channels": ["Trail", "Agents", "Food"],
+        "init_variants": ["physarum", "physarum_two_source",
+                          "physarum_grid", "physarum_ring"],
+        "description": "Adaptive flux network — pressure relaxes (SOR Jacobi, 8 sweeps/step) against food sources; tube conductivity follows Murray's law (grows with flux, prunes without).  Self-organising near-optimal transport.",
+        "vis_channels": ["Trail (|flux|)", "Conductivity ρ", "Food", "Pressure"],
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "volumetric",
@@ -6926,42 +13550,82 @@ RULE_PRESETS = {
     },
     "fracture": {
         "label": "Elastic Fracture",
-        "shader": "fracture_3d",
-        "params": {"Wave speed": 1.0, "Fracture threshold": 0.5, "Diffusion": 0.2, "Stress": 0.5},
-        # Lowered Fracture threshold min from 0.5 -> 0.15 so the slider
-        # can explore the brittle regime where cracks branch densely.
-        "param_ranges": {"Wave speed": (0.2, 2.0), "Fracture threshold": (0.15, 1.5),
-                         "Diffusion": (0.01, 0.5), "Stress": (0.1, 1.0)},
-        "dt": 0.1,
-        "dt_range": (0.01, 0.15),
-        "init": "fracture",
-        "description": "Material fracture — stress concentrates at crack tips, propagates and branches.",
-        "vis_channels": ["Displacement", "Stress", "Integrity", "Strain"],
-        # Strain (ch3) accumulates monotonically along the crack pattern,
-        # so it stays visible long after the material has fully failed.
-        # Integrity (ch2) was the previous default but it depletes from
-        # 1→0 globally as cracks propagate, so by t≈800 the displayed
-        # field is uniformly zero (audit: EXTINCT). Strain reveals the
-        # branching crack structure that actually emerged.
-        "vis_default": 3,
-        "vis_abs": False,
+        "shader": "peridyn_disp_3d",
+        # Bespoke peridynamic 2-pass: bond force / velocity update,
+        # then displacement integration with bond breaking.  The
+        # velocity field2 carries (v, max_stretch); leapfrog gives
+        # second-order time accuracy, and storing max_stretch lets
+        # the disp pass break a cell when ANY of its 26 bonds
+        # exceeded the critical stretch this step.
+        "passes": [
+            {"shader": "peridyn_force_3d", "writes": ["p2"]},
+            {"shader": "peridyn_disp_3d",  "writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "zero",
+        "params": {"Bond stiffness": 8.0, "Critical stretch": 0.05,
+                   "Damping": 0.10, "Applied load": 0.5},
+        "param_ranges": {"Bond stiffness": (1.0, 30.0),
+                         "Critical stretch": (0.005, 0.30),
+                         "Damping": (0.0, 1.0),
+                         "Applied load": (0.0, 4.0)},
+        "dt": 0.05,
+        "dt_range": (0.005, 0.10),
+        "init": "fracture_peridyn",
+        "init_variants": ["fracture_peridyn", "fracture_double_notch",
+                          "fracture_penny_crack", "fracture_shear",
+                          "fracture_pre_damaged"],
+        "description": "Peridynamic mode-I fracture — bond-based brittle failure with crack propagation.",
+        "vis_channels": ["u_x", "u_y", "u_z", "Integrity"],
+        # Show u_y (mode-I displacement) by default — the discontinuity
+        # across the crack surface is what makes the fracture pattern
+        # visually unmistakable.
+        "vis_default": 1,
+        "vis_abs": True,
         "render_mode": "voxel",
         "boundary": "clamped",
     },
     "galaxy": {
         "label": "Galaxy Formation",
-        "shader": "galaxy_3d",
-        "params": {"Gravity": 5.0, "Pressure": 0.02, "Diffusion": 0.05, "Expansion": 0.0},
-        "param_ranges": {"Gravity": (0.2, 15.0), "Pressure": (0.0005, 0.4),
-                         "Diffusion": (0.0, 0.5), "Expansion": (-1.0, 1.0)},
+        "shader": "galaxy_dynamics_3d",
+        # Four Jacobi sweeps on Φ + one dynamics step.  Φ persists in
+        # pair 2 across timesteps (warm start) so 4 sweeps is enough to
+        # track its evolution as ρ changes.  This gives true long-range
+        # gravity — collapse organises into a cosmic web of filaments
+        # and nodes rather than the local-blob behaviour of the legacy
+        # multi-scale gradient hack.
+        "passes": [
+            {"shader": "galaxy_poisson_3d",  "writes": ["p2"]},
+            {"shader": "galaxy_poisson_3d",  "writes": ["p2"]},
+            {"shader": "galaxy_poisson_3d",  "writes": ["p2"]},
+            {"shader": "galaxy_poisson_3d",  "writes": ["p2"]},
+            {"shader": "galaxy_dynamics_3d", "writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "params": {"Gravity": 0.30, "Pressure": 0.05,
+                   "Viscosity": 0.05, "Expansion": 0.0},
+        "param_ranges": {"Gravity": (0.05, 2.0),
+                         "Pressure": (0.001, 0.5),
+                         "Viscosity": (0.0, 0.3),
+                         "Expansion": (-0.5, 0.5)},
         "dt": 0.05,
-        # dt range was (0.1, 2.5) which excluded the validated default —
-        # multi-scale gravity sums force at radii 1,2,4 cells so the
-        # CFL is tighter than a local-stencil simulation.
-        "dt_range": (0.01, 0.5),
-        "init": "galaxy",
-        "init_variants": ["galaxy", "galaxy_filaments"],
-        "description": "Self-gravitating density field — Jeans instability forms cosmic web filaments.",
+        "dt_range": (0.005, 0.2),
+        "init": "galaxy_filaments",
+        "init_variants": ["galaxy_filaments", "galaxy"],
+        "description": (
+            "Self-gravitating density field with a Poisson-solved "
+            "potential.  Each timestep runs four weighted-Jacobi sweeps "
+            "on ∇²Φ = G ρ (warm-started from the previous frame) and "
+            "advances the dynamics with g = -∇Φ.  This produces real "
+            "long-range gravity — overdensities pull from across the "
+            "box, not just from their immediate neighbours, so the "
+            "Jeans instability resolves into a cosmic web of filaments "
+            "and nodes."
+        ),
+        "pass_params": {
+            "galaxy_poisson_3d":  ["Gravity"],
+            "galaxy_dynamics_3d": ["Gravity", "Pressure", "Viscosity", "Expansion"],
+        },
         "vis_channels": ["Density", "Velocity X", "Velocity Y", "Velocity Z"],
         "vis_default": 0,
         "vis_abs": False,
@@ -7022,8 +13686,27 @@ RULE_PRESETS = {
             "orbital_3d0", "orbital_3d1", "orbital_3d2", "orbital_3d-1", "orbital_3d-2",
             "orbital_4s", "orbital_4p0", "orbital_4d0", "orbital_4f0", "orbital_4f3",
             "quantum_orbital", "quantum_hydrogen",
+            "quantum_multi_well", "quantum_packet_scattering", "quantum_stark",
         ],
         "description": "Hydrogen orbital browser — select any orbital from 1s through 4f. Eigenstates rotate phase; superpositions oscillate.",
+        "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "boundary": "clamped",
+    },
+    "quantum_element": {
+        "label": "Periodic Table Orbitals",
+        "shader": "schrodinger_3d",
+        "default_size": 192,
+        "search_size": 96,
+        "params": {"ħ/2m": 2.5, "V strength": 1.0, "Momentum": 0.0, "Potential": 0.0},
+        "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0),
+                         "Momentum": (0.0, 3.0), "Potential": (0.0, 3.0)},
+        "dt": 0.02,
+        "dt_range": (0.005, 0.1),
+        "init": "quantum_element",
+        "description": "Real periodic-table elements rendered as TDSE-evolving valence orbital clouds. Picks an element (random or by atomic number), looks up its valence subshell from element_data.VALENCE, and superposes the m-degenerate set with random complex weights. Slater-screened Coulomb potential. Homage to the periodic-table repo.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
         "vis_default": 3,
         "vis_abs": False,
@@ -7149,9 +13832,1005 @@ RULE_PRESETS = {
         "vis_default": 3,
         "vis_abs": False,
         "render_mode": "volumetric",
+        # |ψ|² of a self-interacting wavefunction can collapse to extremely
+        # high local density (10^4–10^6) when the Poisson coupling pulls in.
+        # Cap at a generous probability bound so the visible volume isn't
+        # one saturated cube.
+        "vis_range": (0.0, 100.0),
         "boundary": "clamped",
     },
+
+    "ising_3d": {
+        "label": "3D Ising / Spin Glass",
+        "shader": "ising_3d",
+        "params": {"Temperature": 4.5, "Field h": 0.0, "J coupling": 1.0, "Update prob": 1.0},
+        "param_ranges": {"Temperature": (0.5, 8.0), "Field h": (-2.0, 2.0),
+                         "J coupling": (-2.0, 2.0), "Update prob": (0.1, 1.0)},
+        "dt": 1.0,
+        "init": "random_spins",
+        "init_variants": ["random_spins"],
+        "description": ("3D Ising model with Metropolis dynamics on a spin-parity "
+                        "checkerboard. Critical T_c ≈ 4.51 for J=1, h=0; below it the "
+                        "system magnetises into one of two phases, above it stays "
+                        "disordered. Negative J gives an antiferromagnetic ground state."),
+        "vis_channels": ["Spin", "Alignment", "Flipped", "Accept"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "eden_3d": {
+        "label": "Eden Growth (DLA-flavoured)",
+        "shader": "eden_3d",
+        "params": {"Sticking p": 0.50, "X bias": 0.0, "Y bias": 0.0, "Z bias": 0.0},
+        "param_ranges": {"Sticking p": (0.05, 1.0), "X bias": (-1.0, 1.0),
+                         "Y bias": (-1.0, 1.0), "Z bias": (-1.0, 1.0)},
+        "dt": 1.0,
+        "init": "eden_seeds",
+        "init_variants": ["eden_seeds", "eden_scattered"],
+        "description": ("Probabilistic surface aggregation. p≈1 grows compact balls; "
+                        "p<0.3 produces fractal dendrites; per-axis bias drives needle/"
+                        "plate morphologies. Solid voxels are persistent (irreversible)."),
+        "vis_channels": ["Solid", "Growth pressure", "Newly grown"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+
+    "hodgepodge_3d": {
+        "label": "BZ Hodgepodge Machine",
+        "shader": "hodgepodge_3d",
+        "params": {"States N": 100.0, "Increment g": 25.0, "k1 healthy": 2.0, "k2 ill": 3.0},
+        "param_ranges": {"States N": (16.0, 256.0), "Increment g": (1.0, 60.0),
+                         "k1 healthy": (1.0, 8.0), "k2 ill": (1.0, 8.0)},
+        "dt": 1.0,
+        "init": "hodgepodge_random",
+        "init_variants": ["hodgepodge_random"],
+        "description": ("Gerhardt-Schuster cyclic CA: each cell cycles healthy → "
+                        "infected (multiple sublevels) → ill → healthy under a "
+                        "Moore-neighbourhood infection rule. Produces self-organising "
+                        "spirals and target patterns reminiscent of the Belousov-"
+                        "Zhabotinsky chemical reaction, but in pure integer arithmetic."),
+        "vis_channels": ["State", "Infected/26", "Ill/26", "|Δ|"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "render_mode": "volumetric",
+        # State distribution clusters around 0.8 (97% of cells > 0.5).
+        # Show only excited/ill bands so spirals are visible.
+        "vis_range": (0.8, 1.0),
+        "voxel_threshold": 0.85,
+        "boundary": "toroidal",
+    },
+
+    "margolus_3d": {
+        "label": "Margolus Lattice Gas",
+        "shader": "margolus_3d",
+        "params": {"Rotation prob": 0.7, "Drift bias": 0.0, "Mixing": 0.05, "Axis bias": 0.0},
+        "param_ranges": {"Rotation prob": (0.0, 1.0), "Drift bias": (-1.0, 1.0),
+                         "Mixing": (0.0, 0.5), "Axis bias": (-1.0, 1.0)},
+        "dt": 1.0,
+        "init": "margolus_gas",
+        "init_variants": ["margolus_gas", "margolus_blob"],
+        "description": ("Reversible Margolus block-partition CA. The grid is split "
+                        "into 2x2x2 blocks (alternating offset each frame), and each "
+                        "block applies a 90° rotation around an axis chosen by a "
+                        "per-block hash. Particle count is exactly conserved; with "
+                        "drift bias > 0 the gas develops a macroscopic flow."),
+        "vis_channels": ["Particle", "Block hash", "Rotation axis", "Rotated"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "stable_fluids_3d": {
+        "label": "3D Smoke Plume",
+        "shader": "stable_fluids_3d",
+        "passes": [
+            {"shader": "stable_fluids_3d",     "writes": ["p1"]},
+            {"shader": "stable_fluids_div",    "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_project","writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "zero",
+        "params": {"Viscosity": 0.005, "Source": 0.6, "Damping": 0.0, "Vorticity": 0.5},
+        "param_ranges": {"Viscosity": (0.0, 0.05), "Source": (0.0, 1.0),
+                         "Damping": (0.0, 0.02), "Vorticity": (0.0, 3.0)},
+        "dt": 0.5,
+        "dt_range": (0.05, 1.5),
+        "init": "fluid_quiescent",
+        "init_variants": ["fluid_quiescent", "fluid_turbulent"],
+        "description": ("True incompressible 3D smoke solver with multi-pass "
+                        "Helmholtz pressure projection. Each step: (1) "
+                        "semi-Lagrangian advect velocity + density, (2) "
+                        "compute divergence, (3) 8 Jacobi iterations on "
+                        "pressure Poisson, (4) subtract grad(p) to enforce "
+                        "div(v)=0. A persistent dye source near the bottom "
+                        "drives a continuously rising plume. Far more "
+                        "physically correct than the prior single-pass "
+                        "version — divergence stays tiny instead of being "
+                        "balanced by aggressive damping."),
+        "vis_channels": ["v_x", "v_y", "v_z", "Dye"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        # Dye density accumulates from the source up to ~4. Without remap the
+        # whole box renders as opaque haze and only the silhouette is visible.
+        "vis_range": (0.0, 4.0),
+        "boundary": "clamped",
+    },
+
+    "smoke_wind_3d": {
+        "label": "3D Smoke (Wind-Blown)",
+        "shader": "smoke_wind_3d",
+        "passes": [
+            {"shader": "smoke_wind_3d",        "writes": ["p1"]},
+            {"shader": "stable_fluids_div",    "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_project","writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "zero",
+        "params": {"Viscosity": 0.005, "Source": 0.6, "Wind": 1.5, "Vorticity": 0.5},
+        "param_ranges": {"Viscosity": (0.0, 0.05), "Source": (0.0, 1.0),
+                         "Wind": (-3.0, 3.0), "Vorticity": (0.0, 3.0)},
+        "dt": 0.5,
+        "dt_range": (0.05, 1.5),
+        "init": "fluid_quiescent",
+        "init_variants": ["fluid_quiescent"],
+        "description": ("Wind-blown smoke plume.  Same incompressible "
+                        "Navier-Stokes solver as 3D Smoke Plume, but the "
+                        "source is offset toward the upwind edge and a "
+                        "constant horizontal wind bends the plume "
+                        "across the box.  Higher wind = more horizontal "
+                        "stretch; negative wind reverses direction."),
+        "vis_channels": ["v_x", "v_y", "v_z", "Dye"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "vis_range": (0.0, 4.0),
+        "boundary": "clamped",
+    },
+
+    "volcanic_3d": {
+        "label": "3D Volcanic Plume",
+        "shader": "volcanic_3d",
+        "passes": [
+            {"shader": "volcanic_3d",          "writes": ["p1"]},
+            {"shader": "stable_fluids_div",    "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_project","writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "zero",
+        "params": {"Viscosity": 0.003, "Source": 0.8, "Ash gravity": 0.10, "Vorticity": 1.0},
+        "param_ranges": {"Viscosity": (0.0, 0.05), "Source": (0.0, 1.0),
+                         "Ash gravity": (0.0, 0.3), "Vorticity": (0.0, 3.0)},
+        "dt": 0.4,
+        "dt_range": (0.05, 1.0),
+        "init": "fluid_quiescent",
+        "init_variants": ["fluid_quiescent"],
+        "description": ("Wide, hot eruption column.  Buoyancy lifts the "
+                        "core, while ash gravity makes dense material "
+                        "fall back, producing a mushroom cap and a "
+                        "pyroclastic ground surge once the column hits "
+                        "the strong ceiling drag layer."),
+        "vis_channels": ["v_x", "v_y", "v_z", "Ash"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "vis_range": (0.0, 4.0),
+        "boundary": "clamped",
+    },
+
+    "rayleigh_benard_3d": {
+        "label": "3D Rayleigh-Bénard Convection",
+        "shader": "rayleigh_benard_3d",
+        "passes": [
+            {"shader": "rayleigh_benard_3d",   "writes": ["p1"]},
+            {"shader": "stable_fluids_div",    "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_jacobi", "writes": ["p2"]},
+            {"shader": "stable_fluids_project","writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "zero",
+        "params": {"Viscosity": 0.001, "Heating": 0.5, "Therm. diff.": 0.02, "Buoyancy": 0.4},
+        "param_ranges": {"Viscosity": (0.0, 0.02), "Heating": (0.0, 1.0),
+                         "Therm. diff.": (0.0, 0.05), "Buoyancy": (0.0, 1.5)},
+        "dt": 0.4,
+        "dt_range": (0.05, 1.0),
+        "init": "rayleigh_benard",
+        "init_variants": ["rayleigh_benard"],
+        "description": ("Spontaneous convection: the floor is heated and "
+                        "the ceiling cooled, with no source.  Above the "
+                        "critical Rayleigh number, hexagonal convection "
+                        "cells nucleate from random thermal noise.  Hot "
+                        "fluid (positive temperature) rises; cold fluid "
+                        "(negative) sinks.  Watch the dye/temperature "
+                        "channel for the convection pattern."),
+        "vis_channels": ["v_x", "v_y", "v_z", "Temperature"],
+        "vis_default": 3,
+        "vis_abs": True,
+        "render_mode": "volumetric",
+        "boundary": "clamped",
+    },
+
+    "langton_ant_3d": {
+        "label": "Langton's Ant 3D",
+        # Multi-pass + agent: pass 0 copies the voxel grid forward (so cells
+        # the ant doesn't visit are preserved), pass 1 walks the agent(s).
+        "shader": "copy_voxel",   # alias for any single-shader code paths
+        "passes": [
+            {"shader": "copy_voxel",     "kind": "voxel", "writes": ["p1"]},
+            {"shader": "langton_ant_3d", "kind": "agent", "writes": []},
+        ],
+        "agent_count": 1,
+        "agent_init": "langton_center",
+        "params": {"_a": 0.0, "_b": 0.0, "_c": 0.0, "_d": 0.0},
+        "param_ranges": {"_a": (0.0, 1.0), "_b": (0.0, 1.0),
+                         "_c": (0.0, 1.0), "_d": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "blank_voxels",
+        "init_variants": ["blank_voxels"],
+        "description": ("3D Langton's ant — a single mobile turtle walks the "
+                        "voxel grid, flipping each cell's binary colour as it "
+                        "passes and turning based on the cell's prior colour. "
+                        "Demonstrates the engine's agent-SSBO infrastructure: "
+                        "voxel passes preserve the grid, agent passes mutate "
+                        "individual cells in place via a 1-D dispatch over "
+                        "the agent buffer. The 3D turning rule is a simple "
+                        "permutation on the 6 axis directions; it is not the "
+                        "canonical 2D Langton (no canonical 3D extension "
+                        "exists), but it preserves the key invariant that "
+                        "exactly one cell flips per agent per step."),
+        "vis_channels": ["Colour", "_", "_", "_"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "smugglers_3d": {
+        "label": "Smuggler's Standoff",
+        "shader": "smugglers_carriers_3d",
+        # Two-pass: voxel decay first (stashes + signed tracer; terrain
+        # in A is preserved), then the agent pass which moves carriers,
+        # handles death/respawn, and writes its own tracer in place.
+        "passes": [
+            {"shader": "smugglers_field_3d",     "kind": "voxel", "writes": ["p1"],
+             "param_names": ["Stash decay", "Tracer decay", "_", "_"]},
+            {"shader": "smugglers_carriers_3d",  "kind": "agent", "writes": [],
+             "param_names": ["Carrier speed", "Base respawn",
+                             "Combat threshold", "Contamination scale"]},
+        ],
+        "agent_count": 600,
+        "agent_init": "smugglers",
+        # Smuggler's Standoff: two teams of mobile carriers compete to
+        # ferry packages across a procedurally-generated terrain to the
+        # enemy's home corner.  Carriers have finite lifetimes; combat
+        # with the opposing team kills.  On death (or successful
+        # delivery) a carrier enters a respawn delay scaled by current
+        # home contamination — so a contaminated home spawns fewer
+        # active carriers, compounding the disadvantage.
+        "params": {
+            "Carrier speed": 3.5,
+            "Base respawn": 30.0,
+            "Combat threshold": 2.0,
+            "Contamination scale": 12.0,
+            "Stash decay": 0.0008,
+            "Tracer decay": 2.0,
+        },
+        "param_ranges": {
+            "Carrier speed":        (1.0, 20.0),
+            "Base respawn":         (5.0, 200.0),
+            "Combat threshold":     (0.05, 4.0),
+            "Contamination scale":  (0.0, 60.0),
+            "Stash decay":          (0.0, 0.2),
+            "Tracer decay":         (0.1, 5.0),
+        },
+        "dt": 0.25,
+        "dt_range": (0.05, 1.0),
+        "init": "smugglers",
+        "init_variants": ["smugglers", "smugglers_handicap"],
+        "description": (
+            "Two carrier teams (red, blue) ferry packages across a "
+            "procedurally generated terrain — rolling hills and "
+            "scattered pillars — to the enemy's home on the opposite "
+            "end of the arena.  Carriers are subject to gravity: they "
+            "walk along the ground and auto-jump short obstacles, "
+            "spreading across personal Z-lanes so they don't bunch "
+            "into a single corridor.  Meeting the opposing team's "
+            "tracer trail KILLS them, dropping their cargo as debris "
+            "in no-man's-land.  Successful delivery dumps team-coloured "
+            "stash inside the enemy base, and every death/delivery "
+            "enters a respawn delay scaled by the killed team's HOME "
+            "contamination — so the more stash piled in YOUR home, "
+            "the slower YOUR carriers come back.  Once a side falls "
+            "behind, the disadvantage compounds."
+        ),
+        "short_description":
+            "Two carrier teams race across procedural terrain; "
+            "contamination throttles your respawn rate.",
+        "vis_channels": ["Red-dominant", "Blue-dominant", "Combat (signed)", "Terrain only"],
+        "vis_default": 0,
+        "vis_abs": True,    # signed tracer reads as magnitude
+        "render_mode": "voxel",
+        "voxel_threshold": 0.05,
+        "boundary": "clamped",
+    },
+
+    "wandering_voxels_3d": _wandering_voxels_preset(),
+    "predator_prey_3d":    _predator_prey_preset(),
+
+    "predator_prey_lattice_3d": {
+        "label": "Predator-Prey (Lattice)",
+        "shader": "pp_lattice_move",
+        # Two-pass tick: movement+eating, then reproduction+regrowth.
+        "passes": [
+            {"shader": "pp_lattice_move",  "writes": ["p1"]},
+            {"shader": "pp_lattice_repro", "writes": ["p1"]},
+        ],
+        "params": {
+            "Prey metab":   0.06,
+            "Pred metab":   0.005,
+            "Food value":   0.50,
+            "Prey value":   1.20,
+            "Prey repro":   0.85,
+            "Pred repro":   1.30,
+            "Food regrow":  0.0030,
+            "(unused)":     0.0,
+        },
+        "param_ranges": {
+            "Prey metab":   (0.005, 0.30),
+            "Pred metab":   (0.005, 0.30),
+            "Food value":   (0.05, 1.00),
+            "Prey value":   (0.10, 1.00),
+            "Prey repro":   (0.20, 1.40),
+            "Pred repro":   (0.20, 1.40),
+            "Food regrow":  (0.0,  0.50),
+            "(unused)":     (0.0,  1.0),
+        },
+        # u_param0..3 differ per pass:
+        #   move  : Prey metab, Pred metab, Food value,  Prey value
+        #   repro : Prey repro, Pred repro, Food regrow, (unused)
+        "pass_params": {
+            "pp_lattice_move":  ["Prey metab", "Pred metab", "Food value", "Prey value"],
+            "pp_lattice_repro": ["Prey repro", "Pred repro", "Food regrow", "(unused)"],
+        },
+        "dt": 1.0,
+        "init": "predator_prey_lattice",
+        "description": (
+            "Genuine cellular automaton ecology. Each voxel is a discrete "
+            "cell — empty, food, prey, or predator. Movement is local "
+            "(face/edge/corner neighbours) with deterministic conflict "
+            "resolution via hash priority. Prey eat food, predators eat "
+            "prey, both starve without energy. A separate reproduction "
+            "pass spawns offspring into adjacent empty cells. Watch "
+            "for travelling waves and Lotka-Volterra cycles."
+        ),
+        "short_description": "Discrete-state ecology on a 3D lattice.",
+        "vis_channels": ["Kind", "Energy"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "voxel_threshold": 0.30,  # hide empty(0)+food(0.25); show prey(0.5)/pred(0.75)
+        "voxel_filter": "nearest",  # discrete states — no interpolation
+        "voxel_gap": 0.35,         # big gap so individual creatures read as distinct cubes
+        "colormap": 4,            # discrete — 3 distinct hues
+        "boundary": "toroidal",
+    },
+
+    "causal_ca": {
+        "label": "Causal Light Cones",
+        "shader": "causal_ca",
+        "params": {"Pulse rate": 0.6, "Decay": 0.02, "Echo": 0.85, "Threshold": 0.02},
+        "param_ranges": {"Pulse rate": (0.05, 2.0), "Decay": (0.0, 0.3),
+                         "Echo": (0.0, 0.99), "Threshold": (0.001, 0.2)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "causal_two_sources",
+        "init_variants": ["causal_two_sources", "causal_octahedron",
+                          "causal_one_source", "causal_random_sources"],
+        "description": ("Explicit relativistic light cones in 3D. Each "
+                        "stationary source pulses at the rate slider; the "
+                        "wavefront propagates strictly at c = 1 cell/step "
+                        "(Manhattan), so the locus of cells that have "
+                        "EVER been excited by a given source is exactly "
+                        "the discrete light cone from its emission events. "
+                        "Switch the visible channel to 'Arrival' to see the "
+                        "full causal history as a rainbow-coloured nested "
+                        "shell structure; switch to 'Wavefront' to see the "
+                        "currently-active shell. With multiple sources, "
+                        "their light cones interfere visibly when they "
+                        "meet — a proper 3D version of the Lichtenberg / "
+                        "Huygens construction."),
+        "vis_channels": ["Wavefront", "Arrival", "Echo", "Sources"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "hopfion_3d": {
+        "label": "Hopfion (linked vortices)",
+        "shader": "hopfion_3d",
+        "params": {"Skyrme κ": 0.5, "Step": 0.05, "_": 0.0, "_2": 0.0},
+        "param_ranges": {"Skyrme κ": (0.0, 3.0), "Step": (0.0, 0.15),
+                         "_": (0.0, 1.0), "_2": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "hopfion_h1",
+        "init_variants": ["hopfion_h1", "hopfion_h2", "hopfion_random_unit"],
+        "description": ("Hopf-soliton / 'hopfion' field — every voxel holds "
+                        "a unit 3-vector n̂ ∈ S². Initial condition is an "
+                        "analytic Hopf-charge-1 soliton: two linked tubes "
+                        "of constant n̂. Dynamics is gradient descent on a "
+                        "Skyrme-stabilised energy. The Skyrme κ slider "
+                        "controls the soliton's stiffness — at κ=0 it "
+                        "diffuses away (elastic-only), at high κ it locks "
+                        "into a stable knotted configuration. Visible "
+                        "channel A shows energy density; the linked-tube "
+                        "structure shows up as paired bright loops."),
+        "vis_channels": ["n_x", "n_y", "n_z", "Energy"],
+        "vis_default": 3,
+        "vis_abs": True,
+        "render_mode": "volumetric",
+        "boundary": "toroidal",
+    },
+
+    "genome_ca_3d": {
+        "label": "Self-Modifying Genome",
+        "shader": "genome_state_3d",
+        "passes": [
+            {"shader": "genome_state_3d",  "kind": "voxel", "writes": ["p1"]},
+            {"shader": "genome_evolve_3d", "kind": "voxel", "writes": ["p2"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "genome_random",
+        "params": {"Drive": 0.4, "Memory": 0.85, "Gene flow": 0.05, "Mutation": 0.005},
+        "param_ranges": {"Drive": (0.1, 1.5), "Memory": (0.5, 0.999),
+                         "Gene flow": (0.0, 0.5), "Mutation": (0.0, 0.05)},
+        "dt": 0.2,
+        "dt_range": (0.05, 0.5),
+        "init": "genome_state_random",
+        "init_variants": ["genome_state_random", "genome_state_blob",
+                          "genome_state_sparse"],
+        "description": ("A CA whose UPDATE RULE is itself a state variable. "
+                        "Every voxel runs a parametric FitzHugh-Nagumo "
+                        "reaction-diffusion system whose four reaction "
+                        "parameters are read from a per-voxel 'genome'. "
+                        "The genome diffuses to neighbours, mutates, and is "
+                        "slightly reinforced where local activity is high. "
+                        "Result: spatial regions self-organise into "
+                        "'cultures' running their own excitable-medium "
+                        "variant \u2014 some quiescent, some oscillatory, some "
+                        "travelling-wave \u2014 competing for territory through "
+                        "pattern coherence. Genuinely novel: rule-space "
+                        "evolution happening live as a spatial process "
+                        "inside the lattice, not as offline search."),
+        "vis_channels": ["u (excite)", "v (recover)", "Memory 1", "Memory 2"],
+        "vis_default": 0,
+        "vis_abs": True,
+        "render_mode": "volumetric",
+        # |u| spans [0, ~1.7]; bulk noise sits below ~0.5. Restrict to
+        # the active fronts so culture boundaries are visible.
+        "vis_range": (0.7, 1.7),
+        "voxel_threshold": 0.9,
+        "boundary": "toroidal",
+    },
+
+    "active_nematic_3d": {
+        "label": "3D Active Nematic",
+        "shader": "q_relax_3d",
+        "passes": [
+            {"shader": "q_relax_3d",  "kind": "voxel", "writes": ["p1", "p2"]},
+            {"shader": "q_flow_3d",   "kind": "voxel", "writes": ["p2"]},
+            {"shader": "q_advect_3d", "kind": "voxel", "writes": ["p1"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "zero",
+        "params": {"Disorder A": 0.3, "Elastic K": 0.4, "Mobility Γ": 0.4, "Activity ζ": 0.3},
+        "param_ranges": {"Disorder A": (0.0, 1.0), "Elastic K": (0.0, 1.0),
+                         "Mobility Γ": (0.05, 1.0), "Activity ζ": (-1.0, 1.0)},
+        "dt": 0.2,
+        "dt_range": (0.05, 0.5),
+        "init": "nematic_random",
+        "init_variants": ["nematic_random", "nematic_aligned_x",
+                          "nematic_defect_pair"],
+        "description": ("3D active nematic — the order parameter is a "
+                        "5-component traceless symmetric Q-tensor (current "
+                        "frontier soft-matter). Includes Landau–de Gennes "
+                        "relaxation toward a uniaxially-ordered state, "
+                        "elastic gradient term (∝ K), and active stress "
+                        "(∝ ζ) that drives an internal flow which then "
+                        "advects Q. Topological defects are 1-D "
+                        "disclination LINES (visible as bright filaments "
+                        "in the order-parameter magnitude). Negative ζ = "
+                        "contractile activity, positive = extensile. Few "
+                        "interactive 3D simulators exist for this anywhere."),
+        "vis_channels": ["Qxx", "Qyy", "Qxy", "Qxz"],
+        "vis_default": 0,
+        "vis_abs": True,
+        "render_mode": "volumetric",
+        "boundary": "toroidal",
+    },
+
+    # ─────────────────────────────────────────────────────────────────
+    # 2026-05 additions: see CA_RULES comment block for rationale.
+    # ─────────────────────────────────────────────────────────────────
+    "sandpile_3d": {
+        "label": "3D Abelian Sandpile (SOC)",
+        "shader": "sandpile_3d",
+        "params": {"Threshold T": 6.0, "Drop p": 0.005, "Drop amt": 1.0, "Region": 0.0},
+        "param_ranges": {"Threshold T": (4.0, 10.0), "Drop p": (0.0, 0.05),
+                         "Drop amt": (0.5, 4.0), "Region": (0.0, 2.0)},
+        "dt": 1.0,
+        "init": "sandpile_critical",
+        "init_variants": ["sandpile_critical", "sandpile_uniform"],
+        "description": ("Bak–Tang–Wiesenfeld self-organised criticality on a 3D "
+                        "cubic lattice. Cells topple at threshold T (default 6 = "
+                        "face-neighbour count), shedding grains to neighbours. "
+                        "Avalanches follow a power law and the steady state is "
+                        "marginally stable — the textbook example of self-organised "
+                        "criticality, in three dimensions."),
+        "vis_channels": ["Grains", "Supercritical", "Slope", "Height/T"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",  # ch0=grains, ch1=will-topple, ch2=slope
+        "render_mode": "volumetric",
+        # The SOC steady state distributes grains in [0, ~12] with mean
+        # ~5 and only ~10% of cells above 8. To actually see INTO the
+        # cube (not just outer faces of a dense block) we cull to the
+        # supercritical tail (>= 8 grains, ~10% of cells = the active
+        # avalanche fronts). Volumetric mode keeps a wider colour ramp.
+        "vis_range": (6.0, 12.0),
+        "voxel_threshold": 8.0,
+        "boundary": "clamped",
+    },
+
+    "greenberg_hastings_3d": {
+        "label": "3D Greenberg–Hastings (Excitable)",
+        "shader": "greenberg_hastings_3d",
+        "params": {"States N": 8.0, "Threshold k": 1.0,
+                   "Spontaneous": 0.0001, "Decay": 0.0},
+        "param_ranges": {"States N": (4.0, 32.0), "Threshold k": (1.0, 6.0),
+                         "Spontaneous": (0.0, 0.01), "Decay": (0.0, 1.0)},
+        "dt": 1.0,
+        "init": "excitable_random",
+        "init_variants": ["excitable_random", "excitable_seed"],
+        "description": ("Discrete excitable medium: rest → excited → "
+                        "(N−2 ramp states) → refractory → rest. With sparse "
+                        "spontaneous excitations as pacemakers, the medium "
+                        "self-organises into rotating 3D scroll waves and scroll "
+                        "rings — the canonical excitable-tissue dynamics."),
+        "vis_channels": ["State", "Just-excited", "Excited n/6", "Refractory"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",  # rgb=state/excite/neighbours, density=refractory
+        "render_mode": "volumetric",
+        # 30% of cells in the (excited+ramp) tail. Show only the
+        # leading-front ramp so scroll waves stand out.
+        "vis_range": (0.5, 1.0),
+        "voxel_threshold": 0.7,
+        "boundary": "toroidal",
+    },
+
+    "wireworld_3d": {
+        "label": "3D Wireworld (Programmable)",
+        "shader": "wireworld_3d",
+        "params": {"Head min": 1.0, "Head max": 2.0, "Spark p": 0.0, "Decay": 0.0},
+        "param_ranges": {"Head min": (1.0, 4.0), "Head max": (1.0, 6.0),
+                         "Spark p": (0.0, 0.005), "Decay": (0.0, 0.01)},
+        "dt": 1.0,
+        "init": "wireworld_torus",
+        "init_variants": ["wireworld_torus", "wireworld_lattice"],
+        "description": ("3D Wireworld: a 4-state programmable substrate (empty / "
+                        "head / tail / conductor) capable of universal computation. "
+                        "The default ring init runs as a self-sustaining electron "
+                        "loop; the lattice init enables a non-classical 'living "
+                        "wire' regime via the decay parameter."),
+        "vis_channels": ["State", "Head", "Tail", "Conductor"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",  # rgb=head/tail/conductor one-hot
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "forest_fire_3d": {
+        "label": "3D Forest Fire (Drossel–Schwabl)",
+        "shader": "forest_fire_3d",
+        "params": {"Regrowth p": 0.005, "Lightning f": 0.00001,
+                   "Moore": 0.0, "Immunity": 0.0},
+        "param_ranges": {"Regrowth p": (0.0001, 0.05),
+                         "Lightning f": (0.0, 0.0005),
+                         "Moore": (0.0, 1.0), "Immunity": (0.0, 0.3)},
+        "dt": 1.0,
+        "init": "forest_dense",
+        "init_variants": ["forest_dense", "forest_burning_seed"],
+        "description": ("Canonical SOC model: empty / tree / burning. Trees "
+                        "regrow with prob p; lightning ignites with prob f≪p. "
+                        "When f/p is small the fires self-organise into power-law "
+                        "cluster sizes — same universality class as 2D directed "
+                        "percolation but with 3D propagation geometry."),
+        "vis_channels": ["State", "Was burning", "Was tree", "Just ignited"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",  # ch1/ch2=burning/tree, density=just-ignited
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "sine_gordon_3d": {
+        "label": "3D Sine–Gordon (Soliton Walls)",
+        "shader": "sine_gordon_3d",
+        "params": {"c²": 1.0, "Damping γ": 0.001, "Mass m²": 1.0, "Drive": 0.0},
+        "param_ranges": {"c²": (0.1, 4.0), "Damping γ": (0.0, 0.1),
+                         "Mass m²": (0.0, 4.0), "Drive": (0.0, 0.5)},
+        "dt": 0.25,
+        "dt_range": (0.05, 0.4),
+        "init": "sine_gordon_kink",
+        "init_variants": ["sine_gordon_kink", "sine_gordon_breather"],
+        "description": ("∂²u/∂t² = c²∇²u − sin(u) — nonlinear wave equation "
+                        "supporting topological soliton solutions. In 3D the 1D "
+                        "kink lifts to a planar π-wall that propagates, oscillates, "
+                        "and reconnects on collision. Damping suppresses radiation "
+                        "without destroying the soliton structure."),
+        "vis_channels": ["u (field)", "v (velocity)"],
+        "vis_default": 0,
+        "vis_abs": True,
+        "vis_mode": "bipolar",
+        "vis_aux_range": (0.0, 6.28),
+        "render_mode": "volumetric",
+        # Field u winds through multiples of 2π across kink walls; abs
+        # gives values up to ~2π. Without remap the walls render the
+        # entire box as opaque haze.
+        "vis_range": (3.0, 6.28),
+        # Voxel mode: only show cells near a kink wall (|u| above the
+        # bulk vacuum of ~π/2). Otherwise the whole box renders.
+        "voxel_threshold": 4.0,
+        "boundary": "toroidal",
+    },
+
+    "larger_than_life_3d": {
+        "label": "Larger Than Life (R≥2 Life)",
+        "shader": "larger_than_life_3d",
+        "params": {"Radius R": 2.0, "Birth low": 12.0, "Birth high": 20.0,
+                   "Survive ±": 8.0},
+        "param_ranges": {"Radius R": (1.0, 4.0),
+                         "Birth low": (0.0, 200.0),
+                         "Birth high": (0.0, 300.0),
+                         "Survive ±": (0.0, 30.0)},
+        "dt": 1.0,
+        "init": "lifelike_cluster",
+        "init_variants": ["lifelike_cluster", "life_fbm_moderate", "random_sparse"],
+        "description": ("Generalised Game of Life with neighbourhood radius R "
+                        "(cube of (2R+1)³−1 cells). Bays/Evans showed unique "
+                        "gliders exist at radius 5 in 2D that have no R=1 analog; "
+                        "the 3D landscape is largely unexplored — a perfect target "
+                        "for the discovery search."),
+        "vis_channels": ["Alive", "Neighbour density", "|Δ|"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "prisoners_dilemma_3d": {
+        "label": "3D Spatial Prisoner's Dilemma",
+        "shader": "prisoners_dilemma_3d",
+        "params": {"Temptation b": 1.85, "Mutation": 0.001,
+                   "Tie keep": 1.0, "Exclude self": 0.0},
+        "param_ranges": {"Temptation b": (1.0, 2.5), "Mutation": (0.0, 0.05),
+                         "Tie keep": (0.0, 1.0), "Exclude self": (0.0, 1.0)},
+        "dt": 1.0,
+        "init": "pd_random",
+        "init_variants": ["pd_random", "pd_invading"],
+        "description": ("Nowak–May spatial PD on a 3D Moore-26 lattice. Each "
+                        "round, every cell scores against its neighbours under "
+                        "the (1, b, 0, 0) payoff matrix and adopts the strategy "
+                        "of its highest-scoring local neighbour. At b ≈ 1.85 the "
+                        "boundary between cooperators and defectors becomes "
+                        "spatio-temporally chaotic — cooperation persists in the "
+                        "face of greedy invasion."),
+        "vis_channels": ["Strategy", "Score", "Coop fraction", "Changed"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "xy_spin_3d": {
+        "label": "3D XY Spin Model",
+        "shader": "xy_spin_3d",
+        "params": {"Temperature": 2.2, "J coupling": 1.0,
+                   "Field h": 0.0, "Proposal σ": 1.0},
+        "param_ranges": {"Temperature": (0.1, 5.0), "J coupling": (-2.0, 2.0),
+                         "Field h": (-1.0, 1.0), "Proposal σ": (0.1, 3.14)},
+        "dt": 1.0,
+        "init": "xy_random",
+        "init_variants": ["xy_random", "xy_aligned"],
+        "description": ("Continuous-spin classical magnet: each cell holds an "
+                        "angle θ ∈ [0, 2π) coupled to its 6 face-neighbours via "
+                        "−J cos(θ−θ'). 8-colour Metropolis sweep keeps detailed "
+                        "balance under synchronous update. In 3D the model has a "
+                        "true second-order phase transition near T ≈ 2.20 (J=1); "
+                        "vortex lines (1D defects) become long-lived below T_c."),
+        "vis_channels": ["θ/2π", "½+½cosθ", "½+½sinθ", "|Δθ|/π"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",  # ch1/ch2 paint a phase wheel via cos/sin
+        "render_mode": "volumetric",
+        # Angle field is uniformly distributed across [0,1] in the
+        # disordered phase — voxel mode would render every cell.
+        # Restrict display to the upper-third ("red domain") so vortex
+        # lines and aligned domains stand out instead of a solid cube.
+        "voxel_threshold": 0.7,
+        "vis_range": (0.5, 1.0),
+        "boundary": "toroidal",
+    },
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Flagship content presets
+# ─────────────────────────────────────────────────────────────────────────
+# Twelve hand-tuned recipes that combine the new infrastructure layers
+# (mesh voxelisation, L-systems, inter-rule composition, GPU particles,
+# vector-field glyphs, marching-cubes iso-surfaces, NN-brain agents) on
+# top of well-tested substrate rules. Each one is a self-contained demo
+# you can drop into `Simulator(rule='flagship_*')`. They live AFTER the
+# main RULE_PRESETS dict so they can reference / deepcopy entries above.
+# ─────────────────────────────────────────────────────────────────────────
+import copy as _copy
+
+def _flagship(base, **overrides):
+    p = _copy.deepcopy(RULE_PRESETS[base])
+    p.update(overrides)
+    return p
+
+# 1. Neural swarm — heterogeneous-brain particles steer on a smoothlife
+#    substrate; each agent has its own randomly-initialised 6→8→3 MLP.
+RULE_PRESETS['flagship_neural_swarm'] = _flagship(
+    'smoothlife_3d',
+    label="Flagship: Neural Swarm",
+    description=("4000 particles, each with its own random tanh MLP, "
+                 "steering on the local smoothlife gradient."),
+    particle_count=4000, particle_init='random_volume',
+    particle_force='nn_brain', particle_force_scale=3.0,
+    particle_dt=0.4, particle_drag=0.06, particle_life_decay=0.0005,
+    particle_color_mode='speed', particle_size=0.35,
+    nn_brain_hidden=8, nn_brain_shared=False, nn_brain_seed=11,
+)
+
+# 2. Synchronised flock — single shared brain coordinates the whole swarm.
+RULE_PRESETS['flagship_unison_flock'] = _flagship(
+    'smoothlife_3d',
+    label="Flagship: Unison Flock",
+    description=("Shared-brain swarm: all 3000 particles obey the same "
+                 "8-neuron MLP, producing globally coherent motion."),
+    particle_count=3000, particle_init='random_volume',
+    particle_force='nn_brain', particle_force_scale=2.0,
+    particle_dt=0.5, particle_drag=0.04, particle_life_decay=0.0,
+    particle_color_mode='velocity', particle_size=0.4,
+    nn_brain_hidden=8, nn_brain_shared=True, nn_brain_seed=101,
+)
+
+# 3. Branching tree — L-system tree seeds BZ spiral waves so chemical
+#    fronts race up the trunk and out along every branch.
+RULE_PRESETS['flagship_branching_tree'] = _flagship(
+    'wave_3d',
+    label="Flagship: Branching Tree",
+    description=("Pulsing 3D waves emanate from an L-system tree seed — "
+                 "each branch becomes a wave source, with the tree "
+                 "silhouette remaining visible as fronts ripple outward."),
+    init='lsystem:tree?channel=0&value=1.0',
+    search_size=48,
+)
+
+# 4. Lightning fire — L-system lightning bolt + fire substrate; the
+#    bolt acts as the ignition front.
+RULE_PRESETS['flagship_lightning_fire'] = _flagship(
+    'fire',
+    label="Flagship: Lightning Fire",
+    description=("An L-system lightning bolt strikes through a sparse fuel "
+                 "field, igniting a 3D fire substrate that spreads then "
+                 "burns down."),
+    init='fire_fluid_sparse+lsystem:lightning?channel=0&value=1.0',
+    search_size=48,
+)
+
+# 5. Coral reef — L-system coral seed + Gray-Scott reaction-diffusion
+#    that paints reef-like patterns over the structure.
+RULE_PRESETS['flagship_coral_reef'] = _flagship(
+    'reaction_diffusion_3d',
+    label="Flagship: Coral Reef",
+    description=("Coral L-system geometry seeds a Gray-Scott reaction-"
+                 "diffusion that paints reef-like patterns over it."),
+    init='gray_scott+lsystem:coral?channel=0&value=1.0',
+    search_size=48,
+)
+
+# 6. Dendrite crystal — L-system dendrite skeleton + smoothlife (which
+#    happily ignites from a sparse skeleton seed).
+RULE_PRESETS['flagship_dendrite_crystal'] = _flagship(
+    'smoothlife_3d',
+    label="Flagship: Dendrite Crystal",
+    description=("SmoothLife dynamics seeded by an L-system dendrite "
+                 "skeleton."),
+    init='lsystem:dendrite?channel=0&value=1.0',
+    search_size=48,
+)
+
+# 7. Sphere genesis — sphere mesh init voxelised into a SmoothLife volume,
+#    then watched as life eats / extrudes / dissolves the sphere.
+RULE_PRESETS['flagship_sphere_genesis'] = _flagship(
+    'smoothlife_3d',
+    label="Flagship: Sphere Genesis",
+    description=("A voxelised sphere is dropped into SmoothLife — watch "
+                 "what survives."),
+    init='mesh:sphere?radius=0.42&channel=0&value=1.0&shell=False',
+)
+
+# 8. Iso surface SmoothLife — same SmoothLife but rendered as a marching-
+#    cubes iso-surface instead of voxels.
+RULE_PRESETS['flagship_iso_smoothlife'] = _flagship(
+    'smoothlife_3d',
+    label="Flagship: Iso-Surface SmoothLife",
+    description=("SmoothLife rendered as a marching-cubes iso-surface."),
+    iso_surface=True, iso_value=0.5, iso_channel=0, iso_use_abs=False,
+    iso_color=(0.95, 0.55, 0.20), iso_alpha=1.0, iso_double_sided=True,
+    render_mode='voxel',  # voxel pass clears + adds the MC mesh on top
+)
+
+# 9. Iso surface BZ — BZ spiral waves visualised as a translucent iso.
+RULE_PRESETS['flagship_iso_bz'] = _flagship(
+    'bz_spiral_waves',
+    label="Flagship: Iso-Surface BZ",
+    description=("BZ spiral waves visualised as a translucent marching-"
+                 "cubes iso-surface."),
+    iso_surface=True, iso_value=0.55, iso_channel=0, iso_use_abs=False,
+    iso_color=(0.30, 0.90, 1.00), iso_alpha=0.45, iso_double_sided=True,
+    render_mode='voxel',
+)
+
+# 10. Vector glyph BZ — BZ field with a vector-field glyph overlay
+#     showing the local gradient direction.
+RULE_PRESETS['flagship_glyph_bz'] = _flagship(
+    'bz_spiral_waves',
+    label="Flagship: Vector Glyphs BZ",
+    description=("BZ field overlaid with a 3D gradient-vector glyph grid."),
+    glyph_enabled=True, glyph_source='gradient', glyph_stride=8,
+    glyph_scale=4.5, glyph_threshold=0.02, glyph_mag_scale=4.0,
+    glyph_alpha=0.7,
+)
+
+# 11. Galaxy with particles — galaxy substrate + 4000 particles drifting
+#     on the gravitational gradient field.
+RULE_PRESETS['flagship_galaxy_dust'] = _flagship(
+    'galaxy',
+    label="Flagship: Galaxy Dust",
+    description=("A galaxy-formation substrate dressed with 4000 dust "
+                 "particles that follow the gravitational gradient."),
+    particle_count=4000, particle_init='random_volume',
+    particle_force='gradient', particle_force_scale=6.0,
+    particle_dt=0.3, particle_drag=0.04, particle_life_decay=0.0,
+    particle_color_mode='speed', particle_size=0.35,
+)
+
+# 12. Dual Lenia — composition of two Lenia variants running in parallel.
+RULE_PRESETS['flagship_dual_lenia'] = {
+    'label': "Flagship: Dual Lenia",
+    'description': ("Two Lenia variants composed into one rule — "
+                    "geminium gliders coexist with multi-channel Lenia."),
+    'compose': [
+        {'rule': 'lenia_3d',    'prefix': 'a_'},
+        {'rule': 'lenia_geminium', 'prefix': 'b_'},
+    ],
+    'init': 'lenia_fbm',
+    'search_size': 48,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Preset overrides (loaded from preset_overrides.json if present)
+#
+# This lets data-driven tuning (apply_preset_tuning.py) update default
+# `params`/`dt`/`default_size` without editing source. Format:
+#   {"<rule_name>": {"params": {...optional...}, "dt": <optional>,
+#                    "default_size": <optional>, "search_size": <optional>}}
+# Only the listed keys per rule are merged; everything else is preserved.
+# Set CA_DISABLE_PRESET_OVERRIDES=1 to bypass (e.g. for regression baselines).
+# ─────────────────────────────────────────────────────────────────────────
+def _apply_preset_overrides():
+    import json as _json
+    import os as _os
+    if _os.environ.get('CA_DISABLE_PRESET_OVERRIDES', '0') == '1':
+        return 0, []
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    path = _os.path.join(here, 'preset_overrides.json')
+    if not _os.path.isfile(path):
+        return 0, []
+    try:
+        with open(path) as f:
+            raw = _json.load(f)
+    except Exception as e:
+        print(f"[preset_overrides] failed to load {path}: {e}")
+        return 0, []
+    overrides = raw.get('overrides', raw) if isinstance(raw, dict) else {}
+    # Excludelist: rules where median-of-top-discoveries pushes the rule
+    # into a chaotic / personality-erasing regime. Keep their pristine
+    # source defaults; the patcher will keep regenerating these into the
+    # JSON, so we filter at load time. To re-include one, remove it here.
+    blocked = raw.get('excludelist', [
+        'lenia_3d',         # patch dt 0.05→0.181 violates source's stability comment
+        'sine_gordon_3d',   # patch turns elegant solitons into forced chaos
+        'element_ca',       # patch jumps to high-energy chemistry regime
+    ])
+    applied = []
+    skipped = []
+    for rule, patch in overrides.items():
+        if rule in blocked:
+            skipped.append((rule, 'excludelist'))
+            continue
+        if rule not in RULE_PRESETS:
+            skipped.append((rule, 'unknown rule'))
+            continue
+        preset = RULE_PRESETS[rule]
+        if 'params' in patch and isinstance(patch['params'], dict):
+            cur = dict(preset.get('params', {}))
+            for k, v in patch['params'].items():
+                if k in cur:
+                    cur[k] = v
+            preset['params'] = cur
+        for key in ('dt', 'default_size', 'search_size'):
+            if key in patch:
+                preset[key] = patch[key]
+        applied.append(rule)
+    return len(applied), skipped
+
+_OVR_N, _OVR_SKIP = _apply_preset_overrides()
+if _OVR_N or _OVR_SKIP:
+    print(f"[preset_overrides] applied {_OVR_N} rule patches"
+          + (f"; skipped {len(_OVR_SKIP)}: {_OVR_SKIP}" if _OVR_SKIP else ""))
 
 
 # ── Initialization patterns (all return 4-channel: size x size x size x 4) ──
@@ -7425,6 +15104,72 @@ def init_random_sparse(size, rng):
     data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.10).astype(np.float32)
     return data
 
+
+def init_blank(size, rng):
+    """All-zero field. Used by entity-arena scenarios that paint their
+    entire visualization from entities each frame."""
+    return np.zeros((size, size, size, 4), dtype=np.float32)
+
+
+def init_food_seed(size, rng):
+    """Seed ch3 (alpha) with low-density food noise + a few hot patches.
+
+    Used by the predator-prey preset so logistic growth (food += r * food *
+    (1 - food)) has something to amplify from. Without this, food=0
+    everywhere and prey starve immediately.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # Background: uniform low food density.
+    bg = rng.random((size, size, size)).astype(np.float32) * 0.05 + 0.02
+    # Hot patches: ~50 sparse seed blobs at ~0.5 food.
+    n_blobs = 50
+    for _ in range(n_blobs):
+        cx = int(rng.random() * size)
+        cy = int(rng.random() * size)
+        cz = int(rng.random() * size)
+        rr = max(2, size // 24)
+        x0, x1 = max(0, cx - rr), min(size, cx + rr + 1)
+        y0, y1 = max(0, cy - rr), min(size, cy + rr + 1)
+        z0, z1 = max(0, cz - rr), min(size, cz + rr + 1)
+        bg[x0:x1, y0:y1, z0:z1] = np.maximum(bg[x0:x1, y0:y1, z0:z1], 0.5)
+    data[..., 3] = bg
+    # ch0 background mirrors food so first frame isn't pure black.
+    data[..., 0] = bg * 0.30
+    return data
+
+def init_predator_prey_lattice(size, rng):
+    """Initial state for the lattice predator-prey CA.
+
+    ch0 encodes the cell kind: 0=empty, 1=food, 2=prey, 3=predator.
+    Densities tuned to give the rule a fair starting point — too much
+    food and prey explode, too few predators and the system never enters
+    the cycling regime.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    n = size ** 3
+    # Generate one uniform random field, partition by quantile thresholds.
+    r = rng.random((size, size, size)).astype(np.float32)
+    # ~3% food, ~1.5% prey, ~0.1% predator, ~95.4% empty.
+    # Sparser than 5/2/0.15% so the grid doesn't look like noise from far,
+    # but dense enough that prey reliably stumble onto food in 1-cell hops.
+    food_mask = r < 0.030
+    prey_mask = (r >= 0.030) & (r < 0.045)
+    pred_mask = (r >= 0.045) & (r < 0.046)
+    kind = np.zeros((size, size, size), dtype=np.float32)
+    # Encode normalized: empty=0, food=0.25, prey=0.50, predator=0.75.
+    # Stays away from value=1.0 which trips the voxel renderer's
+    # "binary CA" grayscale-AO branch.
+    kind[food_mask] = 0.25
+    kind[prey_mask] = 0.50
+    kind[pred_mask] = 0.75
+    data[..., 0] = kind
+    # Initial energies: food=1.0 nominal; prey/pred = 0.6..1.0
+    energy = np.zeros((size, size, size), dtype=np.float32)
+    energy[food_mask] = 1.0
+    energy[prey_mask | pred_mask] = 0.6 + rng.random((size, size, size)).astype(np.float32)[prey_mask | pred_mask] * 0.4
+    data[..., 1] = energy
+    return data
+
 def init_random_dense(size, rng):
     """Random with ~40% density."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
@@ -7569,6 +15314,58 @@ def init_crystal_disc_seed(size, rng):
     in_disc = ((x - cx)**2 + (z - cz)**2 <= r_xz * r_xz) & (np.abs(y - cy) <= y_half)
     data[:, :, :, 0][in_disc] = 1.0
     data[:, :, :, 1][in_disc] = 0.0
+    return data
+
+def init_schnakenberg(size, rng):
+    """Schnakenberg: start near the homogeneous fixed point with small
+    spatial noise. The Turing instability amplifies wavelengths in the
+    unstable band, growing organic spots from initial roughness."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    a, b = 0.1, 0.9
+    U_star = a + b
+    V_star = b / max(U_star * U_star, 1e-6)
+    data[:, :, :, 0] = U_star + rng.uniform(-0.02, 0.02, (size, size, size)).astype(np.float32)
+    data[:, :, :, 1] = V_star + rng.uniform(-0.02, 0.02, (size, size, size)).astype(np.float32)
+    return data
+
+def init_fitzhugh_nagumo(size, rng):
+    """FN: quiescent V=−1, W=−2/3 (resting state), with one or two
+    suprathreshold blobs to trigger propagating pulses."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = -1.0
+    data[:, :, :, 1] = -2.0 / 3.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    n_blobs = rng.randint(1, 3)
+    for _ in range(n_blobs):
+        cx = rng.uniform(0.2, 0.8) * size
+        cy = rng.uniform(0.2, 0.8) * size
+        cz = rng.uniform(0.2, 0.8) * size
+        r  = max(2.0, size / 14.0)
+        d2 = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
+        blob = np.exp(-0.5 * d2 / (r * r)).astype(np.float32)
+        data[:, :, :, 0] += 2.5 * blob   # push V well above threshold
+    return data
+
+def init_brusselator(size, rng):
+    """Brusselator: start at the homogeneous fixed point U=A, V=B/A
+    plus small noise to seed the Turing/Hopf instability."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    A, B = 1.0, 3.0
+    U_star = A
+    V_star = B / max(A, 1e-6)
+    data[:, :, :, 0] = U_star + rng.uniform(-0.05, 0.05, (size, size, size)).astype(np.float32)
+    data[:, :, :, 1] = V_star + rng.uniform(-0.05, 0.05, (size, size, size)).astype(np.float32)
+    return data
+
+def init_cyclic_ca(size, rng):
+    """Cyclic CA: each cell starts in a uniformly random state 0..N-1.
+    N defaults to 14 (matches param0 default rounded). Stored in R as
+    float; G channel mirrors phase = state/N for visualisation."""
+    N = 14
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    states = rng.randint(0, N, (size, size, size)).astype(np.float32)
+    data[:, :, :, 0] = states
+    data[:, :, :, 1] = states / float(N)
     return data
 
 def init_wave_pulse(size, rng):
@@ -8009,10 +15806,13 @@ def init_mycelium(size, rng):
     return data
 
 def init_em_wave(size, rng):
-    """EM wave: Gaussian z-dipole with seed magnetic field.
-    A true dipole has Ez∝y (changes sign across midplane), creating a
-    proper radiation pattern. The seed B field from ∇×E gives the wave
-    an immediate direction instead of ringing from a hard-edged blob."""
+    """EM wave: Gaussian Ez dipole at the box centre.
+
+    Layout for the new Yee-leapfrog rule:
+        Pair 1 = (Ex, Ey, Ez, medium)   — only Ez is seeded
+        Pair 2 = (Bx, By, Bz, _)        — starts at zero; B grows
+                                          from -∂E/∂t in the first step
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     c = size / 2.0
     r = max(2, size // 10)
@@ -8021,42 +15821,329 @@ def init_em_wave(size, rng):
     dy = (y - c).astype(np.float64)
     dz = (z - c).astype(np.float64)
     dist = np.sqrt(dx**2 + dy**2 + dz**2)
-    # Gaussian envelope × dipole moment (Ez changes sign across y-midplane)
-    envelope = np.exp(-0.5 * (dist / r)**2)
+    envelope = np.exp(-0.5 * (dist / r) ** 2)
+    # Dipole Ez ∝ y / r — antisymmetric across y-midplane → proper
+    # radiation pattern (lobes above & below the source plane).
     Ez = (envelope * dy / max(r, 1)).astype(np.float32)
-    data[:, :, :, 0] = Ez
-    # Seed B field from initial curl(E): Bx ∝ -dEz/dz, By ∝ dEz/dx
-    dEz_dx = np.gradient(Ez, axis=2)
-    dEz_dz = np.gradient(Ez, axis=0)
-    data[:, :, :, 1] = (-dEz_dz * 0.1).astype(np.float32)  # Bx seed
-    data[:, :, :, 2] = (dEz_dx * 0.1).astype(np.float32)    # By seed
+    data[:, :, :, 2] = Ez   # Ez slot in (Ex, Ey, Ez, medium)
+    return data
+
+def init_em_dipole_pair(size, rng):
+    """Two coherent Ez dipoles separated along X — produces classic
+    near-field interference (constructive maxima between sources,
+    destructive nulls along the perpendicular bisector at certain
+    radii) that a single dipole cannot."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    c = size / 2.0
+    sep = max(4, size // 4)
+    r = max(2, size // 12)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    dy = (y - c).astype(np.float64)
+    Ez = np.zeros_like(dy)
+    for sign in (-1.0, +1.0):
+        cx = c + sign * 0.5 * sep
+        dx = (x - cx).astype(np.float64)
+        dz = (z - c).astype(np.float64)
+        dist = np.sqrt(dx**2 + dy**2 + dz**2)
+        env = np.exp(-0.5 * (dist / r) ** 2)
+        Ez += env * dy / max(r, 1)
+    data[:, :, :, 2] = Ez.astype(np.float32)
+    return data
+
+def init_em_plane_wave(size, rng):
+    """Travelling Ez plane wave injected from the −X face: an Ez sheet
+    of a few cycles sits at small x, with a matched Bz profile so the
+    pulse propagates as a unidirectional Poynting flux instead of a
+    standing dipole pattern."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    xf = x.astype(np.float64)
+    # Wavelength ≈ size/4, envelope a few wavelengths wide near x=0.
+    k = 2.0 * np.pi / max(4.0, size / 4.0)
+    envelope = np.exp(-0.5 * ((xf - size * 0.1) / max(2.0, size / 16.0)) ** 2)
+    wave = envelope * np.sin(k * xf)
+    data[:, :, :, 2] = wave.astype(np.float32)            # Ez
+    return data
+
+def init_em_cavity_mode(size, rng):
+    """TE_111-like resonant cavity mode in a perfect-conductor box:
+    Ez filled with sin(πx/L)·sin(πy/L)·sin(πz/L). Excites the lowest
+    standing-wave mode of the simulation domain — gives a long-lived
+    oscillation whose nodes/antinodes scan beautifully through the
+    volume."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    L = float(size)
+    Ez = (np.sin(np.pi * x / L) *
+          np.sin(np.pi * y / L) *
+          np.sin(np.pi * z / L)).astype(np.float32)
+    data[:, :, :, 2] = Ez
+    return data
+
+def init_em_photonic_crystal(size, rng):
+    """3D photonic crystal: cubic lattice of high-permittivity spheres
+    embedded in vacuum. The dipole source at box centre radiates into a
+    structured medium with a partial photonic band gap — at certain
+    frequencies the wave is forbidden from propagating along certain
+    directions, producing diffraction patterns and slow-light effects.
+
+    Pair 1: Ez seeded with a small Gaussian pulse + alpha = ε_r map
+    Pair 2: B = 0, sigma = 0 (lossless dielectric)
+
+    Lattice constant ≈ size/4 (so 4×4×4 spheres tile the box). Sphere
+    radius is ~0.3 × lattice constant — moderate filling fraction
+    where the band gap is widest for ε_r ≈ 12 (silicon-like).
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    L = max(8, size // 4)              # lattice constant in cells
+    r_sphere = 0.3 * L
+
+    # Distance from each cell to the *nearest* lattice site (modular).
+    fx = np.minimum((x % L), L - (x % L)).astype(np.float64)
+    fy = np.minimum((y % L), L - (y % L)).astype(np.float64)
+    fz = np.minimum((z % L), L - (z % L)).astype(np.float64)
+    d2 = fx * fx + fy * fy + fz * fz
+    inside = d2 < (r_sphere * r_sphere)
+
+    # ε_r map: 12 inside spheres (Si-like), 1 (vacuum) outside.
+    eps_r = np.where(inside, 12.0, 1.0).astype(np.float32)
+
+    # Small Ez seed at the centre to feed the dipole the first cycle.
+    cx = size / 2.0
+    dx = (x - cx).astype(np.float64)
+    dy = (y - cx).astype(np.float64)
+    dz = (z - cx).astype(np.float64)
+    seed_r = max(2.0, size / 12.0)
+    Ez = (0.3 * np.exp(-0.5 * (dx * dx + dy * dy + dz * dz) / (seed_r * seed_r))
+          * dy / seed_r).astype(np.float32)
+
+    data[:, :, :, 2] = Ez
+    data[:, :, :, 3] = eps_r
+    return data
+
+def init_em_photonic_cavity(size, rng):
+    """Photonic crystal with a defect: same lattice as em_photonic_crystal
+    but one sphere off-centre is removed, creating a localized cavity
+    mode that traps light at specific frequencies inside the band gap.
+    A small seed pulse is placed inside the cavity so radiation builds
+    up there even with the dipole source at box centre."""
+    data = init_em_photonic_crystal(size, rng)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    L = max(8, size // 4)
+    # Pick a lattice site offset from the box centre by ~1.5 lattice
+    # constants so the cavity and the dipole source don't overlap.
+    cav_x = size / 2.0 + 1.5 * L
+    cav_y = size / 2.0
+    cav_z = size / 2.0
+    r_remove = 0.45 * L                        # slightly bigger than a sphere
+    d2 = (x - cav_x) ** 2 + (y - cav_y) ** 2 + (z - cav_z) ** 2
+    inside = d2 < (r_remove * r_remove)
+    eps = data[:, :, :, 3]
+    eps[inside] = 1.0
+    data[:, :, :, 3] = eps
+    # Boost a small Ez seed inside the cavity so the trapped mode has
+    # something to ring on even before the dipole source feeds energy in.
+    seed_r = 0.35 * L
+    seed_d2 = (x - cav_x) ** 2 + (y - cav_y) ** 2 + (z - cav_z) ** 2
+    seed = np.exp(-0.5 * seed_d2 / (seed_r * seed_r))
+    data[:, :, :, 2] += (0.5 * seed * (y - cav_y) / seed_r).astype(np.float32)
+    return data
+
+def init_em_beam_splitter(size, rng):
+    """Two perpendicular waveguides crossing at the box centre. A pulse
+    injected into one arm couples partially into the orthogonal arm at
+    the junction — classic 4-port photonic device."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    cx, cy, cz = size / 2.0, size / 2.0, size / 2.0
+    half_w = max(2, size // 10)
+
+    in_z_guide = (np.abs(x - cx) <= half_w) & (np.abs(y - cy) <= half_w)
+    in_x_guide = (np.abs(z - cz) <= half_w) & (np.abs(y - cy) <= half_w)
+    in_guide = in_z_guide | in_x_guide
+    eps_r = np.where(in_guide, 6.0, 1.0).astype(np.float32)
+    data[:, :, :, 3] = eps_r
+
+    z_inj = size // 8
+    sigma_z = max(2.0, size / 16.0)
+    k = 2.0 * np.pi / max(4.0, size / 5.0)
+    z_env = np.exp(-0.5 * ((z - z_inj) / sigma_z) ** 2)
+    lateral = np.exp(-0.5 * ((x - cx) ** 2 + (y - cy) ** 2) / (half_w ** 2))
+    Ez = (z_env * lateral * np.sin(k * z)).astype(np.float32)
+    data[:, :, :, 2] = Ez
+    return data
+
+def init_em_negative_index_slab(size, rng):
+    """A planar slab of metamaterial-like ε_r < 1 (mathematical curiosity:
+    real metamaterials need both ε and μ negative to be left-handed; here
+    we only have ε. Still produces unusual refraction — the wave entering
+    the slab has elevated phase velocity, like wandering into a region
+    where light "speeds up"). The slab spans full XY, occupies middle Z.
+    A plane-wave pulse from the −Z face encounters the slab front face
+    and partially reflects / transmits with anomalous wavefront curvature.
+    """
+    data = init_em_plane_wave(size, rng)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    z_lo = size // 2 - max(2, size // 10)
+    z_hi = size // 2 + max(2, size // 10)
+    in_slab = (z >= z_lo) & (z < z_hi)
+    eps_r = np.where(in_slab, 0.4, 1.0).astype(np.float32)
+    # ε_r = 0.4 → c_local = c/√0.4 ≈ 1.58·c (phase velocity > c is fine;
+    # group velocity is still bounded by c in real dispersive media).
+    data[:, :, :, 3] = eps_r
+    return data
+
+def init_em_waveguide(size, rng):
+    """Dielectric slab waveguide: a square cross-section channel of
+    high-ε_r runs along Z through the box. A plane-wave pulse injected
+    at the −Z face couples into the guided mode and propagates along
+    the channel; the surrounding vacuum (lower ε_r) confines the wave
+    by total internal reflection — same mechanism as a fiber-optic
+    cable.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    cx, cy = size / 2.0, size / 2.0
+    half_w = max(2, size // 8)         # waveguide half-width in cells
+
+    # Square cross-section, full Z extent.
+    in_guide = (np.abs(x - cx) <= half_w) & (np.abs(y - cy) <= half_w)
+    eps_r = np.where(in_guide, 6.0, 1.0).astype(np.float32)
+    data[:, :, :, 3] = eps_r
+
+    # Inject a tone at z = size/8: Ez × envelope along Z, confined to
+    # the guide cross-section.
+    z_inj = size // 8
+    sigma_z = max(2.0, size / 16.0)
+    k = 2.0 * np.pi / max(4.0, size / 5.0)
+    z_env = np.exp(-0.5 * ((z - z_inj) / sigma_z) ** 2)
+    lateral = np.exp(-0.5 * ((x - cx) ** 2 + (y - cy) ** 2) / (half_w ** 2))
+    Ez_pulse = (z_env * lateral * np.sin(k * z)).astype(np.float32)
+    data[:, :, :, 2] = Ez_pulse
     return data
 
 def init_viscous_fingers(size, rng):
-    """Viscous fingers: smooth injection port with perturbed interface.
-    Real Hele-Shaw injection has a smooth circular port, but the interface
-    is never perfectly smooth — micro-roughness seeds the fingering instability.
-    Sigmoid edge prevents numerical ringing; interface noise creates immediate
-    finger nucleation sites instead of waiting for floating-point perturbation."""
+    """Saffman-Taylor planar geometry: invader injected at the y=0
+    face displaces defender across the volume to a y=L drain.
+
+    A planar interface with sub-voxel roughness seeds the fingering
+    instability — at the bottom, a thin slab is fully saturated; just
+    above it, micro-roughness in saturation breaks symmetry and lets
+    the most-favoured wavelength of the linear instability take off.
+    Permeability is heterogeneous (fixed at init) so that fast-flow
+    channels emerge from real porosity differences rather than only
+    from the dynamics' positive feedback.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    c = size // 2
-    r = max(2, size // 16)
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
-    dist = np.sqrt((x - c)**2 + (y - c)**2 + (z - c)**2).astype(np.float64)
-    # Interface noise: perturb effective radius to seed fingering instability
-    interface_noise = _canonical_noise(size, rng, -1.0, 1.0)
-    perturbed_r = r + interface_noise * (r * 0.3)
-    # Smooth sigmoid transition (~2-voxel width) instead of hard step
-    sat = (1.0 / (1.0 + np.exp(np.clip((dist - perturbed_r) * 2.0, -20, 20)))).astype(np.float32)
+
+    # Smooth invader slab at the bottom (y < L/16) with a perturbed
+    # interface a few voxels above.
+    inj_thickness = max(1, size // 16)
+    interface_y = inj_thickness + 2
+    roughness = _canonical_noise(size, rng, -1.0, 1.0) * 1.5  # ±1.5 voxels
+    perturbed_iface = interface_y + roughness  # shape (size, size, size)
+    sat = (1.0 / (1.0 + np.exp(np.clip((y - perturbed_iface) * 1.5,
+                                        -20, 20)))).astype(np.float32)
+
+    # Pressure: linear ramp from inject_p=1 at y=0 to 0 at y=L (good
+    # initial guess — Jacobi sweep refines it).
+    pressure = (1.0 - y.astype(np.float32) / float(size)).astype(np.float32)
+
+    # Permeability: log-normal-ish heterogeneity around 0.5.
+    raw = _canonical_noise(size, rng, -1.0, 1.0)
+    perm = np.clip(0.55 + 0.35 * raw, 0.15, 1.0).astype(np.float32)
+    # Force unit perm in the injector slab so the front starts fed
+    # from a wide-open channel.
+    perm[:inj_thickness, :, :] = 1.0
+
     data[:, :, :, 0] = sat
-    # Pressure: smooth from center, not hard-edged
-    clean_transition = (1.0 / (1.0 + np.exp(np.clip((dist - r) * 2.0, -20, 20)))).astype(np.float32)
-    data[:, :, :, 1] = clean_transition
-    # Permeability: heterogeneous porous medium, higher where invader starts
-    perm = 0.5 + 0.3 * _canonical_noise(size, rng, -1.0, 1.0)
-    perm = np.clip(perm, 0.1, 1.0).astype(np.float32)
-    # Invader region starts with full permeability (dissolved channel)
-    perm = np.maximum(perm, sat * 0.9)
+    data[:, :, :, 1] = pressure
+    data[:, :, :, 2] = perm
+    return data
+
+def init_viscous_fingers_radial(size, rng):
+    """Saffman-Taylor *radial* geometry: a small spherical invader bubble
+    at the box centre is driven outward radially. The classic
+    laboratory experiment for radial fingering — the front becomes
+    morphologically unstable at a critical radius and tip-splits into
+    a fractal pattern."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r0 = max(2.0, size * 0.06)
+    dist = np.sqrt((x - c)**2 + (y - c)**2 + (z - c)**2)
+    sat = (1.0 / (1.0 + np.exp((dist - r0) * 1.5))).astype(np.float32)
+    # Pressure: ~ -log(r) far field (Stokes), uniform inside the bubble.
+    rr = np.maximum(dist, 1.0)
+    pressure = (1.0 - np.log(rr) / np.log(max(2.0, size / 2.0)))
+    pressure = np.clip(pressure, 0.0, 1.0).astype(np.float32)
+    raw = _canonical_noise(size, rng, -1.0, 1.0)
+    perm = np.clip(0.55 + 0.35 * raw, 0.15, 1.0).astype(np.float32)
+    data[:, :, :, 0] = sat
+    data[:, :, :, 1] = pressure
+    data[:, :, :, 2] = perm
+    return data
+
+def init_viscous_fingers_dual(size, rng):
+    """Two facing injectors on opposite faces: invader pushed in from
+    y=0 AND y=L with a defender drain ring around the equator. Fingers
+    from the two fronts race toward each other and either merge or
+    interfere — useful for studying breakthrough dynamics."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    inj_thickness = max(1, size // 16)
+    rough = _canonical_noise(size, rng, -1.0, 1.0) * 1.5
+    sat = np.zeros((size, size, size), dtype=np.float32)
+    yf = y.astype(np.float32)
+    iface_lo = inj_thickness + 2 + rough
+    iface_hi = (size - 1) - inj_thickness - 2 + rough
+    sat += (1.0 / (1.0 + np.exp(np.clip((yf - iface_lo) * 1.5, -20, 20)))).astype(np.float32)
+    sat += (1.0 / (1.0 + np.exp(np.clip((iface_hi - yf) * 1.5, -20, 20)))).astype(np.float32)
+    sat = np.clip(sat, 0.0, 1.0)
+    # Pressure: peak at both injectors → drains at mid-height.
+    yc = float(size) / 2.0
+    pressure = np.clip(1.0 - np.abs(yf - yc) / yc, 0.0, 1.0).astype(np.float32)
+    raw = _canonical_noise(size, rng, -1.0, 1.0)
+    perm = np.clip(0.55 + 0.35 * raw, 0.15, 1.0).astype(np.float32)
+    perm[:inj_thickness, :, :] = 1.0
+    perm[-inj_thickness:, :, :] = 1.0
+    data[:, :, :, 0] = sat
+    data[:, :, :, 1] = pressure
+    data[:, :, :, 2] = perm
+    return data
+
+def init_viscous_fingers_layered(size, rng):
+    """Planar bottom→top injection with horizontally-banded permeability
+    (alternating high/low layers).  Fingers preferentially channel
+    through the high-perm layers and stall in the low-perm ones —
+    a textbook stratified-reservoir study."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    inj_thickness = max(1, size // 16)
+    interface_y = inj_thickness + 2
+    rough = _canonical_noise(size, rng, -1.0, 1.0) * 1.5
+    perturbed = interface_y + rough
+    yf = y.astype(np.float32)
+    sat = (1.0 / (1.0 + np.exp(np.clip((yf - perturbed) * 1.5,
+                                        -20, 20)))).astype(np.float32)
+    pressure = (1.0 - yf / float(size)).astype(np.float32)
+    # Banded permeability: 4 horizontal layers along Y.
+    n_bands = 4
+    band_h = max(1, size // n_bands)
+    perm = np.full((size, size, size), 0.3, dtype=np.float32)
+    for b in range(n_bands):
+        if b % 2 == 0:
+            ylo = b * band_h
+            yhi = min(size, ylo + band_h)
+            perm[:, ylo:yhi, :] = 0.9
+    perm[:inj_thickness, :, :] = 1.0
+    # Tiny noise on top so individual fingers can break out.
+    perm += _canonical_noise(size, rng, -0.05, 0.05)
+    perm = np.clip(perm, 0.15, 1.0)
+    data[:, :, :, 0] = sat
+    data[:, :, :, 1] = pressure
     data[:, :, :, 2] = perm
     return data
 
@@ -8101,42 +16188,184 @@ def init_fire(size, rng):
     data[:, :, :, 1] = np.where(dist < r, 1.0, 0.0).astype(np.float32)
     return data
 
-def init_physarum(size, rng):
-    """Physarum: agent halos around food sources with distant scouts.
-    Agents scattered uniformly take forever to find food and build networks.
-    Seeding agents in halos *near* (not on) food sources creates immediate
-    exploration dynamics — nearby agents lay trail toward food, trail attracts
-    distant scouts, competing fronts merge into optimal transport networks."""
+
+def init_fire_fluid(size, rng):
+    """Fire (fluid version): pair-1 channel layout (T, soot, ember, fuel).
+
+    Same fuel-terrain logic as init_fire but rearranged to feed the new
+    multi-pass fire pipeline (fire_chem_3d / fire_flow_3d).  Oxygen lives
+    in pair 2 and is initialised separately by the `fire_oxygen`
+    field2_init.
+
+    Layout:
+        R = temperature  (1.0 in a hot ignition ball near bottom-centre)
+        G = soot         (starts at 0)
+        B = ember        (starts at 0)
+        A = fuel         (heterogeneous terrain)
+    """
+    from scipy.ndimage import gaussian_filter, zoom
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    fine_noise = _canonical_noise(size, rng, 0.0, 1.0)
+    cs = CANONICAL_INIT_SIZE
+    coarse = rng.random((cs, cs, cs)).astype(np.float32)
+    coarse = gaussian_filter(coarse, sigma=4.0)
+    if size != cs:
+        coarse = zoom(coarse, size / cs, order=1).astype(np.float32)
+    coarse = (coarse - coarse.min()) / (coarse.max() - coarse.min() + 1e-8)
+    fuel = np.zeros((size, size, size), dtype=np.float32)
+    for y_idx in range(size):
+        frac = y_idx / float(size)
+        base = max(0.3, 1.0 - frac * 0.7)
+        layer = base * (coarse[:, y_idx, :] * 0.5
+                        + fine_noise[:, y_idx, :] * 0.3 + 0.4)
+        layer[coarse[:, y_idx, :] < 0.18] *= 0.2
+        fuel[:, y_idx, :] = np.clip(layer, 0.0, 1.0)
+    data[..., 3] = fuel  # A = fuel
+
+    # Ignition: hot ball near bottom-centre.
+    c = size // 2
+    r = max(4, size // 6)
+    z, yy, x = np.mgrid[0:size, 0:size, 0:size]
+    iy = size // 6
+    dist = np.sqrt((x - c) ** 2 + (yy - iy) ** 2 + (z - c) ** 2)
+    data[..., 0] = np.where(dist < r, 1.0, 0.0).astype(np.float32)  # R = T
+    return data
+
+
+def init_fire_fluid_sparse(size, rng):
+    """Fire (fluid, sparse): scattered fuel patches + bottom-centre spark."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
-    # Food sources: concentrated blobs
+
+    fuel = np.zeros((size, size, size), dtype=np.float64)
+    n_patches = rng.randint(8, 16)
+    for _ in range(n_patches):
+        fx = rng.uniform(0.1, 0.9) * size
+        fy = rng.uniform(0.05, 0.85) * size
+        fz = rng.uniform(0.1, 0.9) * size
+        rad = rng.uniform(0.06, 0.14) * size
+        d2 = (x - fx) ** 2 + (y - fy) ** 2 + (z - fz) ** 2
+        fuel += rng.uniform(0.5, 0.9) * np.exp(-0.5 * d2 / rad ** 2)
+    data[..., 3] = np.clip(fuel, 0, 1).astype(np.float32)  # A = fuel
+
+    # Spark at bottom-centre.
+    ic = size // 2
+    for dx in range(-2, 3):
+        for dz in range(-2, 3):
+            ix, iz = ic + dx, ic + dz
+            if 0 <= ix < size and 0 <= iz < size:
+                data[iz, 1, ix, 0] = 1.0  # R = T
+    return data
+
+def init_physarum(size, rng):
+    """Physarum (adaptive flux network).
+
+    Layout for the new `physarum_adaptive_3d` rule:
+        R = trail (visualisation, |Q|)            — start 0
+        G = conductivity ρ                        — small uniform + halos
+        B = food sources (pressure boundary)      — sparse blobs
+        A = pressure                              — start 0 (relaxes)
+
+    A small but non-zero ρ baseline is essential: ρ acts as the
+    diffusion coefficient for the pressure equation; all-zero ρ would
+    leave pressure stuck and no flow could form.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+
+    # ---- Food sources (B channel = pressure boundary condition) ----
     n_food = rng.randint(3, 7)
     food_centers = []
     for _ in range(n_food):
         fx = rng.uniform(0.15, 0.85) * size
         fy = rng.uniform(0.15, 0.85) * size
         fz = rng.uniform(0.15, 0.85) * size
-        fr = rng.uniform(0.05, 0.12) * size
+        fr = rng.uniform(0.05, 0.10) * size
         food_centers.append((fx, fy, fz, fr))
         dist = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
         data[:, :, :, 2] += np.where(dist < fr, 1.0, 0.0).astype(np.float32)
     data[:, :, :, 2] = np.clip(data[:, :, :, 2], 0.0, 1.0)
-    # Agent density: ring-shaped halos around each food source
+
+    # ---- Conductivity ρ (G channel) ----
+    # Small uniform baseline so the pressure solve has something to work
+    # with everywhere; halos around food so initial tubes nucleate
+    # sensibly toward each source.
+    data[:, :, :, 1] = 0.04
     for fx, fy, fz, fr in food_centers:
         dist = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
-        halo_r = fr * 1.5  # peak at 1.5× food radius
-        halo_w = fr * 0.6
-        ring = np.exp(-0.5 * ((dist - halo_r) / halo_w)**2).astype(np.float32)
-        data[:, :, :, 1] += ring * 0.4
-    # Distant scout clusters: sparse agents far from food for competing fronts
-    scout_noise = _canonical_noise(size, rng, 0.0, 1.0)
-    food_proximity = np.zeros((size, size, size), dtype=np.float32)
-    for fx, fy, fz, fr in food_centers:
-        dist = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
-        food_proximity = np.maximum(food_proximity, np.exp(-0.5 * (dist / (fr * 3))**2))
-    distant_mask = food_proximity < 0.3
-    data[:, :, :, 1] += np.where(distant_mask & (scout_noise > 0.97), 0.5, 0.0).astype(np.float32)
+        halo = np.exp(-0.5 * (dist / (fr * 2.0))**2).astype(np.float32)
+        data[:, :, :, 1] += halo * 0.15
     data[:, :, :, 1] = np.clip(data[:, :, :, 1], 0.0, 1.0)
+
+    return data
+
+def init_physarum_two_source(size, rng):
+    """Two food sources on opposite faces — the classic shortest-path
+    optimisation problem (Tokyo-rail-network experiment style). The
+    network should converge to a single thick tube connecting them."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    fr = max(2.0, size * 0.07)
+    centers = [
+        (size * 0.15, size * 0.5, size * 0.5),
+        (size * 0.85, size * 0.5, size * 0.5),
+    ]
+    food = np.zeros((size, size, size), dtype=np.float32)
+    for fx, fy, fz in centers:
+        d = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
+        food += np.where(d < fr, 1.0, 0.0).astype(np.float32)
+    data[:, :, :, 2] = np.clip(food, 0.0, 1.0)
+    data[:, :, :, 1] = 0.04
+    for fx, fy, fz in centers:
+        d = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
+        data[:, :, :, 1] += np.exp(-0.5 * (d / (fr * 2.0))**2).astype(np.float32) * 0.20
+    data[:, :, :, 1] = np.clip(data[:, :, :, 1], 0.0, 1.0)
+    return data
+
+def init_physarum_grid(size, rng):
+    """3×3×3 lattice of food sources — forces the network to grow a
+    real Steiner-tree-like structure instead of one straight tube,
+    revealing redundant-path pruning behaviour."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    fr = max(1.5, size * 0.04)
+    n = 3
+    food = np.zeros((size, size, size), dtype=np.float32)
+    halo = np.zeros((size, size, size), dtype=np.float32)
+    for ix in range(n):
+        for iy in range(n):
+            for iz in range(n):
+                fx = size * (ix + 1) / (n + 1)
+                fy = size * (iy + 1) / (n + 1)
+                fz = size * (iz + 1) / (n + 1)
+                d = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
+                food += (d < fr).astype(np.float32)
+                halo += np.exp(-0.5 * (d / (fr * 2.0))**2).astype(np.float32)
+    data[:, :, :, 2] = np.clip(food, 0.0, 1.0)
+    data[:, :, :, 1] = np.clip(0.04 + halo * 0.10, 0.0, 1.0)
+    return data
+
+def init_physarum_ring(size, rng):
+    """Food sources arranged on a ring — the network should form a
+    circular highway with internal shortcut chords pruning over time."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    cx = cy = cz = size / 2.0
+    R = size * 0.32
+    fr = max(1.5, size * 0.05)
+    n = 8
+    food = np.zeros((size, size, size), dtype=np.float32)
+    halo = np.zeros((size, size, size), dtype=np.float32)
+    for k in range(n):
+        ang = 2.0 * np.pi * k / n
+        fx = cx + R * np.cos(ang)
+        fy = cy + R * np.sin(ang)
+        fz = cz
+        d = np.sqrt((x - fx)**2 + (y - fy)**2 + (z - fz)**2)
+        food += (d < fr).astype(np.float32)
+        halo += np.exp(-0.5 * (d / (fr * 2.0))**2).astype(np.float32)
+    data[:, :, :, 2] = np.clip(food, 0.0, 1.0)
+    data[:, :, :, 1] = np.clip(0.04 + halo * 0.12, 0.0, 1.0)
     return data
 
 def init_fracture(size, rng):
@@ -8188,16 +16417,210 @@ def init_fracture(size, rng):
     data[:, :, :, 1] = np.clip(tension + stress_conc * 0.2, 0.0, 0.5).astype(np.float32)
     return data
 
-def init_galaxy(size, rng):
-    """Galaxy: near-uniform density with small perturbations (Jeans instability)."""
+def init_fracture_peridyn(size, rng):
+    """Peridynamic fracture init: quasi-static pre-load with edge notch.
+
+    Layout for `peridyn_disp_3d` rule:
+        R = u_x = 0
+        G = u_y  (linear strain ramp from -load at y=0 to +load at y=L)
+        B = u_z = 0
+        A = integrity ∈ {0,1}
+
+    A V-shaped through-thickness edge notch from the −X face into the
+    centre acts as a stress concentrator (1/√r in linear elasticity).
+    Imposing the linear-strain field as the *initial* condition skips
+    the elastic-wave loading transient — the medium starts in static
+    equilibrium far from the notch, and the geometric stress
+    concentration breaks bonds at the notch tip first.  The crack
+    then propagates because as bonds break the load is redistributed
+    onto the new tip — the textbook brittle-fracture mechanism.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    # Channel 0 = density: uniform + moderate noise to seed Jeans instability
-    data[:, :, :, 0] = 0.1 + _canonical_noise(size, rng, -0.05, 0.05)
-    data[:, :, :, 0] = np.clip(data[:, :, :, 0], 0.001, None)
-    # Channels 1-3 = velocity: small random initial velocities
-    data[:, :, :, 1] = _canonical_noise(size, rng, -0.02, 0.02)
-    data[:, :, :, 2] = _canonical_noise(size, rng, -0.02, 0.02)
-    data[:, :, :, 3] = _canonical_noise(size, rng, -0.02, 0.02)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+
+    # Pre-loaded linear strain field. With load=0.5 and L=48,
+    # bulk strain ≈ 2 · 0.5 / 43 ≈ 0.023 — well below s_crit=0.05,
+    # so the bulk is sub-critical.  Stress concentration at the
+    # notch tip (≈3× in linear elasticity, similar in peridynamics)
+    # locally raises the stretch above critical, breaking the
+    # tip-most bonds first — then the crack propagates because
+    # each newly-broken bond redistributes load onto the next.
+    load = 0.5
+    slab = max(1, size // 24)
+    inner_lo = float(slab)
+    inner_hi = float(size - slab - 1)
+    inner_extent = max(1.0, inner_hi - inner_lo)
+    yf = y.astype(np.float32)
+    # Linear ramp inside the bulk; clamp the ends to ±load to match
+    # the disp pass's hard-set grip displacement.
+    t = np.clip((yf - inner_lo) / inner_extent, 0.0, 1.0)
+    u_y_field = (-load + 2.0 * load * t).astype(np.float32)
+
+    # Tiny noise to break perfect symmetry — kept much smaller than
+    # the gap between bulk strain (~0.054) and s_crit (0.06).
+    u_y_field += _canonical_noise(size, rng, -0.001, 0.001)
+
+    integrity = np.ones((size, size, size), dtype=np.float32)
+
+    # Edge notch: V-shape from −X face into the bulk, centred on
+    # y = size/2.
+    c = size // 2
+    notch_depth = max(3, size // 6)
+    notch_w = max(1, size // 24)
+    for xi in range(notch_depth):
+        w = max(1, int(notch_w * (1.0 - xi / notch_depth)))
+        integrity[:, c - w:c + w + 1, xi] = 0.0
+
+    # Sub-percolation random weakening: just 0.1% of cells damaged.
+    # Random damage seeds micro-branching but every broken cell
+    # concentrates stress on its 26 neighbours (each bond now carries
+    # roughly N/(N-1) more force) so a high density cascades the
+    # whole bulk into failure.  Keep it sparse.
+    weak = rng.random((size, size, size)) < 0.001
+    integrity[weak] = 0.0
+
+    # Grip slabs MUST stay intact — they're the loaded boundary.
+    integrity[:, :slab, :] = 1.0
+    integrity[:, -slab:, :] = 1.0
+
+    data[:, :, :, 1] = u_y_field
+    data[:, :, :, 3] = integrity
+    return data
+
+
+def _peridyn_preload(size, rng, load=0.5):
+    """Helper: return (u_y_field, slab) with a pre-loaded linear strain
+    matching displacement-controlled grip BCs at y = ±slab faces."""
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    slab = max(1, size // 24)
+    inner_lo = float(slab)
+    inner_hi = float(size - slab - 1)
+    inner_extent = max(1.0, inner_hi - inner_lo)
+    yf = y.astype(np.float32)
+    t = np.clip((yf - inner_lo) / inner_extent, 0.0, 1.0)
+    u_y = (-load + 2.0 * load * t).astype(np.float32)
+    u_y += _canonical_noise(size, rng, -0.001, 0.001)
+    return u_y, slab
+
+
+def init_fracture_double_notch(size, rng):
+    """Two facing edge notches on −X and +X faces. The two crack tips
+    race toward each other under tensile load — they typically curve
+    slightly to meet, producing a non-coplanar mode-I+II ligament
+    failure rather than a single straight Mode-I crack."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    u_y, slab = _peridyn_preload(size, rng, load=0.5)
+    integrity = np.ones((size, size, size), dtype=np.float32)
+    c = size // 2
+    notch_depth = max(3, size // 6)
+    notch_w = max(1, size // 24)
+    for xi in range(notch_depth):
+        w = max(1, int(notch_w * (1.0 - xi / notch_depth)))
+        # −X face notch
+        integrity[:, c - w:c + w + 1, xi] = 0.0
+        # +X face notch (mirror)
+        integrity[:, c - w:c + w + 1, size - 1 - xi] = 0.0
+    weak = rng.random((size, size, size)) < 0.001
+    integrity[weak] = 0.0
+    integrity[:, :slab, :] = 1.0
+    integrity[:, -slab:, :] = 1.0
+    data[:, :, :, 1] = u_y
+    data[:, :, :, 3] = integrity
+    return data
+
+
+def init_fracture_penny_crack(size, rng):
+    """Internal penny-shaped crack on the z-midplane: a thin disc of
+    broken bonds in the bulk with no surface contact. Loading drives
+    Mode-I opening and the crack ring grows radially outward — the
+    canonical 3D fracture mechanics test geometry."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    u_y, slab = _peridyn_preload(size, rng, load=0.5)
+    integrity = np.ones((size, size, size), dtype=np.float32)
+    c = size / 2.0
+    crack_radius = max(2.0, size * 0.18)
+    in_plane = (np.abs(y - c) < 1.5)
+    in_disc = ((x - c)**2 + (z - c)**2 < crack_radius**2)
+    integrity[in_plane & in_disc] = 0.0
+    weak = rng.random((size, size, size)) < 0.0005
+    integrity[weak] = 0.0
+    integrity[:, :slab, :] = 1.0
+    integrity[:, -slab:, :] = 1.0
+    data[:, :, :, 1] = u_y
+    data[:, :, :, 3] = integrity
+    return data
+
+
+def init_fracture_shear(size, rng):
+    """Mode-II shear loading: linear u_x ramp along Y instead of u_y.
+    The −X edge notch tip now experiences in-plane shear, producing
+    a slanted crack that propagates at ~45° to the loading axis
+    (the maximum-tensile-stress direction in pure shear)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    load = 0.5
+    slab = max(1, size // 24)
+    inner_lo = float(slab)
+    inner_hi = float(size - slab - 1)
+    inner_extent = max(1.0, inner_hi - inner_lo)
+    yf = y.astype(np.float32)
+    t = np.clip((yf - inner_lo) / inner_extent, 0.0, 1.0)
+    # Shear: u_x grows linearly with y
+    u_x = (-load + 2.0 * load * t).astype(np.float32)
+    u_x += _canonical_noise(size, rng, -0.001, 0.001)
+    integrity = np.ones((size, size, size), dtype=np.float32)
+    c = size // 2
+    notch_depth = max(3, size // 6)
+    notch_w = max(1, size // 24)
+    for xi in range(notch_depth):
+        w = max(1, int(notch_w * (1.0 - xi / notch_depth)))
+        integrity[:, c - w:c + w + 1, xi] = 0.0
+    weak = rng.random((size, size, size)) < 0.001
+    integrity[weak] = 0.0
+    integrity[:, :slab, :] = 1.0
+    integrity[:, -slab:, :] = 1.0
+    data[:, :, :, 0] = u_x
+    data[:, :, :, 3] = integrity
+    return data
+
+
+def init_fracture_pre_damaged(size, rng):
+    """No notch, but a denser field of random pre-damage (~1%). With
+    enough seeds and a moderate load the cracks self-organise into a
+    branching, percolating fracture network — qualitatively different
+    from the single-tip propagation of the notched specimen."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    u_y, slab = _peridyn_preload(size, rng, load=0.5)
+    integrity = np.ones((size, size, size), dtype=np.float32)
+    weak = rng.random((size, size, size)) < 0.012
+    integrity[weak] = 0.0
+    integrity[:, :slab, :] = 1.0
+    integrity[:, -slab:, :] = 1.0
+    data[:, :, :, 1] = u_y
+    data[:, :, :, 3] = integrity
+    return data
+
+
+def init_galaxy(size, rng):
+    """Galaxy: low-amplitude perturbations on a uniform background.
+    Seeds the Jeans instability — collapse takes a few hundred steps to
+    become visible.  For a stronger initial cosmic-web structure prefer
+    the `galaxy_filaments` variant (now the preset default)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # Density: 0.1 baseline + spatially-correlated perturbations big
+    # enough to seed Jeans collapse within a few hundred timesteps.
+    # The legacy ±0.05 white-noise init was too small-wavelength for
+    # gravity to amplify before pressure smoothed it out.
+    from scipy.ndimage import gaussian_filter
+    pert = _canonical_noise(size, rng, -1.0, 1.0).astype(np.float32)
+    pert = gaussian_filter(pert, sigma=2.0)
+    pert *= 0.06 / max(np.std(pert), 1e-6)
+    data[:, :, :, 0] = np.clip(0.1 + pert, 0.005, None)
+    # Velocity: tiny random seed.
+    data[:, :, :, 1] = _canonical_noise(size, rng, -0.005, 0.005)
+    data[:, :, :, 2] = _canonical_noise(size, rng, -0.005, 0.005)
+    data[:, :, :, 3] = _canonical_noise(size, rng, -0.005, 0.005)
     return data
 
 def init_lichen(size, rng):
@@ -8325,6 +16748,55 @@ def init_bz_spiral_seed(size, rng):
     data[:, :, :, 0] = (amp * np.cos(combined_phase)).astype(np.float32)
     data[:, :, :, 1] = (amp * np.sin(combined_phase)).astype(np.float32)
     data[:, :, :, 2] = ((combined_phase / (2 * np.pi)) % 1.0).astype(np.float32)
+    return data
+
+
+def init_bz_scroll_filament(size, rng):
+    """Barkley scroll-wave seed: Winfree broken-wavefront recipe.
+
+    A planar excitation that abruptly TERMINATES inside the box
+    creates a phase-singularity line along the termination edge.
+    The wave can't propagate into the recovery zone but can curl
+    around the broken end → 1-D scroll filament along the axis of
+    the discontinuity.
+
+    Layout for `bz_scroll_3d` rule:
+        R = activator u ∈ [0, 1]    (excited slab terminating mid-box)
+        G = inhibitor v ∈ [0, 1]    (refractory tail just behind front)
+        B = filament strength       (start 0; rule fills it in)
+        A = phase                   (start 0)
+
+    Two perpendicular broken fronts produce two intersecting scroll
+    filaments that twist, knot, and (for break-up parameters) cascade
+    into the spaghetti-defect regime.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    L = float(size)
+
+    # ---- Broken front #1: filament along z-axis ----
+    # Wave occupies y > L/2 AND x in [L/3, 2L/3].
+    # Tail (refractory) immediately behind: y > L/2 AND x in [L/3-w, L/3].
+    front1 = ((y > L / 2) & (x >= L / 3) & (x <= 2 * L / 3))
+    tail1  = ((y > L / 2) & (x >= L / 3 - 4) & (x < L / 3))
+
+    # ---- Broken front #2: filament along x-axis (perpendicular) ----
+    front2 = ((z > L / 2) & (y >= L / 3) & (y <= 2 * L / 3) & (x < L / 2))
+    tail2  = ((z > L / 2) & (y >= L / 3 - 4) & (y < L / 3) & (x < L / 2))
+
+    u = np.where(front1 | front2, 1.0, 0.0).astype(np.float32)
+    v = np.where(tail1 | tail2,  0.4, 0.0).astype(np.float32)
+    # Smooth the tail so v is graded (helps the rule's window catch the
+    # filament cleanly).
+    v += np.where(front1 | front2, 0.15, 0.0).astype(np.float32)
+
+    # Tiny noise to help symmetry break and the second filament find
+    # a spot to wander into.
+    u = np.clip(u + _canonical_noise(size, rng, -0.02, 0.02), 0.0, 1.0)
+    v = np.clip(v + _canonical_noise(size, rng, -0.02, 0.02), 0.0, 1.0)
+
+    data[:, :, :, 0] = u.astype(np.float32)
+    data[:, :, :, 1] = v.astype(np.float32)
     return data
 
 
@@ -8989,6 +17461,180 @@ def init_quantum_orbital(size, rng):
     return data
 
 
+def init_quantum_element(size, rng, atomic_number=None):
+    """Render a real periodic-table element's valence orbital cloud.
+
+    Picks an element (random if `atomic_number` is None), looks up its
+    valence subshell (n, l, occupancy) from element_data.VALENCE, builds
+    a |m|-degenerate superposition with random complex weights, and uses
+    a Slater-screened Coulomb potential V(r) = -Z_eff/r so that orbital
+    sizes stay roughly comparable across the periodic table.
+
+    Homage to /home/user/development/periodic-table/ — every element's
+    actual valence shell is renderable as a TDSE-evolving wavepacket.
+    """
+    from element_data import VALENCE, slater_zeff, SYMBOLS
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+
+    # Pick element. Default focus: low-Z (period 1-4) for visibility,
+    # but allow the full table when explicitly requested.
+    if atomic_number is None:
+        # Bias toward periods 1-4 (Z 1-36) so the visualization is rich
+        # — high-Z d/f orbitals get cramped at typical search sizes.
+        if rng.random() < 0.85:
+            Z = rng.randint(1, 37)
+        else:
+            Z = rng.randint(37, 119)
+    else:
+        Z = int(atomic_number)
+    Z = max(1, min(118, Z))
+
+    n, l, occ = VALENCE[Z]
+    z_eff = slater_zeff(Z, n, l, occ)
+
+    # Build a superposition of all (2l+1) m-states with random complex
+    # weights. This produces a visually-interesting cloud rather than a
+    # single oriented dumbbell/clover. Weights are normalised so peak |Ψ|=1.
+    psi_r = np.zeros((size, size, size), dtype=np.float64)
+    psi_i = np.zeros((size, size, size), dtype=np.float64)
+    for m in range(-l, l + 1):
+        # Spatial scale: hydrogen-like orbitals scale as r/Z_eff. Choose a
+        # `scale` that puts the bulk of the cloud comfortably inside the
+        # box — empirically scale ~ size / (n * 8) keeps things visible
+        # for n=1..5 at typical sizes (64..192).
+        spatial_scale = max(0.5, size / (n * 8.0 * max(1.0, z_eff ** 0.5)))
+        pr, pi = _hydrogen_orbital(size, n, l, m, Z=z_eff, scale=spatial_scale)
+        # Complex weight (cr + i*ci) — random unit complex
+        theta = rng.uniform(0.0, 2 * np.pi)
+        amp   = rng.uniform(0.5, 1.0)
+        cr, ci = amp * np.cos(theta), amp * np.sin(theta)
+        # (cr + i*ci) * (pr + i*pi) = (cr*pr - ci*pi) + i*(cr*pi + ci*pr)
+        psi_r += cr * pr - ci * pi
+        psi_i += cr * pi + ci * pr
+
+    # Normalize peak |Ψ| = 1
+    peak = float(np.sqrt(np.max(psi_r * psi_r + psi_i * psi_i)))
+    if peak > 1e-10:
+        psi_r /= peak
+        psi_i /= peak
+
+    data[:, :, :, 0] = psi_r.astype(np.float32)
+    data[:, :, :, 1] = psi_i.astype(np.float32)
+    # Slater-screened Coulomb keeps orbital scale physical across the table
+    data[:, :, :, 2] = _coulomb_potential(size, Z=z_eff, r_soft=1.5)
+    data[:, :, :, 3] = (psi_r * psi_r + psi_i * psi_i).astype(np.float32)
+    print(f"[quantum_element] Z={Z} ({SYMBOLS[Z]}) "
+          f"valence={n}{'spdf'[l]}^{occ}  Z_eff={z_eff:.2f}")
+    return data
+
+
+def init_quantum_multi_well(size, rng, n_wells=None):
+    """Multiple Coulomb wells: paint 2-4 nuclei at random positions, each
+    with its own attractive potential. The wavefunction starts as a
+    superposition of 1s orbitals around each nucleus — over time, tunneling
+    between wells produces molecular-orbital-like patterns (bonding /
+    antibonding linear combinations form spontaneously)."""
+    if n_wells is None:
+        n_wells = rng.choice([2, 2, 3, 3, 4])      # weight toward 2-3
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+
+    # Place nuclei at well-separated random positions (avoid box edges).
+    margin = max(4, size // 6)
+    centres = []
+    for _ in range(int(n_wells)):
+        for _try in range(20):
+            cx = rng.uniform(margin, size - margin)
+            cy = rng.uniform(margin, size - margin)
+            cz = rng.uniform(margin, size - margin)
+            ok = all(((cx-px)**2 + (cy-py)**2 + (cz-pz)**2) > (size/4)**2
+                     for px, py, pz in centres)
+            if ok or not centres:
+                break
+        centres.append((cx, cy, cz))
+
+    psi_r = np.zeros((size, size, size), dtype=np.float64)
+    psi_i = np.zeros_like(psi_r)
+    V     = np.zeros_like(psi_r)
+    a0 = max(2.0, size / 16.0)                    # Bohr radius in cells
+    Z_each = 1.0
+    r_soft = 1.5
+
+    # Build superposed 1s orbitals + summed Coulomb potential.
+    for cx, cy, cz in centres:
+        d2 = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
+        d  = np.sqrt(d2)
+        # 1s orbital: exp(-r/a0) (real, normalised loosely)
+        amp = np.exp(-d / a0)
+        # Random phase per well so initial state is a coherent superposition.
+        phase = rng.uniform(0.0, 2 * np.pi)
+        psi_r += amp * np.cos(phase)
+        psi_i += amp * np.sin(phase)
+        # Soft Coulomb: V = -Z / sqrt(r^2 + r_soft^2)
+        V    -= Z_each / np.sqrt(d2 + r_soft * r_soft)
+
+    peak = max(np.abs(psi_r).max(), np.abs(psi_i).max(), 1e-10)
+    psi_r /= peak; psi_i /= peak
+    data[:, :, :, 0] = psi_r.astype(np.float32)
+    data[:, :, :, 1] = psi_i.astype(np.float32)
+    data[:, :, :, 2] = V.astype(np.float32)
+    data[:, :, :, 3] = (psi_r * psi_r + psi_i * psi_i).astype(np.float32)
+    print(f"[quantum_multi_well] {len(centres)} nuclei placed")
+    return data
+
+
+def init_quantum_packet_scattering(size, rng):
+    """Gaussian wave packet with an initial momentum heading toward a
+    barrier. Demonstrates quantum tunneling (some |ψ|² appears past
+    the barrier even if E_packet < V_barrier) and partial reflection.
+    The barrier is a thick wall of high V perpendicular to the packet's
+    direction of motion."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+
+    # Packet starts at x = size/4, moving in +x.
+    cx, cy, cz = size / 4.0, size / 2.0, size / 2.0
+    sigma = max(2.5, size / 12.0)
+    k0 = 2.0 * np.pi / max(4.0, size / 8.0)        # central wavenumber
+
+    d2 = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
+    envelope = np.exp(-0.5 * d2 / (sigma * sigma))
+    phase = k0 * (x - cx)
+    psi_r = (envelope * np.cos(phase)).astype(np.float32)
+    psi_i = (envelope * np.sin(phase)).astype(np.float32)
+
+    # Barrier: thick slab at x = 5*size/8, V = +5 (taller than packet KE
+    # for partial transmission via tunneling).
+    V = np.zeros((size, size, size), dtype=np.float32)
+    x_b_lo = int(5 * size / 8)
+    x_b_hi = int(5 * size / 8) + max(2, size // 16)
+    V[(x >= x_b_lo) & (x < x_b_hi)] = 5.0
+
+    data[:, :, :, 0] = psi_r
+    data[:, :, :, 1] = psi_i
+    data[:, :, :, 2] = V
+    data[:, :, :, 3] = psi_r * psi_r + psi_i * psi_i
+    return data
+
+
+def init_quantum_stark(size, rng):
+    """Hydrogen 1s + uniform external electric field along Z. The Stark
+    effect lifts the energy degeneracy and polarises the orbital — the
+    electron cloud shifts toward the +Z (lower-potential) side over time.
+    Sets V = -Z/r + F·z so the linear gradient drives the polarisation."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    psi_r, psi_i = _hydrogen_orbital(size, n=1, l=0, m=0, Z=1.0)
+    data[:, :, :, 0] = psi_r
+    data[:, :, :, 1] = psi_i
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    cz = (z - size / 2.0).astype(np.float64)
+    F = 0.05                                       # field strength (atomic units)
+    V_coul = _coulomb_potential(size, Z=1.0, r_soft=1.5)
+    data[:, :, :, 2] = (V_coul + (F * cz).astype(np.float32)).astype(np.float32)
+    data[:, :, :, 3] = psi_r ** 2 + psi_i ** 2
+    return data
+
+
 # ── Individual orbital init variants (factory) ──
 
 def _make_orbital_init(n, l, m, label):
@@ -9224,11 +17870,828 @@ def init_quantum_selfinteract(size, rng):
     return data
 
 
+def init_random_spins(size, rng):
+    """Uniform 50/50 binary spins for Ising. Channel R holds {0.0, 1.0}."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.5).astype(np.float32)
+    return data
+
+
+def init_eden_seeds(size, rng):
+    """Single solid voxel at the geometric centre. The Eden growth shader
+    expands from any solid neighbourhood, so a 1-voxel seed is enough to
+    test the rule. Toroidal boundary will eventually let two growth fronts
+    collide on the back face — that's a feature for visual interest."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    c = size // 2
+    data[c, c, c, 0] = 1.0
+    return data
+
+
+def init_eden_scattered(size, rng):
+    """Several scattered solid seeds. Useful for showing competition
+    between independent growth fronts."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    n_seeds = max(4, size // 24)
+    # Use the supplied rng so the seed map is reproducible per trial.
+    coords = rng.integers(0, size, size=(n_seeds, 3)) if hasattr(rng, 'integers') \
+             else rng.randint(0, size, size=(n_seeds, 3))
+    for x, y, z in coords:
+        data[int(x), int(y), int(z), 0] = 1.0
+    return data
+
+
+def init_hodgepodge_random(size, rng):
+    """Uniform random integer states in [0, 1] (normalised). The shader
+    decodes int(round(v * (N-1))) so a uniform float in [0,1] yields a
+    near-uniform integer distribution across the full state range
+    regardless of the N parameter chosen at sim time."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = _canonical_noise(size, rng)
+    return data
+
+
+def init_margolus_gas(size, rng):
+    """Random binary particles for the Margolus 3D lattice gas.
+    Density ~25% gives a fluid regime with frequent collisions but
+    plenty of vacuum for particle motion to be visible."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.25).astype(np.float32)
+    return data
+
+
+def init_margolus_blob(size, rng):
+    """A dense ball of particles in vacuum — Margolus rule will
+    diffusively scatter it. Useful for visualising the rule's
+    transport coefficient: track how the radius grows with time."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    c = size / 2.0
+    r = size / 6.0
+    xx, yy, zz = np.meshgrid(np.arange(size), np.arange(size),
+                             np.arange(size), indexing='ij')
+    inside = ((xx - c) ** 2 + (yy - c) ** 2 + (zz - c) ** 2) < r * r
+    data[:, :, :, 0] = inside.astype(np.float32)
+    return data
+
+
+def init_fluid_quiescent(size, rng):
+    """Stable Fluids: zero velocity, zero dye. The shader's source term
+    (an injected smoke plume) provides all the energy. Starting from
+    rest gives a clean test of the source + advection + projection
+    pipeline."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    return data
+
+
+def init_fluid_turbulent(size, rng):
+    """Stable Fluids: divergence-free initial velocity (multi-octave
+    curl noise) + a few dye blobs. Gives the rule something to advect
+    immediately rather than waiting for the source plume to develop."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # Curl of three independent FBM scalar potentials gives a roughly
+    # divergence-free field. We approximate with three independent
+    # octaves of low-amplitude noise instead — cheap, looks fine.
+    for ch in range(3):
+        field = _canonical_noise(size, rng) - 0.5
+        # Smooth via two simple averages (cheap blur).
+        for _ in range(2):
+            padded = np.pad(field, 1, mode='wrap')
+            field = (padded[:-2, 1:-1, 1:-1] + padded[2:, 1:-1, 1:-1] +
+                     padded[1:-1, :-2, 1:-1] + padded[1:-1, 2:, 1:-1] +
+                     padded[1:-1, 1:-1, :-2] + padded[1:-1, 1:-1, 2:] +
+                     padded[1:-1, 1:-1, 1:-1]) / 7.0
+        data[:, :, :, ch] = field.astype(np.float32) * 2.0  # modest amplitude
+    # Scattered dye blobs.
+    n_blobs = 6
+    coords = rng.integers(size // 4, 3 * size // 4, size=(n_blobs, 3)) \
+             if hasattr(rng, 'integers') else \
+             rng.randint(size // 4, 3 * size // 4, size=(n_blobs, 3))
+    blob_r = max(2, size // 16)
+    for cx, cy, cz in coords:
+        x0, x1 = max(0, int(cx) - blob_r), min(size, int(cx) + blob_r)
+        y0, y1 = max(0, int(cy) - blob_r), min(size, int(cy) + blob_r)
+        z0, z1 = max(0, int(cz) - blob_r), min(size, int(cz) + blob_r)
+        data[x0:x1, y0:y1, z0:z1, 3] = 1.0
+    return data
+
+
+def init_rayleigh_benard(size, rng):
+    """Rayleigh-Bénard: tiny random temperature perturbation across the
+    full volume to break symmetry.  Without this, the initially uniform
+    field is a fixed point and convection cells never nucleate.
+    Velocity = 0; temperature = small white noise scaled so it's well
+    below the boundary forcing strength but enough to seed instability.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # Small uniform-noise perturbation in the temperature (W) channel.
+    if hasattr(rng, 'random'):
+        noise = rng.random((size, size, size)).astype(np.float32)
+    else:
+        noise = rng.random_sample((size, size, size)).astype(np.float32)
+    data[:, :, :, 3] = (noise - 0.5) * 0.02
+    return data
+
+
+# ── Inits for the 2026-05 CA additions ──────────────────────────────
+
+def init_sandpile_uniform(size, rng):
+    """Start with a uniform sub-critical grain count plus a tall central
+    spike. The spike topples on step 1 and seeds the avalanche cascade
+    that drives the system toward the SOC attractor."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    base = (rng.random((size, size, size)).astype(np.float32) * 4.0)
+    data[:, :, :, 0] = base
+    c = size // 2
+    data[c, c, c, 0] = 12.0
+    return data
+
+
+def init_sandpile_critical(size, rng):
+    """Pre-relaxed near-SOC state spanning a wide grain distribution
+    so the visualiser shows immediate structure (rather than a uniform
+    sub-threshold field that takes many steps to develop visible
+    avalanche fronts). Values drawn uniformly from [3, 7] with a few
+    super-critical pokes seed self-spanning cascades on step 1."""
+    data = np.full((size, size, size, 4), 0.0, dtype=np.float32)
+    data[:, :, :, 0] = (3.0 + rng.random((size, size, size)).astype(np.float32) * 4.0)
+    n_pokes = max(4, size // 8)
+    coords = rng.randint(size // 4, 3 * size // 4, size=(n_pokes, 3))
+    for x, y, z in coords:
+        data[int(x), int(y), int(z), 0] = 9.0
+    return data
+
+
+def init_excitable_seed(size, rng):
+    """One excited cell at the centre of an otherwise rest medium —
+    a single rotating-spiral or expanding-wavefront source."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    c = size // 2
+    data[c, c, c, 0] = 1.0 / 7.0   # state 1 in an N=8 default
+    return data
+
+
+def init_excitable_random(size, rng):
+    """Sparse random excited cells in a sea of rest. Asymmetric ignition
+    geometry so the resulting waves break and form scroll structures
+    rather than concentric shells."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    n_seeds = max(8, size // 4)
+    coords = rng.randint(0, size, size=(n_seeds, 3))
+    for x, y, z in coords:
+        data[int(x), int(y), int(z), 0] = 1.0 / 7.0
+    # Add a small refractory tail beside each seed to bias the spiral chirality.
+    for x, y, z in coords:
+        nx = (int(x) + 1) % size
+        data[nx, int(y), int(z), 0] = 6.0 / 7.0
+    return data
+
+
+def init_wireworld_torus(size, rng):
+    """A 3D loop of conductor with a single propagating electron head
+    inserted. Produces a self-sustaining ring oscillator (the simplest
+    Wireworld circuit) that runs forever in the classical rule."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z = size // 2
+    cx, cy = size // 2, size // 2
+    r_outer = max(6, size // 3)
+    # Build a ring of conductor in the z-mid plane.
+    for ang_deg in range(0, 360, 1):
+        ang = np.deg2rad(ang_deg)
+        x = int(cx + r_outer * np.cos(ang))
+        y = int(cy + r_outer * np.sin(ang))
+        if 0 <= x < size and 0 <= y < size:
+            data[x, y, z, 0] = 1.0          # conductor (state 3 = 1.0)
+    # Insert one electron head + tail (states 1/3, 2/3 normalised).
+    sx = int(cx + r_outer)
+    if 0 <= sx < size:
+        data[sx, cy, z, 0] = 1.0 / 3.0      # head
+        if sx - 1 >= 0:
+            data[sx - 1, cy, z, 0] = 2.0 / 3.0  # tail
+    return data
+
+
+def init_wireworld_lattice(size, rng):
+    """Random conductor scaffold with a few sparks. Useful for the rule's
+    non-classical 'living wire' regime where decay and growth are nonzero —
+    you get evolving wire networks rather than a pre-built circuit."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    p_cond = 0.15
+    mask = rng.random((size, size, size)) < p_cond
+    field = np.zeros((size, size, size), dtype=np.float32)
+    field[mask] = 1.0          # conductor everywhere it's seeded
+    # Sprinkle a few electron heads to start activity.
+    n_heads = max(8, size // 4)
+    coords = rng.randint(0, size, size=(n_heads, 3))
+    for x, y, z in coords:
+        field[int(x), int(y), int(z)] = 1.0 / 3.0
+    data[:, :, :, 0] = field
+    return data
+
+
+def init_forest_dense(size, rng):
+    """Dense forest at 75% density with no fires — let the rule kindle
+    its own ignitions via lightning. Best for visualising the SOC
+    crossover from small fires to grid-spanning firestorms."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    tree_mask = rng.random((size, size, size)) < 0.75
+    data[:, :, :, 0] = np.where(tree_mask, 0.5, 0.0).astype(np.float32)
+    return data
+
+
+def init_forest_burning_seed(size, rng):
+    """Empty grid except for a small burning patch and ~50% trees.
+    Demonstrates the cascade dynamics for a known ignition source."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    tree_mask = rng.random((size, size, size)) < 0.5
+    data[:, :, :, 0] = np.where(tree_mask, 0.5, 0.0).astype(np.float32)
+    c = size // 2
+    rad = max(1, size // 32)
+    for dx in range(-rad, rad + 1):
+        for dy in range(-rad, rad + 1):
+            for dz in range(-rad, rad + 1):
+                if abs(dx) + abs(dy) + abs(dz) <= rad:
+                    data[c + dx, c + dy, c + dz, 0] = 1.0
+    return data
+
+
+def init_sine_gordon_kink(size, rng):
+    """Single planar kink — u jumps from 0 to 2π across the y = size/2
+    plane with a tanh profile of width ~3 cells. The natural soliton
+    solution of the static sine–Gordon equation in 1D, lifted to 3D
+    as a planar wall. Should propagate without dispersing in the
+    massless limit and oscillate around the centre under restoring force."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    y_idx = np.arange(size, dtype=np.float32)
+    profile = 4.0 * np.arctan(np.exp((y_idx - size / 2.0) / 3.0))
+    # Broadcast to 3D.
+    u = np.broadcast_to(profile[None, :, None], (size, size, size)).copy()
+    data[:, :, :, 0] = u
+    return data
+
+
+def init_sine_gordon_breather(size, rng):
+    """Localised breather mode at the centre. Small Gaussian perturbation
+    in the velocity field excites the breather, which oscillates in
+    place rather than propagating. Tests the rule's energy conservation."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    coords = np.indices((size, size, size)).astype(np.float32) - size / 2.0
+    r2 = np.sum(coords ** 2, axis=0)
+    sigma = max(2.0, size / 16.0)
+    pulse = np.exp(-r2 / (2.0 * sigma * sigma))
+    data[:, :, :, 1] = (pulse * 0.5).astype(np.float32)   # velocity kick
+    return data
+
+
+def init_lifelike_cluster(size, rng):
+    """A dense central cluster of alive cells in an empty surround,
+    suitable for any Life-like rule (LtL, GoL with non-default params).
+    The cluster is at ~25% density inside a sphere of radius size/8."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    coords = np.indices((size, size, size)).astype(np.float32) - size / 2.0
+    r = np.sqrt(np.sum(coords ** 2, axis=0))
+    inside = r < (size / 8.0)
+    rand = rng.random((size, size, size))
+    data[:, :, :, 0] = np.where(inside & (rand < 0.25), 1.0, 0.0).astype(np.float32)
+    return data
+
+
+def init_pd_random(size, rng):
+    """Initial cooperator/defector distribution: ~90% cooperators with
+    sparse defector seeds. At b ≈ 1.85 the defectors invade as fractal
+    fronts but are pinned by cooperator clusters — produces the classic
+    Nowak–May spatio-temporal chaos."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = (rng.random((size, size, size)) < 0.9).astype(np.float32)
+    return data
+
+
+def init_pd_invading(size, rng):
+    """A single defector seed in an all-cooperator grid. With b > 1
+    the defector spreads as a fractal invasion front whose shape
+    depends sensitively on b."""
+    data = np.ones((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 1:] = 0.0
+    c = size // 2
+    data[c, c, c, 0] = 0.0  # one defector
+    return data
+
+
+def init_xy_random(size, rng):
+    """Uniform random spin angles. Above the (3D) critical temperature
+    T_KT ≈ 2.20 the system stays disordered; below it, order parameter
+    grows and vortex lines (1D defects) become long-lived."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = rng.random((size, size, size)).astype(np.float32)
+    return data
+
+
+def init_xy_aligned(size, rng):
+    """All spins aligned to θ=0 plus a small perturbation. Heating from
+    a perfect ground state lets you watch the order parameter decay
+    smoothly to its equilibrium value at the chosen temperature."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = 0.5 + (rng.random((size, size, size)).astype(np.float32) - 0.5) * 0.02
+    return data
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Mesh voxelisation init
+# ─────────────────────────────────────────────────────────────────────────
+# Provides a reusable "initialise the grid from a 3D mesh" path so any
+# rule (erosion, fossilisation, EM, fluid, growth) can run on the
+# voxelised shape of an arbitrary .obj/.glb/.stl/.ply asset. Two paths:
+#
+#   1. Built-in procedural shapes (no external file): keys 'mesh:sphere',
+#      'mesh:torus', 'mesh:cube', 'mesh:icosahedron', 'mesh:cylinder',
+#      'mesh:pillar', 'mesh:bunny' (icosphere fallback).
+#   2. Arbitrary file: 'mesh:/abs/path/to/foo.obj' or 'mesh:rel/path.glb'.
+#
+# Optional query string after the path tunes the result, e.g.
+#   'mesh:sphere?radius=0.45&channel=0&value=1.0&shell=False'
+#   'mesh:assets/skull.obj?channel=0&scale=0.85'
+#
+# Parameters:
+#   channel  : which RGBA channel to populate (default 0)
+#   value    : value to write into solid voxels (default 1.0)
+#   scale    : fraction of grid extent the mesh fills (default 0.85)
+#   shell    : if True, only the surface voxels are filled (hollow);
+#              otherwise the watertight interior is also filled (solid).
+#              Default False (solid).
+#
+# All other RGBA channels are left at zero. Shaders that need a
+# different default (e.g. erosion's water/sediment fields) should
+# initialise those channels themselves on the first step.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _builtin_mesh(name: str):
+    """Return a trimesh.Trimesh for a named built-in procedural shape,
+    or None if the name isn't a built-in. The mesh is centred at the
+    origin with extents in roughly [-0.5, 0.5]."""
+    try:
+        import trimesh
+    except ImportError:
+        return None
+    n = name.lower()
+    if n in ('sphere', 'icosahedron', 'icosphere', 'bunny'):
+        return trimesh.creation.icosphere(subdivisions=4, radius=0.5)
+    if n == 'torus':
+        return trimesh.creation.torus(major_radius=0.35, minor_radius=0.12)
+    if n in ('cube', 'box'):
+        return trimesh.creation.box(extents=(0.7, 0.7, 0.7))
+    if n == 'cylinder':
+        return trimesh.creation.cylinder(radius=0.3, height=0.8, sections=32)
+    if n == 'pillar':
+        return trimesh.creation.box(extents=(0.3, 0.9, 0.3))
+    if n == 'cone':
+        return trimesh.creation.cone(radius=0.4, height=0.8, sections=32)
+    if n == 'capsule':
+        return trimesh.creation.capsule(radius=0.2, height=0.7, count=(16, 16))
+    return None
+
+
+def voxelize_mesh(mesh_or_path, size: int, scale: float = 0.85,
+                  shell: bool = False) -> np.ndarray:
+    """Voxelise a mesh into a (size, size, size) bool array.
+
+    Args:
+      mesh_or_path: a trimesh.Trimesh, a path string to a mesh file, or
+                    the name of a built-in shape (e.g. 'sphere').
+      size: cubic grid resolution.
+      scale: fraction of the grid the mesh occupies along its longest
+             axis (0.85 leaves a 7.5% margin each side).
+      shell: when True returns only surface voxels (hollow); when False
+             also fills the watertight interior (default).
+
+    Returns:
+      np.ndarray of shape (size, size, size), dtype=bool.
+    """
+    try:
+        import trimesh
+    except ImportError as e:
+        raise RuntimeError(
+            "voxelize_mesh requires the 'trimesh' package "
+            "(pip install trimesh). " + str(e))
+
+    if isinstance(mesh_or_path, trimesh.Trimesh):
+        mesh = mesh_or_path.copy()
+    elif isinstance(mesh_or_path, str):
+        builtin = _builtin_mesh(mesh_or_path)
+        if builtin is not None:
+            mesh = builtin
+        else:
+            mesh = trimesh.load(mesh_or_path, force='mesh')
+            if not isinstance(mesh, trimesh.Trimesh):
+                raise RuntimeError(
+                    f"voxelize_mesh: '{mesh_or_path}' did not load as a single mesh")
+    else:
+        raise TypeError(f"voxelize_mesh: unsupported mesh source {type(mesh_or_path)}")
+
+    # Centre and scale the mesh so its longest axis fits `scale * size`
+    # voxels, then translate to occupy [0, size).
+    extents = mesh.extents
+    longest = float(max(extents)) if max(extents) > 0 else 1.0
+    target_extent = scale * size
+    s = target_extent / longest
+    mesh.apply_translation(-mesh.bounds.mean(axis=0))
+    mesh.apply_scale(s)
+    mesh.apply_translation(np.full(3, size * 0.5))
+
+    pitch = 1.0  # one voxel per grid cell after the scale above
+    grid = np.zeros((size, size, size), dtype=bool)
+    try:
+        # Surface voxelisation (always works, watertightness not required).
+        vox = mesh.voxelized(pitch=pitch)
+        if not shell:
+            try:
+                vox = vox.fill()  # requires watertight mesh
+            except Exception:
+                # Non-watertight: fall back to per-cell point-in-mesh.
+                xs, ys, zs = np.meshgrid(
+                    np.arange(size) + 0.5,
+                    np.arange(size) + 0.5,
+                    np.arange(size) + 0.5,
+                    indexing='ij')
+                pts = np.stack([xs, ys, zs], axis=-1).reshape(-1, 3)
+                inside = mesh.contains(pts).reshape(size, size, size)
+                grid |= inside
+                return grid
+        # Splat the (possibly filled) voxel grid into the cubic array.
+        pts = vox.points  # world-space cell centres
+        idx = np.round(pts).astype(np.int64)
+        ok = (
+            (idx[:, 0] >= 0) & (idx[:, 0] < size) &
+            (idx[:, 1] >= 0) & (idx[:, 1] < size) &
+            (idx[:, 2] >= 0) & (idx[:, 2] < size)
+        )
+        idx = idx[ok]
+        grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    except Exception as e:
+        # Last-ditch fallback: surface-sample then point-in-mesh test.
+        print(f"[voxelize_mesh] direct path failed ({e}); using contains() fallback")
+        xs, ys, zs = np.meshgrid(
+            np.arange(size) + 0.5,
+            np.arange(size) + 0.5,
+            np.arange(size) + 0.5,
+            indexing='ij')
+        pts = np.stack([xs, ys, zs], axis=-1).reshape(-1, 3)
+        grid = mesh.contains(pts).reshape(size, size, size)
+    return grid
+
+
+def _parse_mesh_init_spec(spec: str):
+    """Parse 'mesh:<source>?key=val&...' into (source, kwargs).
+
+    Returns (source_str, dict). Unknown keys are ignored. Numeric and
+    bool values are auto-coerced.
+    """
+    assert spec.startswith('mesh:'), spec
+    body = spec[len('mesh:'):]
+    if '?' in body:
+        source, qs = body.split('?', 1)
+    else:
+        source, qs = body, ''
+    params: dict = {}
+    if qs:
+        for pair in qs.split('&'):
+            if not pair or '=' not in pair:
+                continue
+            k, v = pair.split('=', 1)
+            v_lower = v.lower()
+            if v_lower in ('true', 'false'):
+                params[k] = (v_lower == 'true')
+                continue
+            try:
+                if '.' in v or 'e' in v_lower:
+                    params[k] = float(v)
+                else:
+                    params[k] = int(v)
+            except ValueError:
+                params[k] = v
+    return source, params
+
+
+def init_mesh_from_spec(spec: str, size: int, rng) -> np.ndarray:
+    """Build a (size, size, size, 4) f32 init array from a 'mesh:...' spec."""
+    source, p = _parse_mesh_init_spec(spec)
+    channel = int(p.get('channel', 0))
+    value = float(p.get('value', 1.0))
+    scale = float(p.get('scale', 0.85))
+    shell = bool(p.get('shell', False))
+    grid = voxelize_mesh(source, size, scale=scale, shell=shell)
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    if 0 <= channel < 4:
+        data[..., channel] = grid.astype(np.float32) * value
+    return data
+
+
+# ── L-system / graph-rewriting init ──────────────────────────────────
+# Stochastic context-free L-systems with a 3D turtle interpreter that
+# rasterises branch segments into the voxel grid. Used as a generative
+# init source for tree/coral/dendritic/lightning structures that CA rules
+# can then animate (grow, dissolve, react with, etc.).
+#
+# Spec syntax (mirrors mesh:): 'lsystem:<preset>?key=val&...'
+#   channel=N      (0..3, default 0) — RGBA channel to write
+#   value=F        (default 1.0)     — written magnitude
+#   depth=N        (default per preset) — production iterations
+#   angle=F        (degrees, default per preset) — turtle turn step
+#   step=F         (default per preset) — turtle move length (voxels)
+#   width=F        (default 1.0)     — initial branch radius (voxels)
+#   width_decay=F  (default 0.7)     — multiplicative on branch ('!')
+#   seed=N         (default 0)       — stochastic-rule RNG seed
+#   axis=str       (default 'y')     — initial growth direction ('x','y','z')
+#
+# Production rules support stochastic alternatives: list of (weight, rhs).
+# Turtle alphabet (Lindenmayer/Prusinkiewicz convention):
+#   F        — move forward `step` voxels, painting a fat segment
+#   f        — move forward `step` voxels without painting
+#   + -      — yaw  by ±angle (around current up axis)
+#   & ^      — pitch by ±angle (around current right axis)
+#   / \      — roll  by ±angle (around current heading axis)
+#   |        — turn 180° (yaw)
+#   [        — push turtle state
+#   ]        — pop  turtle state
+#   !        — multiply branch width by `width_decay`
+#   X..Z A..E — non-terminal placeholders (no turtle effect)
+
+
+LSYSTEM_PRESETS = {
+    # 3D fractal tree (Prusinkiewicz-style with random branch angles)
+    'tree': {
+        'axiom': 'A',
+        'rules': {
+            'A': [(1.0, '!F[&FA][^FA][/&FA][\\^FA]')],
+        },
+        'depth': 4,
+        'angle': 25.0,
+        'step':  3.0,
+        'width': 2.0,
+        'width_decay': 0.65,
+    },
+    # Bushy fern with fine sub-branching
+    'fern': {
+        'axiom': 'X',
+        'rules': {
+            'X': [(0.5, 'F[+X]F[-X]+X'),
+                  (0.5, 'F[&X][^X]F[/X][\\X]+X')],
+        },
+        'depth': 4,
+        'angle': 22.5,
+        'step':  2.5,
+        'width': 1.2,
+        'width_decay': 0.85,
+    },
+    # Coral-like irregular branching
+    'coral': {
+        'axiom': 'A',
+        'rules': {
+            'A': [(0.5, '!F[+A][-A][&A][^A]'),
+                  (0.3, '!F[/A][\\A]F[+A]'),
+                  (0.2, '!FF[&A][+A]')],
+            'F': [(1.0, 'F')],
+        },
+        'depth': 5,
+        'angle': 35.0,
+        'step':  4.0,
+        'width': 2.5,
+        'width_decay': 0.7,
+    },
+    # Lightning bolt (sparse, downward-biased)
+    'lightning': {
+        'axiom': 'A',
+        'rules': {
+            'A': [(0.6, 'F[+A][-A]A'),
+                  (0.4, 'F[&A]A')],
+        },
+        'depth': 5,
+        'angle': 18.0,
+        'step':  3.0,
+        'width': 1.5,
+        'width_decay': 0.8,
+    },
+    # Snowflake-like dendrite (6-fold symmetric branching)
+    'dendrite': {
+        'axiom': 'A',
+        'rules': {
+            'A': [(1.0, '!F[+B][-B][&B][^B][/B][\\B]')],
+            'B': [(1.0, '!F[+F][-F]')],
+        },
+        'depth': 3,
+        'angle': 60.0,
+        'step':  4.0,
+        'width': 1.8,
+        'width_decay': 0.7,
+    },
+}
+
+
+def _lsystem_expand(axiom: str, rules: dict, depth: int, rng) -> str:
+    s = axiom
+    for _ in range(depth):
+        out = []
+        for ch in s:
+            if ch in rules:
+                alts = rules[ch]
+                weights = [w for w, _ in alts]
+                total = sum(weights)
+                r = rng.random() * total
+                acc = 0.0
+                chosen = alts[-1][1]
+                for w, rhs in alts:
+                    acc += w
+                    if r <= acc:
+                        chosen = rhs
+                        break
+                out.append(chosen)
+            else:
+                out.append(ch)
+        s = ''.join(out)
+        # Safety cap: don't let strings grow past a few MB of chars.
+        if len(s) > 2_000_000:
+            break
+    return s
+
+
+def _lsystem_segments(prog: str, size: int, *, angle_deg: float,
+                      step: float, width: float, width_decay: float,
+                      axis: str = 'y'):
+    """Run the turtle interpreter and return a list of
+    (p0, p1, w) tuples in voxel coordinates."""
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+
+    def rot(v, axis_v, c, s):
+        # Rodrigues rotation.
+        v = np.asarray(v, dtype=np.float64)
+        k = np.asarray(axis_v, dtype=np.float64)
+        k /= (np.linalg.norm(k) + 1e-12)
+        return v * c + np.cross(k, v) * s + k * np.dot(k, v) * (1.0 - c)
+
+    # Initial frame: heading along +axis, up perpendicular.
+    if axis == 'x':
+        H = np.array([1.0, 0.0, 0.0]); U = np.array([0.0, 1.0, 0.0])
+    elif axis == 'z':
+        H = np.array([0.0, 0.0, 1.0]); U = np.array([1.0, 0.0, 0.0])
+    else:  # 'y'
+        H = np.array([0.0, 1.0, 0.0]); U = np.array([1.0, 0.0, 0.0])
+    L = np.cross(H, U)  # left
+
+    # Start near bottom-centre so growth rises into the volume.
+    pos = np.array([size * 0.5, size * 0.1, size * 0.5])
+    if axis == 'x':
+        pos = np.array([size * 0.1, size * 0.5, size * 0.5])
+    elif axis == 'z':
+        pos = np.array([size * 0.5, size * 0.5, size * 0.1])
+
+    w = float(width)
+    stack = []
+    segments = []
+    for ch in prog:
+        if ch == 'F':
+            new_pos = pos + H * step
+            segments.append((pos.copy(), new_pos.copy(), w))
+            pos = new_pos
+        elif ch == 'f':
+            pos = pos + H * step
+        elif ch == '+':  # yaw +
+            H = rot(H, U, ca, sa); L = np.cross(H, U)
+        elif ch == '-':  # yaw -
+            H = rot(H, U, ca, -sa); L = np.cross(H, U)
+        elif ch == '&':  # pitch +
+            H = rot(H, L, ca, sa); U = np.cross(L, H)
+        elif ch == '^':  # pitch -
+            H = rot(H, L, ca, -sa); U = np.cross(L, H)
+        elif ch == '/':  # roll +
+            U = rot(U, H, ca, sa); L = np.cross(H, U)
+        elif ch == '\\':  # roll -
+            U = rot(U, H, ca, -sa); L = np.cross(H, U)
+        elif ch == '|':  # 180° yaw
+            H = -H; L = -L
+        elif ch == '[':
+            stack.append((pos.copy(), H.copy(), U.copy(), L.copy(), w))
+        elif ch == ']':
+            if stack:
+                pos, H, U, L, w = stack.pop()
+                pos = pos.copy(); H = H.copy(); U = U.copy(); L = L.copy()
+        elif ch == '!':
+            w = max(0.5, w * width_decay)
+        # other letters (A..E, X..Z) are non-terminals and have no
+        # geometric effect.
+    return segments
+
+
+def _rasterise_segment(grid: np.ndarray, p0, p1, radius: float, value: float):
+    """Stamp a fat line segment into a (S,S,S) f32 grid using max blending.
+
+    Walks along the segment in unit voxel steps, stamping a sphere of the
+    given radius at each step. Cheap; total work is O(segments × length × r³).
+    """
+    S = grid.shape[0]
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    d = p1 - p0
+    L = float(np.linalg.norm(d))
+    if L < 1e-6:
+        steps = 1
+    else:
+        steps = max(1, int(L) + 1)
+    rad = max(1, int(math.ceil(radius)))
+    r2 = radius * radius
+    for s in range(steps + 1):
+        t = s / steps if steps > 0 else 0.0
+        c = p0 + d * t
+        cx, cy, cz = int(round(c[0])), int(round(c[1])), int(round(c[2]))
+        x0, x1 = max(0, cx - rad), min(S - 1, cx + rad)
+        y0, y1 = max(0, cy - rad), min(S - 1, cy + rad)
+        z0, z1 = max(0, cz - rad), min(S - 1, cz + rad)
+        if x0 > x1 or y0 > y1 or z0 > z1:
+            continue
+        # Vectorised distance test inside the bbox.
+        xs = np.arange(x0, x1 + 1) - c[0]
+        ys = np.arange(y0, y1 + 1) - c[1]
+        zs = np.arange(z0, z1 + 1) - c[2]
+        d2 = (xs[:, None, None] ** 2 +
+              ys[None, :, None] ** 2 +
+              zs[None, None, :] ** 2)
+        mask = d2 <= r2
+        sub = grid[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1]
+        np.maximum(sub, value * mask.astype(np.float32), out=sub)
+
+
+def _parse_lsystem_spec(spec: str):
+    """Parse 'lsystem:<preset>?key=val&...' → (preset_name, kwargs)."""
+    assert spec.startswith('lsystem:'), spec
+    body = spec[len('lsystem:'):]
+    if '?' in body:
+        name, qs = body.split('?', 1)
+    else:
+        name, qs = body, ''
+    params: dict = {}
+    if qs:
+        for pair in qs.split('&'):
+            if not pair or '=' not in pair:
+                continue
+            k, v = pair.split('=', 1)
+            v_lower = v.lower()
+            if v_lower in ('true', 'false'):
+                params[k] = (v_lower == 'true')
+                continue
+            try:
+                if '.' in v or 'e' in v_lower:
+                    params[k] = float(v)
+                else:
+                    params[k] = int(v)
+            except ValueError:
+                params[k] = v
+    return name, params
+
+
+def init_lsystem_from_spec(spec: str, size: int, rng) -> np.ndarray:
+    """Build a (size, size, size, 4) f32 init array from an 'lsystem:...' spec."""
+    name, p = _parse_lsystem_spec(spec)
+    if name not in LSYSTEM_PRESETS:
+        raise KeyError(f"Unknown L-system preset {name!r}; "
+                       f"available: {sorted(LSYSTEM_PRESETS)}")
+    cfg = LSYSTEM_PRESETS[name]
+    channel = int(p.get('channel', 0))
+    value = float(p.get('value', 1.0))
+    depth = int(p.get('depth', cfg.get('depth', 4)))
+    angle = float(p.get('angle', cfg.get('angle', 25.0)))
+    step = float(p.get('step', cfg.get('step', 4.0)))
+    width = float(p.get('width', cfg.get('width', 1.5)))
+    width_decay = float(p.get('width_decay', cfg.get('width_decay', 0.7)))
+    axis = str(p.get('axis', 'y'))
+    seed = int(p.get('seed', 0))
+
+    # Scale step/width to grid size if a base size of 64 was assumed.
+    scale = size / 64.0
+    step *= scale
+    width *= scale
+
+    py_rng = random.Random(seed)
+    prog = _lsystem_expand(cfg['axiom'], cfg['rules'], depth, py_rng)
+    segments = _lsystem_segments(
+        prog, size, angle_deg=angle, step=step,
+        width=width, width_decay=width_decay, axis=axis)
+
+    grid = np.zeros((size, size, size), dtype=np.float32)
+    for p0, p1, w in segments:
+        _rasterise_segment(grid, p0, p1, max(0.5, w), value)
+
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    if 0 <= channel < 4:
+        data[..., channel] = grid
+    return data
+
+
 INIT_FUNCS = {
     'random_very_sparse': init_random_very_sparse,
     'random_sparse': init_random_sparse,
     'random_dense': init_random_dense,
     'random_smooth': init_random_smooth,
+    'blank': init_blank,
+    'food_seed': init_food_seed,
+    'predator_prey_lattice': init_predator_prey_lattice,
     'life_fbm_sparse': init_life_fbm_sparse,
     'life_fbm_moderate': init_life_fbm_moderate,
     'life_fbm_dense': init_life_fbm_dense,
@@ -9242,6 +18705,10 @@ INIT_FUNCS = {
     'crystal_dla_multi_seed': init_crystal_dla_multi_seed,
     'wave_pulse': init_wave_pulse,
     'gray_scott': init_gray_scott,
+    'schnakenberg': init_schnakenberg,
+    'fitzhugh_nagumo': init_fitzhugh_nagumo,
+    'brusselator': init_brusselator,
+    'cyclic_ca': init_cyclic_ca,
     'predator_prey': init_predator_prey,
     'kuramoto': init_kuramoto,
     'bz_reaction': init_bz_reaction,
@@ -9258,15 +18725,36 @@ INIT_FUNCS = {
     'erosion_terrain': init_erosion_terrain,
     'mycelium': init_mycelium,
     'em_wave': init_em_wave,
+    'em_dipole_pair': init_em_dipole_pair,
+    'em_plane_wave': init_em_plane_wave,
+    'em_cavity_mode': init_em_cavity_mode,
+    'em_photonic_crystal': init_em_photonic_crystal,
+    'em_photonic_cavity': init_em_photonic_cavity,
+    'em_beam_splitter': init_em_beam_splitter,
+    'em_negative_index_slab': init_em_negative_index_slab,
+    'em_waveguide': init_em_waveguide,
     'viscous_fingers': init_viscous_fingers,
+    'viscous_fingers_radial': init_viscous_fingers_radial,
+    'viscous_fingers_dual': init_viscous_fingers_dual,
+    'viscous_fingers_layered': init_viscous_fingers_layered,
     'fire': init_fire,
+    'fire_fluid': init_fire_fluid,
     'physarum': init_physarum,
+    'physarum_two_source': init_physarum_two_source,
+    'physarum_grid': init_physarum_grid,
+    'physarum_ring': init_physarum_ring,
     'fracture': init_fracture,
+    'fracture_peridyn': init_fracture_peridyn,
+    'fracture_double_notch': init_fracture_double_notch,
+    'fracture_penny_crack': init_fracture_penny_crack,
+    'fracture_shear': init_fracture_shear,
+    'fracture_pre_damaged': init_fracture_pre_damaged,
     'galaxy': init_galaxy,
     'lichen': init_lichen,
     'predator_prey_separated': init_predator_prey_separated,
     'morphogen_hotspots': init_morphogen_hotspots,
     'bz_spiral_seed': init_bz_spiral_seed,
+    'bz_scroll_filament': init_bz_scroll_filament,
     'crystal_multi_seed': init_crystal_multi_seed,
     'crystal_polycrystal': init_crystal_polycrystal,
     'erosion_ridges': init_erosion_ridges,
@@ -9281,10 +18769,15 @@ INIT_FUNCS = {
     'mycelium_foraging': init_mycelium_foraging,
     'bz_turbulence_high_amp': init_bz_turbulence_high_amp,
     'fire_sparse': init_fire_sparse,
+    'fire_fluid_sparse': init_fire_fluid_sparse,
     'phase_separation_quench': init_phase_separation_quench,
     'element_layered': init_element_layered,
     'quantum_hydrogen': init_quantum_hydrogen,
     'quantum_orbital': init_quantum_orbital,
+    'quantum_element': init_quantum_element,
+    'quantum_multi_well': init_quantum_multi_well,
+    'quantum_packet_scattering': init_quantum_packet_scattering,
+    'quantum_stark': init_quantum_stark,
     'quantum_wavepacket': init_quantum_wavepacket,
     'quantum_harmonic': init_quantum_harmonic,
     'quantum_tunneling': init_quantum_tunneling,
@@ -9292,7 +18785,910 @@ INIT_FUNCS = {
     'quantum_molecule': init_quantum_molecule,
     'quantum_antibonding': init_quantum_antibonding,
     'quantum_selfinteract': init_quantum_selfinteract,
+    'random_spins': init_random_spins,
+    'eden_seeds': init_eden_seeds,
+    'eden_scattered': init_eden_scattered,
+    'hodgepodge_random': init_hodgepodge_random,
+    'margolus_gas': init_margolus_gas,
+    'margolus_blob': init_margolus_blob,
+    'fluid_quiescent': init_fluid_quiescent,
+    'fluid_turbulent': init_fluid_turbulent,
+    'rayleigh_benard': init_rayleigh_benard,
+    # 2026-05 additions
+    'sandpile_uniform': init_sandpile_uniform,
+    'sandpile_critical': init_sandpile_critical,
+    'excitable_seed': init_excitable_seed,
+    'excitable_random': init_excitable_random,
+    'wireworld_torus': init_wireworld_torus,
+    'wireworld_lattice': init_wireworld_lattice,
+    'forest_dense': init_forest_dense,
+    'forest_burning_seed': init_forest_burning_seed,
+    'sine_gordon_kink': init_sine_gordon_kink,
+    'sine_gordon_breather': init_sine_gordon_breather,
+    'lifelike_cluster': init_lifelike_cluster,
+    'pd_random': init_pd_random,
+    'pd_invading': init_pd_invading,
+    'xy_random': init_xy_random,
+    'xy_aligned': init_xy_aligned,
 }
+
+
+# ── Agent initialisation ─────────────────────────────────────────────
+#
+# Agent-based rules (Langton's ant, etc.) need a separate buffer of
+# turtle records alongside the voxel grid. Each agent is 32 bytes
+# (two ivec4s, std430 layout) — see AGENT_COMPUTE_HEADER for the field
+# meanings. Init functions return a numpy int32 array of shape
+# (agent_count, 8): rows = agents, columns = (px, py, pz, dir,
+# state0, state1, state2, state3).
+
+# Direction encoding (must match the DIR[] table in AGENT_COMPUTE_HEADER):
+# Interleaved so +1 mod 6 gives a perpendicular direction (a 90° turn),
+# never a 180° axis flip. Opposite of dir d is (d + 3) % 6.
+AGENT_DIRS = np.array([
+    ( 1, 0, 0), ( 0, 1, 0), ( 0, 0, 1),
+    (-1, 0, 0), ( 0,-1, 0), ( 0, 0,-1),
+], dtype=np.int32)
+
+
+def agent_init_langton_center(size, count, rng):
+    """Place agents at the grid centre, all initially facing +X (dir=0).
+    For count==1 this is the canonical single-ant Langton's start.
+    For count>1 the agents stack on the same cell — they will fan out
+    over the first few steps as their colour-driven turning diverges."""
+    rec = np.zeros((count, 8), dtype=np.int32)
+    c = size // 2
+    rec[:, 0] = c    # px
+    rec[:, 1] = c    # py
+    rec[:, 2] = c    # pz
+    rec[:, 3] = 0    # dir = +X
+    return rec
+
+
+def agent_init_random_scatter(size, count, rng):
+    """Random positions, random initial direction. Useful for stress
+    tests where many ants explore the grid simultaneously."""
+    rec = np.zeros((count, 8), dtype=np.int32)
+    if hasattr(rng, 'integers'):
+        rec[:, 0:3] = rng.integers(0, size, size=(count, 3), dtype=np.int32)
+        rec[:, 3]   = rng.integers(0, 6, size=count, dtype=np.int32)
+    else:
+        rec[:, 0:3] = rng.randint(0, size, size=(count, 3))
+        rec[:, 3]   = rng.randint(0, 6, size=count)
+    return rec
+
+
+def _smugglers_seed_positions(size, count, rng, jitter=1.5):
+    """Return float32 positions for `count` carriers split evenly between
+    the two team edges.  First half = red (low-X edge), second half =
+    blue (high-X edge).  Z is spread uniformly across the FULL edge
+    so each team forms a wall of carriers, not a clump."""
+    half = count // 2
+    home_y      = 2.0 + size * 0.10
+    edge_x_red  = size * 0.05
+    edge_x_blue = size * 0.95
+    margin      = max(2.0, size * 0.08)
+    zr_lo, zr_hi = margin, size - margin
+    if hasattr(rng, 'uniform'):
+        zr = rng.uniform(zr_lo, zr_hi, size=half).astype(np.float32)
+        zb = rng.uniform(zr_lo, zr_hi, size=count - half).astype(np.float32)
+    else:
+        zr = (zr_lo + rng.rand(half)        * (zr_hi - zr_lo)).astype(np.float32)
+        zb = (zr_lo + rng.rand(count - half) * (zr_hi - zr_lo)).astype(np.float32)
+    if hasattr(rng, 'standard_normal'):
+        jr = rng.standard_normal((half,        3)).astype(np.float32) * jitter
+        jb = rng.standard_normal((count - half, 3)).astype(np.float32) * jitter
+    else:
+        jr = rng.randn(half,        3).astype(np.float32) * jitter
+        jb = rng.randn(count - half, 3).astype(np.float32) * jitter
+    pos = np.zeros((count, 3), dtype=np.float32)
+    pos[:half, 0] = edge_x_red;  pos[:half, 1] = home_y;  pos[:half, 2] = zr
+    pos[half:, 0] = edge_x_blue; pos[half:, 1] = home_y;  pos[half:, 2] = zb
+    pos += np.concatenate([jr, jb], axis=0)
+    return np.clip(pos, 0.0, size - 1.0)
+
+
+def agent_init_smugglers(size, count, rng):
+    """Smuggler's Standoff carrier init.
+
+    Layout (8 ints per agent — see smugglers_carriers_3d shader):
+        slot 0..2 = float position (intBitsToFloat)
+        slot 3    = team (0 = red, 1 = blue)
+        slot 4..6 = float velocity
+        slot 7    = packed status:
+                      bit  0    = alive (1)
+                      bit  1    = carrying cargo (1)
+                      bits 2-15 = respawn timer (0)
+                      bits 16-31= lifetime remaining (LIFETIME_MAX = 480)
+
+    All carriers start ALIVE inside their home corner, CARRYING a
+    package, with full lifetime — they immediately set off for the
+    enemy base on frame 1.  Velocity gets a small random kick so the
+    streams spread out instead of stacking on a single line.
+    """
+    LIFETIME_MAX = 480
+    rec = np.zeros((count, 8), dtype=np.int32)
+    pos = _smugglers_seed_positions(size, count, rng)
+    rec_f = rec.view(np.float32)
+    rec_f[:, 0:3] = pos
+    half = count // 2
+    rec[:half, 3] = 0   # red
+    rec[half:, 3] = 1   # blue
+
+    # ── Cooperative carriers (large packages) ────────────────────
+    # Roughly 1/3 of each team is split into pairs that carry a
+    # 3× payload but require BOTH halves of the pair to reach the
+    # enemy home together.  Pairs are (i, i^1) within a team — the
+    # shader derives `partner = i ^ 1` for any agent whose pos_dir.w
+    # has bit 1 set.  We sync each partner's Y and Z to the primary
+    # so the pair spawns side-by-side and walks the same lane.
+    def _mark_coop(start, end):
+        n_pairs = ((end - start) // 2) // 3
+        for k in range(n_pairs):
+            a = start + 2 * k
+            b = a + 1
+            rec[a, 3] |= 0x2
+            rec[b, 3] |= 0x2
+            rec_f[b, 1] = rec_f[a, 1]
+            rec_f[b, 2] = rec_f[a, 2]
+            # Tiny X separation so the two halves are visually distinct.
+            rec_f[b, 0] = rec_f[a, 0] + (1.0 if a < half else -1.0)
+    _mark_coop(0,    half)
+    _mark_coop(half, count)
+
+    if hasattr(rng, 'standard_normal'):
+        vel = rng.standard_normal((count, 3)).astype(np.float32) * 0.5
+    else:
+        vel = rng.randn(count, 3).astype(np.float32) * 0.5
+    rec_f[:, 4:7] = vel
+    # Stagger initial lifetimes so carriers don't all expire on the
+    # same frame.  Range: half..full LIFETIME_MAX.  Co-op partners
+    # share a lifetime so the pair lives and dies in sync.
+    if hasattr(rng, 'integers'):
+        life = rng.integers(LIFETIME_MAX // 2, LIFETIME_MAX + 1,
+                            size=count, dtype=np.int32)
+    else:
+        life = rng.randint(LIFETIME_MAX // 2, LIFETIME_MAX + 1,
+                           size=count).astype(np.int32)
+    coop_mask = (rec[:, 3] & 0x2) != 0
+    coop_idx  = np.where(coop_mask)[0]
+    if len(coop_idx):
+        # For every paired index, copy the even partner's lifetime
+        # onto the odd partner.
+        even_partners = coop_idx & ~1
+        life[coop_idx] = life[even_partners]
+    # alive=1, carrying=0 (must collect a package), respawn=0, lifetime=life
+    status = np.int32(1) | (life << 16)
+    rec[:, 7] = status
+    return rec
+
+
+def agent_init_smugglers_handicap(size, count, rng):
+    """Same as `agent_init_smugglers`, but red carriers start DEAD with
+    a long respawn timer — so red has very few active carriers for the
+    first several seconds while blue runs unopposed."""
+    rec = agent_init_smugglers(size, count, rng)
+    half = count // 2
+    # Force red carriers to alive=0, carrying=0, respawn=180, lifetime=0.
+    respawn = np.int32(180)
+    rec[:half, 7] = (respawn & 0x3FFF) << 2
+    return rec
+
+
+AGENT_INIT_FUNCS = {
+    'langton_center': agent_init_langton_center,
+    'agent_random_scatter': agent_init_random_scatter,
+    'smugglers': agent_init_smugglers,
+    'smugglers_handicap': agent_init_smugglers_handicap,
+}
+
+
+# ─── Particle init functions ─────────────────────────────────────────
+# Each returns (count, 8) float32: pos.xyz, life, vel.xyz, mass.
+# Coords are in grid units [0..size]. Life > 0 means alive; the GPU
+# update shader respawns particles whose life decays to <= 0 unless
+# `particle_respawn` is False.
+def particle_init_random_volume(size, count, rng):
+    out = np.zeros((count, 8), dtype=np.float32)
+    out[:, 0:3] = rng.random((count, 3), dtype=np.float32) * size
+    out[:, 3] = 0.5 + rng.random(count, dtype=np.float32) * 0.5  # life
+    out[:, 4:7] = (rng.random((count, 3), dtype=np.float32) - 0.5) * 0.2
+    out[:, 7] = 1.0
+    return out
+
+
+def particle_init_sphere_shell(size, count, rng):
+    """Particles on a sphere shell at 0.4*size radius from centre."""
+    out = np.zeros((count, 8), dtype=np.float32)
+    v = rng.standard_normal((count, 3)).astype(np.float32)
+    v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-6)
+    r = 0.4 * size
+    centre = np.full(3, size * 0.5, dtype=np.float32)
+    out[:, 0:3] = centre + v * r
+    out[:, 3] = 1.0
+    # Tangential initial velocity (cross with up) for an orbiting look.
+    up = np.array([0, 1, 0], dtype=np.float32)
+    tang = np.cross(v, up)
+    n = np.maximum(np.linalg.norm(tang, axis=1, keepdims=True), 1e-6)
+    out[:, 4:7] = tang / n * 0.3
+    out[:, 7] = 1.0
+    return out
+
+
+def particle_init_top_plane(size, count, rng):
+    """Particles raining from the top plane (y = size-1) downward."""
+    out = np.zeros((count, 8), dtype=np.float32)
+    out[:, 0] = rng.random(count, dtype=np.float32) * size
+    out[:, 1] = (size - 1) * (0.85 + 0.15 * rng.random(count, dtype=np.float32))
+    out[:, 2] = rng.random(count, dtype=np.float32) * size
+    out[:, 3] = 0.5 + rng.random(count, dtype=np.float32) * 0.5
+    out[:, 5] = -0.3                # initial downward vy
+    out[:, 7] = 1.0
+    return out
+
+
+def particle_init_bottom_jet(size, count, rng):
+    """Narrow upward jet from a small disc at the bottom."""
+    out = np.zeros((count, 8), dtype=np.float32)
+    cx, cz = size * 0.5, size * 0.5
+    rho = rng.random(count, dtype=np.float32) ** 0.5 * (size * 0.08)
+    th = rng.random(count, dtype=np.float32) * (2 * np.pi)
+    out[:, 0] = cx + rho * np.cos(th)
+    out[:, 1] = 1.0 + rng.random(count, dtype=np.float32) * 2.0
+    out[:, 2] = cz + rho * np.sin(th)
+    out[:, 3] = 0.5 + rng.random(count, dtype=np.float32) * 0.5
+    out[:, 5] = 0.6                 # initial upward vy
+    out[:, 7] = 1.0
+    return out
+
+
+PARTICLE_INIT_FUNCS = {
+    'random_volume': particle_init_random_volume,
+    'sphere_shell': particle_init_sphere_shell,
+    'top_plane': particle_init_top_plane,
+    'bottom_jet': particle_init_bottom_jet,
+}
+
+
+PARTICLE_FORCE_MODES = {
+    'none': 0,
+    'velocity_rgb': 1,
+    'gradient_r': 2,
+    'gradient_neg_r': 3,
+    'curl_rgb': 4,
+    'nn_brain': 5,
+}
+
+PARTICLE_COLOR_MODES = {
+    'fixed': 0,
+    'speed': 1,
+    'lifetime': 2,
+    'position': 3,
+}
+
+
+# ─── Marching Cubes triangle table ──────────────────────────────────
+# Standard Lorensen / Paul Bourke 256-case table. Each row has up to
+# 5 triangles (15 edges) and is terminated with -1. Edge indices
+# match the Lorensen edge ordering used by MC_COMPUTE_SHADER.
+MC_TRI_TABLE = (
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,1,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,8,3,9,8,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,8,3,1,2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    9,2,10,0,2,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    2,8,3,2,10,8,10,9,8,-1,-1,-1,-1,-1,-1,-1,
+    3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,11,2,8,11,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,9,0,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,11,2,1,9,11,9,8,11,-1,-1,-1,-1,-1,-1,-1,
+    3,10,1,11,10,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,10,1,0,8,10,8,11,10,-1,-1,-1,-1,-1,-1,-1,
+    3,9,0,3,11,9,11,10,9,-1,-1,-1,-1,-1,-1,-1,
+    9,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,3,0,7,3,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,1,9,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,1,9,4,7,1,7,3,1,-1,-1,-1,-1,-1,-1,-1,
+    1,2,10,8,4,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    3,4,7,3,0,4,1,2,10,-1,-1,-1,-1,-1,-1,-1,
+    9,2,10,9,0,2,8,4,7,-1,-1,-1,-1,-1,-1,-1,
+    2,10,9,2,9,7,2,7,3,7,9,4,-1,-1,-1,-1,
+    8,4,7,3,11,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    11,4,7,11,2,4,2,0,4,-1,-1,-1,-1,-1,-1,-1,
+    9,0,1,8,4,7,2,3,11,-1,-1,-1,-1,-1,-1,-1,
+    4,7,11,9,4,11,9,11,2,9,2,1,-1,-1,-1,-1,
+    3,10,1,3,11,10,7,8,4,-1,-1,-1,-1,-1,-1,-1,
+    1,11,10,1,4,11,1,0,4,7,11,4,-1,-1,-1,-1,
+    4,7,8,9,0,11,9,11,10,11,0,3,-1,-1,-1,-1,
+    4,7,11,4,11,9,9,11,10,-1,-1,-1,-1,-1,-1,-1,
+    9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    9,5,4,0,8,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,5,4,1,5,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    8,5,4,8,3,5,3,1,5,-1,-1,-1,-1,-1,-1,-1,
+    1,2,10,9,5,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    3,0,8,1,2,10,4,9,5,-1,-1,-1,-1,-1,-1,-1,
+    5,2,10,5,4,2,4,0,2,-1,-1,-1,-1,-1,-1,-1,
+    2,10,5,3,2,5,3,5,4,3,4,8,-1,-1,-1,-1,
+    9,5,4,2,3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,11,2,0,8,11,4,9,5,-1,-1,-1,-1,-1,-1,-1,
+    0,5,4,0,1,5,2,3,11,-1,-1,-1,-1,-1,-1,-1,
+    2,1,5,2,5,8,2,8,11,4,8,5,-1,-1,-1,-1,
+    10,3,11,10,1,3,9,5,4,-1,-1,-1,-1,-1,-1,-1,
+    4,9,5,0,8,1,8,10,1,8,11,10,-1,-1,-1,-1,
+    5,4,0,5,0,11,5,11,10,11,0,3,-1,-1,-1,-1,
+    5,4,8,5,8,10,10,8,11,-1,-1,-1,-1,-1,-1,-1,
+    9,7,8,5,7,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    9,3,0,9,5,3,5,7,3,-1,-1,-1,-1,-1,-1,-1,
+    0,7,8,0,1,7,1,5,7,-1,-1,-1,-1,-1,-1,-1,
+    1,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    9,7,8,9,5,7,10,1,2,-1,-1,-1,-1,-1,-1,-1,
+    10,1,2,9,5,0,5,3,0,5,7,3,-1,-1,-1,-1,
+    8,0,2,8,2,5,8,5,7,10,5,2,-1,-1,-1,-1,
+    2,10,5,2,5,3,3,5,7,-1,-1,-1,-1,-1,-1,-1,
+    7,9,5,7,8,9,3,11,2,-1,-1,-1,-1,-1,-1,-1,
+    9,5,7,9,7,2,9,2,0,2,7,11,-1,-1,-1,-1,
+    2,3,11,0,1,8,1,7,8,1,5,7,-1,-1,-1,-1,
+    11,2,1,11,1,7,7,1,5,-1,-1,-1,-1,-1,-1,-1,
+    9,5,8,8,5,7,10,1,3,10,3,11,-1,-1,-1,-1,
+    5,7,0,5,0,9,7,11,0,1,0,10,11,10,0,-1,
+    11,10,0,11,0,3,10,5,0,8,0,7,5,7,0,-1,
+    11,10,5,7,11,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,8,3,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    9,0,1,5,10,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,8,3,1,9,8,5,10,6,-1,-1,-1,-1,-1,-1,-1,
+    1,6,5,2,6,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,6,5,1,2,6,3,0,8,-1,-1,-1,-1,-1,-1,-1,
+    9,6,5,9,0,6,0,2,6,-1,-1,-1,-1,-1,-1,-1,
+    5,9,8,5,8,2,5,2,6,3,2,8,-1,-1,-1,-1,
+    2,3,11,10,6,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    11,0,8,11,2,0,10,6,5,-1,-1,-1,-1,-1,-1,-1,
+    0,1,9,2,3,11,5,10,6,-1,-1,-1,-1,-1,-1,-1,
+    5,10,6,1,9,2,9,11,2,9,8,11,-1,-1,-1,-1,
+    6,3,11,6,5,3,5,1,3,-1,-1,-1,-1,-1,-1,-1,
+    0,8,11,0,11,5,0,5,1,5,11,6,-1,-1,-1,-1,
+    3,11,6,0,3,6,0,6,5,0,5,9,-1,-1,-1,-1,
+    6,5,9,6,9,11,11,9,8,-1,-1,-1,-1,-1,-1,-1,
+    5,10,6,4,7,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,3,0,4,7,3,6,5,10,-1,-1,-1,-1,-1,-1,-1,
+    1,9,0,5,10,6,8,4,7,-1,-1,-1,-1,-1,-1,-1,
+    10,6,5,1,9,7,1,7,3,7,9,4,-1,-1,-1,-1,
+    6,1,2,6,5,1,4,7,8,-1,-1,-1,-1,-1,-1,-1,
+    1,2,5,5,2,6,3,0,4,3,4,7,-1,-1,-1,-1,
+    8,4,7,9,0,5,0,6,5,0,2,6,-1,-1,-1,-1,
+    7,3,9,7,9,4,3,2,9,5,9,6,2,6,9,-1,
+    3,11,2,7,8,4,10,6,5,-1,-1,-1,-1,-1,-1,-1,
+    5,10,6,4,7,2,4,2,0,2,7,11,-1,-1,-1,-1,
+    0,1,9,4,7,8,2,3,11,5,10,6,-1,-1,-1,-1,
+    9,2,1,9,11,2,9,4,11,7,11,4,5,10,6,-1,
+    8,4,7,3,11,5,3,5,1,5,11,6,-1,-1,-1,-1,
+    5,1,11,5,11,6,1,0,11,7,11,4,0,4,11,-1,
+    0,5,9,0,6,5,0,3,6,11,6,3,8,4,7,-1,
+    6,5,9,6,9,11,4,7,9,7,11,9,-1,-1,-1,-1,
+    10,4,9,6,4,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,10,6,4,9,10,0,8,3,-1,-1,-1,-1,-1,-1,-1,
+    10,0,1,10,6,0,6,4,0,-1,-1,-1,-1,-1,-1,-1,
+    8,3,1,8,1,6,8,6,4,6,1,10,-1,-1,-1,-1,
+    1,4,9,1,2,4,2,6,4,-1,-1,-1,-1,-1,-1,-1,
+    3,0,8,1,2,9,2,4,9,2,6,4,-1,-1,-1,-1,
+    0,2,4,4,2,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    8,3,2,8,2,4,4,2,6,-1,-1,-1,-1,-1,-1,-1,
+    10,4,9,10,6,4,11,2,3,-1,-1,-1,-1,-1,-1,-1,
+    0,8,2,2,8,11,4,9,10,4,10,6,-1,-1,-1,-1,
+    3,11,2,0,1,6,0,6,4,6,1,10,-1,-1,-1,-1,
+    6,4,1,6,1,10,4,8,1,2,1,11,8,11,1,-1,
+    9,6,4,9,3,6,9,1,3,11,6,3,-1,-1,-1,-1,
+    8,11,1,8,1,0,11,6,1,9,1,4,6,4,1,-1,
+    3,11,6,3,6,0,0,6,4,-1,-1,-1,-1,-1,-1,-1,
+    6,4,8,11,6,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    7,10,6,7,8,10,8,9,10,-1,-1,-1,-1,-1,-1,-1,
+    0,7,3,0,10,7,0,9,10,6,7,10,-1,-1,-1,-1,
+    10,6,7,1,10,7,1,7,8,1,8,0,-1,-1,-1,-1,
+    10,6,7,10,7,1,1,7,3,-1,-1,-1,-1,-1,-1,-1,
+    1,2,6,1,6,8,1,8,9,8,6,7,-1,-1,-1,-1,
+    2,6,9,2,9,1,6,7,9,0,9,3,7,3,9,-1,
+    7,8,0,7,0,6,6,0,2,-1,-1,-1,-1,-1,-1,-1,
+    7,3,2,6,7,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    2,3,11,10,6,8,10,8,9,8,6,7,-1,-1,-1,-1,
+    2,0,7,2,7,11,0,9,7,6,7,10,9,10,7,-1,
+    1,8,0,1,7,8,1,10,7,6,7,10,2,3,11,-1,
+    11,2,1,11,1,7,10,6,1,6,7,1,-1,-1,-1,-1,
+    8,9,6,8,6,7,9,1,6,11,6,3,1,3,6,-1,
+    0,9,1,11,6,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    7,8,0,7,0,6,3,11,0,11,6,0,-1,-1,-1,-1,
+    7,11,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    3,0,8,11,7,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,1,9,11,7,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    8,1,9,8,3,1,11,7,6,-1,-1,-1,-1,-1,-1,-1,
+    10,1,2,6,11,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,2,10,3,0,8,6,11,7,-1,-1,-1,-1,-1,-1,-1,
+    2,9,0,2,10,9,6,11,7,-1,-1,-1,-1,-1,-1,-1,
+    6,11,7,2,10,3,10,8,3,10,9,8,-1,-1,-1,-1,
+    7,2,3,6,2,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    7,0,8,7,6,0,6,2,0,-1,-1,-1,-1,-1,-1,-1,
+    2,7,6,2,3,7,0,1,9,-1,-1,-1,-1,-1,-1,-1,
+    1,6,2,1,8,6,1,9,8,8,7,6,-1,-1,-1,-1,
+    10,7,6,10,1,7,1,3,7,-1,-1,-1,-1,-1,-1,-1,
+    10,7,6,1,7,10,1,8,7,1,0,8,-1,-1,-1,-1,
+    0,3,7,0,7,10,0,10,9,6,10,7,-1,-1,-1,-1,
+    7,6,10,7,10,8,8,10,9,-1,-1,-1,-1,-1,-1,-1,
+    6,8,4,11,8,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    3,6,11,3,0,6,0,4,6,-1,-1,-1,-1,-1,-1,-1,
+    8,6,11,8,4,6,9,0,1,-1,-1,-1,-1,-1,-1,-1,
+    9,4,6,9,6,3,9,3,1,11,3,6,-1,-1,-1,-1,
+    6,8,4,6,11,8,2,10,1,-1,-1,-1,-1,-1,-1,-1,
+    1,2,10,3,0,11,0,6,11,0,4,6,-1,-1,-1,-1,
+    4,11,8,4,6,11,0,2,9,2,10,9,-1,-1,-1,-1,
+    10,9,3,10,3,2,9,4,3,11,3,6,4,6,3,-1,
+    8,2,3,8,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1,
+    0,4,2,4,6,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,9,0,2,3,4,2,4,6,4,3,8,-1,-1,-1,-1,
+    1,9,4,1,4,2,2,4,6,-1,-1,-1,-1,-1,-1,-1,
+    8,1,3,8,6,1,8,4,6,6,10,1,-1,-1,-1,-1,
+    10,1,0,10,0,6,6,0,4,-1,-1,-1,-1,-1,-1,-1,
+    4,6,3,4,3,8,6,10,3,0,3,9,10,9,3,-1,
+    10,9,4,6,10,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,9,5,7,6,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,8,3,4,9,5,11,7,6,-1,-1,-1,-1,-1,-1,-1,
+    5,0,1,5,4,0,7,6,11,-1,-1,-1,-1,-1,-1,-1,
+    11,7,6,8,3,4,3,5,4,3,1,5,-1,-1,-1,-1,
+    9,5,4,10,1,2,7,6,11,-1,-1,-1,-1,-1,-1,-1,
+    6,11,7,1,2,10,0,8,3,4,9,5,-1,-1,-1,-1,
+    7,6,11,5,4,10,4,2,10,4,0,2,-1,-1,-1,-1,
+    3,4,8,3,5,4,3,2,5,10,5,2,11,7,6,-1,
+    7,2,3,7,6,2,5,4,9,-1,-1,-1,-1,-1,-1,-1,
+    9,5,4,0,8,6,0,6,2,6,8,7,-1,-1,-1,-1,
+    3,6,2,3,7,6,1,5,0,5,4,0,-1,-1,-1,-1,
+    6,2,8,6,8,7,2,1,8,4,8,5,1,5,8,-1,
+    9,5,4,10,1,6,1,7,6,1,3,7,-1,-1,-1,-1,
+    1,6,10,1,7,6,1,0,7,8,7,0,9,5,4,-1,
+    4,0,10,4,10,5,0,3,10,6,10,7,3,7,10,-1,
+    7,6,10,7,10,8,5,4,10,4,8,10,-1,-1,-1,-1,
+    6,9,5,6,11,9,11,8,9,-1,-1,-1,-1,-1,-1,-1,
+    3,6,11,0,6,3,0,5,6,0,9,5,-1,-1,-1,-1,
+    0,11,8,0,5,11,0,1,5,5,6,11,-1,-1,-1,-1,
+    6,11,3,6,3,5,5,3,1,-1,-1,-1,-1,-1,-1,-1,
+    1,2,10,9,5,11,9,11,8,11,5,6,-1,-1,-1,-1,
+    0,11,3,0,6,11,0,9,6,5,6,9,1,2,10,-1,
+    11,8,5,11,5,6,8,0,5,10,5,2,0,2,5,-1,
+    6,11,3,6,3,5,2,10,3,10,5,3,-1,-1,-1,-1,
+    5,8,9,5,2,8,5,6,2,3,8,2,-1,-1,-1,-1,
+    9,5,6,9,6,0,0,6,2,-1,-1,-1,-1,-1,-1,-1,
+    1,5,8,1,8,0,5,6,8,3,8,2,6,2,8,-1,
+    1,5,6,2,1,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,3,6,1,6,10,3,8,6,5,6,9,8,9,6,-1,
+    10,1,0,10,0,6,9,5,0,5,6,0,-1,-1,-1,-1,
+    0,3,8,5,6,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    10,5,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    11,5,10,7,5,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    11,5,10,11,7,5,8,3,0,-1,-1,-1,-1,-1,-1,-1,
+    5,11,7,5,10,11,1,9,0,-1,-1,-1,-1,-1,-1,-1,
+    10,7,5,10,11,7,9,8,1,8,3,1,-1,-1,-1,-1,
+    11,1,2,11,7,1,7,5,1,-1,-1,-1,-1,-1,-1,-1,
+    0,8,3,1,2,7,1,7,5,7,2,11,-1,-1,-1,-1,
+    9,7,5,9,2,7,9,0,2,2,11,7,-1,-1,-1,-1,
+    7,5,2,7,2,11,5,9,2,3,2,8,9,8,2,-1,
+    2,5,10,2,3,5,3,7,5,-1,-1,-1,-1,-1,-1,-1,
+    8,2,0,8,5,2,8,7,5,10,2,5,-1,-1,-1,-1,
+    9,0,1,5,10,3,5,3,7,3,10,2,-1,-1,-1,-1,
+    9,8,2,9,2,1,8,7,2,10,2,5,7,5,2,-1,
+    1,3,5,3,7,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,8,7,0,7,1,1,7,5,-1,-1,-1,-1,-1,-1,-1,
+    9,0,3,9,3,5,5,3,7,-1,-1,-1,-1,-1,-1,-1,
+    9,8,7,5,9,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    5,8,4,5,10,8,10,11,8,-1,-1,-1,-1,-1,-1,-1,
+    5,0,4,5,11,0,5,10,11,11,3,0,-1,-1,-1,-1,
+    0,1,9,8,4,10,8,10,11,10,4,5,-1,-1,-1,-1,
+    10,11,4,10,4,5,11,3,4,9,4,1,3,1,4,-1,
+    2,5,1,2,8,5,2,11,8,4,5,8,-1,-1,-1,-1,
+    0,4,11,0,11,3,4,5,11,2,11,1,5,1,11,-1,
+    0,2,5,0,5,9,2,11,5,4,5,8,11,8,5,-1,
+    9,4,5,2,11,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    2,5,10,3,5,2,3,4,5,3,8,4,-1,-1,-1,-1,
+    5,10,2,5,2,4,4,2,0,-1,-1,-1,-1,-1,-1,-1,
+    3,10,2,3,5,10,3,8,5,4,5,8,0,1,9,-1,
+    5,10,2,5,2,4,1,9,2,9,4,2,-1,-1,-1,-1,
+    8,4,5,8,5,3,3,5,1,-1,-1,-1,-1,-1,-1,-1,
+    0,4,5,1,0,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    8,4,5,8,5,3,9,0,5,0,3,5,-1,-1,-1,-1,
+    9,4,5,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,11,7,4,9,11,9,10,11,-1,-1,-1,-1,-1,-1,-1,
+    0,8,3,4,9,7,9,11,7,9,10,11,-1,-1,-1,-1,
+    1,10,11,1,11,4,1,4,0,7,4,11,-1,-1,-1,-1,
+    3,1,4,3,4,8,1,10,4,7,4,11,10,11,4,-1,
+    4,11,7,9,11,4,9,2,11,9,1,2,-1,-1,-1,-1,
+    9,7,4,9,11,7,9,1,11,2,11,1,0,8,3,-1,
+    11,7,4,11,4,2,2,4,0,-1,-1,-1,-1,-1,-1,-1,
+    11,7,4,11,4,2,8,3,4,3,2,4,-1,-1,-1,-1,
+    2,9,10,2,7,9,2,3,7,7,4,9,-1,-1,-1,-1,
+    9,10,7,9,7,4,10,2,7,8,7,0,2,0,7,-1,
+    3,7,10,3,10,2,7,4,10,1,10,0,4,0,10,-1,
+    1,10,2,8,7,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,9,1,4,1,7,7,1,3,-1,-1,-1,-1,-1,-1,-1,
+    4,9,1,4,1,7,0,8,1,8,7,1,-1,-1,-1,-1,
+    4,0,3,7,4,3,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    4,8,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    9,10,8,10,11,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    3,0,9,3,9,11,11,9,10,-1,-1,-1,-1,-1,-1,-1,
+    0,1,10,0,10,8,8,10,11,-1,-1,-1,-1,-1,-1,-1,
+    3,1,10,11,3,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,2,11,1,11,9,9,11,8,-1,-1,-1,-1,-1,-1,-1,
+    3,0,9,3,9,11,1,2,9,2,11,9,-1,-1,-1,-1,
+    0,2,11,8,0,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    3,2,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    2,3,8,2,8,10,10,8,9,-1,-1,-1,-1,-1,-1,-1,
+    9,10,2,0,9,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    2,3,8,2,8,10,0,1,8,1,10,8,-1,-1,-1,-1,
+    1,10,2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    1,3,8,9,1,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,9,1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    0,3,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+)
+assert len(MC_TRI_TABLE) == 256 * 16, f"MC tri table size {len(MC_TRI_TABLE)} != 4096"
+
+
+def init_blank_voxels(size, rng):
+    """All-zero RGBA voxel grid. Used as the canvas for agent-based rules
+    where the voxel state starts blank and is painted by the agents
+    (e.g., Langton's ant)."""
+    return np.zeros((size, size, size, 4), dtype=np.float32)
+
+
+INIT_FUNCS['blank_voxels'] = init_blank_voxels
+
+
+def _smugglers_terrain(size, rng):
+    """Generate a heightmap-style terrain in the A channel.
+
+    Layout (Y axis = up):
+      • Bottom 2 cells: solid ground (always wall).
+      • Above ground: rolling hills + occasional vertical walls,
+        derived from a 2D heightmap (XZ plane) summed from two
+        octaves of value noise.  Cell (x,y,z) is a wall iff y is at
+        most the local height H(x,z).
+      • A few thin "wall" obstacles (vertical fences perpendicular to
+        the red→blue corridor) carved through the middle band so the
+        arena has bottlenecks that force carriers to detour.
+      • Clear hemispheres carved around both homes (above the ground
+        plane) so carriers always have a launch pad.
+    """
+    walls = np.zeros((size, size, size), dtype=np.float32)
+
+    # Solid ground: bottom 2 cells of Y.
+    GROUND = 2
+    walls[:, :GROUND, :] = 1.0
+
+    # ── 2D heightmap on the XZ plane ──────────────────────────────
+    def lattice_noise(freq, seed_offset=0):
+        """Trilinear-upsampled value noise on an XZ lattice."""
+        if hasattr(rng, 'random'):
+            lat = rng.random((freq, freq)).astype(np.float32)
+        else:
+            lat = rng.rand(freq, freq).astype(np.float32)
+        coords = np.linspace(0, freq - 1, size, dtype=np.float32)
+        i0 = np.floor(coords).astype(np.int32)
+        i1 = np.minimum(i0 + 1, freq - 1)
+        t = coords - i0
+        # Bilinear lookup → (size, size).
+        A = lat[i0[:, None], i0[None, :]]
+        B = lat[i1[:, None], i0[None, :]]
+        C = lat[i0[:, None], i1[None, :]]
+        D = lat[i1[:, None], i1[None, :]]
+        tx = t[:, None]; tz = t[None, :]
+        return (A + (B - A) * tx) * (1 - tz) + (C + (D - C) * tx) * tz
+
+    n1 = lattice_noise(4)               # large rolling hills
+    n2 = lattice_noise(9) * 0.4         # smaller bumps
+    height_norm = np.clip(n1 + n2, 0.0, 1.4) / 1.4
+    # Hills grow up to ~10% of the box height above the ground plane —
+    # tall enough to be obstacles, short enough that the carrier-AI's
+    # jump impulse can clear them with a running start.
+    max_hill = max(2, int(size * 0.10))
+    height_map = (GROUND + height_norm * max_hill).astype(np.int32)
+
+    # Stamp the heightmap: walls[x, y, z] = 1 if y < height_map[x, z].
+    yidx = np.arange(size, dtype=np.int32)
+    # Broadcast (size, size, size): compare yidx along Y axis to height.
+    walls = (yidx[None, :, None] < height_map[:, None, :]).astype(np.float32)
+
+    # ── A few discrete pillar / wall obstacles ────────────────────
+    # Sprinkle ~6 "buildings" — vertical columns of various footprint
+    # and height — across the middle band.  Distinct features feel more
+    # like terrain than pure noise, and small footprints + wide gaps
+    # between them mean carriers can route around naturally.
+    n_pillars = 6
+    if hasattr(rng, 'integers'):
+        px = rng.integers(int(size * 0.25), int(size * 0.75),
+                          size=n_pillars, dtype=np.int32)
+        pz = rng.integers(int(size * 0.10), int(size * 0.90),
+                          size=n_pillars, dtype=np.int32)
+        ph = rng.integers(4, max(5, int(size * 0.18)),
+                          size=n_pillars, dtype=np.int32)
+        pw = rng.integers(2, 5, size=n_pillars, dtype=np.int32)
+    else:
+        px = rng.randint(int(size * 0.25), int(size * 0.75), n_pillars)
+        pz = rng.randint(int(size * 0.10), int(size * 0.90), n_pillars)
+        ph = rng.randint(4, max(5, int(size * 0.18)), n_pillars)
+        pw = rng.randint(2, 5, n_pillars)
+    for x0, z0, h, w in zip(px, pz, ph, pw):
+        x1 = min(size, int(x0) + int(w))
+        z1 = min(size, int(z0) + int(w))
+        y1 = min(size, GROUND + int(h))
+        walls[int(x0):x1, GROUND:y1, int(z0):z1] = 1.0
+
+    # ── Clear spawn slabs along both X edges ──────────────────────
+    # Each team's home is a thin slab at one X edge that runs the
+    # full Z extent of the box (with a small margin) and a few cells
+    # tall above the ground plane.  Clearing the slab guarantees a
+    # hill or pillar never blocks a carrier from spawning or landing.
+    edge_w     = max(2, int(size * 0.06))    # thickness in X
+    spawn_top  = GROUND + max(3, int(size * 0.14))
+    margin_z   = max(2, int(size * 0.05))
+    walls[:edge_w,            GROUND:spawn_top, margin_z:size - margin_z] = 0.0
+    walls[size - edge_w:size, GROUND:spawn_top, margin_z:size - margin_z] = 0.0
+    # Re-assert the ground floor (clearing might have eaten it under homes).
+    walls[:, :GROUND, :] = 1.0
+
+    return walls
+
+
+def init_smugglers(size, rng):
+    """Smuggler's Standoff arena — empty stash channels plus a procedural
+    wall terrain in channel A.  Carriers must navigate the obstacle
+    field to ferry packages between home corners."""
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    arr[..., 3] = _smugglers_terrain(size, rng)
+    return arr
+
+
+def init_smugglers_handicap(size, rng):
+    """Same arena terrain, but red's home is pre-contaminated with blue
+    stash so red starts the game already losing the spawn-rate war."""
+    arr = init_smugglers(size, rng)
+    cx = int(size * 0.15)
+    cy = int(2 + size * 0.10)
+    cz = int(size * 0.50)
+    r  = max(2, int(size * 0.10))
+    xs = np.arange(size); ys = np.arange(size); zs = np.arange(size)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+    mask = (X - cx)**2 + (Y - cy)**2 + (Z - cz)**2 < r * r
+    arr[..., 1][mask] = 0.6     # blue stash inside red's home
+    return arr
+
+
+INIT_FUNCS['smugglers']          = init_smugglers
+INIT_FUNCS['smugglers_handicap'] = init_smugglers_handicap
+
+
+# ── Init functions for the new exotic CAs ──────────────────────────────
+
+def _causal_blank(size):
+    return np.zeros((size, size, size, 4), dtype=np.float32)
+
+
+def init_causal_one_source(size, rng):
+    """Single source at the centre. Should produce a perfect expanding
+    diamond (Manhattan-norm sphere) once it pulses."""
+    arr = _causal_blank(size)
+    c = size // 2
+    arr[c, c, c, 3] = 1.0
+    return arr
+
+
+def init_causal_two_sources(size, rng):
+    """Two sources separated along x. The two cones meet in a planar
+    interference fringe at the midpoint."""
+    arr = _causal_blank(size)
+    c = size // 2
+    off = max(2, size // 4)
+    arr[c - off, c, c, 3] = 1.0
+    arr[c + off, c, c, 3] = 1.0
+    return arr
+
+
+def init_causal_octahedron(size, rng):
+    """Six sources arranged on the cube axes — light cones combine into
+    a beautiful 3D Lichtenberg figure with 6-fold symmetry."""
+    arr = _causal_blank(size)
+    c = size // 2
+    off = max(2, size // 3)
+    for ax in range(3):
+        for sgn in (-1, 1):
+            p = [c, c, c]
+            p[ax] += sgn * off
+            p = [int(np.clip(v, 0, size - 1)) for v in p]
+            arr[p[0], p[1], p[2], 3] = 1.0
+    return arr
+
+
+def init_causal_random_sources(size, rng):
+    """8-16 sources scattered through the grid. Multi-cone interference
+    patterns with no global symmetry."""
+    arr = _causal_blank(size)
+    if hasattr(rng, 'integers'):
+        n = int(rng.integers(8, 17))
+        coords = rng.integers(size // 6, 5 * size // 6, size=(n, 3))
+        amps = rng.random(n).astype(np.float32) * 0.7 + 0.3
+    else:
+        n = rng.randint(8, 17)
+        coords = rng.randint(size // 6, 5 * size // 6, size=(n, 3))
+        amps = rng.rand(n).astype(np.float32) * 0.7 + 0.3
+    for (x, y, z), a in zip(coords, amps):
+        arr[int(x), int(y), int(z), 3] = float(a)
+    return arr
+
+
+def init_hopfion_h1(size, rng):
+    """Analytic Hopf-charge-1 soliton. Stereographic from the standard
+    Whitehead map ψ : ℝ³ → S² with one linked-pair preimage. The closed
+    form of the unit vector field at position (x,y,z) (with the soliton
+    of size R centred at the origin) is
+
+        n = (2(xz + yw), 2(yz - xw), z² + w² - x² - y²) / (x² + y² + z² + w²)
+
+    where w = (R² - r²) / (2R) is the auxiliary 4th coordinate from the
+    inverse stereographic projection."""
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    R = size * 0.25
+    cx = (size - 1) * 0.5
+    xs = np.arange(size, dtype=np.float32) - cx
+    X, Y, Z = np.meshgrid(xs, xs, xs, indexing='ij')
+    r2 = X * X + Y * Y + Z * Z
+    W = (R * R - r2) / (2.0 * R)
+    denom = X * X + Y * Y + Z * Z + W * W
+    denom = np.where(denom < 1e-6, 1e-6, denom)
+    nx = (2.0 * (X * Z + Y * W)) / denom
+    ny = (2.0 * (Y * Z - X * W)) / denom
+    nz = (Z * Z + W * W - X * X - Y * Y) / denom
+    # Re-normalise (numerical drift only).
+    norm = np.sqrt(nx * nx + ny * ny + nz * nz)
+    norm = np.where(norm < 1e-6, 1.0, norm)
+    arr[..., 0] = nx / norm
+    arr[..., 1] = ny / norm
+    arr[..., 2] = nz / norm
+    return arr.astype(np.float32)
+
+
+def init_hopfion_h2(size, rng):
+    """Higher-charge Hopfion (H=2) by squaring the stereographic phase.
+    Less stable than H=1 but starts as a doubly-linked configuration."""
+    arr = init_hopfion_h1(size, rng)
+    # Square the (nx + i*ny) part to double the linking.
+    nx = arr[..., 0].copy()
+    ny = arr[..., 1].copy()
+    arr[..., 0] = nx * nx - ny * ny
+    arr[..., 1] = 2.0 * nx * ny
+    norm = np.sqrt(arr[..., 0] ** 2 + arr[..., 1] ** 2 + arr[..., 2] ** 2)
+    norm = np.where(norm < 1e-6, 1.0, norm)
+    for c in range(3):
+        arr[..., c] /= norm
+    return arr.astype(np.float32)
+
+
+def init_hopfion_random_unit(size, rng):
+    """Random direction at every voxel — gives a noisy field that the
+    dynamics will try to relax. Useful for finding any stable solitons
+    that the energy landscape supports."""
+    if hasattr(rng, 'integers'):
+        v = rng.random((size, size, size, 3), dtype=np.float32) * 2.0 - 1.0
+    else:
+        v = rng.rand(size, size, size, 3).astype(np.float32) * 2.0 - 1.0
+    norm = np.sqrt((v * v).sum(axis=-1, keepdims=True))
+    norm = np.where(norm < 1e-6, 1.0, norm)
+    v /= norm
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    arr[..., :3] = v
+    return arr
+
+
+def init_genome_state_random(size, rng):
+    """State initialised with a small random kick — the FitzHugh-Nagumo
+    dynamics naturally amplify spatially-correlated structure as the
+    excitatory channel u and recovery v cross-couple."""
+    if hasattr(rng, 'integers'):
+        arr = rng.random((size, size, size, 4), dtype=np.float32) * 2.0 - 1.0
+    else:
+        arr = rng.rand(size, size, size, 4).astype(np.float32) * 2.0 - 1.0
+    # Modest amplitude so we sit near the unstable fixed point.
+    arr *= 0.5
+    return arr.astype(np.float32)
+
+
+def init_genome_state_blob(size, rng):
+    """Single dense blob in the centre — lets one 'culture' get a head
+    start before competing with whatever spontaneously emerges around it."""
+    arr = init_genome_state_random(size, rng) * 0.05
+    c = size // 2
+    r = max(2, size // 8)
+    xs = np.arange(size) - c
+    X, Y, Z = np.meshgrid(xs, xs, xs, indexing='ij')
+    mask = (X * X + Y * Y + Z * Z) < r * r
+    arr[mask, 0] = 1.0
+    return arr.astype(np.float32)
+
+
+def init_genome_state_sparse(size, rng):
+    """Very sparse seed: a few isolated active cells. Rule-space search
+    then runs from the bottom up."""
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    if hasattr(rng, 'integers'):
+        n = int(size ** 3 // 200)
+        coords = rng.integers(0, size, size=(n, 3))
+    else:
+        n = size ** 3 // 200
+        coords = rng.randint(0, size, size=(n, 3))
+    for x, y, z in coords:
+        arr[int(x), int(y), int(z), 0] = 1.0
+    return arr
+
+
+def init_nematic_random(size, rng):
+    """Random Q-tensor field. Cooled it will form a network of 1-D
+    disclination defect lines — the visual signature of an active
+    nematic in 3D."""
+    if hasattr(rng, 'integers'):
+        arr = (rng.random((size, size, size, 4), dtype=np.float32) - 0.5) * 0.3
+    else:
+        arr = (rng.rand(size, size, size, 4).astype(np.float32) - 0.5) * 0.3
+    return arr
+
+
+def init_nematic_aligned_x(size, rng):
+    """Uniform alignment along x-axis with a small noise. Q ≈ S * (n n^T - I/3)
+    with n = (1,0,0)  ⇒  Qxx = +2S/3, Qyy=Qzz=-S/3, off-diag = 0.
+    With S = 0.5 and tiny noise."""
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    arr[..., 0] = 2.0 / 3.0 * 0.5    # Qxx
+    arr[..., 1] = -1.0 / 3.0 * 0.5   # Qyy
+    if hasattr(rng, 'integers'):
+        arr += (rng.random((size, size, size, 4), dtype=np.float32) - 0.5) * 0.05
+    else:
+        arr += (rng.rand(size, size, size, 4).astype(np.float32) - 0.5) * 0.05
+    return arr
+
+
+def init_nematic_defect_pair(size, rng):
+    """Aligned background with TWO opposing-sign defects placed near the
+    centre — gives the active solver an immediate target to evolve."""
+    arr = init_nematic_aligned_x(size, rng) * 0.5
+    c = size // 2
+    off = max(2, size // 6)
+    for sgn, dx in ((+1, -off), (-1, +off)):
+        x = c + dx
+        # Local defect: rotate the alignment around z by ±2π over a
+        # disc of radius r in the xy plane.
+        r = max(2, size // 10)
+        xs = np.arange(size) - x
+        ys = np.arange(size) - c
+        X, Y = np.meshgrid(xs, ys, indexing='ij')
+        rho = np.sqrt(X * X + Y * Y)
+        phi = sgn * np.arctan2(Y, X)
+        # Q for a director rotated by phi/2 in the xy plane:
+        # n = (cos(phi/2), sin(phi/2), 0)  ⇒  Qxy = S sin(phi)
+        S = 0.5 * np.exp(-rho * rho / (r * r))
+        for z in range(size):
+            arr[:, :, z, 2] += (S * np.sin(phi)).astype(np.float32) * 0.3
+    return arr
+
+
+INIT_FUNCS['causal_one_source']     = init_causal_one_source
+INIT_FUNCS['causal_two_sources']    = init_causal_two_sources
+INIT_FUNCS['causal_octahedron']     = init_causal_octahedron
+INIT_FUNCS['causal_random_sources'] = init_causal_random_sources
+INIT_FUNCS['hopfion_h1']            = init_hopfion_h1
+INIT_FUNCS['hopfion_h2']            = init_hopfion_h2
+INIT_FUNCS['hopfion_random_unit']   = init_hopfion_random_unit
+INIT_FUNCS['genome_state_random']   = init_genome_state_random
+INIT_FUNCS['genome_state_blob']     = init_genome_state_blob
+INIT_FUNCS['genome_state_sparse']   = init_genome_state_sparse
+INIT_FUNCS['nematic_random']        = init_nematic_random
+INIT_FUNCS['nematic_aligned_x']     = init_nematic_aligned_x
+INIT_FUNCS['nematic_defect_pair']   = init_nematic_defect_pair
 
 # Register individual orbital init variants
 INIT_FUNCS.update(ORBITAL_INITS)
@@ -9356,21 +19752,154 @@ def _fence_delete(fence):
         pass
 
 
+# ── Inter-rule composition ───────────────────────────────────────────
+# A composed preset declares `compose: [...]` listing 2+ sub-rules. At
+# load time we expand this into a flat preset whose `passes` list is the
+# concatenation of each sub-rule's passes. Each sub-rule's params are
+# merged into a single namespace under a per-sub-rule prefix to avoid
+# name clashes, and `param_names` is set on every pass so u_param0..3
+# bind to that pass's intended params regardless of dict insertion order.
+#
+# Top-level keys on the composed preset (label, init, dt, extra_fields,
+# field_inits, vis_*, render_mode, etc.) override values inherited from
+# the first sub-rule. Sub-entry `params` dicts override individual
+# parameter starting values (using the prefixed key, or the bare key
+# which is then prefixed automatically).
+#
+# Example:
+#   'rd_plus_fire': {
+#       'label': 'Reaction-Diffusion + Fire',
+#       'compose': [
+#           {'rule': 'reaction_diffusion_3d', 'prefix': 'rd_'},
+#           {'rule': 'fire',                 'prefix': 'fire_',
+#            'params': {'fire_burn': 0.5}},
+#       ],
+#       'init': 'fear_seed',  # optional
+#   }
+
+def _resolve_composed_preset(name):
+    """Return a fully-resolved preset dict for `name`, expanding any
+    `compose` field into a concatenated passes list. If the named preset
+    has no `compose` key, returns RULE_PRESETS[name] unchanged."""
+    if name not in RULE_PRESETS:
+        raise KeyError(f"Unknown rule preset: {name!r}")
+    p = RULE_PRESETS[name]
+    if 'compose' not in p:
+        return p
+
+    entries = list(p['compose'])
+    if len(entries) < 1:
+        raise ValueError(f"compose for {name!r} must list at least one sub-rule")
+
+    # Build merged preset starting from a copy of the first sub-rule.
+    first_name = entries[0]['rule'] if isinstance(entries[0], dict) else entries[0]
+    base = dict(_resolve_composed_preset(first_name))  # recursive: nested compose ok
+
+    merged_params = {}
+    merged_ranges = {}
+    merged_passes = []
+
+    for entry in entries:
+        if isinstance(entry, str):
+            entry = {'rule': entry}
+        sub_name = entry['rule']
+        prefix   = entry.get('prefix', f"{sub_name}_")
+        sub      = _resolve_composed_preset(sub_name)
+        overrides = entry.get('params', {})
+
+        # Extract sub-rule's raw passes list (matching _compile_compute logic).
+        if 'passes' in sub:
+            raw_passes = list(sub['passes'])
+        else:
+            raw_passes = [sub['shader']]
+        sub_pass_params = sub.get('pass_params', {})
+
+        # Merge params with prefix. Apply per-sub-entry overrides
+        # (overrides may use the prefixed or bare key — both accepted).
+        sub_params_ordered = list(sub['params'].keys())
+        sub_ranges = sub.get('param_ranges', {})
+        for k in sub_params_ordered:
+            v = sub['params'][k]
+            pk = f"{prefix}{k}"
+            if pk in overrides:
+                v = overrides[pk]
+            elif k in overrides:
+                v = overrides[k]
+            merged_params[pk] = v
+            if k in sub_ranges:
+                merged_ranges[pk] = sub_ranges[k]
+
+        # Concatenate passes, ensuring `param_names` is set on each so
+        # u_param0..3 unambiguously bind to this sub-rule's params.
+        for raw in raw_passes:
+            if isinstance(raw, str):
+                spec = {"shader": raw, "writes": ("p1",), "kind": "voxel"}
+            else:
+                spec = {"shader": raw["shader"],
+                        "writes": tuple(raw.get("writes", ("p1",))),
+                        "kind": raw.get("kind", "voxel")}
+            # Determine which sub-rule param names this pass binds.
+            override = sub_pass_params.get(spec["shader"])
+            if override is not None:
+                names = list(override)
+            else:
+                # Default: first 4 of sub-rule's param dict (insertion order).
+                names = sub_params_ordered[:4]
+            spec["param_names"] = [f"{prefix}{n}" for n in names]
+            merged_passes.append(spec)
+
+    # Assemble: start from first sub-rule's keys, then overlay our
+    # composed result, then overlay any top-level keys on the
+    # composed preset (label, init, dt, extra_fields, ...).
+    out = dict(base)
+    out['params'] = merged_params
+    out['param_ranges'] = merged_ranges
+    out['passes'] = merged_passes
+    out['pass_params'] = {}  # already baked into per-pass param_names
+    # Note: keep `shader` from base sub-rule — it's used as a hint by
+    # _build_accel_textures and other render paths; _compile_compute
+    # ignores it when `passes` is present.
+    # Apply top-level overrides from the composed preset (everything
+    # except 'compose' itself).
+    for k, v in p.items():
+        if k == 'compose':
+            continue
+        out[k] = v
+    return out
+
+
 # ── Simulator class ──────────────────────────────────────────────────
 
 class Simulator:
-    def __init__(self, size=64, rule='game_of_life_3d', headless=False):
+    def __init__(self, size=64, rule='game_of_life_3d', headless=False,
+                 force_precision=None, dims=None):
+        """
+        force_precision: None (auto), 'fp16', or 'fp32'. Overrides both
+            the per-preset 'precision' key and the size-based fallback.
+        dims: (W, H, D) tuple for anisotropic grids. If None, falls back
+            to cubic (size, size, size). When given, `size` is ignored
+            for grid shape but still used as a back-compat scalar via
+            self.size = max(W, H, D).
+        """
         # Honour the preset's preferred grid size when the caller didn't
         # explicitly request a larger one. Some presets (e.g. dendritic
         # crystals) need >=144^3 to resolve their characteristic features
         # at all, so an unmodified launch with default size=64 would just
         # show a blob.
-        preset = RULE_PRESETS[rule]
+        preset = _resolve_composed_preset(rule)
         pref = preset.get('default_size')
         if pref and size < pref:
             size = pref
-        self.size = size
+        # Normalize dims: explicit dims wins; else cubic from size.
+        if dims is None:
+            dims = (size, size, size)
+        else:
+            dims = tuple(int(d) for d in dims)
+            if len(dims) != 3 or any(d <= 0 for d in dims):
+                raise ValueError(f"dims must be (W, H, D) of positive ints, got {dims!r}")
+        self._apply_dims(dims)
         self.rule_name = rule
+        self._force_precision = force_precision
         self.preset = preset
         self._current_init = self.preset.get('init')
         self.headless = headless
@@ -9394,14 +19923,20 @@ class Simulator:
         self.cam_theta = 0.5      # horizontal angle
         self.cam_phi = 0.4        # vertical angle
         self.cam_dist = 2.5       # distance from center
-        self.cam_target = np.array([0.5, 0.5, 0.5])
+        # cam_target is initialized by _apply_dims() to the centre of the
+        # (possibly non-cubic) world box. For cubic this is (0.5,0.5,0.5)
+        # \u2014 same as the legacy hard-coded default.
+        if not hasattr(self, 'cam_target'):
+            self.cam_target = np.array([self.box_dims[0] * 0.5,
+                                        self.box_dims[1] * 0.5,
+                                        self.box_dims[2] * 0.5])
 
         # Rendering
         self.density_scale = 15.0
         self.brightness = 1.5
         self.render_mode = 0      # 0=volume, 1=iso, 2=MIP
         self.iso_threshold = 0.5
-        self.colormap = 0
+        self.colormap = self.preset.get('colormap', 0)
         self.slice_pos = -1.0     # -1 = disabled
         self.slice_axis = 2
 
@@ -9412,10 +19947,16 @@ class Simulator:
         self.is_element_ca = self.preset.get('is_element_ca', False)
 
         # Voxel rendering settings
-        self.voxel_gap = 0.1       # gap between cubes (0=touching, 0.2=20% gap)
-        self.voxel_threshold = 0.5  # visibility threshold for non-element CAs
+        self.voxel_gap = float(self.preset.get('voxel_gap', 0.1))  # 0=touching, 0.2=20% gap
+        # Honour the preset's pinned voxel_threshold at startup. Without
+        # this, __init__ ran with a hard-coded 0.5 default and the
+        # preset key was only consulted later in _change_rule(), so
+        # rules launched directly via --rule would render with the
+        # wrong threshold (clipping/leaking the wrong value bands).
+        self.voxel_threshold = float(self.preset.get('voxel_threshold', 0.5))
         self.voxel_alpha = 1.0      # transparency
         self._cull_valid = False     # True when SSBO has valid cull data for current state
+        self._sparse_built_step = -1  # step_count at which _sparse_blocks_ssbo was last built
         # Adaptive voxel-threshold state. Fixed per-shader thresholds were
         # often well below a rule's natural "dead" field value (e.g.
         # Gray-Scott U sits near 1.0 everywhere by default with threshold
@@ -9423,7 +19964,7 @@ class Simulator:
         # framing the simulation. The adaptive path reads back the
         # existing min/max accel mipmap once every N steps and sets
         # threshold = min + (max - min) * frac.
-        self._adaptive_threshold = True
+        self._adaptive_threshold = False
         self._adaptive_threshold_frac = 0.20
         self._steps_since_threshold_update = 1_000_000  # force on next render
         self._threshold_update_interval = 30
@@ -9433,6 +19974,14 @@ class Simulator:
         self.vis_channels = self.preset.get('vis_channels', ['Value'])
         self.vis_channel = self.preset.get('vis_default', 0)
         self.vis_abs = self.preset.get('vis_abs', False)
+        # Multi-channel transfer-function mode. See VIEW_TEX_BUILD_SHADER
+        # docstring for the 5 modes.  Per-preset 'vis_mode' string key:
+        #   'density' (legacy single-channel via apply_colormap),
+        #   'rgb_channels', 'hsv_phase', 'bipolar', 'rgba_blend'.
+        self.vis_mode = _vis_mode_to_int(self.preset.get('vis_mode', 'density'))
+        # Auxiliary range for vis_mode (vector-magnitude / signed-bipolar normalisation).
+        # Defaults to (0, 1); presets that need a different range set 'vis_aux_range'.
+        self.vis_aux_range = tuple(self.preset.get('vis_aux_range', (0.0, 1.0)))
 
         # Parameters (copy from preset)
         self.params = dict(self.preset['params'])
@@ -9585,9 +20134,21 @@ class Simulator:
         global _TEX_ALLOC_LIMIT
         _TEX_ALLOC_LIMIT = _probe_tex_alloc_limit(self.ctx)
 
-        # Determine texture format (rgba32f or rgba16f depending on grid size)
-        self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
-            _tex_format_for_size(self.size)
+        # Determine texture format (rgba32f or rgba16f or rgba8).
+        # Resolution order: explicit force_precision > preset['precision'] >
+        # size-based auto fallback. u8 is opt-in only (per the audit at
+        # /memories/session/u8_value_range_audit).
+        forced = getattr(self, '_force_precision', None) or self.preset.get('precision')
+        if forced in _PRECISION_SPECS:
+            self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
+                _PRECISION_SPECS[forced]
+        else:
+            self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
+                _tex_format_for_size(self.size)
+        # u8 textures are normalised: float [0,1] on shader side ↔
+        # uint8 [0,255] on storage. Set the scale once so every upload/
+        # readback site can use it uniformly.
+        self._tex_is_norm_u8 = (self._tex_dtype == 'f1')
 
         # Full-screen quad (for volumetric mode)
         vertices = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype='f4')
@@ -9608,6 +20169,8 @@ class Simulator:
         self._rp_u_size = rp.get('u_size', None)
         self._rp_u_inv_size = rp.get('u_inv_size', None)
         self._rp_u_max_steps = rp.get('u_max_steps', None)
+        self._rp_u_box_dims = rp.get('u_box_dims', None)
+        self._rp_u_inv_box_dims = rp.get('u_inv_box_dims', None)
         self._rp_u_camera_pos = rp['u_camera_pos']
         self._rp_u_camera_rot = rp['u_camera_rot']
         self._rp_u_fov = rp['u_fov']
@@ -9621,6 +20184,7 @@ class Simulator:
         self._rp_u_colormap = rp['u_colormap']
         self._rp_u_vis_channel = rp.get('u_vis_channel', None)
         self._rp_u_vis_abs = rp.get('u_vis_abs', None)
+        self._rp_u_vis_mode = rp.get('u_vis_mode', None)
         # New acceleration uniforms (use .get() — GLSL compiler may strip unused ones)
         self._rp_u_frame_id = rp.get('u_frame_id', None)
         self._rp_u_occupancy = rp.get('u_occupancy', None)
@@ -9671,14 +20235,15 @@ class Simulator:
         self._use_half_res = False
         self._use_compute_ray = False
 
-        # Compile voxel render shader
+        # Compile voxel render shader (pack layout depends on grid size).
         self.voxel_prog = self.ctx.program(
-            vertex_shader=VOXEL_VERTEX_SHADER,
+            vertex_shader=self._voxel_pack_inject(VOXEL_VERTEX_SHADER),
             fragment_shader=VOXEL_FRAGMENT_SHADER,
         )
         # Cache voxel program uniform references
         vp = self.voxel_prog
         self._vp_u_size = vp['u_size']
+        self._vp_u_dims = vp.get('u_dims', None)
         self._vp_u_view_proj = vp['u_view_proj']
         self._vp_u_voxel_gap = vp['u_voxel_gap']
         self._vp_u_camera_pos = vp['u_camera_pos']
@@ -9794,15 +20359,72 @@ class Simulator:
         # Total visible counter (1 uint, accumulates across all chunks per frame)
         self._voxel_total_counter = self.ctx.buffer(data=np.array([0], dtype=np.uint32).tobytes())
 
+    def _recompile_voxel_prog(self):
+        """Rebuild self.voxel_prog with current pack-bit layout. Re-cache
+        all uniform refs since the program object is new."""
+        if hasattr(self, 'voxel_prog'):
+            self.voxel_prog.release()
+        self.voxel_prog = self.ctx.program(
+            vertex_shader=self._voxel_pack_inject(VOXEL_VERTEX_SHADER),
+            fragment_shader=VOXEL_FRAGMENT_SHADER,
+        )
+        vp = self.voxel_prog
+        self._vp_u_size = vp['u_size']
+        self._vp_u_dims = vp.get('u_dims', None)
+        self._vp_u_view_proj = vp['u_view_proj']
+        self._vp_u_voxel_gap = vp['u_voxel_gap']
+        self._vp_u_camera_pos = vp['u_camera_pos']
+        self._vp_u_brightness = vp['u_brightness']
+        self._vp_u_colormap = vp['u_colormap']
+        self._vp_u_is_element_ca = vp['u_is_element_ca']
+        self._vp_u_alpha = vp['u_alpha']
+        self._vp_u_channel = vp['u_channel']
+        self._vp_u_use_abs = vp['u_use_abs']
+        self._vp_u_threshold = vp['u_threshold']
+        self._vp_u_volume_tex = vp['u_volume_tex']
+        self._vp_u_volume_tex.value = 0
+        self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
+
+    def _voxel_pack_inject(self, src: str) -> str:
+        """Substitute pack-layout placeholders in voxel shaders based on
+        current max grid axis. Tier 1 (max <= 512): 9 bits/axis + 5-bit
+        shading (32 AO levels). Tier 2 (max <= 1024): 10 bits/axis +
+        2-bit shading (4 AO levels — coarser but supports 1024^3).
+        Anything larger needs a 64-bit packed format (uvec2)."""
+        m = max(self.W, self.H, self.D)
+        if m <= 512:
+            pb, sb = 9, 5
+        elif m <= 1024:
+            pb, sb = 10, 2
+        else:
+            raise RuntimeError(
+                f"voxel pack layout supports max axis <= 1024; got {m}. "
+                f"Use volumetric renderer or extend to uvec2 packing.")
+        pmask = (1 << pb) - 1
+        smax = (1 << sb) - 1
+        return (src
+                .replace('__PB__',     f'{pb}u')
+                .replace('__SB__',     f'{sb}u')
+                .replace('__PMASK__',  f'{pmask}u')
+                .replace('__SMASK__',  f'{smax}u')
+                .replace('__SHADE_MAX__', str(smax)))
+
     def _compile_cull(self):
-        """Compile voxel cull shader (uses sampler3D, no format dependency)."""
+        """Compile voxel cull shader (uses sampler3D, no format dependency).
+        Compiles both the dense (chunked) and sparse (brick-list) variants.
+        Sparse path is consumed by `_render_voxels` when single-pass +
+        size>=128 + sparse infrastructure exists."""
         if hasattr(self, 'voxel_cull_prog'):
             self.voxel_cull_prog.release()
-        self.voxel_cull_prog = self.ctx.compute_shader(VOXEL_CULL_SHADER)
+        if hasattr(self, 'voxel_cull_sparse_prog') and self.voxel_cull_sparse_prog is not None:
+            self.voxel_cull_sparse_prog.release()
+        self.voxel_cull_prog = self.ctx.compute_shader(
+            self._voxel_pack_inject(VOXEL_CULL_SHADER))
         # Cache cull shader uniform references
         self._cull_u_volume_tex = self.voxel_cull_prog['u_volume_tex']
         self._cull_u_volume_tex.value = 0  # texture unit 0
-        self._cull_u_size = self.voxel_cull_prog['u_size']
+        self._cull_u_size = self.voxel_cull_prog.get('u_size', None)
+        self._cull_u_dims = self.voxel_cull_prog.get('u_dims', None)
         self._cull_u_threshold = self.voxel_cull_prog['u_threshold']
         self._cull_u_is_element_ca = self.voxel_cull_prog['u_is_element_ca']
         self._cull_u_max_voxels = self.voxel_cull_prog['u_max_voxels']
@@ -9810,6 +20432,28 @@ class Simulator:
         self._cull_u_use_abs = self.voxel_cull_prog['u_use_abs']
         self._cull_u_chunk_min = self.voxel_cull_prog['u_chunk_min']
         self._cull_u_chunk_max = self.voxel_cull_prog['u_chunk_max']
+
+        # Sparse variant: same shader, #define SPARSE_DISPATCH switches
+        # the wg_origin source from gl_WorkGroupID*8 to a fetch from
+        # sparse_blocks_ssbo[gl_WorkGroupID.x].
+        sparse_src = self._voxel_pack_inject(VOXEL_CULL_SHADER).replace(
+            '#version 430',
+            '#version 430\n#define SPARSE_DISPATCH 1', 1)
+        try:
+            self.voxel_cull_sparse_prog = self.ctx.compute_shader(sparse_src)
+            self._cull_sp_u_volume_tex = self.voxel_cull_sparse_prog['u_volume_tex']
+            self._cull_sp_u_volume_tex.value = 0
+            self._cull_sp_u_size = self.voxel_cull_sparse_prog.get('u_size', None)
+            self._cull_sp_u_dims = self.voxel_cull_sparse_prog.get('u_dims', None)
+            self._cull_sp_u_threshold = self.voxel_cull_sparse_prog['u_threshold']
+            self._cull_sp_u_is_element_ca = self.voxel_cull_sparse_prog['u_is_element_ca']
+            self._cull_sp_u_max_voxels = self.voxel_cull_sparse_prog['u_max_voxels']
+            self._cull_sp_u_channel = self.voxel_cull_sparse_prog['u_channel']
+            self._cull_sp_u_use_abs = self.voxel_cull_sparse_prog['u_use_abs']
+        except Exception as e:
+            print(f"[cull] sparse cull compile failed (falling back to dense): {e}")
+            self.voxel_cull_sparse_prog = None
+
         # Compile indirect reset shader (one-time, shared across recompiles)
         if not hasattr(self, '_indirect_reset_prog'):
             self._indirect_reset_prog = self.ctx.compute_shader(INDIRECT_RESET_SHADER)
@@ -9824,6 +20468,8 @@ class Simulator:
         self._cr_u_size = cr.get('u_size', None)
         self._cr_u_inv_size = cr.get('u_inv_size', None)
         self._cr_u_max_steps = cr.get('u_max_steps', None)
+        self._cr_u_box_dims = cr.get('u_box_dims', None)
+        self._cr_u_inv_box_dims = cr.get('u_inv_box_dims', None)
         self._cr_u_camera_pos = cr.get('u_camera_pos', None)
         self._cr_u_camera_rot = cr.get('u_camera_rot', None)
         self._cr_u_fov = cr.get('u_fov', None)
@@ -9834,6 +20480,7 @@ class Simulator:
         self._cr_u_colormap = cr.get('u_colormap', None)
         self._cr_u_vis_channel = cr.get('u_vis_channel', None)
         self._cr_u_vis_abs = cr.get('u_vis_abs', None)
+        self._cr_u_vis_mode = cr.get('u_vis_mode', None)
         self._cr_u_aspect = cr.get('u_aspect', None)
         self._cr_u_frame_id = cr.get('u_frame_id', None)
         self._cr_u_resolution = cr.get('u_resolution', None)
@@ -9854,18 +20501,29 @@ class Simulator:
         if self._cr_u_view_tex is not None:
             self._cr_u_view_tex.value = 3
 
-    def _alloc_accel_textures(self, size):
+    def _alloc_accel_textures(self, size_or_dims):
         """Allocate or reallocate occupancy bitmap, min/max mipmap, and
-        reduced-precision view texture."""
+        reduced-precision view texture.
+
+        Accepts either an int (cubic) or a (W,H,D) tuple (anisotropic).
+        """
+        if isinstance(size_or_dims, tuple):
+            W, H, D = size_or_dims
+        else:
+            W = H = D = int(size_or_dims)
+        max_dim = max(W, H, D)
         # Adaptive brick size: coarser bricks at larger grids halve the DDA
         # traversal cost. At 512³ with bs=8 the occupancy grid is 64³ (512k
         # cells) instead of 128³ (2M cells) — ~2× faster empty-space skip,
         # with negligible over-march from the larger bricks (a brick with a
         # single active voxel is 512 voxels wide vs 64, which the per-voxel
         # marching loop handles cheaply thanks to the R16F view tex).
-        self._occ_block_size = 8 if size >= 192 else 4
+        self._occ_block_size = 8 if max_dim >= 192 else 4
         bs = self._occ_block_size
-        occ_dim = (size + bs - 1) // bs
+        occ_dims = ((W + bs - 1) // bs,
+                    (H + bs - 1) // bs,
+                    (D + bs - 1) // bs)
+        occ_voxels = occ_dims[0] * occ_dims[1] * occ_dims[2]
 
         # Release old textures
         if hasattr(self, '_occ_tex') and self._occ_tex is not None:
@@ -9876,30 +20534,42 @@ class Simulator:
             self._view_tex.release()
 
         # Occupancy: R8UI (1 byte per block)
-        occ_data = bytes(occ_dim ** 3)
+        occ_data = bytes(occ_voxels)
         self._occ_tex = self.ctx.texture3d(
-            (occ_dim, occ_dim, occ_dim), 1, occ_data, dtype='u1')
+            occ_dims, 1, occ_data, dtype='u1')
         self._occ_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self._occ_dim = occ_dim
+        # Legacy scalar (cubic-only callers): max axis. Per-axis tuple in
+        # _occ_dims for new code.
+        self._occ_dim = max(occ_dims)
+        self._occ_dims = occ_dims
 
         # Min/max mipmap: RG16F (4 bytes per block: min + max)
-        mm_data = bytes(occ_dim ** 3 * 4)
+        mm_data = bytes(occ_voxels * 4)
         self._mm_tex = self.ctx.texture3d(
-            (occ_dim, occ_dim, occ_dim), 2, mm_data, dtype='f2')
+            occ_dims, 2, mm_data, dtype='f2')
         self._mm_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self._mm_dim = occ_dim
+        self._mm_dim = max(occ_dims)
+        self._mm_dims = occ_dims
 
-        # Reduced-precision view tex: single-channel R16F, full voxel res.
-        # Trilinear filter so ray-march sampling interpolates smoothly.
-        view_data = bytes(size ** 3 * 2)  # 2 bytes per voxel
+        # View tex: RGBA16F (.r=density used by accel/MIP/iso, .gba=baked
+        # colour for multi-channel transfer functions). Trilinear so
+        # ray-march sampling interpolates smoothly. Memory is 4× the old
+        # R16F variant — 1 GB at 512³ — but accel/occupancy still reads
+        # only .r so its bandwidth is unchanged.
+        view_data = bytes(W * H * D * 8)  # 8 bytes per voxel (4 ch × f16)
         self._view_tex = self.ctx.texture3d(
-            (size, size, size), 1, view_data, dtype='f2')
+            (W, H, D), 4, view_data, dtype='f2')
         self._view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._view_tex.repeat_x = False
         self._view_tex.repeat_y = False
         self._view_tex.repeat_z = False
 
         self._accel_textures_valid = False
+
+        # Sparse-dispatch resources scale with grid; reallocate alongside
+        # the accel textures. Cheap (a few MB at 384³) and only used by
+        # opted-in presets at runtime.
+        self._alloc_sparse_dispatch((W, H, D))
 
     def _build_accel_textures(self):
         """Dispatch occupancy and min/max compute shaders to build acceleration structures.
@@ -9915,11 +20585,11 @@ class Simulator:
         if is_elem:
             channel, use_abs = 0, 0
             threshold = 0.5
-        elif shader in ('wave_3d', 'em_wave_3d'):
+        elif shader in ('wave_3d', 'em_wave_3d', 'em_yee_E_3d'):
             channel, use_abs = self.vis_channel, 1
             threshold = 0.005
         else:
-            channel, use_abs = self.vis_channel, 0
+            channel, use_abs = self.vis_channel, int(self.vis_abs)
             threshold = 0.01
 
         src_tex.use(location=0)
@@ -9933,6 +20603,24 @@ class Simulator:
         self._view_build_prog['u_size'].value = size
         self._view_build_prog['u_channel'].value = channel
         self._view_build_prog['u_use_abs'].value = use_abs
+        # Per-preset visualisation range. Default (0,1) is a no-op so rules
+        # whose channel already lives in [0,1] are unchanged. Rules that
+        # store unbounded counts/temperatures declare 'vis_range' in the
+        # preset and the view tex is rescaled to [0,1] before raymarching.
+        vis_lo, vis_hi = self.preset.get('vis_range', (0.0, 1.0))
+        u_lo = self._view_build_prog.get('u_vis_lo', None)
+        u_hi = self._view_build_prog.get('u_vis_hi', None)
+        if u_lo is not None: u_lo.value = float(vis_lo)
+        if u_hi is not None: u_hi.value = float(vis_hi)
+        # Multi-channel TF mode + auxiliary range
+        u_mode = self._view_build_prog.get('u_vis_mode', None)
+        if u_mode is not None:
+            u_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+        aux_lo, aux_hi = getattr(self, 'vis_aux_range', (0.0, 1.0))
+        u_alo = self._view_build_prog.get('u_aux_lo', None)
+        u_ahi = self._view_build_prog.get('u_aux_hi', None)
+        if u_alo is not None: u_alo.value = float(aux_lo)
+        if u_ahi is not None: u_ahi.value = float(aux_hi)
         vgroups = (size + 3) // 4
         self._view_build_prog.run(vgroups, vgroups, vgroups)
 
@@ -9960,6 +20648,143 @@ class Simulator:
         # min/max mipmap. Cheap (~1 MB readback every 30 frames) and
         # only runs when the user hasn't manually pinned the threshold.
         self._maybe_update_adaptive_threshold()
+
+    # ──────────────────────────────────────────────────────────────
+    # Block-sparse compute dispatch
+    # ──────────────────────────────────────────────────────────────
+    def _sparse_supported(self):
+        """A rule is eligible for sparse dispatch when:
+          - the preset opts in via ``sparse_dispatch: True``
+          - grid is large enough that block_size==8 (else _occ uses bs=4
+            and our compute workgroup mapping breaks)
+          - it's a single-pass voxel rule (multi-pass / agent / entity
+            rules need per-pass enablement which is a future extension)
+
+        IMPORTANT: this runtime check MUST mirror the compile-time
+        ``sparse_eligible`` check in ``_compile_pass`` exactly. Any
+        mismatch means the shader is text-rewritten to use the sparse
+        SSBO but the dispatcher uses dense indices (or vice-versa),
+        producing "garbage everywhere except a tiny cube near origin"
+        because gl_WorkGroupID.x indexes uninitialized SSBO entries.
+        """
+        if not self.preset.get('sparse_dispatch', False):
+            return False
+        # 8³ workgroup ↔ 8³ sparse block. We don't couple to
+        # ``_occ_block_size`` (which serves the renderer at bs=4 for
+        # small grids) — sparse-dispatch resources always use bs=8.
+        if self.size < 128:
+            return False
+        # Disable for any preset using agents/entities/multi-pass for now —
+        # safe fallback to dense dispatch.
+        if len(self._pass_specs) != 1:
+            return False
+        if self._pass_specs[0].get('kind', 'voxel') != 'voxel':
+            return False
+        return True
+
+    def _alloc_sparse_dispatch(self, size_or_dims):
+        """Allocate or reallocate the sparse-dispatch resources.
+        Sized to the current grid; called from ``_alloc_accel_textures``.
+        Accepts int (cubic) or (W,H,D) tuple."""
+        if isinstance(size_or_dims, tuple):
+            W, H, D = size_or_dims
+        else:
+            W = H = D = int(size_or_dims)
+        # Match the existing _occ_tex block size of 8 (dense path uses
+        # bs=4 for very small grids; sparse dispatch is then disabled).
+        bs = 8
+        occ_dims = ((W + bs - 1) // bs,
+                    (H + bs - 1) // bs,
+                    (D + bs - 1) // bs)
+        occ_voxels = occ_dims[0] * occ_dims[1] * occ_dims[2]
+        max_blocks = occ_voxels   # absolute worst case (every block active)
+
+        # Release prior allocations if grid shrunk
+        for attr in ('_sim_occ_tex', '_sim_active_tex',
+                     '_sparse_blocks_ssbo', '_sparse_indirect_buf'):
+            t = getattr(self, attr, None)
+            if t is not None:
+                t.release()
+                setattr(self, attr, None)
+
+        self._sim_occ_tex = self.ctx.texture3d(
+            occ_dims, 1, bytes(occ_voxels), dtype='u1')
+        self._sim_occ_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+        self._sim_active_tex = self.ctx.texture3d(
+            occ_dims, 1, bytes(occ_voxels), dtype='u1')
+        self._sim_active_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+        # Compact list: 16 bytes per block (uvec4 for std430 alignment).
+        self._sparse_blocks_ssbo = self.ctx.buffer(reserve=max_blocks * 16)
+        # Indirect dispatch buffer: 3 uints (groupCountX, Y, Z).
+        self._sparse_indirect_buf = self.ctx.buffer(
+            data=np.array([0, 1, 1], dtype=np.uint32).tobytes())
+
+        # Legacy scalars (max-dim) + per-axis tuple.
+        self._sparse_occ_dim = max(occ_dims)
+        self._sparse_occ_dims = occ_dims
+        self._sparse_max_blocks = max_blocks
+
+    def _compile_sparse(self):
+        """Compile the three sparse-pipeline shaders. Idempotent."""
+        if hasattr(self, '_sparse_occ_prog') and self._sparse_occ_prog is not None:
+            return
+        self._sparse_occ_prog = self.ctx.compute_shader(SPARSE_OCC_SHADER)
+        self._sparse_dilate_prog = self.ctx.compute_shader(SPARSE_DILATE_SHADER)
+        self._sparse_compact_prog = self.ctx.compute_shader(SPARSE_COMPACT_SHADER)
+        self._sparse_reset_prog = self.ctx.compute_shader(SPARSE_INDIRECT_RESET_SHADER)
+
+    def _build_sparse_active_list(self):
+        """Build the compact list of active 8³ blocks for the current
+        sim state. Three GPU passes, no CPU sync. After this returns,
+        ``_sparse_indirect_buf`` slot 0 holds the active-block count
+        and ``_sparse_blocks_ssbo`` holds the block coords in slots
+        ``[0..count-1]``. Result is consumed by glDispatchComputeIndirect.
+        """
+        self._compile_sparse()
+        size = self.size
+        occ_dim = self._sparse_occ_dim
+        src_tex = self.tex_a if self.ping == 0 else self.tex_b
+
+        # ── Pass 1: occupancy from current sim state ──
+        # 1 workgroup per 8³ block, 512 threads each fetching 1 voxel
+        # → atomicOr into shared memory → write 1 byte. Fully parallel.
+        src_tex.use(location=0)
+        self._sim_occ_tex.bind_to_image(0, read=False, write=True)
+        self._sparse_occ_prog['u_volume'].value = 0
+        self._sparse_occ_prog['u_size'].value = size
+        self._sparse_occ_prog.run(occ_dim, occ_dim, occ_dim)
+        GL.glMemoryBarrier(GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+
+        # ── Pass 2: dilate by 1 block (face neighbours) ──
+        self._sim_occ_tex.bind_to_image(0, read=True, write=False)
+        self._sim_active_tex.bind_to_image(1, read=False, write=True)
+        self._sparse_dilate_prog['u_occ_dim'].value = occ_dim
+        wrap = 1 if str(self.boundary_mode) == '1' or self.boundary_mode == 1 else 0
+        self._sparse_dilate_prog['u_boundary'].value = wrap
+        g = (occ_dim + 3) // 4
+        self._sparse_dilate_prog.run(g, g, g)
+        GL.glMemoryBarrier(GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+
+        # ── Pass 3a: reset indirect buffer counter ──
+        self._sparse_indirect_buf.bind_to_storage_buffer(10)
+        self._sparse_reset_prog.run(1, 1, 1)
+        GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT)
+
+        # ── Pass 3b: compact active blocks → indirect + blocks SSBO ──
+        self._sim_active_tex.bind_to_image(0, read=True, write=False)
+        self._sparse_indirect_buf.bind_to_storage_buffer(10)
+        self._sparse_blocks_ssbo.bind_to_storage_buffer(11)
+        self._sparse_compact_prog['u_occ_dim'].value = occ_dim
+        self._sparse_compact_prog.run(g, g, g)
+        # Indirect-dispatch fetches the count via the indirect buffer:
+        # need to ensure the SSBO write is visible to the indirect cmd.
+        GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT
+                           | GL.GL_COMMAND_BARRIER_BIT)
+        # Tag the step at which the sparse list was built so the renderer
+        # can reuse it without rebuilding.
+        self._sparse_built_step = self.step_count
 
     def _maybe_update_adaptive_threshold(self):
         """Periodically rescale ``voxel_threshold`` from the actual field
@@ -10071,53 +20896,294 @@ class Simulator:
         self._metrics_prog = self.ctx.compute_shader(source)
 
     def _compile_compute(self):
-        shader_key = self.preset['shader']
-        if shader_key == 'element_ca':
-            source = ELEMENT_COMPUTE_HEADER + ELEMENT_CA_RULE
+        """Compile the compute program(s) for the active rule.
+
+        A rule is either:
+          - SINGLE PASS (legacy): preset has `shader: "name"` → one CA_RULES
+            body, one compiled program.
+          - MULTI PASS: preset has `passes: [...]` where each entry is either
+            a string shader name (treated as `{"shader": s, "writes": ["p1"]}`)
+            or a dict of the form:
+              {
+                "shader": "key in CA_RULES",
+                "writes": ["p1"] or ["p2"] or ["p1", "p2"]
+              }
+            `writes` declares which texture pair(s) the pass produces output
+            for; only those pairs ping-pong after the dispatch. Pairs the
+            pass does NOT write keep their src binding pointing at the
+            current frame's data so a later pass can still read it.
+
+        Multi-pass is required for algorithms that cannot fit in a single
+        dispatch — Stable Fluids' pressure projection (advect → divergence
+        → multiple Jacobi iterations → gradient subtract) is the motivating
+        example.
+
+        Each pass shader source receives a compile-time constant
+        `PASS_INDEX` (0..N-1)."""
+        is_element = self.preset.get('shader') == 'element_ca'
+        if 'passes' in self.preset:
+            raw_passes = list(self.preset['passes'])
+            if is_element:
+                raise ValueError("element_ca rules cannot use the multi-pass "
+                                 "pipeline (separate compute header).")
         else:
-            source = COMPUTE_HEADER + CA_RULES[shader_key]
-        # Inject shared memory toggle (disabled on nouveau to avoid driver crashes)
+            raw_passes = [self.preset['shader']]
+
+        # Normalise pass entries to dicts with explicit writes-set.
+        # `param_names` is an optional per-pass override that selects which
+        # of the rule's named params get bound to u_param0..u_param3 for
+        # this pass.  Without it, the first 4 of self.params (in insertion
+        # order) are used for every pass (legacy behaviour).
+        pass_param_map = self.preset.get('pass_params', {})
+        self._pass_specs = []
+        for entry in raw_passes:
+            if isinstance(entry, str):
+                spec = {"shader": entry, "writes": ("p1",), "kind": "voxel"}
+            else:
+                spec = {"shader": entry["shader"],
+                        "writes": tuple(entry.get("writes", ("p1",))),
+                        "kind": entry.get("kind", "voxel")}
+            override = pass_param_map.get(spec["shader"])
+            if override is not None:
+                spec["param_names"] = list(override)
+            self._pass_specs.append(spec)
+
+        # Release any previously compiled programs.
+        if hasattr(self, 'compute_progs'):
+            for p in self.compute_progs:
+                try:
+                    p.release()
+                except Exception:
+                    pass
+        self.compute_progs = []
         smem = '1' if self._use_shared_mem else '0'
-        source = source.replace('#version 430', '#version 430\n#define USE_SHARED_MEM ' + smem)
-        # Match shader image format to texture format
-        if self._tex_glsl_fmt != 'rgba32f':
-            source = source.replace('rgba32f', self._tex_glsl_fmt)
-        # Bake grid size as a compile-time constant. Lets the GLSL compiler
-        # constant-fold modulo-by-pow2 to bitwise AND, hoist 1.0/u_size out
-        # of per-fragment loops, and unroll bounds. The cached uniform ref
-        # (_cu_size) becomes None and the per-step assignment is no-op'd by
-        # the existing None-guard in _step_sim.
-        source = source.replace(
-            'uniform int u_size;',
-            f'const int u_size = {self.size};')
-        if hasattr(self, 'compute_prog'):
-            self.compute_prog.release()
-        self.compute_prog = self.ctx.compute_shader(source)
+
+        for pass_idx, spec in enumerate(self._pass_specs):
+            key = spec['shader']
+            kind = spec.get('kind', 'voxel')
+            if is_element:
+                source = ELEMENT_COMPUTE_HEADER + ELEMENT_CA_RULE
+            elif kind == 'agent':
+                if key not in AGENT_RULES:
+                    raise KeyError(f"Pass {pass_idx} of preset {self.preset.get('label')!r} "
+                                   f"references unknown agent shader {key!r}")
+                source = AGENT_COMPUTE_HEADER + AGENT_RULES[key]
+            elif kind in ('entity_clear_hash', 'entity_build_hash',
+                          'entity_step', 'entity_paint', 'entity_paint_clear',
+                          'entity_field'):
+                # Entity-arena pass: pick the body and concat the shared header.
+                if kind == 'entity_clear_hash':
+                    body = entity_arena.SHADER_CLEAR_HASH
+                elif kind == 'entity_build_hash':
+                    body = entity_arena.SHADER_BUILD_HASH
+                elif kind == 'entity_paint':
+                    body = self.preset.get('entity_paint_shader',
+                                           entity_arena.SHADER_PAINT)
+                elif kind == 'entity_paint_clear':
+                    body = entity_arena.SHADER_PAINT_CLEAR
+                elif kind == 'entity_field':
+                    # 3D voxel-style pass: full COMPUTE_HEADER (8x8x8 layout,
+                    # u_src/u_dst image bindings, u_param0..3, u_dt, etc.)
+                    # Body comes from preset['entity_shaders'][key]; it does
+                    # NOT have access to entity SSBOs by default. Use
+                    # entity_step for per-entity work; entity_field is for
+                    # background field updates (food regrowth, diffusion).
+                    shaders = self.preset.get('entity_shaders', {})
+                    if key not in shaders:
+                        raise KeyError(
+                            f"Pass {pass_idx} kind=entity_field references unknown "
+                            f"shader {key!r}; declare it in preset['entity_shaders']")
+                    source = COMPUTE_HEADER + shaders[key]
+                    source = source.replace(
+                        '#version 430',
+                        f'#version 430\n#define USE_SHARED_MEM {smem}\n#define PASS_INDEX {pass_idx}')
+                    if self._tex_glsl_fmt != 'rgba32f':
+                        source = source.replace('rgba32f', self._tex_glsl_fmt)
+                    source = source.replace(
+                        'uniform int u_size;',
+                        f'const int u_size = {self.size};\n'
+                        f'const ivec3 u_dims = ivec3({self.W}, {self.H}, {self.D});')
+                    source = _anisotropize_glsl(source)
+                    self.compute_progs.append(self.ctx.compute_shader(source))
+                    continue
+                else:  # entity_step — body comes from preset's 'entity_shaders' dict
+                    shaders = self.preset.get('entity_shaders', {})
+                    if key not in shaders:
+                        raise KeyError(
+                            f"Pass {pass_idx} kind=entity_step references unknown "
+                            f"shader {key!r}; declare it in preset['entity_shaders']")
+                    body = shaders[key]
+                source = (entity_arena.ENTITY_LAYOUT_HEADER
+                          + entity_arena.ENTITY_GLSL_HEADER
+                          + body)
+            else:
+                if key not in CA_RULES:
+                    raise KeyError(f"Pass {pass_idx} of preset {self.preset.get('label')!r} "
+                                   f"references unknown shader {key!r}")
+                source = COMPUTE_HEADER + CA_RULES[key]
+            source = source.replace(
+                '#version 430',
+                f'#version 430\n#define USE_SHARED_MEM {smem}\n#define PASS_INDEX {pass_idx}')
+            if self._tex_glsl_fmt != 'rgba32f':
+                source = source.replace('rgba32f', self._tex_glsl_fmt)
+            source = source.replace(
+                'uniform int u_size;',
+                f'const int u_size = {self.size};\n'
+                f'const ivec3 u_dims = ivec3({self.W}, {self.H}, {self.D});')
+            source = _anisotropize_glsl(source)
+            # ── Block-sparse dispatch injection ──
+            # When the preset opts in AND this is a single-pass voxel rule
+            # AND we're at a grid size where _occ block_size == 8, rewrite
+            # the standard coord patterns so this shader can be dispatched
+            # indirectly over a compact list of active 8³ blocks.
+            #
+            # The rewrite is purely textual and depends on the canonical
+            # patterns that all CA shaders use:
+            #     ivec3 pos = ivec3(gl_GlobalInvocationID);
+            #     ivec3 tile_origin = ivec3(gl_WorkGroupID) * 8 - ivec3(1);
+            #     ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
+            # If a future shader uses a different pattern it must either
+            # adopt one of these forms or set sparse_dispatch=False.
+            sparse_eligible = (
+                self.preset.get('sparse_dispatch', False)
+                and len(self._pass_specs) == 1
+                and self._pass_specs[0].get('kind', 'voxel') == 'voxel'
+                and self.size >= 128
+                and kind == 'voxel'
+                # Honor the runtime toggle at compile time. Shaders are
+                # rewritten textually to use the sparse SSBO; the rewrite
+                # is incompatible with dense dispatch (gl_WorkGroupID would
+                # index uninitialized SSBO entries). Toggling the flag at
+                # runtime requires a recompile via _compile_compute().
+                and getattr(self, 'sparse_dispatch_enabled', True)
+            )
+            if sparse_eligible:
+                # Helpers that fetch the virtual workgroup coord from
+                # the SSBO, plus textual rewrites of the canonical
+                # patterns used by every CA shader. We inject the
+                # helpers RIGHT BEFORE `void main(` so they appear
+                # after the layout(local_size_*) qualifier (which
+                # `gl_WorkGroupSize` requires).
+                helpers = (
+                    "\n// ── injected by sparse_dispatch ──\n"
+                    "layout(std430, binding=11) readonly buffer _SparseBlocks {\n"
+                    "    uvec4 _sparse_blocks[];\n"
+                    "};\n"
+                    "uvec3 _sparse_wg(void)  { return _sparse_blocks[gl_WorkGroupID.x].xyz; }\n"
+                    "uvec3 _sparse_gid(void) { return _sparse_wg() * gl_WorkGroupSize + gl_LocalInvocationID; }\n"
+                    "// ── end injection ──\n\n"
+                )
+                if 'void main(' in source:
+                    source = source.replace('void main(', helpers + 'void main(', 1)
+                    # Rewrite the three canonical coord patterns to
+                    # use the virtual workgroup. Order matters — the
+                    # `* 8` patterns must be replaced before the bare
+                    # `ivec3(gl_WorkGroupID)` rewrite would catch them.
+                    source = source.replace(
+                        'ivec3(gl_WorkGroupID) * 8',
+                        'ivec3(_sparse_wg()) * 8')
+                    source = source.replace(
+                        'ivec3(gl_GlobalInvocationID)',
+                        'ivec3(_sparse_gid())')
+                    source = source.replace(
+                        'ivec3(gl_WorkGroupID)',
+                        'ivec3(_sparse_wg())')
+            self.compute_progs.append(self.ctx.compute_shader(source))
+
+        self.compute_prog = self.compute_progs[0]
 
     def _needs_field2(self):
-        """True when the active rule uses the second 4-channel scratchpad texture.
-        Currently only crystal_growth (separate solute concentration field for
-        partition rejection / constitutional undercooling)."""
+        """True when the active rule uses the second 4-channel scratchpad texture
+        (bindings 2/3, ping-ponged in lockstep with the primary pair).
+
+        A rule opts in either by setting `extra_fields: 1` (or higher) in its
+        preset, or — for backward compatibility — by being one of the historical
+        users (crystal_growth) that adopted the pair before the flag existed."""
+        if self.preset.get('extra_fields', 0) >= 1:
+            return True
         return self.preset.get('shader', '') == 'crystal_growth'
 
-    def _make_field2_init(self):
-        """Initial state for the second physics field. Only crystal_growth uses it.
-        R = solute concentration c (uniform 1.0 in the melt, 0 in pre-existing solid).
-        G,B,A = reserved for future fields (anisotropic temperature, convection v, ...)."""
+    def _extras_count(self):
+        """Number of ADDITIONAL fields beyond field2 (i.e. fields 3..N).
+        Returns 0 unless the preset declares `extra_fields >= 2`.
+        Bound at image units (4/5), (6/7), (8/9) for extras[0], extras[1], ..."""
+        n = int(self.preset.get('extra_fields', 0))
+        return max(0, n - 1)
+
+    def _make_field_init(self, init_name):
+        """Build a (size, size, size, 4) f32 init array for one auxiliary
+        field. Recognised names (extend as needed):
+          'zero'              — all zeros (default scratchpad)
+          'ones'              — all 1.0
+          'crystal_solute'    — R=1.0 (solute concentration in melt)
+          'fire_oxygen'       — A=1.0 (oxygen reservoir)
+          'fear_seed'         — small Gaussian fear bump (flocking pred)
+          'genome_random'     — random FitzHugh-Nagumo genome weights
+          'random_sparse_r'   — sparse 1.0 hits in R channel
+          'mesh:<spec>'       — voxelised mesh into channel 0
+        """
         arr = np.zeros((self.size, self.size, self.size, 4), dtype=np.float32)
-        arr[..., 0] = 1.0  # uniform solute concentration in the melt
+        if init_name in (None, 'zero'):
+            return arr
+        if init_name == 'ones':
+            arr[...] = 1.0
+            return arr
+        if init_name == 'crystal_solute':
+            arr[..., 0] = 1.0
+            return arr
+        if init_name == 'fire_oxygen':
+            arr[..., 3] = 1.0
+            return arr
+        if init_name == 'fear_seed':
+            cx = self.size * 0.7
+            cy = self.size * 0.3
+            cz = self.size * 0.5
+            sigma = max(self.size / 8.0, 2.0)
+            zz, yy, xx = np.mgrid[0:self.size, 0:self.size, 0:self.size]
+            r2 = (xx - cx)**2 + (yy - cy)**2 + (zz - cz)**2
+            arr[..., 0] = (0.3 * np.exp(-r2 / (2.0 * sigma * sigma))).astype(np.float32)
+            return arr
+        if init_name == 'genome_random':
+            rng = np.random.default_rng(getattr(self, 'seed', None) or 0)
+            r = rng.random((self.size, self.size, self.size, 4), dtype=np.float32)
+            arr[..., 0] = (r[..., 0] - 0.5) * 0.6
+            arr[..., 1] = 0.7 + r[..., 1] * 0.6
+            arr[..., 2] = (r[..., 2] - 0.5) * 0.6
+            arr[..., 3] = r[..., 3]
+            return arr
+        if init_name == 'random_sparse_r':
+            rng = np.random.default_rng(getattr(self, 'seed', None) or 0)
+            mask = rng.random((self.size, self.size, self.size), dtype=np.float32) < 0.05
+            arr[..., 0] = mask.astype(np.float32)
+            return arr
+        if isinstance(init_name, str) and init_name.startswith('mesh:'):
+            return init_mesh_from_spec(init_name, self.size,
+                                       np.random.RandomState(self.seed))
+        if isinstance(init_name, str) and init_name.startswith('lsystem:'):
+            return init_lsystem_from_spec(init_name, self.size,
+                                          np.random.RandomState(self.seed))
+        # Unknown name: fall through to zeros with a warning.
+        print(f"[field_init] unknown init '{init_name}', using zeros")
         return arr
+
+    def _make_field2_init(self):
+        """Initial state for the second physics field (back-compat shim
+        around _make_field_init)."""
+        init_name = self.preset.get('field2_init')
+        if init_name is None and self.preset.get('shader') == 'crystal_growth':
+            init_name = 'crystal_solute'
+        return self._make_field_init(init_name)
 
     def _alloc_field2(self):
         """Allocate tex_a2/tex_b2 sized to current grid. Caller must have already
         released any prior pair via _release_field2."""
-        init2 = self._make_field2_init()
-        init2_bytes = np.ascontiguousarray(init2.astype(self._tex_np_dtype)).tobytes()
-        self.tex_a2 = self.ctx.texture3d((self.size, self.size, self.size), 4,
+        init2 = self._fit_cubic_init(self._make_field2_init())
+        init2_bytes = self._encode_tex_data(init2)
+        self.tex_a2 = self.ctx.texture3d(self.dims, 4,
                                           init2_bytes, dtype=self._tex_dtype)
         del init2, init2_bytes
-        self.tex_b2 = self.ctx.texture3d((self.size, self.size, self.size), 4,
-                                          bytes(self.size ** 3 * self._tex_bpt),
+        self.tex_b2 = self.ctx.texture3d(self.dims, 4,
+                                          bytes(self.voxel_count * self._tex_bpt),
                                           dtype=self._tex_dtype)
         self.tex_a2.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.tex_b2.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -10130,30 +21196,669 @@ class Simulator:
             self.tex_b2.release()
             self.tex_b2 = None
 
+    # ── Additional auxiliary fields (extras[0..N-1] = fields 3..N+2) ─
+    # Bound at image units (4/5), (6/7), (8/9) for extras 0, 1, 2 ...
+    # Preset opts in by setting `extra_fields: N` with N>=2; per-field
+    # init name comes from `field_inits` (a list aligned with fields
+    # 2..N, i.e. field2 + extras). If `field_inits` is shorter than
+    # needed, missing entries default to 'zero'.
+    def _alloc_field_extras(self):
+        n = self._extras_count()
+        self.tex_a_extras = []
+        self.tex_b_extras = []
+        self.ping_extras = []
+        if n == 0:
+            return
+        inits = self.preset.get('field_inits', []) or []
+        # `field_inits[0]` corresponds to field2; extras[i] uses
+        # `field_inits[i+1]` if present, else 'zero'.
+        zero_bytes = bytes(self.voxel_count * self._tex_bpt)
+        for i in range(n):
+            init_name = inits[i + 1] if (i + 1) < len(inits) else 'zero'
+            init_arr = self._fit_cubic_init(self._make_field_init(init_name))
+            init_bytes = self._encode_tex_data(init_arr)
+            ta = self.ctx.texture3d(self.dims, 4, init_bytes, dtype=self._tex_dtype)
+            tb = self.ctx.texture3d(self.dims, 4, zero_bytes, dtype=self._tex_dtype)
+            ta.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            tb.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.tex_a_extras.append(ta)
+            self.tex_b_extras.append(tb)
+            self.ping_extras.append(0)
+            del init_arr, init_bytes
+
+    def _release_field_extras(self):
+        for tex_list_name in ('tex_a_extras', 'tex_b_extras'):
+            lst = getattr(self, tex_list_name, None)
+            if lst:
+                for t in lst:
+                    try:
+                        t.release()
+                    except Exception:
+                        pass
+            setattr(self, tex_list_name, [])
+        self.ping_extras = []
+
+    def _has_agents(self):
+        return self.preset.get('agent_count', 0) > 0
+
+    def _alloc_agents(self):
+        """Allocate the agent SSBO and seed it from the preset's
+        `agent_init` function. Buffer is sized for `agent_count` records of
+        32 bytes each (two ivec4s). Bound at SSBO binding 8 every step."""
+        count = int(self.preset['agent_count'])
+        init_name = self.preset.get('agent_init', 'langton_center')
+        init_func = AGENT_INIT_FUNCS.get(init_name, agent_init_langton_center)
+        rng = np.random.RandomState(self.seed)
+        rec = init_func(self.size, count, rng).astype(np.int32, copy=False)
+        if rec.shape != (count, 8):
+            raise ValueError(
+                f"agent_init {init_name!r} returned shape {rec.shape}, "
+                f"expected ({count}, 8)")
+        self.agent_count = count
+        self.agent_ssbo = self.ctx.buffer(data=rec.tobytes())
+
+    def _release_agents(self):
+        if getattr(self, 'agent_ssbo', None) is not None:
+            try:
+                self.agent_ssbo.release()
+            except Exception:
+                pass
+            self.agent_ssbo = None
+        self.agent_count = 0
+
+    # ── GPU Particles ────────────────────────────────────────────────
+    # Particles live in an SSBO at binding 9 (8 floats / 32 bytes each).
+    # Updated each step by `particle_update_prog`, rendered as
+    # screen-aligned billboards on top of voxel/volume output. Force
+    # comes from sampling the primary volume texture.
+    def _has_particles(self):
+        return int(self.preset.get('particle_count', 0)) > 0
+
+    def _alloc_particles(self):
+        count = int(self.preset['particle_count'])
+        init_name = self.preset.get('particle_init', 'random_volume')
+        init_func = PARTICLE_INIT_FUNCS.get(init_name,
+                                            particle_init_random_volume)
+        # Use default_rng (BitGenerator) so init funcs that pass dtype=
+        # to .random() work; legacy RandomState lacked that kwarg.
+        rng = np.random.default_rng(self.seed)
+        rec = init_func(self.size, count, rng).astype(np.float32, copy=False)
+        if rec.shape != (count, 8):
+            raise ValueError(
+                f"particle_init {init_name!r} returned shape {rec.shape}, "
+                f"expected ({count}, 8)")
+        self.particle_count = count
+        self.particle_ssbo = self.ctx.buffer(data=rec.tobytes())
+        # Empty VAO; vertex shader pulls particle data from the SSBO and
+        # synthesises the 6 quad corners from gl_VertexID.
+        if not hasattr(self, '_particle_render_prog'):
+            self._compile_particle_progs()
+        if getattr(self, 'particle_render_vao', None) is None:
+            self.particle_render_vao = self.ctx.vertex_array(
+                self._particle_render_prog, [])
+        # NN brains (optional). Allocate once particle_count is known.
+        self._alloc_brains()
+
+    def _release_particles(self):
+        if getattr(self, 'particle_ssbo', None) is not None:
+            try:
+                self.particle_ssbo.release()
+            except Exception:
+                pass
+            self.particle_ssbo = None
+        if getattr(self, 'particle_render_vao', None) is not None:
+            try:
+                self.particle_render_vao.release()
+            except Exception:
+                pass
+            self.particle_render_vao = None
+        self.particle_count = 0
+        self._release_brains()
+
+    # ── NN Brains for particle agents ────────────────────────────────
+    # When `nn_brain_hidden > 0` is set in the preset, each particle
+    # gets a small MLP (6 inputs → H hidden → 3 outputs) whose weights
+    # live in an SSBO at binding 13. Set `nn_brain_shared=True` to use
+    # one brain for the whole swarm (deterministic flock); leave False
+    # for per-agent random brains (heterogeneous behaviour).
+    def _has_brains(self):
+        return int(self.preset.get('nn_brain_hidden', 0)) > 0 \
+               and self._has_particles()
+
+    def _alloc_brains(self):
+        if not self._has_brains():
+            self._release_brains()
+            return
+        h = int(self.preset['nn_brain_hidden'])
+        shared = bool(self.preset.get('nn_brain_shared', False))
+        stride = 10 * h + 3  # W1(6×h) + b1(h) + W2(h×3) + b2(3)
+        n = 1 if shared else self.particle_count
+        seed = int(self.preset.get('nn_brain_seed', self.seed))
+        rng = np.random.default_rng(seed)
+        # Xavier init for tanh: scale = sqrt(6/(fan_in+fan_out))
+        s1 = float(np.sqrt(6.0 / (6 + h)))
+        s2 = float(np.sqrt(6.0 / (h + 3)))
+        weights = np.zeros((n, stride), dtype=np.float32)
+        # W1: indices [0 : 6h)
+        weights[:, 0:6*h]      = (rng.random((n, 6*h), dtype=np.float32)*2 - 1) * s1
+        # b1: indices [6h : 7h)
+        # (zero init — already zeros)
+        # W2: indices [7h : 10h)
+        weights[:, 7*h:10*h]   = (rng.random((n, 3*h), dtype=np.float32)*2 - 1) * s2
+        # b2: indices [10h : 10h+3)
+        # (zero init)
+        # Release any prior brain SSBO (size may have changed).
+        if getattr(self, 'brain_ssbo', None) is not None:
+            try: self.brain_ssbo.release()
+            except Exception: pass
+        self.brain_ssbo = self.ctx.buffer(data=weights.tobytes())
+
+    def _release_brains(self):
+        if getattr(self, 'brain_ssbo', None) is not None:
+            try: self.brain_ssbo.release()
+            except Exception: pass
+            self.brain_ssbo = None
+
+    def _compile_particle_progs(self):
+        """Compile + cache the particle update (compute) and render
+        (vertex/fragment) programs and look up uniforms once.
+
+        If the preset enables NN brains (via `nn_brain_hidden > 0`), the
+        compute shader is built with `#define NN_HID <h>` and an extra
+        SSBO at binding 13 holding per-agent (or shared) MLP weights.
+        """
+        nn_hid    = int(self.preset.get('nn_brain_hidden', 0))
+        nn_shared = 1 if self.preset.get('nn_brain_shared', False) else 0
+        src = PARTICLE_UPDATE_COMPUTE.replace(
+            '#version 430',
+            f'#version 430\n#define NN_HID {nn_hid}\n#define NN_SHARED {nn_shared}',
+            1,
+        )
+        self._particle_update_prog = self.ctx.compute_shader(src)
+        self._nn_hid_compiled    = nn_hid
+        self._nn_shared_compiled = nn_shared
+        u = self._particle_update_prog
+        self._pu_size       = u['u_size']
+        self._pu_count      = u['u_count']
+        self._pu_force_mode = u['u_force_mode']
+        self._pu_force_scale = u['u_force_scale']
+        self._pu_dt         = u['u_dt']
+        self._pu_drag       = u['u_drag']
+        self._pu_life_decay = u['u_life_decay']
+        self._pu_respawn    = u['u_respawn']
+        self._pu_frame      = u['u_frame']
+        self._pu_spawn_min  = u['u_spawn_min']
+        self._pu_spawn_max  = u['u_spawn_max']
+        self._pu_spawn_speed = u['u_spawn_speed']
+        u['u_field_tex'].value = 7  # texture unit 7 (won't clash w/ unit 0)
+
+        self._particle_render_prog = self.ctx.program(
+            vertex_shader=PARTICLE_VERTEX_SHADER,
+            fragment_shader=PARTICLE_FRAGMENT_SHADER,
+        )
+        r = self._particle_render_prog
+        # Some uniforms (e.g. u_camera_pos) may be optimised out if unused
+        # by the current shader paths; use .get() and tolerate None.
+        self._pr_view_proj    = r.get('u_view_proj', None)
+        self._pr_camera_pos   = r.get('u_camera_pos', None)
+        self._pr_camera_right = r.get('u_camera_right', None)
+        self._pr_camera_up    = r.get('u_camera_up', None)
+        self._pr_size_world   = r.get('u_size_world', None)
+        self._pr_world_per_cell = r.get('u_world_per_cell', None)
+        self._pr_color_mode   = r.get('u_color_mode', None)
+        self._pr_color_fixed  = r.get('u_color_fixed', None)
+        self._pr_speed_scale  = r.get('u_speed_scale', None)
+        self._pr_alpha        = r.get('u_alpha', None)
+
+    def _step_particles(self):
+        """One integration step. Called from `_step_sim` after the rule
+        passes have written the latest field state."""
+        if not self._has_particles():
+            return
+        if not hasattr(self, '_particle_update_prog'):
+            self._compile_particle_progs()
+        # If the preset's NN config changed (rule swap, manual edit), the
+        # cached compute shader has stale NN_HID/NN_SHARED #defines. Detect
+        # and recompile.
+        wanted_hid    = int(self.preset.get('nn_brain_hidden', 0))
+        wanted_shared = 1 if self.preset.get('nn_brain_shared', False) else 0
+        if (getattr(self, '_nn_hid_compiled', 0)    != wanted_hid
+                or getattr(self, '_nn_shared_compiled', 0) != wanted_shared):
+            try: self._particle_update_prog.release()
+            except Exception: pass
+            del self._particle_update_prog
+            self._compile_particle_progs()
+            # Brain SSBO may need re-allocating if hidden size changed.
+            self._alloc_brains()
+        # Bind primary volume tex (current src) on unit 7 for sampling.
+        src = self.tex_a if self.ping == 0 else self.tex_b
+        src.use(location=7)
+        # Bind SSBO at binding 9.
+        self.particle_ssbo.bind_to_storage_buffer(9)
+        # Bind brain SSBO at binding 13 if present.
+        if self._has_brains() and getattr(self, 'brain_ssbo', None) is not None:
+            self.brain_ssbo.bind_to_storage_buffer(13)
+
+        force_name = self.preset.get('particle_force', 'none')
+        force_mode = PARTICLE_FORCE_MODES.get(force_name, 0)
+        self._pu_size.value        = self.size
+        self._pu_count.value       = self.particle_count
+        self._pu_force_mode.value  = force_mode
+        self._pu_force_scale.value = float(self.preset.get('particle_force_scale', 1.0))
+        self._pu_dt.value          = float(self.preset.get('particle_dt', 0.5))
+        self._pu_drag.value        = float(self.preset.get('particle_drag', 0.02))
+        self._pu_life_decay.value  = float(self.preset.get('particle_life_decay', 0.005))
+        self._pu_respawn.value     = 1 if self.preset.get('particle_respawn', True) else 0
+        self._pu_frame.value       = int(self.step_count) & 0x7fffffff
+        spawn_min = self.preset.get('particle_spawn_min', (0.0, 0.0, 0.0))
+        spawn_max = self.preset.get('particle_spawn_max',
+                                    (float(self.size), float(self.size), float(self.size)))
+        self._pu_spawn_min.value = tuple(spawn_min)
+        self._pu_spawn_max.value = tuple(spawn_max)
+        self._pu_spawn_speed.value = float(self.preset.get('particle_spawn_speed', 0.1))
+
+        groups = (self.particle_count + 63) // 64
+        self._particle_update_prog.run(groups, 1, 1)
+        GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT
+                           | GL.GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT)
+
+    def _render_particles(self):
+        """Draw the particle SSBO as additive billboards on top of the
+        already-rendered scene. Caller must leave the screen FBO bound."""
+        if not self._has_particles():
+            return
+        if not hasattr(self, '_particle_render_prog'):
+            self._compile_particle_progs()
+        self.particle_ssbo.bind_to_storage_buffer(9)
+
+        view_proj_flat, vp_row_major = self._get_view_proj()
+        cam_pos = self._get_camera_pos()
+        cam_rot = self._get_camera_rot()
+        right = cam_rot[:, 0]
+        up    = cam_rot[:, 1]
+
+        def _set(u, v):
+            if u is not None:
+                u.value = v
+        _set(self._pr_view_proj, tuple(view_proj_flat))
+        _set(self._pr_camera_pos, tuple(float(c) for c in cam_pos))
+        _set(self._pr_camera_right, tuple(float(c) for c in right))
+        _set(self._pr_camera_up, tuple(float(c) for c in up))
+        _set(self._pr_size_world, float(self.preset.get('particle_size', 0.6)))
+        _set(self._pr_world_per_cell, (float(self.box_dims[0]) / self.W,
+                                        float(self.box_dims[1]) / self.H,
+                                        float(self.box_dims[2]) / self.D))
+        _set(self._pr_color_mode, PARTICLE_COLOR_MODES.get(
+            self.preset.get('particle_color_mode', 'speed'), 1))
+        _set(self._pr_color_fixed, tuple(self.preset.get(
+            'particle_color', (1.0, 0.8, 0.4))))
+        _set(self._pr_speed_scale, float(self.preset.get(
+            'particle_speed_scale', 5.0)))
+        _set(self._pr_alpha, float(self.preset.get('particle_alpha', 0.6)))
+
+        # Additive blend; no depth write so particles never occlude
+        # each other. Depth test off for v1 — will refine later.
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.particle_render_vao.render(moderngl.TRIANGLES,
+                                        vertices=self.particle_count * 6)
+        self.ctx.disable(moderngl.BLEND)
+
+    # ── Vector-Field Glyphs ──────────────────────────────────────────
+    # Sparse 3D grid of oriented line segments sampled from the primary
+    # volume tex. Configured per-preset:
+    #   "glyph_stride": int N         — one glyph every N cells (default 8)
+    #   "glyph_source": str           — 'rgb', 'gradient', 'curl' (default 'rgb')
+    #   "glyph_scale":  float         — segment length per unit |v| in cells
+    #   "glyph_threshold": float      — skip glyphs with |v| < this
+    #   "glyph_alpha":  float         — overall alpha (default 0.6)
+    #   "glyph_mag_scale": float      — colour magnitude scale (default 5.0)
+    GLYPH_SOURCES = {'rgb': 0, 'gradient': 1, 'curl': 2}
+
+    def _has_glyphs(self):
+        return bool(self.preset.get('glyph_enabled', False)) or \
+               'glyph_stride' in self.preset or \
+               'glyph_source' in self.preset
+
+    def _compile_glyph_progs(self):
+        self._glyph_line_prog = self.ctx.program(
+            vertex_shader=GLYPH_LINE_VERTEX_SHADER,
+            fragment_shader=GLYPH_LINE_FRAGMENT_SHADER,
+        )
+        g = self._glyph_line_prog
+        # All uniforms via .get() — driver can optimise some out for
+        # specific source modes (e.g. u_threshold trivially passes).
+        self._gl_view_proj = g.get('u_view_proj', None)
+        self._gl_size      = g.get('u_size', None)
+        self._gl_world_per_cell = g.get('u_world_per_cell', None)
+        self._gl_grid_dim  = g.get('u_grid_dim', None)
+        self._gl_origin    = g.get('u_origin', None)
+        self._gl_step      = g.get('u_step', None)
+        self._gl_scale     = g.get('u_scale', None)
+        self._gl_source    = g.get('u_source', None)
+        self._gl_threshold = g.get('u_threshold', None)
+        self._gl_mag_scale = g.get('u_mag_scale', None)
+        self._gl_global_alpha = g.get('u_global_alpha', None)
+        ft = g.get('u_field_tex', None)
+        if ft is not None:
+            ft.value = 7
+        self._glyph_vao = self.ctx.vertex_array(self._glyph_line_prog, [])
+
+    def _render_glyphs(self):
+        if not self._has_glyphs():
+            return
+        if not hasattr(self, '_glyph_line_prog'):
+            self._compile_glyph_progs()
+
+        stride = max(1, int(self.preset.get('glyph_stride', 8)))
+        gn = max(1, self.size // stride)
+        # Centre the grid: origin offset puts the first glyph at half-stride.
+        origin = (stride * 0.5, stride * 0.5, stride * 0.5)
+        step = (float(stride),) * 3
+
+        # Bind primary volume on tex unit 7
+        src = self.tex_a if self.ping == 0 else self.tex_b
+        src.use(location=7)
+
+        view_proj_flat, _ = self._get_view_proj()
+        def _set(u, v):
+            if u is not None:
+                u.value = v
+        _set(self._gl_view_proj, tuple(view_proj_flat))
+        _set(self._gl_size, self.size)
+        _set(self._gl_world_per_cell, (float(self.box_dims[0]) / self.W,
+                                        float(self.box_dims[1]) / self.H,
+                                        float(self.box_dims[2]) / self.D))
+        _set(self._gl_grid_dim, (gn, gn, gn))
+        _set(self._gl_origin, origin)
+        _set(self._gl_step, step)
+        _set(self._gl_scale, float(self.preset.get('glyph_scale', stride * 0.6)))
+        src_name = self.preset.get('glyph_source', 'rgb')
+        _set(self._gl_source, self.GLYPH_SOURCES.get(src_name, 0))
+        _set(self._gl_threshold, float(self.preset.get('glyph_threshold', 0.02)))
+        _set(self._gl_mag_scale, float(self.preset.get('glyph_mag_scale', 5.0)))
+        _set(self._gl_global_alpha, float(self.preset.get('glyph_alpha', 0.6)))
+
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self._glyph_vao.render(moderngl.LINES,
+                               vertices=gn * gn * gn * 2)
+        self.ctx.disable(moderngl.BLEND)
+
+    # ── Marching Cubes Iso-surface ───────────────────────────────────
+    # GPU MC: per-step compute pass writes triangles into an SSBO; render
+    # pass draws them. Enabled by `iso_surface: True` in preset (or by the
+    # UI/runtime). Falls back to no-op when disabled.
+    def _has_iso_surface(self):
+        return bool(self.preset.get('iso_surface', False)) or \
+               bool(getattr(self, '_iso_surface_enabled', False))
+
+    def _compile_mc_progs(self):
+        self._mc_compute_prog = self.ctx.compute_shader(MC_COMPUTE_SHADER)
+        c = self._mc_compute_prog
+        self._mc_size      = c.get('u_size', None)
+        self._mc_channel   = c.get('u_channel', None)
+        self._mc_use_abs   = c.get('u_use_abs', None)
+        self._mc_iso       = c.get('u_iso', None)
+        self._mc_max_verts = c.get('u_max_verts', None)
+        ft = c.get('u_field_tex', None)
+        if ft is not None:
+            ft.value = 7
+
+        self._mc_render_prog = self.ctx.program(
+            vertex_shader=MC_VERTEX_SHADER,
+            fragment_shader=MC_FRAGMENT_SHADER,
+        )
+        r = self._mc_render_prog
+        self._mc_r_view_proj   = r.get('u_view_proj', None)
+        self._mc_r_camera_pos  = r.get('u_camera_pos', None)
+        self._mc_r_world_per_cell = r.get('u_world_per_cell', None)
+        self._mc_r_color       = r.get('u_color', None)
+        self._mc_r_alpha       = r.get('u_alpha', None)
+        self._mc_r_double_sided = r.get('u_double_sided', None)
+        self._mc_r_size        = r.get('u_size', None)
+        self._mc_render_vao = self.ctx.vertex_array(self._mc_render_prog, [])
+
+        # Default vertex budget: 2M verts × 32 B = 64 MB
+        self._mc_max_verts_value = int(self.preset.get('iso_max_verts', 2_000_000))
+        self._mc_vert_ssbo = self.ctx.buffer(reserve=self._mc_max_verts_value * 32)
+        # Counter SSBO: 16 B (uint vert_count + 12 B padding)
+        self._mc_counter_ssbo = self.ctx.buffer(reserve=16)
+
+        # Tri table SSBO (4096 ints = 16 KB)
+        tri_data = np.array(MC_TRI_TABLE, dtype=np.int32).tobytes()
+        self._mc_tri_ssbo = self.ctx.buffer(data=tri_data)
+
+    def _step_iso_surface(self):
+        """Run the MC compute pass, populating the vertex SSBO from the
+        current field state. Called from _render_iso_surface (lazy)."""
+        if not hasattr(self, '_mc_compute_prog'):
+            self._compile_mc_progs()
+
+        # Zero counter
+        self._mc_counter_ssbo.write(b'\x00' * 16)
+
+        # Bind primary tex on unit 7
+        src = self.tex_a if self.ping == 0 else self.tex_b
+        src.use(location=7)
+        # Bind SSBOs
+        self._mc_vert_ssbo.bind_to_storage_buffer(10)
+        self._mc_counter_ssbo.bind_to_storage_buffer(11)
+        self._mc_tri_ssbo.bind_to_storage_buffer(12)
+
+        def _set(u, v):
+            if u is not None:
+                u.value = v
+        _set(self._mc_size, self.size)
+        _set(self._mc_channel, int(self.preset.get('iso_channel', self.vis_channel)))
+        _set(self._mc_use_abs, 1 if self.preset.get('iso_use_abs', self.vis_abs) else 0)
+        _set(self._mc_iso, float(self.preset.get('iso_value', self.iso_threshold)))
+        _set(self._mc_max_verts, self._mc_max_verts_value)
+
+        gx = (self.size + 3) // 4
+        self._mc_compute_prog.run(gx, gx, gx)
+        GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT
+                           | GL.GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT)
+
+        # Read back vertex count (4 B) — small + cheap, lets us draw exact count
+        cnt_bytes = self._mc_counter_ssbo.read(size=4)
+        self._mc_last_vert_count = min(int(np.frombuffer(cnt_bytes, dtype=np.uint32)[0]),
+                                       self._mc_max_verts_value)
+
+    def _render_iso_surface(self):
+        if not self._has_iso_surface():
+            return
+        if not hasattr(self, '_mc_compute_prog'):
+            self._compile_mc_progs()
+        # Re-extract every frame so it tracks the live field
+        self._step_iso_surface()
+        if self._mc_last_vert_count == 0:
+            return
+
+        self._mc_vert_ssbo.bind_to_storage_buffer(10)
+        view_proj_flat, _ = self._get_view_proj()
+        cam_pos = self._get_camera_pos()
+        def _set(u, v):
+            if u is not None:
+                u.value = v
+        _set(self._mc_r_view_proj, tuple(view_proj_flat))
+        _set(self._mc_r_camera_pos, tuple(float(c) for c in cam_pos))
+        _set(self._mc_r_world_per_cell, (float(self.box_dims[0]) / self.W,
+                                          float(self.box_dims[1]) / self.H,
+                                          float(self.box_dims[2]) / self.D))
+        _set(self._mc_r_color, tuple(self.preset.get('iso_color', (0.85, 0.78, 0.62))))
+        _set(self._mc_r_alpha, float(self.preset.get('iso_alpha', 1.0)))
+        _set(self._mc_r_double_sided,
+             1 if self.preset.get('iso_double_sided', True) else 0)
+        _set(self._mc_r_size, self.size)
+
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        # Translucent isos use a sane premult-over blend; opaque ones skip blend.
+        if float(self.preset.get('iso_alpha', 1.0)) < 0.999:
+            self.ctx.enable(moderngl.BLEND)
+            self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self._mc_render_vao.render(moderngl.TRIANGLES,
+                                   vertices=self._mc_last_vert_count)
+        self.ctx.disable(moderngl.BLEND)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+
+    def _release_mc(self):
+        for attr in ('_mc_vert_ssbo', '_mc_counter_ssbo', '_mc_tri_ssbo',
+                     '_mc_render_vao'):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try: obj.release()
+                except Exception: pass
+                setattr(self, attr, None)
+        # Force recompile on next use (handles size changes that affect cap)
+        for attr in ('_mc_compute_prog', '_mc_render_prog'):
+            if hasattr(self, attr):
+                try: getattr(self, attr).release()
+                except Exception: pass
+                delattr(self, attr)
+
+    # ── Entity Arena ──────────────────────────────────────────────────
+    def _has_entity_arena(self):
+        return 'entity_arena' in self.preset
+
+    def _alloc_entity_arena(self):
+        """Construct and seed an EntityArena from the preset's
+        `entity_arena` config dict and `on_init` callback."""
+        cfg = dict(self.preset['entity_arena'])  # copy
+        max_entities = int(cfg.pop('max_entities', entity_arena.DEFAULT_MAX_ENTITIES))
+        max_teams    = int(cfg.pop('max_teams',    entity_arena.DEFAULT_MAX_TEAMS))
+        max_goals    = int(cfg.pop('max_goals',    entity_arena.DEFAULT_MAX_GOALS))
+        hash_cell    = int(cfg.pop('hash_cell',    entity_arena.DEFAULT_HASH_CELL))
+        self.arena = entity_arena.EntityArena(
+            self.ctx, self.size,
+            max_entities=max_entities, max_teams=max_teams, max_goals=max_goals,
+            hash_cell=hash_cell)
+        self.arena.alloc_gpu()
+        on_init = self.preset.get('on_init')
+        if on_init is not None:
+            rng = np.random.RandomState(self.seed)
+            on_init(self.arena, self.size, rng, self.params)
+        # Push initial CPU state to GPU.
+        self.arena.push_all()
+
+    def _release_entity_arena(self):
+        if getattr(self, 'arena', None) is not None:
+            try:
+                self.arena.release()
+            except Exception:
+                pass
+            self.arena = None
+
     def _init_volume(self):
         rng = np.random.RandomState(self.seed)
         init_name = getattr(self, '_current_init', self.preset['init'])
-        init_func = INIT_FUNCS.get(init_name, init_random_sparse)
-        data = init_func(self.size, rng)
+        if isinstance(init_name, str) and '+' in init_name:
+            # Compound init: sum each part, clip to [0,1]. Allows flagships
+            # to layer L-system seeds on top of a substrate background.
+            parts = [p.strip() for p in init_name.split('+') if p.strip()]
+            def _resolve_one(p):
+                if p.startswith('mesh:'):
+                    return lambda sz, r: init_mesh_from_spec(p, sz, r)
+                if p.startswith('lsystem:'):
+                    return lambda sz, r: init_lsystem_from_spec(p, sz, r)
+                return INIT_FUNCS.get(p, init_random_sparse)
+            funcs = [_resolve_one(p) for p in parts]
+            def _compound(sz, r):
+                acc = funcs[0](sz, r)
+                for f in funcs[1:]:
+                    acc = acc + f(sz, r)
+                return np.clip(acc, 0.0, 1.0).astype(np.float32)
+            init_func = _compound
+        elif isinstance(init_name, str) and init_name.startswith('mesh:'):
+            spec = init_name
+            init_func = lambda sz, r: init_mesh_from_spec(spec, sz, r)
+        elif isinstance(init_name, str) and init_name.startswith('lsystem:'):
+            spec = init_name
+            init_func = lambda sz, r: init_lsystem_from_spec(spec, sz, r)
+        else:
+            init_func = INIT_FUNCS.get(init_name, init_random_sparse)
 
-        # Convert to the active texture dtype (float32 for small grids, float16 for large)
-        data_bytes = np.ascontiguousarray(data.astype(self._tex_np_dtype)).tobytes()
-        self.tex_a = self.ctx.texture3d((self.size, self.size, self.size), 4,
-                                         data_bytes, dtype=self._tex_dtype)
-        del data, data_bytes  # free before allocating second texture
-        zeros = bytes(self.size ** 3 * self._tex_bpt)
-        self.tex_b = self.ctx.texture3d((self.size, self.size, self.size), 4,
-                                         zeros, dtype=self._tex_dtype)
-        del zeros
-        self.tex_a.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.tex_b.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        # ── Init path selection by grid memory cost ──────────────────
+        # CPU init scratch = voxel_count * 16 B (full f32 RGBA cube).
+        # At 1024³ that's 16 GiB and OOMs. We have three tiers:
+        #   1. < 256 MiB scratch → legacy full-array path (any init).
+        #   2. >= 256 MiB AND init in STREAMABLE → CPU streaming path.
+        #   3. >= 1 GiB OR init not streamable AND too big → GPU init
+        #      (zero CPU scratch). The original init is replaced with
+        #      a 'random_sparse' equivalent computed on-device; we
+        #      print a notice so the caller knows the preset's IC
+        #      was substituted.
+        full_scratch = self.voxel_count * 16  # bytes for f32 RGBA
+        STREAM_THRESHOLD = 256 * 1024 * 1024   # 256 MiB
+        GPU_THRESHOLD    = 1024 * 1024 * 1024  # 1 GiB
+        STREAMABLE = ('random_sparse', 'blank', 'blank_voxels')
+        force_gpu = full_scratch > GPU_THRESHOLD or (
+            full_scratch > STREAM_THRESHOLD and init_name not in STREAMABLE)
+
+        if force_gpu:
+            # Pick a GPU-supported init equivalent.
+            gpu_init = 'random_sparse'
+            if init_name in ('blank', 'blank_voxels'):
+                gpu_init = 'blank'
+            if init_name not in STREAMABLE:
+                print(f"[init] grid {self.dims} too large for CPU init "
+                      f"'{init_name}' ({full_scratch/2**30:.1f} GiB scratch); "
+                      f"using GPU '{gpu_init}' instead.")
+            self.tex_a = self.ctx.texture3d(self.dims, 4, dtype=self._tex_dtype)
+            self._gpu_init_volume(gpu_init, self.seed)
+        elif full_scratch > STREAM_THRESHOLD and init_name in STREAMABLE:
+            self.tex_a = self._alloc_volume_streaming(init_name, rng)
+        else:
+            data = init_func(self.size, rng)
+            data = self._fit_cubic_init(data)
+            data_bytes = self._encode_tex_data(data)
+            self.tex_a = self.ctx.texture3d(self.dims, 4,
+                                             data_bytes, dtype=self._tex_dtype)
+            del data, data_bytes  # free before allocating second texture
+
+        # tex_b: zero-init. Stream as well to avoid a multi-GiB Python
+        # bytes object at large sizes.
+        if full_scratch > STREAM_THRESHOLD:
+            self.tex_b = self._alloc_volume_zero_streaming()
+        else:
+            zeros = bytes(self.voxel_count * self._tex_bpt)
+            self.tex_b = self.ctx.texture3d(self.dims, 4,
+                                             zeros, dtype=self._tex_dtype)
+            del zeros
+        # Discrete-state CAs (kind enum stored in ch0) need NEAREST
+        # filtering so adjacent empty/occupied cells don't trilinearly
+        # interpolate into ghost voxels at the boundary.
+        if self.preset.get('voxel_filter') == 'nearest':
+            self.tex_a.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.tex_b.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        else:
+            self.tex_a.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.tex_b.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.ping = 0
         # Allocate (or release) the optional second physics field
         self._release_field2()
         if self._needs_field2():
             self._alloc_field2()
+        # Allocate (or release) extras (fields 3..N)
+        self._release_field_extras()
+        if self._extras_count() > 0:
+            self._alloc_field_extras()
+        # Allocate (or release) the optional agent buffer
+        self._release_agents()
+        if self._has_agents():
+            self._alloc_agents()
+        # Allocate (or release) the optional GPU particle layer
+        self._release_particles()
+        if self._has_particles():
+            self._alloc_particles()
+        # Allocate (or release) the optional entity arena substrate
+        self._release_entity_arena()
+        if self._has_entity_arena():
+            self._alloc_entity_arena()
         # Allocate acceleration structures for new volume
-        self._alloc_accel_textures(self.size)
+        self._alloc_accel_textures(self.dims)
 
     def _get_camera_pos(self):
         x = self.cam_dist * math.cos(self.cam_phi) * math.sin(self.cam_theta)
@@ -10448,7 +22153,10 @@ class Simulator:
             self.tex_a.release()
             self.tex_b.release()
             self._release_field2()
-            self.size = loaded_size
+            self._release_field_extras()
+            self._release_particles()
+            self._release_mc()
+            self._apply_dims((loaded_size, loaded_size, loaded_size))
             self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
                 _tex_format_for_size(loaded_size)
             self._compile_compute()
@@ -10479,7 +22187,7 @@ class Simulator:
         # Write loaded data into the current source texture
         self.ping = 0
         src_tex = self.tex_a
-        src_tex.write(grid.astype(self._tex_np_dtype).tobytes())
+        src_tex.write(self._encode_tex_data(grid))
         self.step_count = int(data['step'])
 
         # Reset scoring state for the new grid
@@ -10638,56 +22346,262 @@ class Simulator:
     # ── Simulation ────────────────────────────────────────────────────
 
     def _cache_compute_uniforms(self):
-        """Cache uniform member references to avoid dict lookups every step."""
-        prog = self.compute_prog
-        self._cu_size = prog['u_size'] if 'u_size' in prog else None
-        self._cu_dt = prog['u_dt'] if 'u_dt' in prog else None
-        self._cu_boundary = prog['u_boundary'] if 'u_boundary' in prog else None
-        self._cu_frame = prog['u_frame'] if 'u_frame' in prog else None
-        self._cu_params = []
-        for i in range(4):
-            name = f'u_param{i}'
-            self._cu_params.append(prog[name] if name in prog else None)
-        self._cu_groups = (self.size + 7) // 8
+        """Cache uniform member references (per pass) to avoid dict lookups
+        every step. Stores one dict per program in `self._cu_per_pass`."""
+        self._cu_per_pass = []
+        for prog in self.compute_progs:
+            cu = {
+                'size': prog['u_size'] if 'u_size' in prog else None,
+                'dt': prog['u_dt'] if 'u_dt' in prog else None,
+                'boundary': prog['u_boundary'] if 'u_boundary' in prog else None,
+                'frame': prog['u_frame'] if 'u_frame' in prog else None,
+                'pass': prog['u_pass'] if 'u_pass' in prog else None,
+                'params': [prog[f'u_param{i}'] if f'u_param{i}' in prog else None
+                           for i in range(4)],
+                # Cache prog handle for entity-arena uniform pushes that
+                # iterate by name rather than fixed slots.
+                'prog': prog,
+            }
+            self._cu_per_pass.append(cu)
+        # Legacy aliases (single-pass code paths still touch these).
+        first = self._cu_per_pass[0]
+        self._cu_size = first['size']
+        self._cu_dt = first['dt']
+        self._cu_boundary = first['boundary']
+        self._cu_frame = first['frame']
+        self._cu_params = first['params']
+        # Per-axis dispatch group counts. For cubic grids gx==gy==gz, so
+        # callers can keep using `*self._cu_groups`. For anisotropic
+        # grids each axis is rounded up independently.
+        self._cu_groups = ((self.W + 7) // 8,
+                           (self.H + 7) // 8,
+                           (self.D + 7) // 8)
 
     def _step_sim(self):
-        src = self.tex_a if self.ping == 0 else self.tex_b
-        dst = self.tex_b if self.ping == 0 else self.tex_a
+        """Advance the simulation by one logical step.
 
-        src.bind_to_image(0, read=True, write=False)
-        dst.bind_to_image(1, read=False, write=True)
+        Each pass declares which texture pair(s) it writes to (via the
+        `writes` field in the pass spec). Only the written pairs are
+        ping-ponged after the dispatch — pairs the pass leaves alone keep
+        their src binding stable so a later pass can still read them.
 
-        # Optional second 4-channel physics field (e.g. crystal_growth solute).
-        # Pings in lockstep with the primary pair so reads/writes stay coherent.
-        if getattr(self, 'tex_a2', None) is not None:
-            src2 = self.tex_a2 if self.ping == 0 else self.tex_b2
-            dst2 = self.tex_b2 if self.ping == 0 else self.tex_a2
-            src2.bind_to_image(2, read=True, write=False)
-            dst2.bind_to_image(3, read=False, write=True)
-
-        if self.is_element_ca:
-            self.element_ssbo.bind_to_storage_buffer(2)
-
-        # Use cached uniform references (built in _cache_compute_uniforms)
-        if self._cu_size is not None:
-            self._cu_size.value = self.size
-        if self._cu_dt is not None:
-            self._cu_dt.value = self.dt
-        if self._cu_boundary is not None:
-            self._cu_boundary.value = self.boundary_mode
-        if self._cu_frame is not None:
-            self._cu_frame.value = self.step_count
-
+        For single-pass rules `writes=("p1",)` is the default, matching
+        legacy behaviour. For Stable Fluids:
+          - Pass 1 (advect)     writes p1 only
+          - Passes 2..4 (proj)  write p2 only — p1 stays untouched
+          - Pass 5 (subtract)   writes p1 — reads pressure from p2
+        """
         param_values = list(self.params.values())
-        for i, cu in enumerate(self._cu_params):
-            if cu is not None:
-                cu.value = float(param_values[i]) if i < len(param_values) else 0.0
+        # Per-pair ping bits. self.ping (legacy) tracks p1; self.ping2 tracks p2.
+        if not hasattr(self, 'ping2'):
+            self.ping2 = 0
+        if not hasattr(self, 'ping_extras'):
+            self.ping_extras = []
+        if not hasattr(self, 'tex_a_extras'):
+            self.tex_a_extras = []
+            self.tex_b_extras = []
+        has_agents = getattr(self, 'agent_ssbo', None) is not None
+        has_arena = getattr(self, 'arena', None) is not None
 
-        self.compute_prog.run(self._cu_groups, self._cu_groups, self._cu_groups)
-        GL.glMemoryBarrier(GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
-                           GL.GL_TEXTURE_FETCH_BARRIER_BIT)
+        # Entity-arena CPU hook: lets the scenario spawn/despawn/score
+        # before the GPU passes run for this frame.
+        if has_arena:
+            on_tick = self.preset.get('on_tick')
+            if on_tick is not None:
+                on_tick(self.arena, self.step_count, self.params)
+            # Push any CPU-side mutations (entities/teams/goals) to GPU.
+            # Cheap full-buffer rewrite for now; can be optimised later.
+            self.arena.push_all()
 
-        self.ping = 1 - self.ping
+        for pass_idx, spec in enumerate(self._pass_specs):
+            kind = spec.get('kind', 'voxel')
+            is_entity_pass = kind.startswith('entity_')
+
+            if kind == 'agent':
+                # Agent passes mutate the current voxel grid IN PLACE: bind
+                # the same texture to both image units so the shader can
+                # imageLoad and imageStore at agent positions.
+                cur = self.tex_a if self.ping == 0 else self.tex_b
+                cur.bind_to_image(0, read=True, write=True)
+                cur.bind_to_image(1, read=True, write=True)
+                # NB: pair 2 is left bound from any preceding voxel pass; we
+                # don't rebind it here because agent rules don't use it yet.
+            elif is_entity_pass:
+                # Entity passes that touch the field (paint / paint_clear /
+                # entity_field) use the standard src->dst voxel pattern.
+                # entity_step gets the *current* texture bound read+write so
+                # scenarios can read AND mutate the field at entity positions
+                # (e.g. prey grazing food). Race conditions are tolerated.
+                # Pure-compute passes (clear_hash / build_hash) only need the
+                # field bound read-only on unit 0 in case the step shader
+                # samples it.
+                if kind in ('entity_paint', 'entity_paint_clear',
+                            'entity_field'):
+                    src = self.tex_a if self.ping == 0 else self.tex_b
+                    dst = self.tex_b if self.ping == 0 else self.tex_a
+                    src.bind_to_image(0, read=True, write=False)
+                    dst.bind_to_image(1, read=False, write=True)
+                elif kind == 'entity_step':
+                    cur = self.tex_a if self.ping == 0 else self.tex_b
+                    cur.bind_to_image(0, read=True, write=True)
+                else:
+                    cur = self.tex_a if self.ping == 0 else self.tex_b
+                    cur.bind_to_image(0, read=True, write=False)
+            else:
+                src = self.tex_a if self.ping == 0 else self.tex_b
+                dst = self.tex_b if self.ping == 0 else self.tex_a
+                src.bind_to_image(0, read=True, write=False)
+                dst.bind_to_image(1, read=False, write=True)
+
+                # Optional second 4-channel physics field (own ping bit).
+                has_p2 = getattr(self, 'tex_a2', None) is not None
+                if has_p2:
+                    src2 = self.tex_a2 if self.ping2 == 0 else self.tex_b2
+                    dst2 = self.tex_b2 if self.ping2 == 0 else self.tex_a2
+                    src2.bind_to_image(2, read=True, write=False)
+                    dst2.bind_to_image(3, read=False, write=True)
+
+                # Optional additional auxiliary fields (extras 0..N-1
+                # = preset fields 3..N+2). Bound at image units (4/5),
+                # (6/7), ...
+                extras_a = getattr(self, 'tex_a_extras', None) or []
+                extras_b = getattr(self, 'tex_b_extras', None) or []
+                pings_e = getattr(self, 'ping_extras', None) or []
+                for i, (ea, eb) in enumerate(zip(extras_a, extras_b)):
+                    p = pings_e[i] if i < len(pings_e) else 0
+                    src_e = ea if p == 0 else eb
+                    dst_e = eb if p == 0 else ea
+                    src_e.bind_to_image(4 + 2 * i, read=True, write=False)
+                    dst_e.bind_to_image(5 + 2 * i, read=False, write=True)
+
+            if self.is_element_ca:
+                self.element_ssbo.bind_to_storage_buffer(2)
+            if has_agents:
+                self.agent_ssbo.bind_to_storage_buffer(8)
+            if has_arena:
+                self.arena.bind_all()
+                self.arena.set_uniforms(self._cu_per_pass[pass_idx]['prog'])
+
+            cu = self._cu_per_pass[pass_idx]
+            if cu['size'] is not None:
+                cu['size'].value = self.size
+            if cu['dt'] is not None:
+                cu['dt'].value = self.dt
+            if cu['boundary'] is not None:
+                cu['boundary'].value = self.boundary_mode
+            if cu['frame'] is not None:
+                cu['frame'].value = self.step_count
+            if cu['pass'] is not None:
+                cu['pass'].value = pass_idx
+            for i, cu_p in enumerate(cu['params']):
+                if cu_p is None:
+                    continue
+                # Per-pass override: select which named params map to
+                # u_param0..3 for this pass.  Allows multi-pass rules
+                # whose passes use disjoint parameter sets (e.g. fire
+                # chemistry vs. flow).
+                names = spec.get('param_names')
+                if names is not None:
+                    if i < len(names):
+                        cu_p.value = float(self.params.get(names[i], 0.0))
+                    else:
+                        cu_p.value = 0.0
+                else:
+                    cu_p.value = float(param_values[i]) if i < len(param_values) else 0.0
+
+            if kind == 'agent':
+                # 1D dispatch over agent count; workgroup is (64,1,1).
+                n = self.agent_count
+                groups = (n + 63) // 64
+                self.compute_progs[pass_idx].run(groups, 1, 1)
+            elif is_entity_pass:
+                if kind == 'entity_clear_hash':
+                    groups = entity_arena.hash_groups(self.arena.hash_total)
+                    self.compute_progs[pass_idx].run(groups, 1, 1)
+                elif kind == 'entity_paint_clear':
+                    # Flat 1D dispatch over W*H*D voxels (workgroup 64).
+                    total = self.voxel_count
+                    groups = (total + 63) // 64
+                    self.compute_progs[pass_idx].run(groups, 1, 1)
+                elif kind == 'entity_field':
+                    # 3D dispatch over the voxel grid (workgroup 8x8x8).
+                    self.compute_progs[pass_idx].run(*self._cu_groups)
+                else:
+                    # entity_build_hash, entity_step, entity_paint:
+                    # 1D dispatch over entity slot count.
+                    groups = entity_arena.entity_groups(self.arena.max_entities)
+                    self.compute_progs[pass_idx].run(groups, 1, 1)
+            else:
+                # ── Block-sparse vs dense voxel dispatch ──
+                if (self.preset.get('sparse_dispatch', False)
+                        and self._sparse_supported()
+                        and getattr(self, 'sparse_dispatch_enabled', True)):
+                    # Build active-block list from current sim state, then
+                    # indirect-dispatch over the compact list. The shader
+                    # was rewritten at compile time to read its work-group
+                    # coord from the SSBO.
+                    self._build_sparse_active_list()
+                    # _build_sparse_active_list rebinds image units 0/1
+                    # to its accel textures (_sim_occ_tex / _sim_active_tex).
+                    # Restore the field src/dst bindings before the sim
+                    # shader runs — otherwise the CA shader reads/writes
+                    # the wrong (R8UI) textures and silently no-ops.
+                    src.bind_to_image(0, read=True, write=False)
+                    dst.bind_to_image(1, read=False, write=True)
+                    # Sparse dispatch only writes to active blocks; the
+                    # destination texture's INACTIVE blocks would otherwise
+                    # retain stale data from the previous time we wrote to
+                    # this texture (could be several steps back, including
+                    # the original init pattern). Copy src→dst so inactive
+                    # cells are correctly carried forward. Cheap relative
+                    # to the saved compute (~28 MB at 192³ float32).
+                    sz = self.size
+                    GL.glCopyImageSubData(
+                        src.glo, GL.GL_TEXTURE_3D, 0, 0, 0, 0,
+                        dst.glo, GL.GL_TEXTURE_3D, 0, 0, 0, 0,
+                        self.W, self.H, self.D)
+                    GL.glMemoryBarrier(
+                        GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL.GL_TEXTURE_UPDATE_BARRIER_BIT)
+                    self._sparse_blocks_ssbo.bind_to_storage_buffer(11)
+                    # CRITICAL: glDispatchComputeIndirect dispatches the
+                    # CURRENTLY-BOUND program. _build_sparse_active_list
+                    # left _sparse_compact_prog bound (its last .run()).
+                    # Bind the sim program explicitly first.
+                    GL.glUseProgram(self.compute_progs[pass_idx].glo)
+                    GL.glBindBuffer(GL.GL_DISPATCH_INDIRECT_BUFFER,
+                                    self._sparse_indirect_buf.glo)
+                    GL.glDispatchComputeIndirect(0)
+                    GL.glBindBuffer(GL.GL_DISPATCH_INDIRECT_BUFFER, 0)
+                else:
+                    self.compute_progs[pass_idx].run(*self._cu_groups)
+            GL.glMemoryBarrier(GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                               GL.GL_TEXTURE_FETCH_BARRIER_BIT |
+                               GL.GL_SHADER_STORAGE_BARRIER_BIT)
+
+            # Ping-pong only the pairs this pass wrote to. Agent passes
+            # write in place and therefore never advance the ping bits.
+            # Entity passes that don't touch the field also don't ping.
+            if kind == 'agent':
+                pass
+            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field'):
+                pass
+            else:
+                writes = spec['writes']
+                if 'p1' in writes:
+                    self.ping = 1 - self.ping
+                if 'p2' in writes and getattr(self, 'tex_a2', None) is not None:
+                    self.ping2 = 1 - self.ping2
+                # Extras: 'p3', 'p4', ... map to extras[0], extras[1], ...
+                pings_e = getattr(self, 'ping_extras', None) or []
+                for i in range(len(pings_e)):
+                    if f'p{3 + i}' in writes:
+                        pings_e[i] = 1 - pings_e[i]
+
+        # Step the GPU particle layer after all rule passes so it sees
+        # the freshly-written field state.
+        self._step_particles()
+
         self.step_count += 1
         self._cpu_grid_dirty = True  # invalidate CPU cache
         self._cull_valid = False
@@ -10699,12 +22613,35 @@ class Simulator:
         self.step_count = 0
         rng = np.random.RandomState(self.seed)
         init_name = getattr(self, '_current_init', self.preset['init'])
-        init_func = INIT_FUNCS.get(init_name, init_random_sparse)
+        if isinstance(init_name, str) and '+' in init_name:
+            parts = [p.strip() for p in init_name.split('+') if p.strip()]
+            def _resolve_one(p):
+                if p.startswith('mesh:'):
+                    return lambda sz, r: init_mesh_from_spec(p, sz, r)
+                if p.startswith('lsystem:'):
+                    return lambda sz, r: init_lsystem_from_spec(p, sz, r)
+                return INIT_FUNCS.get(p, init_random_sparse)
+            funcs = [_resolve_one(p) for p in parts]
+            def _compound(sz, r):
+                acc = funcs[0](sz, r)
+                for f in funcs[1:]:
+                    acc = acc + f(sz, r)
+                return np.clip(acc, 0.0, 1.0).astype(np.float32)
+            init_func = _compound
+        elif isinstance(init_name, str) and init_name.startswith('mesh:'):
+            spec = init_name
+            init_func = lambda sz, r: init_mesh_from_spec(spec, sz, r)
+        elif isinstance(init_name, str) and init_name.startswith('lsystem:'):
+            spec = init_name
+            init_func = lambda sz, r: init_lsystem_from_spec(spec, sz, r)
+        else:
+            init_func = INIT_FUNCS.get(init_name, init_random_sparse)
         data = init_func(self.size, rng)
+        data = self._fit_cubic_init(data)
 
-        self.tex_a.write(np.ascontiguousarray(data.astype(self._tex_np_dtype)).tobytes())
+        self.tex_a.write(self._encode_tex_data(data))
         del data
-        self.tex_b.write(bytes(self.size ** 3 * self._tex_bpt))
+        self.tex_b.write(bytes(self.voxel_count * self._tex_bpt))
         self.ping = 0
         # Sync the optional second physics field to current rule's needs.
         # If textures already exist and rule still wants them: reset to initial
@@ -10714,11 +22651,42 @@ class Simulator:
             if getattr(self, 'tex_a2', None) is None:
                 self._alloc_field2()
             else:
-                init2 = self._make_field2_init()
-                self.tex_a2.write(np.ascontiguousarray(init2.astype(self._tex_np_dtype)).tobytes())
-                self.tex_b2.write(bytes(self.size ** 3 * self._tex_bpt))
+                init2 = self._fit_cubic_init(self._make_field2_init())
+                self.tex_a2.write(self._encode_tex_data(init2))
+                self.tex_b2.write(bytes(self.voxel_count * self._tex_bpt))
         else:
             self._release_field2()
+        # Same for the additional auxiliary fields (extras 0..N-1).
+        # Re-seed when present, allocate if rule just changed, release
+        # if rule no longer wants them or count changed.
+        wanted_extras = self._extras_count()
+        if wanted_extras != len(getattr(self, 'tex_a_extras', []) or []):
+            self._release_field_extras()
+            if wanted_extras > 0:
+                self._alloc_field_extras()
+        else:
+            inits = self.preset.get('field_inits', []) or []
+            zero_bytes = bytes(self.voxel_count * self._tex_bpt)
+            for i in range(wanted_extras):
+                init_name = inits[i + 1] if (i + 1) < len(inits) else 'zero'
+                init_arr = self._fit_cubic_init(self._make_field_init(init_name))
+                self.tex_a_extras[i].write(self._encode_tex_data(init_arr))
+                self.tex_b_extras[i].write(zero_bytes)
+                self.ping_extras[i] = 0
+        # Likewise sync the optional agent SSBO. Always re-seed when present
+        # so reset_grid restarts the agents at their initial positions.
+        self._release_agents()
+        if self._has_agents():
+            self._alloc_agents()
+        # Same for particles — always re-seed.
+        self._release_particles()
+        if self._has_particles():
+            self._alloc_particles()
+        # Same for the entity arena — release+reseed so populations
+        # are restored to their on_init state on every Reset/Randomize.
+        self._release_entity_arena()
+        if self._has_entity_arena():
+            self._alloc_entity_arena()
         self._prev_grid = None
         _fence_delete(getattr(self, '_metrics_fence', None))
         self._metrics_fence = None
@@ -10744,17 +22712,20 @@ class Simulator:
 
     def _change_rule(self, rule_name):
         self.rule_name = rule_name
-        self.preset = RULE_PRESETS[rule_name]
+        self.preset = _resolve_composed_preset(rule_name)
         self.params = dict(self.preset['params'])
         self.dt = self.preset['dt']
         self._current_init = self.preset['init']
         self.vis_channels = self.preset.get('vis_channels', ['Value'])
         self.vis_channel = self.preset.get('vis_default', 0)
         self.vis_abs = self.preset.get('vis_abs', False)
+        self.vis_mode = _vis_mode_to_int(self.preset.get('vis_mode', 'density'))
+        self.vis_aux_range = tuple(self.preset.get('vis_aux_range', (0.0, 1.0)))
         self.renderer_mode = self.preset.get('render_mode', 'volumetric')
         self.boundary_mode = _BOUNDARY_NAME_TO_MODE.get(
             self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
+        self.voxel_gap = float(self.preset.get('voxel_gap', 0.1))
         # Apply preset's preferred grid size if specified and current size is smaller
         pref_size = self.preset.get('default_size')
         if pref_size and self.size < pref_size:
@@ -10780,26 +22751,39 @@ class Simulator:
             self.voxel_threshold = 0.12
         elif shader == 'cahn_hilliard':
             self.voxel_threshold = 0.1
-        elif shader == 'erosion_3d':
+        elif shader in ('erosion_3d', 'erosion_hydraulic_3d'):
             self.voxel_threshold = 0.3
-        elif shader in ('mycelium_3d', 'fracture_3d'):
+        elif shader in ('mycelium_3d', 'mycelium_directed_3d', 'fracture_3d',
+                        'peridyn_disp_3d'):
             self.voxel_threshold = 0.3
         elif shader == 'fire_3d':
             self.voxel_threshold = 0.1
-        elif shader in ('em_wave_3d', 'viscous_fingers_3d', 'physarum_3d', 'galaxy_3d', 'lichen_3d'):
+        elif shader in ('em_wave_3d', 'em_yee_E_3d', 'viscous_fingers_3d',
+                        'viscous_transport_3d', 'physarum_3d',
+                        'physarum_adaptive_3d',
+                        'galaxy_3d', 'galaxy_dynamics_3d', 'lichen_3d'):
             self.voxel_threshold = 0.05
         elif shader.startswith('schrodinger'):
             self.voxel_threshold = 0.01
         else:
             self.voxel_threshold = 0.5
-        # Per-preset overrides. 'voxel_threshold' = absolute value (also
-        # disables adaptive). 'voxel_threshold_frac' = fraction of the
-        # field's dynamic range used by the adaptive updater.
+        # Per-preset overrides:
+        #   'voxel_threshold' = absolute pinned value (disables adaptive)
+        #   'voxel_threshold_frac' = enables adaptive at this fraction of
+        #                            the live field's dynamic range.
+        # Adaptive is OFF by default — it badly mis-handles bimodal
+        # fields (e.g. fracture integrity ≈ {0,1} → threshold lands at
+        # 0.2 and inverts what's visible) and signed/centred fields
+        # (EM Ez, ψ, displacements → most of the field passes and the
+        # volume looks like a solid blob).  Presets with smooth unimodal
+        # fields can opt in by setting 'voxel_threshold_frac'.
         if 'voxel_threshold' in self.preset:
             self.voxel_threshold = float(self.preset['voxel_threshold'])
             self._adaptive_threshold = False
-        else:
+        elif 'voxel_threshold_frac' in self.preset:
             self._adaptive_threshold = True
+        else:
+            self._adaptive_threshold = False
         self._adaptive_threshold_frac = float(
             self.preset.get('voxel_threshold_frac', 0.20))
         self._steps_since_threshold_update = 1_000_000
@@ -10810,6 +22794,217 @@ class Simulator:
         self._cache_compute_uniforms()
         self._reset()
 
+    def _apply_dims(self, dims):
+        """Set (W, H, D), self.dims tuple, and back-compat self.size.
+        Single source of truth for grid shape state. Anywhere that used
+        to do `self.size = N` should now go through this so W/H/D stay
+        in sync. For cubic resizes pass (N, N, N).
+        """
+        W, H, D = dims
+        self.W = int(W)
+        self.H = int(H)
+        self.D = int(D)
+        self.dims = (self.W, self.H, self.D)
+        # Back-compat scalar. Code that assumes a cubic grid will now see
+        # max(W,H,D) which is correct for camera-fit / step-budget / etc.
+        # but wrong for any per-axis index math — those callers must be
+        # migrated to self.W/H/D explicitly in later phases.
+        self.size = max(self.W, self.H, self.D)
+        # World-space box: voxels are CUBIC in world (size 1/M), so the
+        # box spans [0, W/M] x [0, H/M] x [0, D/M]. For cubic grids
+        # box_dims = (1, 1, 1) and the renderer math collapses to the
+        # legacy unit-cube form (bit-identical).
+        M = float(self.size)
+        self.box_dims = (self.W / M, self.H / M, self.D / M)
+        self.inv_box_dims = (M / self.W, M / self.H, M / self.D)
+        # Re-center cam_target on the (possibly non-cubic) box. Only do
+        # this when cam_target was previously the default unit-cube
+        # center or doesn't exist yet — don't trample a user-aimed pan.
+        new_target = np.array([self.box_dims[0] * 0.5,
+                               self.box_dims[1] * 0.5,
+                               self.box_dims[2] * 0.5], dtype=np.float64)
+        prev = getattr(self, 'cam_target', None)
+        if prev is None or np.allclose(prev, [0.5, 0.5, 0.5], atol=1e-6):
+            self.cam_target = new_target
+
+    @property
+    def voxel_count(self):
+        """Total voxels in the grid. == size**3 for cubic, W*H*D otherwise."""
+        return self.W * self.H * self.D
+
+    def _encode_tex_data(self, arr):
+        """Convert a float array to bytes matching the active texture format.
+
+        For rgba8 (u8 normalised) the float values are clipped to [0,1] and
+        scaled to uint8 [0,255] so the driver's normalisation undoes the
+        scale on shader reads. For float formats this is just an astype.
+        """
+        if self._tex_is_norm_u8:
+            scaled = np.clip(arr.astype(np.float32, copy=False), 0.0, 1.0) * 255.0
+            return np.ascontiguousarray(scaled.astype(np.uint8)).tobytes()
+        return np.ascontiguousarray(arr.astype(self._tex_np_dtype)).tobytes()
+
+    def _decode_tex_data(self, raw):
+        """Inverse of _encode_tex_data: raw bytes → float32 array (flat).
+
+        For u8 textures the uint8 [0,255] is divided by 255 to yield
+        [0,1] floats matching the shader-side view.
+        """
+        arr = np.frombuffer(raw, dtype=self._tex_np_dtype)
+        if self._tex_is_norm_u8:
+            return arr.astype(np.float32) * (1.0 / 255.0)
+        return arr.astype(np.float32, copy=False)
+
+    def _fit_cubic_init(self, arr):
+        """Centre-crop a cubic init array to (W, H, D, ...) for non-cubic
+        grids. arr is expected to have shape (S, S, S, ...) where S == self.size
+        (== max(W,H,D)). For cubic grids this is a no-op. The returned array
+        has shape (D, H, W, ...) matching texture3d byte order (Z-major).
+        """
+        if arr.shape[0] == self.D and arr.shape[1] == self.H and arr.shape[2] == self.W:
+            return arr
+        S = arr.shape[0]
+        if not (arr.shape[1] == S and arr.shape[2] == S):
+            raise ValueError(f"_fit_cubic_init expected cubic input, got {arr.shape}")
+        if S < max(self.W, self.H, self.D):
+            raise ValueError(
+                f"init returned size={S} but grid needs >= {max(self.W,self.H,self.D)}")
+        # Centre-crop. Note: numpy axis 0 == Z (depth), 1 == Y, 2 == X.
+        zlo = (S - self.D) // 2
+        ylo = (S - self.H) // 2
+        xlo = (S - self.W) // 2
+        return arr[zlo:zlo+self.D, ylo:ylo+self.H, xlo:xlo+self.W, ...]
+
+    def _alloc_volume_streaming(self, init_name, rng):
+        """Allocate tex_a empty, then fill via per-Z-slab uploads.
+        Caps CPU peak at ~slab_voxels * 16 bytes regardless of grid size."""
+        # Slab depth chosen so per-slab f32 scratch is ≤ 64 MiB even at 1024².
+        plane_bytes = self.W * self.H * 16
+        slab_d = max(1, min(self.D, (64 * 1024 * 1024) // max(plane_bytes, 1)))
+        tex = self.ctx.texture3d(self.dims, 4, dtype=self._tex_dtype)
+        # Pre-build small canonical noise once (only ~1 MiB at cs=64).
+        # Match _canonical_noise: draw cs³ values, upsample to self.size,
+        # then we centre-crop to (D,H,W). For streaming we re-derive each
+        # voxel's source index instead of materialising the full upsample.
+        small = None
+        if init_name == 'random_sparse':
+            cs = CANONICAL_INIT_SIZE
+            small = rng.uniform(0.0, 1.0, (cs, cs, cs)).astype(np.float32)
+        # Centre-crop offsets (where the (D,H,W) view sits inside size³).
+        S = self.size
+        zlo_c = (S - self.D) // 2
+        ylo_c = (S - self.H) // 2
+        xlo_c = (S - self.W) // 2
+        for z0 in range(0, self.D, slab_d):
+            z1 = min(self.D, z0 + slab_d)
+            sd = z1 - z0
+            slab = np.zeros((sd, self.H, self.W, 4), dtype=np.float32)
+            if init_name == 'random_sparse':
+                # For each voxel (sz, y, x) in the slab, the source index
+                # in the upsampled S³ noise is (zlo_c+z0+sz, ylo_c+y, xlo_c+x).
+                # _fast_upsample_3d uses np.repeat with factor f = S//cs
+                # for the integer-multiple case; the source small-noise
+                # index is large_idx // f. For non-integer ratios we'd
+                # need the scipy fallback — refuse those at streaming
+                # sizes (raise so the caller falls back).
+                cs = CANONICAL_INIT_SIZE
+                if S < cs or S % cs != 0:
+                    raise RuntimeError(
+                        f"streaming init_random_sparse needs size % {cs} == 0 "
+                        f"and size >= {cs}; got size={S}")
+                f = S // cs
+                # Build per-axis index lookups (small arrays, cheap).
+                z_idx = ((zlo_c + z0 + np.arange(sd)) // f).astype(np.intp)
+                y_idx = ((ylo_c + np.arange(self.H)) // f).astype(np.intp)
+                x_idx = ((xlo_c + np.arange(self.W)) // f).astype(np.intp)
+                # 3-D fancy-index assemble of the slab from the small cube.
+                noise_slab = small[np.ix_(z_idx, y_idx, x_idx)]
+                slab[..., 0] = (noise_slab < 0.10).astype(np.float32)
+            # init_name in ('blank', 'blank_voxels') => leave zero
+            tex.write(self._encode_tex_data(slab),
+                      viewport=(0, 0, z0, self.W, self.H, sd))
+        return tex
+
+    # GLSL source for GPU-side init. {FMT} placeholder is filled with
+    # the storage format ('rgba8' or 'rgba32f') to match self.tex_a.
+    _GPU_INIT_SHADER_SRC = """
+#version 430
+layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+layout({FMT}, binding=0) uniform image3D u_dst;
+uniform ivec3 u_dims;
+uniform uint u_seed;
+uniform int u_mode;        // 0 = blank, 1 = random_sparse
+uniform float u_density;   // for random_sparse
+
+uint hash3(ivec3 p, uint seed) {
+    uint h = seed;
+    h ^= uint(p.x) * 0x85ebca6bu; h = (h ^ (h >> 13)) * 0xc2b2ae35u;
+    h ^= uint(p.y) * 0xcc9e2d51u; h = (h ^ (h >> 13)) * 0x1b873593u;
+    h ^= uint(p.z) * 0xe6546b64u; h = h ^ (h >> 16);
+    return h;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, u_dims))) return;
+    vec4 v = vec4(0.0);
+    if (u_mode == 1) {
+        uint h = hash3(pos, u_seed);
+        float r = float(h & 0x00FFFFFFu) / 16777216.0;
+        if (r < u_density) v.x = 1.0;
+    }
+    imageStore(u_dst, pos, v);
+}
+"""
+
+    def _gpu_init_volume(self, init_name, seed):
+        """Fill self.tex_a entirely on GPU — zero CPU scratch.
+        Supports 'blank' / 'blank_voxels' (mode 0) and 'random_sparse'
+        (mode 1). The texture must already exist."""
+        fmt = self._tex_glsl_fmt  # 'rgba8' or 'rgba32f'
+        # Cache one program per storage format. Releasing the program
+        # while it is still the active GL_CURRENT_PROGRAM causes the
+        # next caller (e.g. imgui's state-restore) to hit INVALID_VALUE
+        # on glUseProgram(<deleted id>), so we keep it alive instead.
+        cache = getattr(self, '_gpu_init_progs', None)
+        if cache is None:
+            cache = {}
+            self._gpu_init_progs = cache
+        prog = cache.get(fmt)
+        if prog is None:
+            src = self._GPU_INIT_SHADER_SRC.replace('{FMT}', fmt)
+            prog = self.ctx.compute_shader(src)
+            cache[fmt] = prog
+        prog['u_dims'] = self.dims
+        prog['u_seed'] = int(seed) & 0xFFFFFFFF
+        if init_name == 'random_sparse':
+            prog['u_mode'] = 1
+            prog['u_density'] = 0.10
+        else:
+            prog['u_mode'] = 0
+            if 'u_density' in prog:
+                prog['u_density'] = 0.0
+        self.tex_a.bind_to_image(0, read=False, write=True)
+        gx = (self.W + 7) // 8
+        gy = (self.H + 7) // 8
+        gz = (self.D + 7) // 8
+        prog.run(gx, gy, gz)
+        self.ctx.memory_barrier()
+
+    def _alloc_volume_zero_streaming(self):
+        """Allocate tex_b filled with zeros via per-slab uploads —
+        avoids a multi-GiB Python bytes object at large sizes."""
+        plane_bytes = self.W * self.H * self._tex_bpt
+        slab_d = max(1, min(self.D, (64 * 1024 * 1024) // max(plane_bytes, 1)))
+        tex = self.ctx.texture3d(self.dims, 4, dtype=self._tex_dtype)
+        zero_slab = bytes(slab_d * plane_bytes)  # ≤ 64 MiB
+        for z0 in range(0, self.D, slab_d):
+            z1 = min(self.D, z0 + slab_d)
+            sd = z1 - z0
+            payload = zero_slab if sd == slab_d else bytes(sd * plane_bytes)
+            tex.write(payload, viewport=(0, 0, z0, self.W, self.H, sd))
+        return tex
+
     def _change_size(self, new_size):
         if new_size == self.size:
             return
@@ -10817,22 +23012,35 @@ class Simulator:
         self.tex_a.release()
         self.tex_b.release()
         self._release_field2()
+        self._release_field_extras()
+        self._release_particles()
+        self._release_mc()
         old_fmt = self._tex_glsl_fmt
-        self.size = new_size
+        self._apply_dims((new_size, new_size, new_size))
         self._tex_dtype, self._tex_np_dtype, self._tex_bpt, self._tex_glsl_fmt = \
             _tex_format_for_size(new_size)
         self._alloc_voxel_buffer(new_size)
+        # Reallocate acceleration textures (occupancy/mipmap/view) AND the
+        # block-sparse dispatch resources for the new grid. Without this,
+        # the sparse SSBO/_sim_occ_tex stay sized for the OLD grid and
+        # crossing the size>=128 sparse-eligibility threshold via UI
+        # resize produces "tiny cube in corner" garbage.
+        self._alloc_accel_textures((new_size, new_size, new_size))
         # Recompile the active CA shader to bake the new grid size as a
         # compile-time const (unlocks modulo->AND, constant 1/size, etc.).
         # The cull/metrics shaders use u_size as a true uniform so they
         # only need recompile on format change.
         self._compile_compute()
         self._cache_compute_uniforms()
+        # Always recompile cull + voxel render: both bake the voxel-pack
+        # layout (9/5 vs 10/2 split at size==512) at compile time. Cheap
+        # (~10 ms total). Metrics only depends on storage format.
+        self._compile_cull()
+        self._recompile_voxel_prog()
         if self._tex_glsl_fmt != old_fmt:
-            self._compile_cull()
             self._compile_metrics()
         # Always update dispatch group count (even without recompile)
-        self._cu_groups = (new_size + 7) // 8
+        self._cu_groups = ((new_size + 7) // 8,) * 3
         # Auto-sync ħ/2m for quantum shaders when grid size changes
         self._sync_quantum_K()
         self._init_volume()
@@ -10885,8 +23093,10 @@ class Simulator:
             return ("barren", "lush", "grass coverage")
         elif shader == 'kuramoto_3d':
             return ("0", "2\u03c0", "oscillator phase")
-        elif shader == 'bz_3d':
+        elif shader in ('bz_3d', 'bz_scroll_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'u'
+            if 'Filament' in ch: return ("bulk", "core", "scroll-filament |∇u×∇v|")
+            if 'Phase' in ch: return ("0", "2π", "wave phase")
             if 'u' in ch.lower() or 'Activator' in ch: return ("resting", "excited", "activator (HBrO\u2082)")
             return ("recovered", "oxidized", "catalyst recovery")
         elif shader == 'morphogen_3d':
@@ -10894,7 +23104,7 @@ class Simulator:
             if 'Activator' in ch: return ("absent", "peak", "morphogen activator")
             if 'Inhibitor' in ch: return ("low", "saturated", "morphogen inhibitor")
             return ("sparse", "dense", "tissue density")
-        elif shader == 'flocking_3d':
+        elif shader in ('flocking_3d', 'flocking_reynolds_3d', 'flocking_predator_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Density'
             if 'Density' in ch: return ("empty", "crowded", "agent density")
             return ("-max", "+max", "velocity component")
@@ -10902,22 +23112,22 @@ class Simulator:
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Order param'
             if 'Order' in ch: return ("phase A", "phase B", "order parameter")
             return ("low μ", "high μ", "chemical potential")
-        elif shader == 'erosion_3d':
+        elif shader in ('erosion_3d', 'erosion_hydraulic_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Solid'
             if 'Solid' in ch: return ("empty", "rock", "solid density")
             if 'Fluid' in ch: return ("dry", "flooded", "water amount")
             return ("clear", "laden", "sediment load")
-        elif shader == 'mycelium_3d':
+        elif shader in ('mycelium_3d', 'mycelium_directed_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Biomass'
             if 'Biomass' in ch: return ("empty", "dense", "hyphal biomass")
             if 'Nutrient' in ch: return ("depleted", "rich", "nutrient concentration")
             return ("quiet", "active", "chemical signal")
-        elif shader == 'em_wave_3d':
+        elif shader in ('em_wave_3d', 'em_yee_E_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Ez'
             if 'Ez' in ch: return ("-E", "+E", "electric field (Ez)")
             if 'Bx' in ch: return ("-B", "+B", "magnetic field (Bx)")
             return ("-B", "+B", "magnetic field (By)")
-        elif shader == 'viscous_fingers_3d':
+        elif shader in ('viscous_fingers_3d', 'viscous_transport_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Saturation'
             if 'Saturation' in ch: return ("defender", "invader", "fluid saturation")
             if 'Pressure' in ch: return ("low P", "high P", "fluid pressure")
@@ -10928,18 +23138,21 @@ class Simulator:
             if 'Temperature' in ch: return ("cold", "inferno", "temperature")
             if 'Oxygen' in ch: return ("vacuum", "rich", "oxygen level")
             return ("none", "bright", "ember density")
-        elif shader == 'physarum_3d':
+        elif shader in ('physarum_3d', 'physarum_adaptive_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Trail'
-            if 'Trail' in ch: return ("fresh", "marked", "pheromone trail")
-            if 'Agent' in ch: return ("empty", "crowded", "agent density")
+            if 'Trail' in ch: return ("calm", "flowing", "|flux| through tube")
+            if 'Conductivity' in ch or 'Agent' in ch:
+                return ("empty", "thick tube", "tube conductivity")
+            if 'Pressure' in ch: return ("sink", "source", "hydraulic pressure")
             return ("consumed", "abundant", "food source")
-        elif shader == 'fracture_3d':
+        elif shader in ('fracture_3d', 'peridyn_disp_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Integrity'
-            if 'Displacement' in ch: return ("-u", "+u", "elastic displacement")
+            if 'Displacement' in ch or ch.startswith('u_'):
+                return ("-u", "+u", "elastic displacement")
             if 'Stress' in ch: return ("relaxed", "strained", "stress magnitude")
             if 'Integrity' in ch: return ("broken", "intact", "material integrity")
             return ("zero", "high", "strain rate")
-        elif shader == 'galaxy_3d':
+        elif shader in ('galaxy_3d', 'galaxy_dynamics_3d'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'Density'
             if 'Density' in ch: return ("void", "cluster", "matter density")
             return ("-v", "+v", "velocity component")
@@ -10954,7 +23167,7 @@ class Simulator:
     def _draw_colormap_legend(self):
         """Draw a colormap legend with gradient bar, labels, and description."""
         _c2u = imgui.color_convert_float4_to_u32
-        colormap_names = ["Fire", "Cool", "Grayscale", "Neon", "Discrete", "Spectral"]
+        colormap_names = ["Fire", "Cool", "Grayscale", "Neon", "Discrete", "Spectral", "Diverging"]
         low_label, high_label, desc = self._colormap_semantic_labels()
         white = _c2u(imgui.ImVec4(1, 1, 1, 1))
         gray = _c2u(imgui.ImVec4(0.7, 0.7, 0.7, 1))
@@ -11131,6 +23344,33 @@ class Simulator:
             json.dump(self.discoveries, f, indent=2)
         self.discovery_index = len(self.discoveries) - 1
 
+    def _load_best_for_current_rule(self, random_topk: int = 1):
+        """Load the best discovery for the currently-loaded rule.
+
+        random_topk=1   → load the single highest-scoring discovery.
+        random_topk=N>1 → pick uniformly from the top N (by score).
+        Surfaces a console message if there are no discoveries for this rule.
+        """
+        if not self.discoveries:
+            return
+        same_rule = [(i, d) for i, d in enumerate(self.discoveries)
+                     if d.get('rule') == self.rule_name]
+        if not same_rule:
+            print(f"[discovery] no discoveries on file for '{self.rule_name}'")
+            return
+        same_rule.sort(key=lambda pair: pair[1].get('score', 0.0), reverse=True)
+        topk = same_rule[:max(1, random_topk)]
+        if random_topk <= 1:
+            chosen_idx, chosen_disc = topk[0]
+            tag = 'top'
+        else:
+            import random as _r
+            chosen_idx, chosen_disc = _r.choice(topk)
+            tag = f'random in top-{len(topk)}'
+        print(f"[discovery] loading {tag} for '{self.rule_name}' "
+              f"(score={chosen_disc.get('score', 0):.3f}, idx={chosen_idx})")
+        self._load_discovery(chosen_idx)
+
     def _load_discovery(self, index):
         """Load a discovery by index into the simulator.
 
@@ -11163,6 +23403,22 @@ class Simulator:
             self.dt = disc['dt']
         if 'seed' in disc:
             self.seed = disc['seed']
+        # Restore the saved init variant (if any). _change_rule above reset
+        # _current_init to the preset default; without this override the
+        # discovery would replay with the wrong topology (e.g. a saved
+        # bz_scroll_filament run would reload as default bz_reaction).
+        saved_init = disc.get('init_variant')
+        if saved_init:
+            variants = self.preset.get('init_variants') or []
+            default_init = self.preset.get('init')
+            if saved_init == default_init or saved_init in variants \
+               or saved_init in INIT_FUNCS:
+                self._current_init = saved_init
+            else:
+                sys.stderr.write(
+                    f"[discovery] WARNING: init variant '{saved_init}' is no "
+                    f"longer registered for rule '{disc.get('rule', '?')}'; "
+                    f"falling back to preset default.\n")
         self.discovery_index = index
         self._reset()
 
@@ -11224,7 +23480,7 @@ class Simulator:
         shader = self.preset['shader']
         if self.preset.get('is_element_ca', False):
             mode = 3
-        elif shader in ('wave_3d', 'em_wave_3d'):
+        elif shader in ('wave_3d', 'em_wave_3d', 'em_yee_E_3d'):
             mode = 2
         else:
             mode = 1
@@ -11238,7 +23494,7 @@ class Simulator:
         #     rules, so rounding doesn't eat the signal at large N
         # Python decoder must divide by (N * u_norm_n * SCALE_S) to get
         # the mean (stored in self._debug_sum_divisor for clarity).
-        N = float(self.size ** 3)
+        N = float(self.voxel_count)
         self._debug_sum_divisor = max(1.0, N / 2048.0)
         prog['u_norm_n'].value = 1.0 / self._debug_sum_divisor
         # Histogram bounds = previous frame's range (per channel). moderngl
@@ -11246,8 +23502,7 @@ class Simulator:
         prog['u_hist_min'].write(np.array(self._debug_hist_min, dtype=np.float32).tobytes())
         prog['u_hist_max'].write(np.array(self._debug_hist_max, dtype=np.float32).tobytes())
 
-        gx = (self.size + 7) // 8
-        prog.run(gx, gx, gx)
+        prog.run(*self._cu_groups)
         GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT)
         self._debug_fence = _fence_after_dispatch()
         self._debug_pending_step = self.step_count
@@ -11293,7 +23548,7 @@ class Simulator:
         # chosen so the global sum fits int32 with good sub-unit precision.
         sum_signed = u[20:24].view(np.int32).astype(np.float64)
         sumsq_u    = u[24:28].astype(np.float64)
-        N = float(self.size ** 3)
+        N = float(self.voxel_count)
         divisor = getattr(self, '_debug_sum_divisor', max(1.0, N / 2048.0))
         means = sum_signed * divisor / (N * self._DEBUG_SCALE_S)
         e_x2  = sumsq_u    * divisor / (N * self._DEBUG_SCALE_Q)
@@ -11352,7 +23607,7 @@ class Simulator:
             'var': variances.tolist(),
             'std': np.sqrt(variances).tolist(),
             'active_count': active_count,
-            'active_frac': active_count / float(self.size ** 3),
+            'active_frac': active_count / float(self.voxel_count),
             'bbox_min': bbox[0],
             'bbox_max': bbox[1],
             'com': com.tolist(),
@@ -11376,7 +23631,7 @@ class Simulator:
         from test_harness import score_interestingness
 
         src = self.tex_a if self.ping == 0 else self.tex_b
-        total = self.size ** 3
+        total = self.voxel_count
 
         # ── 1. Harvest previous results (non-blocking) ───────────────
         # Only read the SSBO if the GPU fence is signaled. Otherwise
@@ -11397,6 +23652,21 @@ class Simulator:
             surface_ratio = surface_count / max(alive_count, 1)
             has_bad = nan_count > 0
 
+            # Map last-dispatched int mode → score_interestingness string
+            # bucket. Without this, score_interestingness defaults to
+            # 'discrete' and applies blinker/std penalties + a low-activity
+            # peak (-2.0 log10) that biases the live UI score AGAINST every
+            # PDE rule. test_harness sets richer modes (deviation,
+            # phase_coherence) that score_interestingness collapses back to
+            # `continuous_field=True` — so 4 buckets here is sufficient.
+            _last_mode = getattr(self, '_score_last_mode', 0)
+            _last_is_elem = getattr(self, '_score_last_is_elem', False)
+            mode_str = (
+                'element'    if _last_is_elem else
+                'continuous' if _last_mode == 1 else
+                'wave'       if _last_mode == 2 else
+                'discrete')
+
             m = {
                 'alive_count': alive_count,
                 'alive_ratio': alive_ratio,
@@ -11404,6 +23674,7 @@ class Simulator:
                 'surface_ratio': surface_ratio,
                 'has_nan': has_bad,
                 'has_inf': has_bad,
+                'measure_mode': mode_str,
             }
             self._score_metrics = m
             self._metric_history.append(m)
@@ -11451,8 +23722,12 @@ class Simulator:
         prog['u_has_prev'].value = 1 if self.step_count > 0 else 0
         prog['u_boundary'].value = self.boundary_mode
 
-        gx = (self.size + 7) // 8
-        prog.run(gx, gx, gx)
+        # Stash for the next harvest cycle so the resulting metric dict can
+        # be tagged with measure_mode (used by score_interestingness).
+        self._score_last_mode = mode
+        self._score_last_is_elem = is_elem
+
+        prog.run(*self._cu_groups)
 
         # Barrier ensures compute SSBO writes complete before next CPU read,
         # then a fence so we can poll completion without ever blocking.
@@ -11462,9 +23737,14 @@ class Simulator:
     # ── Rendering ─────────────────────────────────────────────────────
 
     def _render_volume(self):
+        sub = getattr(self, '_render_sub', None)
+        _t = time.perf_counter() if sub is not None else 0.0
         # Build acceleration structures if stale
         if not self._accel_textures_valid:
             self._build_accel_textures()
+        if sub is not None:
+            sub['accel'] = time.perf_counter() - _t
+            sub['_t_disp'] = time.perf_counter()  # closed out at function end
 
         src_tex = self.tex_a if self.ping == 0 else self.tex_b
 
@@ -11474,6 +23754,13 @@ class Simulator:
         aspect = self.width / max(self.height, 1)
 
         # Determine if rendering to half-res FBO
+        # Capture the currently bound framebuffer up-front. The caller may
+        # have bound an offscreen FBO (e.g. _render_to_rec_fbo for video
+        # capture) and the half-res / non-half paths below must blit /
+        # render back into THAT target instead of unconditionally
+        # switching to self.ctx.screen.
+        target_fbo = self.ctx.fbo if self.ctx.fbo is not None else self.ctx.screen
+        target_viewport = self.ctx.viewport
         use_half = self._use_half_res and self.size >= 96
         if use_half:
             hw, hh = max(self.width // 2, 1), max(self.height // 2, 1)
@@ -11483,7 +23770,8 @@ class Simulator:
             self._half_res_fbo.use()
             self.ctx.viewport = (0, 0, hw, hh)
         else:
-            self.ctx.screen.use()
+            target_fbo.use()
+            self.ctx.viewport = target_viewport
 
         self.ctx.clear(0.02, 0.02, 0.04)
 
@@ -11504,7 +23792,11 @@ class Simulator:
         if self._rp_u_inv_size is not None:
             self._rp_u_inv_size.value = 1.0 / float(self.size)
         if self._rp_u_max_steps is not None:
-            self._rp_u_max_steps.value = self.size * 3
+            self._rp_u_max_steps.value = self.size * 3 if self.render_mode == 0 else self.size * 2
+        if self._rp_u_box_dims is not None:
+            self._rp_u_box_dims.value = self.box_dims
+        if self._rp_u_inv_box_dims is not None:
+            self._rp_u_inv_box_dims.value = self.inv_box_dims
         self._rp_u_camera_pos.value = tuple(cam_pos)
         self._rp_u_camera_rot.value = tuple(cam_rot.T.flatten())
         self._rp_u_fov.value = fov
@@ -11519,7 +23811,9 @@ class Simulator:
         if self._rp_u_vis_channel is not None:
             self._rp_u_vis_channel.value = self.vis_channel
         if self._rp_u_vis_abs is not None:
-            self._rp_u_vis_abs.value = 1 if self.vis_abs else 0
+            self._rp_u_vis_abs.value = int(self.vis_abs)
+        if self._rp_u_vis_mode is not None:
+            self._rp_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
 
         # Acceleration uniforms (None-safe — GLSL compiler may strip unused)
         if self._rp_u_frame_id is not None:
@@ -11528,25 +23822,38 @@ class Simulator:
         mm_dim = getattr(self, '_mm_dim', 1)
         if self._rp_u_occ_size is not None:
             self._rp_u_occ_size.value = occ_dim
+        # Occupancy + min/max accel structures index by cubic u_occ_size /
+        # u_minmax_size. For non-cubic grids the indexing would be wrong
+        # on the short axes (would skip valid voxels). Disable them when
+        # non-cubic until the accel build + DDA are migrated to per-axis
+        # dims. Cubic case: identity (u_use_*=1, prior behavior).
+        cubic = (self.W == self.H == self.D)
         if self._rp_u_use_occupancy is not None:
-            self._rp_u_use_occupancy.value = 1
+            self._rp_u_use_occupancy.value = 1 if cubic else 0
         if self._rp_u_minmax_size is not None:
             self._rp_u_minmax_size.value = mm_dim
         if self._rp_u_use_minmax is not None:
-            self._rp_u_use_minmax.value = 1
+            self._rp_u_use_minmax.value = 1 if cubic else 0
 
         self.vao.render(moderngl.TRIANGLE_STRIP)
         self._frame_counter += 1
 
-        # Upsample half-res to screen
+        # Upsample half-res to the original render target (screen OR
+        # the recording FBO captured at entry). Hard-coding
+        # self.ctx.screen.use() here would dump the half-res scene into
+        # the visible window during recording, leaving the rec FBO black.
         if use_half:
-            self.ctx.screen.use()
-            self.ctx.viewport = (0, 0, self.width, self.height)
+            target_fbo.use()
+            self.ctx.viewport = target_viewport
             self._half_res_tex.use(location=0)
             self._up_u_half_res.value = 0
             self._up_u_texel_size.value = (1.0 / hw, 1.0 / hh)
             self.ctx.disable(moderngl.DEPTH_TEST)
             self._upsample_vao.render(moderngl.TRIANGLE_STRIP)
+        if sub is not None:
+            t_disp_start = sub.pop('_t_disp', None)
+            if t_disp_start is not None:
+                sub['dispatch'] = time.perf_counter() - t_disp_start
 
     def _get_view_proj(self):
         """Build a view-projection matrix for voxel rendering."""
@@ -11627,6 +23934,8 @@ class Simulator:
         Uses multi-pass spatial chunking for large grids: the grid is split
         into chunks, each cull+draw pass reuses the same SSBO, so no voxels
         are ever dropped regardless of grid size or fill density."""
+        sub = getattr(self, '_render_sub', None)
+        _t = time.perf_counter() if sub is not None else 0.0
         # Ensure the min/max acceleration mipmap is up to date -- the
         # adaptive voxel-threshold updater piggybacks on it inside
         # _build_accel_textures().  Without this call the voxel renderer
@@ -11636,6 +23945,9 @@ class Simulator:
         # as a solid block).
         if not self._accel_textures_valid:
             self._build_accel_textures()
+        if sub is not None:
+            sub['accel'] = time.perf_counter() - _t
+            _t_disp = time.perf_counter()
         self.ctx.clear(0.02, 0.02, 0.04)
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.BLEND)
@@ -11650,7 +23962,7 @@ class Simulator:
         is_elem = self.preset.get('is_element_ca', False)
         if is_elem:
             cull_channel, cull_use_abs = 0, 0
-        elif shader in ('wave_3d', 'em_wave_3d'):
+        elif shader in ('wave_3d', 'em_wave_3d', 'em_yee_E_3d'):
             cull_channel, cull_use_abs = self.vis_channel, 1
         else:
             cull_channel, cull_use_abs = self.vis_channel, 0
@@ -11664,6 +23976,8 @@ class Simulator:
         view_proj_flat, vp_row_major = self._get_view_proj()
 
         self._vp_u_size.value = self.size
+        if self._vp_u_dims is not None:
+            self._vp_u_dims.value = self.dims
         self._vp_u_view_proj.value = tuple(view_proj_flat)
         self._vp_u_voxel_gap.value = self.voxel_gap
         self._vp_u_camera_pos.value = tuple(cam_pos)
@@ -11673,7 +23987,13 @@ class Simulator:
         self._vp_u_alpha.value = self.voxel_alpha
         self._vp_u_channel.value = cull_channel
         self._vp_u_use_abs.value = cull_use_abs
-        self._vp_u_threshold.value = self.voxel_threshold
+        # The voxel cull threshold is independent of the volumetric
+        # `vis_range` colour-map: a preset can show the full pile in
+        # voxel mode (low cull) while colour-ramping a narrower window
+        # in volumetric mode (e.g. sandpile shows all sand but the
+        # palette focuses on near-critical cells).
+        effective_threshold = self.voxel_threshold
+        self._vp_u_threshold.value = effective_threshold
 
         cpd = self._voxel_chunks_per_dim
 
@@ -11691,14 +24011,99 @@ class Simulator:
             return
 
         # ── Full cull path ────────────────────────────────────────────
-        # Barrier: ensure previous frame's draw-call SSBO reads complete
-        # before this frame's cull compute overwrites the buffers.
-        GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
+        # Barrier: ensure previous frame's draw-indirect SSBO + indirect
+        # reads complete before this frame's cull compute overwrites the
+        # buffers.  Use precise barrier bits — GL_ALL_BARRIER_BITS
+        # serializes the entire pipeline (≈2-5 ms stall on RTX 4070 Ti).
+        GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT |
+                           GL.GL_COMMAND_BARRIER_BIT |
+                           GL.GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT)
+
+        # ── Brick-list cull (sparse) ──────────────────────────────────
+        # When eligible, dispatch one workgroup per ACTIVE 8³ block (read
+        # from _sparse_blocks_ssbo) instead of one per nominal block.
+        # Skips empty / fully-buried regions entirely.
+        #
+        # MEASURED (RTX 4070 Ti, headless, ctx.finish() per frame):
+        #   size=256 game_of_life_3d:   dense=2.39ms  sparse=2.70ms   (-0.31ms)
+        #   size=256 reaction_diff_3d:  dense=2.61ms  sparse=3.31ms   (-0.70ms)
+        #   size=256 kuramoto_3d:       dense=6.40ms  sparse=6.31ms   (+0.09ms)
+        #   size=384 game_of_life_3d:   dense=7.37ms  sparse=7.86ms   (-0.49ms)
+        #   size=384 reaction_diff_3d:  dense=9.25ms  sparse=11.59ms  (-2.34ms)
+        # The 3-pass active-list build (occ + dilate + compact) costs
+        # more than the cull savings: dense cull already early-outs on
+        # empty blocks (cheap texelFetch + scalar test). Brick-list will
+        # likely become a win only when memory forces sparse-resident
+        # textures (1024³+ goal), where dense is impossible. Default OFF.
+        # Toggle via `sim.sparse_voxel_cull_enabled = True` for A/B.
+        use_sparse_cull = (
+            cpd == 1
+            and getattr(self, 'sparse_voxel_cull_enabled', False)
+            and self.voxel_cull_sparse_prog is not None
+            and self.size >= 128
+            and getattr(self, '_sparse_blocks_ssbo', None) is not None
+        )
+        if use_sparse_cull:
+            # Build the active-block list if not already built this step
+            # (sim path may have already done so for sparse_dispatch rules).
+            if self._sparse_built_step != self.step_count:
+                self._build_sparse_active_list()
+                # _build_sparse_active_list rebinds image units / textures;
+                # restore the source texture for cull.
+                src_tex.use(location=0)
+
+            # Reset the indirect draw buffer (instanceCount=0) and total
+            # counter — sparse path doesn't loop chunks so we always
+            # reset the total too.
+            self.voxel_indirect_buffer.bind_to_storage_buffer(4)
+            self._voxel_total_counter.bind_to_storage_buffer(6)
+            self._indirect_reset_u_reset_total.value = 1
+            self._indirect_reset_prog.run(1, 1, 1)
+            GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT)
+
+            # Cull uniforms on the sparse program
+            if self._cull_sp_u_size is not None:
+                self._cull_sp_u_size.value = self.size
+            if self._cull_sp_u_dims is not None:
+                self._cull_sp_u_dims.value = self.dims
+            self._cull_sp_u_threshold.value = effective_threshold
+            self._cull_sp_u_is_element_ca.value = 1 if is_elem else 0
+            self._cull_sp_u_max_voxels.value = self.max_voxels
+            self._cull_sp_u_channel.value = cull_channel
+            self._cull_sp_u_use_abs.value = cull_use_abs
+
+            # Bind the active-block list at binding=11 (matches shader).
+            self._sparse_blocks_ssbo.bind_to_storage_buffer(11)
+
+            # Indirect-dispatch over the active block count. The indirect
+            # buffer holds (count, 1, 1) from _build_sparse_active_list.
+            GL.glUseProgram(self.voxel_cull_sparse_prog.glo)
+            GL.glBindBuffer(GL.GL_DISPATCH_INDIRECT_BUFFER,
+                            self._sparse_indirect_buf.glo)
+            GL.glDispatchComputeIndirect(0)
+            GL.glBindBuffer(GL.GL_DISPATCH_INDIRECT_BUFFER, 0)
+            GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT |
+                               GL.GL_COMMAND_BARRIER_BIT)
+
+            # Draw
+            self.voxel_vao.render_indirect(self.voxel_indirect_buffer,
+                                           moderngl.TRIANGLES, count=1)
+            self._cull_valid = True
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.disable(moderngl.BLEND)
+            if sub is not None:
+                sub['dispatch'] = time.perf_counter() - _t_disp
+            # Read back total voxel count via async copy + fence-polled read.
+            self._voxel_count_frame = getattr(self, '_voxel_count_frame', 0) + 1
+            return
 
         # Set up cull uniforms (constant across all chunks)
         self.voxel_indirect_buffer.bind_to_storage_buffer(4)
-        self._cull_u_size.value = self.size
-        self._cull_u_threshold.value = self.voxel_threshold
+        if self._cull_u_size is not None:
+            self._cull_u_size.value = self.size
+        if self._cull_u_dims is not None:
+            self._cull_u_dims.value = self.dims
+        self._cull_u_threshold.value = effective_threshold
         self._cull_u_is_element_ca.value = 1 if is_elem else 0
         self._cull_u_max_voxels.value = self.max_voxels
         self._cull_u_channel.value = cull_channel
@@ -11716,33 +24121,38 @@ class Simulator:
         for cz in range(cpd):
             for cy in range(cpd):
                 for cx in range(cpd):
-                    # Compute chunk bounds
+                    # Compute chunk bounds (clamp to per-axis dims so we
+                    # don't dispatch over voxels that don't exist on
+                    # short axes for non-cubic grids).
                     cmin = (cx * chunk_edge, cy * chunk_edge, cz * chunk_edge)
-                    cmax = (min((cx + 1) * chunk_edge, self.size),
-                            min((cy + 1) * chunk_edge, self.size),
-                            min((cz + 1) * chunk_edge, self.size))
+                    cmax = (min((cx + 1) * chunk_edge, self.W),
+                            min((cy + 1) * chunk_edge, self.H),
+                            min((cz + 1) * chunk_edge, self.D))
+                    # Skip empty chunks (cmin >= cmax on any axis).
+                    if cmin[0] >= cmax[0] or cmin[1] >= cmax[1] or cmin[2] >= cmax[2]:
+                        continue
 
-                    # Frustum cull: skip chunks entirely outside the view
+                    # Frustum cull: skip chunks entirely outside the view.
+                    # Bounds are in world space; for non-cubic the box
+                    # spans [0, box_dims] and voxel coord / M maps in.
                     if frustum_planes is not None:
-                        inv_size = 1.0 / self.size
-                        bmin = (cmin[0] * inv_size, cmin[1] * inv_size, cmin[2] * inv_size)
-                        bmax = (cmax[0] * inv_size, cmax[1] * inv_size, cmax[2] * inv_size)
+                        inv_M = 1.0 / self.size
+                        bmin = (cmin[0] * inv_M, cmin[1] * inv_M, cmin[2] * inv_M)
+                        bmax = (cmax[0] * inv_M, cmax[1] * inv_M, cmax[2] * inv_M)
                         if not self._aabb_in_frustum(frustum_planes, bmin, bmax):
                             continue
 
                     # Reset indirect buffer for this chunk (GPU-side, no CPU->GPU stall)
-                    # First chunk also resets the frame-level total counter
-                    self.voxel_indirect_buffer.bind_to_storage_buffer(4)
+                    # First chunk also resets the frame-level total counter.
+                    # Bindings (src_tex, element_ssbo, voxel_buffer,
+                    # voxel_indirect_buffer, _voxel_total_counter) were
+                    # already established before the loop and remain valid
+                    # across compute dispatches — re-issuing them every
+                    # chunk is pure CPU overhead.
                     self._indirect_reset_u_reset_total.value = 1 if is_first_chunk else 0
                     self._indirect_reset_prog.run(1, 1, 1)
                     GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT)
                     is_first_chunk = False
-
-                    # Bind SSBOs for cull
-                    src_tex.use(location=0)
-                    self.voxel_buffer.bind_to_storage_buffer(3)
-                    self.voxel_indirect_buffer.bind_to_storage_buffer(4)
-                    self._voxel_total_counter.bind_to_storage_buffer(6)
 
                     # Set chunk bounds
                     self._cull_u_chunk_min.value = cmin
@@ -11755,10 +24165,7 @@ class Simulator:
                     self.voxel_cull_prog.run(gx, gy, gz)
                     GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT | GL.GL_COMMAND_BARRIER_BIT)
 
-                    # Draw this chunk's voxels
-                    self.voxel_buffer.bind_to_storage_buffer(3)
-                    self.element_ssbo.bind_to_storage_buffer(2)
-                    src_tex.use(location=0)
+                    # Draw this chunk's voxels (bindings still live)
                     self.voxel_vao.render_indirect(self.voxel_indirect_buffer, moderngl.TRIANGLES, count=1)
 
         # Mark cull as valid for single-pass reuse on subsequent frames
@@ -11767,6 +24174,8 @@ class Simulator:
 
         self.ctx.disable(moderngl.DEPTH_TEST)
         self.ctx.disable(moderngl.BLEND)
+        if sub is not None:
+            sub['dispatch'] = time.perf_counter() - _t_disp
 
         # Read back total voxel count via async copy + fence-polled read.
         self._voxel_count_frame = getattr(self, '_voxel_count_frame', 0) + 1
@@ -11792,12 +24201,21 @@ class Simulator:
 
     def _render(self):
         """Dispatch to the appropriate renderer."""
+        # Reset sub-timings dict; populated by the chosen renderer path.
+        # Captured by the main loop into sec['render.*'] entries.
+        self._render_sub = {}
         if self.renderer_mode == 'voxel':
             self._render_voxels()
         elif self._use_compute_ray:
             self._render_volume_compute()
         else:
             self._render_volume()
+        # Optional GPU particle overlay (no-op when preset doesn't enable it).
+        self._render_particles()
+        # Optional vector-field glyph overlay.
+        self._render_glyphs()
+        # Optional marching-cubes iso-surface overlay.
+        self._render_iso_surface()
 
     def _scene_hash(self):
         """Tuple of every state bit that affects what a rendered frame shows.
@@ -11822,6 +24240,12 @@ class Simulator:
             self.vis_channel, bool(self.vis_abs),
             # Recording disables caching (we need a fresh render each frame)
             bool(getattr(self, '_recording', False)),
+            # Particles always animate; including count forces re-render.
+            int(getattr(self, 'particle_count', 0)),
+            # Glyphs always re-sample the live field; force re-render.
+            bool(self._has_glyphs()),
+            # Iso-surface re-extracts every frame; force re-render.
+            bool(self._has_iso_surface()),
         )
 
     def _ensure_scene_cache(self):
@@ -11857,8 +24281,13 @@ class Simulator:
 
     def _render_volume_compute(self):
         """Render volume using compute shader raymarcher."""
+        sub = getattr(self, '_render_sub', None)
+        _t = time.perf_counter() if sub is not None else 0.0
         if not self._accel_textures_valid:
             self._build_accel_textures()
+        if sub is not None:
+            sub['accel'] = time.perf_counter() - _t
+            _t = time.perf_counter()
 
         w, h = self.width, self.height
         if (not hasattr(self, '_cr_output_tex') or self._cr_output_tex is None or
@@ -11886,7 +24315,13 @@ class Simulator:
                 u.value = v
         _su(self._cr_u_size, self.size)
         _su(self._cr_u_inv_size, 1.0 / float(self.size))
-        _su(self._cr_u_max_steps, self.size * 3)
+        _su(self._cr_u_box_dims, self.box_dims)
+        _su(self._cr_u_inv_box_dims, self.inv_box_dims)
+        # Cube diagonal is sqrt(3)*size ≈ 1.73*size voxels; size*2 is a
+        # safe upper bound for ISO / MIP where the loop just walks to
+        # t_end. Volume mode keeps the larger headroom because faint
+        # densities can fail to alpha-saturate before the ray exits.
+        _su(self._cr_u_max_steps, self.size * 3 if self.render_mode == 0 else self.size * 2)
         _su(self._cr_u_camera_pos, tuple(cam_pos))
         _su(self._cr_u_camera_rot, tuple(cam_rot.T.flatten()))
         _su(self._cr_u_fov, 1.0)
@@ -11897,15 +24332,18 @@ class Simulator:
         _su(self._cr_u_iso_threshold, self.iso_threshold)
         _su(self._cr_u_colormap, self.colormap)
         _su(self._cr_u_vis_channel, self.vis_channel)
-        _su(self._cr_u_vis_abs, 1 if self.vis_abs else 0)
+        _su(self._cr_u_vis_abs, int(self.vis_abs))
+        _su(self._cr_u_vis_mode, int(getattr(self, 'vis_mode', VIS_MODE_DENSITY)))
         _su(self._cr_u_frame_id, self._frame_counter)
         _su(self._cr_u_resolution, (w, h))
         occ_dim = getattr(self, '_occ_dim', 1)
         mm_dim = getattr(self, '_mm_dim', 1)
         _su(self._cr_u_occ_size, occ_dim)
-        _su(self._cr_u_use_occupancy, 1)
+        # See _render_volumetric: accel structures are cubic-indexed.
+        cubic = (self.W == self.H == self.D)
+        _su(self._cr_u_use_occupancy, 1 if cubic else 0)
         _su(self._cr_u_minmax_size, mm_dim)
-        _su(self._cr_u_use_minmax, 1)
+        _su(self._cr_u_use_minmax, 1 if cubic else 0)
 
         # Dispatch: 8x8 workgroups
         gx = (w + 7) // 8
@@ -11913,10 +24351,15 @@ class Simulator:
         self._compute_ray_prog.run(gx, gy, 1)
         GL.glMemoryBarrier(GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                            GL.GL_TEXTURE_FETCH_BARRIER_BIT)
+        if sub is not None:
+            sub['dispatch'] = time.perf_counter() - _t
         self._frame_counter += 1
 
-        # Blit result to screen
-        self.ctx.screen.use()
+        # Blit result to the active framebuffer (screen OR recording FBO).
+        # Hard-coding self.ctx.screen.use() here broke video capture in
+        # compute-raymarch mode the same way it did in _render_volume.
+        target_fbo = self.ctx.fbo if self.ctx.fbo is not None else self.ctx.screen
+        target_fbo.use()
         self.ctx.clear(0.02, 0.02, 0.04)
         self._cr_output_tex.use(location=0)
         self._up_u_half_res.value = 0
@@ -12145,7 +24588,11 @@ class Simulator:
         if not getattr(self, '_show_perf_overlay', False) or len(history) < 5:
             return
         # Aggregate stats over the rolling window
-        keys = ('poll', 'step', 'score', 'render', 'ui', 'swap', 'total')
+        # Base sections + every render.* sub-section seen in the history.
+        base_keys = ('poll', 'step', 'score', 'render', 'ui', 'swap', 'total')
+        sub_keys = sorted({k for sec in history for k in sec
+                            if k.startswith('render.')})
+        keys = base_keys + tuple(sub_keys)
         worst = {k: 0.0 for k in keys}
         worst_frame_idx = {k: -1 for k in keys}
         mean = {k: 0.0 for k in keys}
@@ -12165,10 +24612,10 @@ class Simulator:
                 mean[k] /= counts[k]
 
         imgui.set_next_window_pos(imgui.ImVec2(10, 250), imgui.Cond_.first_use_ever)
-        imgui.set_next_window_size(imgui.ImVec2(320, 0), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(380, 0), imgui.Cond_.first_use_ever)
         imgui.begin("Perf (F12)", flags=imgui.WindowFlags_.always_auto_resize)
         imgui.text(f"Window: last {len(history)} frames")
-        imgui.text(f"{'section':<8} {'mean':>7} {'worst':>7} {'frame':>6}")
+        imgui.text(f"{'section':<18} {'mean':>7} {'worst':>7} {'frame':>6}")
         imgui.separator()
         for k in keys:
             ms_mean = mean[k] * 1000
@@ -12178,12 +24625,78 @@ class Simulator:
             # otherwise cheap operation.
             spiky = ms_worst > 2.0 * ms_mean and ms_worst > 5.0
             color = (1.0, 0.4, 0.4, 1.0) if spiky else (1.0, 1.0, 1.0, 1.0)
+            # render.* sub-keys get dimmed slightly to read as children of render
+            if k.startswith('render.') and not spiky:
+                color = (0.75, 0.85, 1.0, 1.0)
             imgui.text_colored(imgui.ImVec4(*color),
-                f"{k:<8} {ms_mean:>6.2f}m {ms_worst:>6.2f}m {worst_frame_idx[k]:>6d}")
+                f"{k:<18} {ms_mean:>6.2f}m {ms_worst:>6.2f}m {worst_frame_idx[k]:>6d}")
         imgui.separator()
         imgui.text_colored(imgui.ImVec4(0.7, 0.7, 0.7, 1.0),
             "red = worst > 2x mean (likely stutter)")
+        if imgui.button("Save perf log JSON"):
+            self._save_perf_log(list(history))
+        imgui.same_line()
+        imgui.text_colored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0), "-> perf_runs/")
         imgui.end()
+
+    def _save_perf_log(self, history, extra=None, suffix=''):
+        """Dump the per-frame section_history ring + summary stats to
+        perf_runs/<rule>_<size>_<renderer>_<timestamp>.json.
+
+        history is a list of dicts (one per frame) keyed by section name.
+        extra is an optional dict merged into the top-level payload (used
+        by the benchmark mode to tack on per-CA metadata)."""
+        import os
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'perf_runs')
+        os.makedirs(out_dir, exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        tag = f"{suffix}_" if suffix else ''
+        path = os.path.join(out_dir,
+            f"{tag}{self.rule_name}_{self.size}_{self.renderer_mode}_{ts}.json")
+
+        # Compute summary stats so the JSON is useful without re-derivation.
+        all_keys = sorted({k for sec in history for k in sec})
+        summary = {}
+        for k in all_keys:
+            vals = [sec[k] for sec in history if k in sec and isinstance(sec[k], (int, float))]
+            if not vals:
+                continue
+            vals.sort()
+            n = len(vals)
+            summary[k] = {
+                'n': n,
+                'mean_ms': 1000.0 * sum(vals) / n,
+                'p50_ms':  1000.0 * vals[n // 2],
+                'p95_ms':  1000.0 * vals[min(n - 1, int(n * 0.95))],
+                'p99_ms':  1000.0 * vals[min(n - 1, int(n * 0.99))],
+                'max_ms':  1000.0 * vals[-1],
+            }
+
+        payload = {
+            'rule': self.rule_name,
+            'size': self.size,
+            'renderer_mode': self.renderer_mode,
+            'render_mode': int(self.render_mode),
+            'colormap': int(self.colormap),
+            'width': int(self.width),
+            'height': int(self.height),
+            'gl_renderer': self.ctx.info.get('GL_RENDERER', '?'),
+            'gl_vendor': self.ctx.info.get('GL_VENDOR', '?'),
+            'frames': len(history),
+            'summary': summary,
+            'history': history,
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            with open(path, 'w') as f:
+                json.dump(payload, f)
+            print(f"[perf] saved {len(history)} frames -> {path}", flush=True)
+            return path
+        except Exception as e:
+            print(f"[perf] save failed: {e!r}", flush=True)
+            return None
 
     def _draw_ui(self):
         imgui.set_next_window_pos(imgui.ImVec2(10, 10), imgui.Cond_.first_use_ever)
@@ -12211,8 +24724,20 @@ class Simulator:
         imgui.text_wrapped(self.preset['description'])
         imgui.separator()
 
-        # Grid size
+        # Grid size. 768/1024 are only offered for rules that we've
+        # verified scale: they need GPU-init-substitutable IC (`tex_a`
+        # auto-falls-back at >1 GiB scratch) AND must not own a second
+        # full-size physics field (`extra_fields`/`crystal_growth`),
+        # entity arena, or agent buffer — those still allocate full
+        # size³ on CPU and OOM at 1024.
+        p = self.preset
+        big_safe = (p.get('extra_fields', 0) == 0
+                    and p.get('shader', '') != 'crystal_growth'
+                    and 'entity_arena' not in p
+                    and p.get('agent_count', 0) == 0)
         sizes = [32, 48, 64, 96, 128, 192, 256, 384, 512]
+        if big_safe:
+            sizes += [768, 1024]
         imgui.text("Grid size:")
         if imgui.begin_combo("##size", str(self.size)):
             for s in sizes:
@@ -12374,6 +24899,18 @@ class Simulator:
         if imgui.button("Reload##disc_reload"):
             self._load_discoveries()
         imgui.same_line()
+        if imgui.button("Top##disc_top"):
+            self._load_best_for_current_rule(random_topk=1)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Load the highest-scoring discovery\n"
+                              "for the current rule.")
+        imgui.same_line()
+        if imgui.button("Surprise##disc_random_top"):
+            self._load_best_for_current_rule(random_topk=10)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Load a random pick from the top 10\n"
+                              "discoveries for the current rule.")
+        imgui.same_line()
         imgui.text(f"({len(self.discoveries)} total)")
 
         # Discovery browser — all rules
@@ -12471,9 +25008,29 @@ class Simulator:
                             pc = d.get('projection_complexity', 0)
                             mi = d.get('slice_mi', 0)
                             is_sel = (idx == self.discovery_index)
-                            label = f"#{idx:3d} S={sc:.2f} G={gc:.2f} P={pc:.2f} M={mi:.2f}##d{idx}"
+                            # Tag the row with the init variant when it differs
+                            # from the preset default, so two discoveries that
+                            # share params but diverge purely in topology
+                            # (e.g. one-source vs many-source) are visually
+                            # distinguishable in the list.
+                            iv = d.get('init_variant')
+                            preset_default = (
+                                RULE_PRESETS.get(d.get('rule', ''), {}).get('init')
+                            )
+                            tag = ''
+                            if iv and iv != preset_default:
+                                # Strip rule-name prefix for compactness
+                                short = iv
+                                rn = d.get('rule', '')
+                                if rn and short.startswith(rn + '_'):
+                                    short = short[len(rn) + 1:]
+                                tag = f' [{short}]'
+                            label = (f"#{idx:3d} S={sc:.2f} G={gc:.2f} "
+                                     f"P={pc:.2f} M={mi:.2f}{tag}##d{idx}")
                             if imgui.selectable(label, is_sel)[0]:
                                 self._load_discovery(idx)
+                            if iv and imgui.is_item_hovered():
+                                imgui.set_tooltip(f"init: {iv}")
                         imgui.tree_pop()
                 imgui.end_child()
             else:
@@ -12548,7 +25105,7 @@ class Simulator:
                 self.brightness = new_val
 
             if not self.is_element_ca:
-                colormap_names = ["Fire", "Cool", "Grayscale", "Neon", "Discrete", "Spectral"]
+                colormap_names = ["Fire", "Cool", "Grayscale", "Neon", "Discrete", "Spectral", "Diverging"]
                 if imgui.begin_combo("##colormap", colormap_names[min(self.colormap, len(colormap_names)-1)]):
                     for i, label in enumerate(colormap_names):
                         is_sel = (i == self.colormap)
@@ -12596,7 +25153,7 @@ class Simulator:
                 if changed:
                     self.iso_threshold = new_val
 
-            colormap_names = ["Fire", "Cool", "Grayscale", "Neon", "Discrete", "Spectral"]
+            colormap_names = ["Fire", "Cool", "Grayscale", "Neon", "Discrete", "Spectral", "Diverging"]
             if imgui.begin_combo("##colormap", colormap_names[min(self.colormap, len(colormap_names)-1)]):
                 for i, label in enumerate(colormap_names):
                     is_sel = (i == self.colormap)
@@ -12636,9 +25193,37 @@ class Simulator:
                         imgui.set_item_default_focus()
                 imgui.end_combo()
 
-            changed, self.vis_abs = imgui.checkbox("Absolute value", self.vis_abs)
+            # vis_abs is an int code (0=raw, 1=abs, 2=signed bipolar). The
+            # checkbox toggles between 0 and 1; preset-set value of 2 is
+            # preserved as long as the user doesn't touch the checkbox.
+            cur_abs_bool = bool(self.vis_abs)
+            changed, new_abs_bool = imgui.checkbox("Absolute value", cur_abs_bool)
             if changed:
+                self.vis_abs = 1 if new_abs_bool else 0
                 self._accel_textures_valid = False
+
+        # Vis-mode selector (multi-channel transfer function). Available for
+        # any rule, not only multi-field, so users can experiment with single-
+        # channel rules in bipolar mode etc. once those rules write to ch1+.
+        if self.renderer_mode != 'voxel':
+            imgui.text("Vis mode:")
+            cur_mode = int(getattr(self, 'vis_mode', 0))
+            cur_label = _VIS_MODE_LABELS[cur_mode] if 0 <= cur_mode < len(_VIS_MODE_LABELS) else _VIS_MODE_LABELS[0]
+            if imgui.begin_combo("##vis_mode", cur_label):
+                for i, label in enumerate(_VIS_MODE_LABELS):
+                    is_sel = (i == cur_mode)
+                    if imgui.selectable(label, is_sel)[0]:
+                        if self.vis_mode != i:
+                            self.vis_mode = i
+                    if is_sel:
+                        imgui.set_item_default_focus()
+                imgui.end_combo()
+            if cur_mode in (VIS_MODE_HSV_PHASE, VIS_MODE_BIPOLAR):
+                lo, hi = self.vis_aux_range
+                changed, new_hi = imgui.slider_float("##aux_hi", float(hi), 0.01, 10.0,
+                                                      flags=imgui.SliderFlags_.logarithmic)
+                if changed:
+                    self.vis_aux_range = (float(lo), float(new_hi))
 
         imgui.separator()
 
@@ -12946,12 +25531,27 @@ class Simulator:
             f"drawtext=fontfile='{fontb}':text='{_esc(title)}':"
             f"fontcolor=white:fontsize={title_fs}:x={margin}:y={top_y}:"
             f"borderw={border_w}:bordercolor=black@0.8")
-        # Description (under title)
+        # Description (under title) — word-wrap so long descriptions don't
+        # run off the right edge. We don't have ffmpeg's textwrap available
+        # without re-encoding via a separate filter, so wrap in Python using
+        # a conservative average-glyph-width estimate.
         if desc:
-            drawtext_parts.append(
-                f"drawtext=fontfile='{font}':text='{_esc(desc)}':"
-                f"fontcolor=white:fontsize={desc_fs}:x={margin}:y={top_y + title_h}:"
-                f"borderw={border_w}:bordercolor=black@0.8")
+            # DejaVu Sans average glyph width ~= 0.55 * fontsize.
+            avg_glyph_px = max(4.0, desc_fs * 0.55)
+            # Reserve a small right margin equal to the left margin.
+            usable_px = max(120, w - 2 * margin)
+            max_chars = max(20, int(usable_px / avg_glyph_px))
+            wrapped = textwrap.wrap(
+                desc, width=max_chars,
+                break_long_words=False, break_on_hyphens=False,
+            ) or [desc]
+            line_h = int(round(desc_fs * 1.2))
+            for i, line in enumerate(wrapped):
+                drawtext_parts.append(
+                    f"drawtext=fontfile='{font}':text='{_esc(line)}':"
+                    f"fontcolor=white:fontsize={desc_fs}:x={margin}:"
+                    f"y={top_y + title_h + i * line_h}:"
+                    f"borderw={border_w}:bordercolor=black@0.8")
         # Parameters (bottom-left)
         if param_str:
             drawtext_parts.append(
@@ -13342,6 +25942,9 @@ class Simulator:
             'rule': self.rule_name,
             'label': preset['label'],
             'description': preset.get('description', ''),
+            # Optional Shorts-friendly one-liner; falls back to first
+            # sentence of description in the YouTube pipeline.
+            'short_description': preset.get('short_description', ''),
             'params': {k: float(v) if isinstance(v, (int, float)) else v
                        for k, v in self.params.items()},
             'dt': self.dt,
@@ -13437,8 +26040,18 @@ class Simulator:
                     sec['render_skipped'] = True
                 else:
                     self._render()
+                    t_snap = time.perf_counter()
                     self._snapshot_scene()
+                    sec['render.snapshot'] = time.perf_counter() - t_snap
                     self._last_scene_hash = cur_hash
+                    # Promote per-stage sub-timings collected by the
+                    # active renderer into the section dict so the
+                    # F12 overlay + perf log can see them.
+                    sub = getattr(self, '_render_sub', None)
+                    if sub:
+                        for k, v in sub.items():
+                            if not k.startswith('_'):
+                                sec[f'render.{k}'] = v
                 sec['render'] = time.perf_counter() - t_render_start
 
                 # Capture frame for video (scene only, before UI overlay)
@@ -13748,12 +26361,249 @@ def run_audit(rule, sizes, steps, seed=None, sample_interval=5, warmup=0,
     return results
 
 
+def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
+                            renderers='auto', seed=None):
+    """Cycle through N random 3D rule presets, run each for `frames_per_rule`
+    frames in a visible GLFW window, and dump a combined JSON report to
+    perf_runs/benchmark_<timestamp>.json.
+
+    The first `warmup_frames` of each rule are discarded (shader compile,
+    accel-texture build, GPU clock spin-up). All remaining frames are
+    captured with full per-section + render.* sub-section timings.
+
+    `renderers` is a comma-separated list of renderer modes to test
+    (voxel, volumetric, slice, auto). 'auto' uses each rule's default.
+    Multiple modes multiply the run length.
+    """
+    import os, random as _rnd
+    rng = _rnd.Random(seed if seed is not None else int(time.time()))
+
+    # Pick only 3D rules (the renderer is 3D-only). Heuristic: presets
+    # whose shader name contains '3d', '_3d', or whose render_mode is
+    # 'voxel' / 'volumetric'. Skip element_ca + agent rules which have
+    # special bring-up paths.
+    candidates = []
+    for name, p in RULE_PRESETS.items():
+        shader = p.get('shader', '')
+        rmode = p.get('render_mode', 'volumetric')
+        if rmode == 'slice':
+            continue  # slice renderer is intentionally not 3D
+        if p.get('is_element_ca', False):
+            continue  # element CAs need element_data wiring
+        if 'agent' in shader.lower() or 'lambda' in shader.lower():
+            continue
+        if '3d' in shader.lower() or rmode in ('voxel', 'volumetric'):
+            candidates.append(name)
+
+    if not candidates:
+        print("[bench] no candidate rules found", flush=True)
+        return
+    if len(candidates) < n_rules:
+        print(f"[bench] only {len(candidates)} candidate rules available "
+              f"(requested {n_rules})", flush=True)
+        n_rules = len(candidates)
+    chosen = rng.sample(candidates, n_rules)
+
+    # Renderer modes to cycle.
+    if renderers == 'auto':
+        rmodes = [None]
+    else:
+        rmodes = [r.strip() for r in renderers.split(',') if r.strip()]
+
+    print(f"\n=== Benchmark: {n_rules} rules x {len(rmodes)} renderer mode(s) "
+          f"x {frames_per_rule} frames @ {size}³ ===", flush=True)
+    print(f"  rules: {', '.join(chosen)}", flush=True)
+    print(f"  renderers: {rmodes}", flush=True)
+    print(f"  warmup/rule: {warmup_frames} frames\n", flush=True)
+
+    # Single Simulator instance — _change_rule swaps presets without
+    # rebuilding the GL context. Visible window so the renderer paths
+    # actually execute (a hidden window often has the swapchain disabled).
+    sim = Simulator(size=size, rule=chosen[0], headless=False)
+    sim._show_perf_overlay = False  # we capture frames directly, no overlay
+    sim.target_sps = 0  # unlimited (one step per frame)
+    sim.paused = False
+    glfw.swap_interval(0)  # disable vsync — we want raw render time
+
+    per_rule = []
+    overall_t = time.time()
+    for rule_name in chosen:
+        for rmode in rmodes:
+            label = f"{rule_name}" + (f" [{rmode}]" if rmode else "")
+            print(f"[bench] {label} ...", flush=True)
+            try:
+                sim._change_rule(rule_name)
+                if rmode is not None:
+                    sim.renderer_mode = rmode
+                sim._reset()
+            except Exception as e:
+                print(f"[bench]   skipped: change_rule failed: {e!r}", flush=True)
+                continue
+
+            # Run warmup + measured frames inline (mirrors the shape of
+            # Simulator.run() but without UI panels & without imgui).
+            from collections import deque
+            section_history = deque(maxlen=frames_per_rule)
+            t_rule_start = time.time()
+            for fi in range(warmup_frames + frames_per_rule):
+                if glfw.window_should_close(sim.window):
+                    print("[bench]   window closed early — aborting", flush=True)
+                    break
+                t0 = time.perf_counter()
+                sec = {}
+                glfw.poll_events()
+                sim.imgui_renderer.process_inputs()
+                sec['poll'] = time.perf_counter() - t0
+
+                fb_w, fb_h = glfw.get_framebuffer_size(sim.window)
+                if fb_w > 0 and fb_h > 0:
+                    sim.width, sim.height = fb_w, fb_h
+                    sim.ctx.viewport = (0, 0, fb_w, fb_h)
+
+                t_step = time.perf_counter()
+                sim._step_sim()
+                sec['step'] = time.perf_counter() - t_step
+
+                t_render = time.perf_counter()
+                sim._render()
+                sub = getattr(sim, '_render_sub', None)
+                if sub:
+                    for k, v in sub.items():
+                        if not k.startswith('_'):
+                            sec[f'render.{k}'] = v
+                sec['render'] = time.perf_counter() - t_render
+
+                t_swap = time.perf_counter()
+                glfw.swap_buffers(sim.window)
+                sec['swap'] = time.perf_counter() - t_swap
+                sec['total'] = time.perf_counter() - t0
+
+                if fi >= warmup_frames:
+                    section_history.append(sec)
+
+            rule_dt = time.time() - t_rule_start
+            # Per-rule summary
+            hist = list(section_history)
+            if not hist:
+                print(f"[bench]   no frames captured", flush=True)
+                continue
+            mean_total = sum(s['total'] for s in hist) / len(hist) * 1000
+            mean_render = sum(s['render'] for s in hist) / len(hist) * 1000
+            print(f"[bench]   {len(hist)} frames in {rule_dt:.2f}s — "
+                  f"mean total {mean_total:.2f}ms (render {mean_render:.2f}ms)",
+                  flush=True)
+            per_rule.append({
+                'rule': rule_name,
+                'renderer_mode': sim.renderer_mode,
+                'render_mode': int(sim.render_mode),
+                'frames': len(hist),
+                'rule_dt_sec': rule_dt,
+                'history': hist,
+            })
+
+    # Combined report
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'perf_runs')
+    os.makedirs(out_dir, exist_ok=True)
+    ts = time.strftime('%Y%m%d_%H%M%S')
+    out_path = os.path.join(out_dir, f"benchmark_{ts}_{size}.json")
+
+    # Summary table: per (rule, renderer) percentile breakdown of every
+    # section that appeared in any frame.
+    def _percentiles(vals):
+        if not vals:
+            return None
+        v = sorted(vals)
+        n = len(v)
+        return {
+            'n': n,
+            'mean_ms': 1000.0 * sum(v) / n,
+            'p50_ms':  1000.0 * v[n // 2],
+            'p95_ms':  1000.0 * v[min(n - 1, int(n * 0.95))],
+            'p99_ms':  1000.0 * v[min(n - 1, int(n * 0.99))],
+            'max_ms':  1000.0 * v[-1],
+        }
+
+    for entry in per_rule:
+        all_keys = sorted({k for sec in entry['history'] for k in sec})
+        entry['summary'] = {
+            k: _percentiles([s[k] for s in entry['history']
+                              if k in s and isinstance(s[k], (int, float))])
+            for k in all_keys
+        }
+
+    payload = {
+        'size': size,
+        'frames_per_rule': frames_per_rule,
+        'warmup_frames': warmup_frames,
+        'renderers_arg': renderers,
+        'seed': seed,
+        'gl_renderer': sim.ctx.info.get('GL_RENDERER', '?'),
+        'gl_vendor': sim.ctx.info.get('GL_VENDOR', '?'),
+        'wall_time_sec': time.time() - overall_t,
+        'rules': per_rule,
+    }
+    try:
+        with open(out_path, 'w') as f:
+            json.dump(payload, f)
+        print(f"\n[bench] saved combined report -> {out_path}", flush=True)
+    except Exception as e:
+        print(f"[bench] save failed: {e!r}", flush=True)
+
+    # Print top-level summary table to stdout
+    print("\n=== Bench summary (mean ms, p99 ms) ===")
+    print(f"{'rule':<30} {'mode':<10} {'total_mean':>10} {'total_p99':>10} "
+          f"{'render_mean':>11} {'accel_mean':>10} {'disp_mean':>10}")
+    for entry in per_rule:
+        s = entry['summary']
+        def _g(k, field):
+            x = s.get(k); return x[field] if x else float('nan')
+        print(f"{entry['rule']:<30} {entry['renderer_mode']:<10} "
+              f"{_g('total','mean_ms'):>10.2f} {_g('total','p99_ms'):>10.2f} "
+              f"{_g('render','mean_ms'):>11.2f} "
+              f"{_g('render.accel','mean_ms'):>10.2f} "
+              f"{_g('render.dispatch','mean_ms'):>10.2f}")
+    print('', flush=True)
+
+    # Tear down
+    try:
+        sim._cleanup()
+    except Exception:
+        pass
+
+
+def _resolve_precision(args):
+    """Translate --fp16/--fp32 CLI flags into the constructor argument."""
+    if getattr(args, 'fp16', False) and getattr(args, 'fp32', False):
+        raise SystemExit("--fp16 and --fp32 are mutually exclusive")
+    if getattr(args, 'fp16', False):
+        return 'fp16'
+    if getattr(args, 'fp32', False):
+        return 'fp32'
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="3D CA Simulator")
     parser.add_argument('--size', type=int, default=64, help='Grid size (default: 64)')
+    parser.add_argument('--dims', type=str, default=None,
+                        help='Anisotropic grid as WxHxD (e.g. 128x128x32). '
+                             'Overrides --size when given. Most CA rules '
+                             'still assume cubic indexing internally; '
+                             'use cubic dims (NxNxN) for known-correct '
+                             'behavior on existing presets.')
     parser.add_argument('--rule', type=str, default='game_of_life_3d',
                         choices=list(RULE_PRESETS.keys()),
                         help='Rule preset (default: game_of_life_3d)')
+    parser.add_argument('--fp16', action='store_true',
+                        help='Force FP16 (rgba16f) compute textures at any '
+                             'grid size. Halves memory bandwidth and lifts '
+                             'the size cap, at the cost of precision. Auto '
+                             'kicks in for grids > ~256³ regardless.')
+    parser.add_argument('--fp32', action='store_true',
+                        help='Force FP32 (rgba32f) compute textures even '
+                             'at large grids where FP16 would auto-fall '
+                             'back. May fail to allocate above ~512³.')
     parser.add_argument('--discovery', type=str, default=None,
                         help='Load discovery from JSON file (index with --discovery-index)')
     parser.add_argument('--discovery-index', type=int, default=0,
@@ -13778,10 +26628,59 @@ def main():
                              'advances the same physical time. Use for '
                              'PDE rules (reaction-diffusion, wave, etc.) '
                              'whose shaders clamp dt for CFL stability.')
+    # --- benchmark mode ---
+    parser.add_argument('--benchmark', action='store_true',
+                        help='Run a renderer perf benchmark across N random '
+                             'rules and dump a combined JSON report. Opens '
+                             'a visible GLFW window so the perf overlay can '
+                             'render (closed automatically when done).')
+    parser.add_argument('--benchmark-rules', type=int, default=8,
+                        help='Number of random rules to cycle through '
+                             '(default: 8)')
+    parser.add_argument('--benchmark-frames', type=int, default=300,
+                        help='Frames to record per rule (default: 300, '
+                             '~5s @ 60 FPS). The first 60 frames are '
+                             'discarded as warmup.')
+    parser.add_argument('--benchmark-warmup', type=int, default=60,
+                        help='Warmup frames per rule before recording '
+                             '(default: 60)')
+    parser.add_argument('--benchmark-renderers', type=str, default='auto',
+                        help='Comma-separated renderer modes to test '
+                             '(voxel,volumetric,slice,auto). "auto" uses '
+                             'each rule\'s default. (default: auto)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Override seed before reset (applies to audit '
                              'and non-audit runs)')
     args = parser.parse_args()
+
+    # Parse --dims if provided.
+    dims = None
+    if args.dims is not None:
+        try:
+            parts = [int(p) for p in args.dims.lower().split('x')]
+            if len(parts) != 3 or any(p <= 0 for p in parts):
+                raise ValueError
+            dims = tuple(parts)
+        except ValueError:
+            print(f"Invalid --dims: {args.dims!r}; expected WxHxD with positive ints.")
+            sys.exit(1)
+
+    # Benchmark mode: cycle through random rules, render each for N
+    # frames with the F12 perf overlay enabled, save a combined JSON.
+    if args.benchmark:
+        run_renderer_benchmark(
+            size=args.size,
+            n_rules=args.benchmark_rules,
+            frames_per_rule=args.benchmark_frames,
+            warmup_frames=args.benchmark_warmup,
+            renderers=args.benchmark_renderers,
+            seed=args.seed,
+        )
+        try:
+            glfw.terminate()
+        except Exception:
+            pass
+        return
 
     # Audit mode: loop through sizes headlessly, dump per-size JSON, exit.
     if args.audit:
@@ -13809,7 +26708,8 @@ def main():
             sys.exit(1)
         disc = discoveries[args.discovery_index]
         args.rule = disc['rule']
-        sim = Simulator(size=args.size, rule=args.rule)
+        sim = Simulator(size=args.size, rule=args.rule,
+                        force_precision=_resolve_precision(args), dims=dims)
         # Override params from discovery
         for k, v in disc['params'].items():
             if k in sim.params:
@@ -13822,7 +26722,8 @@ def main():
         print(f"Loaded discovery #{args.discovery_index}: {disc['rule']} "
               f"score={disc.get('score', '?')} params={disc['params']}")
     else:
-        sim = Simulator(size=args.size, rule=args.rule)
+        sim = Simulator(size=args.size, rule=args.rule,
+                        force_precision=_resolve_precision(args), dims=dims)
 
     if args.seed is not None:
         sim.seed = int(args.seed)
