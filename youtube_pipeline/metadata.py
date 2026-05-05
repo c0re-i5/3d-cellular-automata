@@ -36,6 +36,39 @@ def _is_shorts(resolution: list[int]) -> bool:
     return h > w
 
 
+# Shorts only show the first ~100 chars of the description before
+# truncating with a "more" link, so a 400-char paragraph just produces
+# an unreadable wall of text on the watch screen.
+SHORTS_DESC_MAX = 140
+
+
+def _shorten_for_shorts(desc: str) -> str:
+    """Return a Shorts-friendly blurb derived from the full description.
+
+    Strategy: take the first sentence (split on ". " — preserves
+    abbreviations like "B6/S5" and "vs."), then if it's too long try
+    keeping the first em-dash clause if that gives a substantive head
+    (≥ 60 chars), otherwise hard-truncate at a word boundary.
+    """
+    if not desc:
+        return desc
+    desc = desc.replace('\n', ' ').strip()
+    # First sentence — split on ". " (with trailing space) so decimals
+    # like "0.5" don't break it.
+    sentence = desc.split('. ', 1)[0].rstrip('.').strip()
+    if len(sentence) <= SHORTS_DESC_MAX:
+        return sentence + '.'
+    # Drop a trailing em-dash explanation if present, the head fits
+    # AND the head is long enough on its own to be a useful blurb.
+    if ' — ' in sentence:
+        head = sentence.split(' — ', 1)[0].strip()
+        if 60 <= len(head) <= SHORTS_DESC_MAX:
+            return head + '.'
+    # Hard-truncate at a word boundary.
+    truncated = sentence[:SHORTS_DESC_MAX].rsplit(' ', 1)[0]
+    return truncated + '…'
+
+
 def build_metadata(sidecar_path: Path) -> dict:
     """Return a dict with ``title``, ``description``, ``tags``, ``shorts``.
 
@@ -45,6 +78,7 @@ def build_metadata(sidecar_path: Path) -> dict:
     meta = json.loads(sidecar_path.read_text())
     label = meta.get('label', meta.get('rule', 'Cellular Automaton'))
     desc = meta.get('description', '')
+    short_desc = meta.get('short_description', '') or _shorten_for_shorts(desc)
     rule = meta.get('rule', '')
     size = meta.get('size', 0)
     seed = meta.get('seed', 0)
@@ -54,16 +88,25 @@ def build_metadata(sidecar_path: Path) -> dict:
     shorts = _is_shorts(resolution)
 
     # ── Title ─────────────────────────────────────────────────────────
+    # Strip the in-app "Flagship: " curation prefix — viewers searching
+    # YouTube don't care about our internal preset tier, they care what's
+    # actually on screen ("Coral Reef", not "Flagship: Coral Reef").
+    title_label = label
+    if title_label.startswith('Flagship: '):
+        title_label = title_label[len('Flagship: '):]
     if shorts:
-        title = f'{label} — 3D Cellular Automata #Shorts'
+        title = f'{title_label} — 3D Cellular Automata #Shorts'
     else:
-        title = f'{label} — 3D Cellular Automata Simulation'
+        title = f'{title_label} — 3D Cellular Automata Simulation'
     title = title[:TITLE_MAX]
 
     # ── Description ───────────────────────────────────────────────────
+    # Shorts use a single-sentence blurb (the watch screen truncates
+    # to ~100 chars before "more"); long-form keeps the rich paragraph.
     lines = []
-    if desc:
-        lines.append(desc)
+    body_desc = short_desc if shorts else desc
+    if body_desc:
+        lines.append(body_desc)
         lines.append('')
     lines.append(f'Rule: {rule}')
     lines.append(f'Grid: {size}³  •  Seed: {seed}')
@@ -89,7 +132,7 @@ def build_metadata(sidecar_path: Path) -> dict:
     raw_tags = [
         'cellular automata', '3d cellular automata', 'generative art',
         'simulation', 'emergent behavior', 'gpu compute',
-        'volumetric rendering', label.lower(),
+        'volumetric rendering', title_label.lower(),
         rule.replace('_', ' ') if rule else '',
     ]
     # Dedup case-insensitively, preserve order, drop empties.
