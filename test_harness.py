@@ -2291,6 +2291,19 @@ def cmd_audit(ctx, args):
             result = run_trial(ctx, name, size=run_size, steps=args.steps,
                               seed=args.seed, verbose=args.verbose,
                               recorder=rec)
+            # Persist the run-level summary into the bundle manifest so
+            # downstream analysis (smell.py, properties.py, matrix.py)
+            # can rank rules by score without re-running them. Without
+            # this, every audit bundle's manifest['score'] defaults to 0
+            # and every rule looks dead in the smell report.
+            if rec is not None:
+                rec.update_manifest(
+                    score=float(result['score']),
+                    final_alive=float(result['final_alive']),
+                    final_activity=float(result['final_activity']),
+                    final_surface=float(result['final_surface']),
+                    measure_mode=result.get('measure_mode'),
+                )
         results.append(result)
 
         status = "OK"
