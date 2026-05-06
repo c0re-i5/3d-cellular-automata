@@ -13366,7 +13366,9 @@ RULE_PRESETS = {
         "dt": 0.5,
         "dt_range": (0.1, 2.5),
         "init": "gray_scott",
-        "init_variants": ["gray_scott", "gray_scott_worms_dense"],
+        # Dropped 'gray_scott_worms_dense' (median 0.34 vs 0.86 for
+        # 'gray_scott') — INIT_DEAD per ca_debug.triage.
+        "init_variants": ["gray_scott"],
         "description": "Gray-Scott worm regime — labyrinthine stripe patterns.",
         "vis_channels": ["U (substrate)", "V (catalyst)"],
         "vis_default": 1,
@@ -13797,8 +13799,10 @@ RULE_PRESETS = {
                          "Freq scale": (0.05, 2.0), "Adaptation": (0.0, 3.0)},
         "dt": 0.1,
         "dt_range": (0.02, 0.3),
-        "init": "kuramoto",
-        "init_variants": ["kuramoto", "kuramoto_clusters"],
+        # Swap default to 'kuramoto_clusters' — the bare 'kuramoto'
+        # init was flagged INIT_DEAD by ca_debug.triage (median ~0.0).
+        "init": "kuramoto_clusters",
+        "init_variants": ["kuramoto_clusters"],
         "description": "Coupled oscillators synchronize — adaptive frequencies create chimera states.",
         "vis_channels": ["Phase", "Frequency", "Coherence"],
         "vis_default": 0,
@@ -14064,7 +14068,8 @@ RULE_PRESETS = {
         "dt": 0.1,
         "dt_range": (0.02, 0.3),
         "init": "mycelium",
-        "init_variants": ["mycelium", "mycelium_foraging"],
+        # Dropped 'mycelium_foraging' — INIT_DEAD per ca_debug.triage.
+        "init_variants": ["mycelium"],
         "description": (
             "Fungal hyphal network with directional persistence and "
             "anastomosis.  Each tip remembers the direction it last "
@@ -14104,10 +14109,15 @@ RULE_PRESETS = {
                          "Amplitude": (0.01, 5.0)},
         "dt": 0.05,
         "dt_range": (0.01, 0.1),
-        "init": "em_wave",
-        "init_variants": ["em_wave", "em_dipole_pair", "em_plane_wave",
-                          "em_cavity_mode", "em_photonic_crystal",
-                          "em_photonic_cavity", "em_beam_splitter",
+        # Swap default to 'em_photonic_cavity' — the bare 'em_wave'
+        # init was flagged INIT_DEAD (median 0.00) along with
+        # 'em_cavity_mode' and 'em_dipole_pair'. 'em_photonic_cavity'
+        # has the highest, most stable response (median 0.66, sd 0.01)
+        # in the ca_debug.triage report.
+        "init": "em_photonic_cavity",
+        "init_variants": ["em_photonic_cavity", "em_plane_wave",
+                          "em_photonic_crystal",
+                          "em_beam_splitter",
                           "em_negative_index_slab", "em_waveguide"],
         "description": (
             "Full 3D Maxwell with vector E and B fields on a Yee "
@@ -14149,7 +14159,8 @@ RULE_PRESETS = {
         "dt": 0.05,
         "dt_range": (0.01, 0.2),
         "init": "viscous_fingers",
-        "init_variants": ["viscous_fingers", "viscous_fingers_radial",
+        # Dropped 'viscous_fingers_radial' — INIT_DEAD per ca_debug.triage.
+        "init_variants": ["viscous_fingers",
                           "viscous_fingers_dual", "viscous_fingers_layered"],
         "description": "Saffman-Taylor instability — low-viscosity fluid invades, creating fractal fingers.",
         "vis_channels": ["Saturation", "Pressure", "Permeability", "Interface"],
@@ -14190,7 +14201,10 @@ RULE_PRESETS = {
         "dt": 0.1,
         "dt_range": (0.02, 0.5),
         "init": "fire_fluid",
-        "init_variants": ["fire_fluid", "fire_fluid_sparse"],
+        # Dropped 'fire_fluid_sparse' — INIT_DEAD per ca_debug.triage,
+        # also propagates to flagship_lightning_fire which uses the
+        # composed 'fire_fluid_sparse+lsystem:lightning' init.
+        "init_variants": ["fire_fluid"],
         "description": (
             "Buoyant combustion plume.  Two-pass pipeline: chemistry "
             "(Arrhenius-gated combustion + soot/ember production + "
@@ -14342,8 +14356,10 @@ RULE_PRESETS = {
                          "Regen": (0.01, 1.0), "Diffusion": (0.01, 0.5)},
         "dt": 0.1,
         "dt_range": (0.03, 0.15),
-        "init": "lichen",
-        "init_variants": ["lichen", "lichen_dense"],
+        # Swap default to 'lichen_dense' — the bare 'lichen' init was
+        # INIT_DEAD per ca_debug.triage (median 0.10, max 0.10).
+        "init": "lichen_dense",
+        "init_variants": ["lichen_dense"],
         "description": "Three species compete for space — pioneer, competitor, and nomad create territorial mosaic.",
         "vis_channels": ["Species A", "Species B", "Resource", "Species C"],
         "vis_default": 0,
@@ -14998,7 +15014,8 @@ RULE_PRESETS = {
         "dt": 1.0,
         "dt_range": (1.0, 1.0),
         "init": "hopfion_h1",
-        "init_variants": ["hopfion_h1", "hopfion_h2", "hopfion_random_unit"],
+        # Dropped 'hopfion_random_unit' — INIT_DEAD per ca_debug.triage.
+        "init_variants": ["hopfion_h1", "hopfion_h2"],
         "description": ("Hopf-soliton / 'hopfion' field — every voxel holds "
                         "a unit 3-vector n̂ ∈ S². Initial condition is an "
                         "analytic Hopf-charge-1 soliton: two linked tubes "
@@ -15160,8 +15177,12 @@ RULE_PRESETS = {
         "param_ranges": {"Head min": (1.0, 4.0), "Head max": (1.0, 6.0),
                          "Spark p": (0.0, 0.005), "Decay": (0.0, 0.01)},
         "dt": 1.0,
-        "init": "wireworld_torus",
-        "init_variants": ["wireworld_torus", "wireworld_lattice"],
+        # Swap default to 'wireworld_lattice' — the original
+        # 'wireworld_torus' init was INIT_DEAD per ca_debug.triage
+        # (median 0.10) while 'wireworld_lattice' is healthy
+        # (median 0.97).
+        "init": "wireworld_lattice",
+        "init_variants": ["wireworld_lattice"],
         "description": ("3D Wireworld: a 4-state programmable substrate (empty / "
                         "head / tail / conductor) capable of universal computation. "
                         "The default ring init runs as a self-sustaining electron "
@@ -15207,8 +15228,10 @@ RULE_PRESETS = {
                          "Mass m²": (0.0, 4.0), "Drive": (0.0, 0.5)},
         "dt": 0.25,
         "dt_range": (0.05, 0.4),
-        "init": "sine_gordon_kink",
-        "init_variants": ["sine_gordon_kink", "sine_gordon_breather"],
+        # Swap default to 'sine_gordon_breather' — 'sine_gordon_kink'
+        # was INIT_DEAD per ca_debug.triage.
+        "init": "sine_gordon_breather",
+        "init_variants": ["sine_gordon_breather"],
         "description": ("∂²u/∂t² = c²∇²u − sin(u) — nonlinear wave equation "
                         "supporting topological soliton solutions. In 3D the 1D "
                         "kink lifts to a planar π-wall that propagates, oscillates, "
