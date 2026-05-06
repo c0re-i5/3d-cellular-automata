@@ -162,53 +162,97 @@ def check_finite_run(run) -> list[Failure]:
 
 
 # ── Cross-bundle property checks (need a RunSet) ──────────────────────
-def check_seed_respected(rs) -> dict[str, list[Failure]]:
-    """For any rule with ≥3 runs that share size+steps but differ in seed,
-    require the runs to produce ≥2 distinct *spatial fingerprints* of the
-    final state. The fingerprint is a tuple of populated-by-default
-    columns (alive_count, activity, com_x/y/z, rg, bbox_min/max_x/y/z,
-    boundary_count) at the last recorded step.
+def _state_fingerprint(ts_row) -> tuple:
+    """Spatial fingerprint of a single timeseries row. Uses populated-by-
+    default columns sensitive to where mass sits in the grid.
 
-    These quantities are sensitive to where mass sits in the grid, not just
-    how much — so seed-driven spatial reorganisation will distinguish runs
-    even when alive_count happens to coincide. The per-channel ch_* stats
-    can't be used because the harness only fills them for the single
-    measure-channel.
-
-    Returns {run_id: [Failure, ...]} keyed by the first run in each
-    violating group.
+    The per-channel ch_* stats are omitted because the harness only fills
+    them for the single measure-channel — most are NaN and would falsely
+    distinguish runs that are actually identical.
     """
-    import pandas as pd
     import numpy as np
-
-    fingerprint_cols = [
+    cols = [
         'alive_count', 'activity',
         'com_x', 'com_y', 'com_z', 'rg',
         'bbox_min_x', 'bbox_min_y', 'bbox_min_z',
         'bbox_max_x', 'bbox_max_y', 'bbox_max_z',
         'boundary_count', 'surface_ratio',
     ]
+    fp = []
+    for c in cols:
+        v = ts_row.get(c)
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            fp.append(None)
+        else:
+            fp.append(round(float(v), 4))
+    return tuple(fp)
+
+
+def _trajectory_fingerprint(ts) -> tuple:
+    """Full-trajectory fingerprint: a tuple of (alive_count, activity)
+    pairs across every sampled step. Two seeds are considered to have
+    "the same trajectory" iff the entire sequence matches bit-for-bit.
+
+    This is robust to rules whose initial state is below the alive
+    threshold (so step-0 alive_count = 0 for every seed) but whose
+    dynamics later diverge — those rules properly fail neither stage of
+    seed_respected. Conversely, a rule that genuinely ignores its rng
+    will produce identical trajectories at every step.
+    """
+    import numpy as np
+    if ts is None or len(ts) == 0:
+        return ()
+    ts_sorted = ts.sort_values('step')
+    out = []
+    for _, row in ts_sorted.iterrows():
+        ac = row.get('alive_count')
+        ap = row.get('activity')
+        ac_v = int(ac) if ac is not None and not (isinstance(ac, float) and np.isnan(ac)) else None
+        ap_v = round(float(ap), 6) if ap is not None and not (isinstance(ap, float) and np.isnan(ap)) else None
+        out.append((int(row['step']), ac_v, ap_v))
+    return tuple(out)
+
+
+def check_seed_respected(rs) -> dict[str, list[Failure]]:
+    """Whole-trajectory seed-sensitivity check, run per (rule, size) cell
+    with ≥3 distinct seeds:
+
+      `seed_affects_trajectory`: across the full timeseries, the
+        (alive_count, activity) sequence must vary across at least two
+        of the seeds. If every seed produces a bit-identical trajectory
+        at every sampled step, the rule's RNG is being ignored — either
+        the init function ignores its rng, or the dynamics use no
+        randomness and all seeds happen to share a trivial init (which
+        is itself worth flagging if the init is supposed to be random).
+
+    Why whole-trajectory rather than just step-0 fingerprint: many rules
+    have initial state below the `alive_threshold` so step-0 alive_count
+    is 0 regardless of seed (e.g. predator_prey_3d's food field starts
+    at 0.02–0.07, all below 0.5). Those rules properly diverge at later
+    steps; only the trajectory comparison catches the divergence.
+
+    Caveat: rules with deterministic-by-design inits (analytic quantum
+    wavefunctions, single-voxel seeds, fluid_quiescent zero start, …)
+    that *also* have deterministic dynamics will legitimately fail this
+    check. They're not bugs — they're physics. The smell report's
+    severity tier lets a reviewer skim the list and dismiss them.
+
+    Returns {run_id: [Failure, ...]} keyed by the first run in each
+    violating group.
+    """
+    import pandas as pd
 
     rows = []
     for r in rs.runs:
-        ts = r.timeseries
         m = r.manifest
-        if ts is None or len(ts) == 0:
+        if r.timeseries is None or len(r.timeseries) == 0:
             continue
-        last = ts.sort_values('step').iloc[-1]
-        fp = []
-        for col in fingerprint_cols:
-            v = last.get(col)
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                fp.append(None)
-            else:
-                fp.append(round(float(v), 4))
         rows.append({
             'run_id': r.run_id,
             'rule':   m.get('rule'),
             'size':   m.get('size'),
             'seed':   m.get('seed'),
-            'fp':     tuple(fp),
+            'traj':   _trajectory_fingerprint(r.timeseries),
         })
     if not rows:
         return {}
@@ -220,18 +264,18 @@ def check_seed_respected(rs) -> dict[str, list[Failure]]:
     for (rule, size), grp in df.groupby(['rule', 'size']):
         if grp['seed'].nunique() < 3:
             continue
-        n_distinct = grp['fp'].nunique()
-        if n_distinct == 1:
+        if grp['traj'].nunique() == 1:
             first_run = grp['run_id'].iloc[0]
             out.setdefault(first_run, []).append(Failure(
-                property="seed_respected",
+                property="seed_affects_trajectory",
                 detail=f"all {len(grp)} runs of {rule} at size={size} "
-                       f"produced bit-identical spatial fingerprints "
-                       f"(alive, activity, com, rg, bbox, boundary) across "
-                       f"{grp['seed'].nunique()} distinct seeds — init "
-                       f"and/or dynamics RNG is ignored",
+                       f"produced bit-identical (alive_count, activity) "
+                       f"trajectories across {grp['seed'].nunique()} "
+                       f"distinct seeds for every sampled step — "
+                       f"init and/or dynamics RNG is ignored",
                 metrics={"n_runs": int(len(grp)),
-                         "n_seeds": int(grp['seed'].nunique())},
+                         "n_seeds": int(grp['seed'].nunique()),
+                         "n_steps_sampled": len(grp['traj'].iloc[0])},
             ))
     return out
 
