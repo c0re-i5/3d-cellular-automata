@@ -157,19 +157,36 @@ def _select_rules(args) -> list[str]:
 def _run_one(ctx, rule: str, args) -> tuple[dict, dict, str]:
     """Returns (report, grade, captured_stdout)."""
     from ca_debug.microscope import microscope
+    from simulator import RULE_PRESETS, _resolve_composed_preset
+
+    # Per-rule size selection. With --respect-preset (default), use the
+    # preset's `search_size` (cheap GPU-friendly minimum) or fall back
+    # to `default_size`, but never go below `--size`. This matches what
+    # the harness silently auto-bumps to anyway, but makes the choice
+    # explicit so the report shows the size each rule actually ran at.
+    size = args.size
+    if args.respect_preset:
+        preset = _resolve_composed_preset(rule)
+        pref = preset.get('search_size') or preset.get('default_size')
+        if pref:
+            size = max(size, int(pref))
+
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
             report = microscope(ctx, rule,
                                 n_seeds=args.seeds, n_params=args.params,
-                                size=args.size, steps=args.steps,
+                                size=size, steps=args.steps,
                                 seed_base=args.seed_base)
+        report['size_used'] = size
     except Exception as e:
         tb = traceback.format_exc(limit=4)
         report = {'rule': rule, 'n_trials': 0,
                   'errors': [{'error': f"{type(e).__name__}: {e}"}],
-                  'sections': {}, 'fatal': True, 'traceback': tb}
+                  'sections': {}, 'fatal': True, 'traceback': tb,
+                  'size_used': size}
     grade = _grade(report)
+    grade['size'] = size
     if report.get('fatal'):
         grade['severity'] = 'err'
         grade['flags'] = ['FATAL']
@@ -186,15 +203,16 @@ def _print_table(rows: list[dict]) -> None:
                                        -len(r['grade']['flags']),
                                        r['rule']))
     print()
-    print(f"{'SEV':5s}  {'RULE':30s}  {'MAX':>5s}  {'DEAD':>9s}  {'TIME':>5s}  FLAGS / NOTE")
-    print("-" * 110)
+    print(f"{'SEV':5s}  {'RULE':30s}  {'SIZE':>4s}  {'MAX':>5s}  {'DEAD':>9s}  {'TIME':>5s}  FLAGS / NOTE")
+    print("-" * 120)
     for r in rows:
         g = r['grade']
         max_s = f"{g['max_score']:.2f}" if g['max_score'] == g['max_score'] else "  nan"
         dead = f"{g['n_dead']}/{g['n_total']}"
         flags = " ".join(g['flags'])
         note = (" — " + g['note']) if g.get('note') else ""
-        print(f"{g['severity']:5s}  {r['rule']:30s}  {max_s:>5s}  "
+        size_s = str(g.get('size', '?'))
+        print(f"{g['severity']:5s}  {r['rule']:30s}  {size_s:>4s}  {max_s:>5s}  "
               f"{dead:>9s}  {r['elapsed']:>4.1f}s  {flags}{note}")
     print()
     # Counts
@@ -223,10 +241,16 @@ def _cli():
                     help="Seeds per (param, init) cell (default: 2)")
     ap.add_argument("--params", type=int, default=3,
                     help="Random param vectors per rule (default: 3)")
-    ap.add_argument("--size", type=int, default=24,
-                    help="Grid size (default: 24)")
-    ap.add_argument("--steps", type=int, default=48,
-                    help="Steps per trial (default: 48)")
+    ap.add_argument("--size", type=int, default=48,
+                    help="Minimum grid size; raised per-rule when --respect-preset "
+                         "is set (default: 48)")
+    ap.add_argument("--steps", type=int, default=80,
+                    help="Steps per trial (default: 80)")
+    ap.add_argument("--respect-preset", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Honour each preset's search_size / default_size as a "
+                         "per-rule minimum (default: True). Use --no-respect-preset "
+                         "to force every rule to --size exactly.")
     ap.add_argument("--seed-base", type=int, default=1000)
     ap.add_argument("--json", default="",
                     help="If set, dump full per-rule reports + grades to this file")
@@ -255,7 +279,8 @@ def _cli():
             all_reports[rule] = {'report': report, 'grade': grade}
             flag_str = " ".join(grade['flags'])
             print(f"  [{i:3d}/{len(rules)}] {grade['severity']:5s}  "
-                  f"{rule:30s}  max={grade['max_score']:.2f}  "
+                  f"{rule:30s}  size={grade['size']:>3d}  "
+                  f"max={grade['max_score']:.2f}  "
                   f"dead={grade['n_dead']}/{grade['n_total']}  "
                   f"{elapsed:.1f}s  {flag_str}", flush=True)
             if args.verbose and captured:
