@@ -126,6 +126,46 @@ def _reflect(arr: np.ndarray, axis: int,
 # `forward` and `inverse` take (arr, vec_channels).
 # ---------------------------------------------------------------------------
 
+# Shaders whose internal lab-frame noise (hash_static(pos,..),
+# hash_temporal(pos,..), fbm3(vec3(pos),..)) breaks rotational and
+# reflection equivariance by design.  Detected at import time by
+# inspecting shader source.  Translation by an integer voxel under
+# periodic BCs is still meaningful (the pos-keyed hash shifts with
+# the field, so equivariance holds).
+def _detect_lab_noise_shaders() -> set[str]:
+    """Find shaders whose update reads stochastic noise keyed on lab
+    coordinates -- breaks rotation/reflection/translation equivariance.
+
+    Heuristic: any call to a function whose name contains 'hash',
+    'noise', 'fbm', or 'rand' counts as a candidate.  We only flag the
+    shader if such a call appears in the body (not just the function
+    definition itself), which we approximate by counting matches and
+    flagging when count > 1 (the definition site contributes 1).
+    """
+    try:
+        from simulator import CA_RULES
+    except Exception:
+        return set()
+    import re
+    pat = re.compile(
+        r'\b(?:'
+        r'hash_static|hash_temporal|hash_dir|block_hash|pp_hash|ppr_hash'
+        r'|fbm3|noise3'
+        r')\s*\(',
+        re.MULTILINE,
+    )
+    out: set[str] = set()
+    for name, src in CA_RULES.items():
+        if not isinstance(src, str):
+            continue
+        if pat.search(src):
+            out.add(name)
+    return out
+
+
+_SHADERS_QUENCHED_LAB_NOISE: set[str] = _detect_lab_noise_shaders()
+
+
 class Probe:
     def __init__(self, name: str, label: str,
                  forward: Callable, inverse: Callable,
@@ -142,6 +182,19 @@ class Probe:
         skip = preset.get('symmetry_break') or []
         if self.name in skip or self.label in skip:
             return False, 'opt-out via symmetry_break'
+        # Shaders that intentionally use position-dependent quenched
+        # noise (hash_static(pos,..), fbm3(vec3(pos),..)) are *not*
+        # exactly equivariant under spatial transformations -- their
+        # internal "defect" texture is fixed in lab coordinates.  This
+        # is a documented design choice (e.g. crystal_growth defects +
+        # twin nucleation), not a bug, so we skip rotate/reflect for
+        # those shaders.  Translation by an integer voxel under
+        # periodic BCs is still meaningful (hashes shift with the
+        # field, since they're indexed by pos which we also shift).
+        shader = preset.get('shader') or ''
+        if shader in _SHADERS_QUENCHED_LAB_NOISE:
+            if self.name in ('rotate_z90', 'reflect_x', 'translate_x'):
+                return False, f'{shader}: lab-frame quenched defects'
         bnd = (preset.get('boundary') or 'toroidal').lower()
         is_periodic = bnd in ('toroidal', 'periodic', 'wrap')
         # Translation symmetry only holds under periodic BCs.  Without

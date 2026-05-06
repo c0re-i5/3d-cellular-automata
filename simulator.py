@@ -8294,7 +8294,12 @@ void main() {
 // u_param0 = N      number of states (4..32)
 // u_param1 = k      neighbour threshold for excitation (1..6)
 // u_param2 = sp     spontaneous excitation probability per quiescent cell
-// u_param3 = decay  if 1, refractory state decays exponentially; if 0, instant
+// u_param3 = decay  per-step probability that a refractory cell resets
+//                   to rest.  Decay=1.0 -> always reset (classical GH);
+//                   Decay=0.0 -> never reset (refractory persists
+//                   forever, eventually freezing the medium).  Continuous
+//                   intermediate values give exponentially-decaying
+//                   refractory tails -> longer scroll-wave coherence.
 
 int gh_state(ivec3 p, int N) {
     return clamp(int(round(fetch(p).r * float(N - 1))), 0, N - 1);
@@ -8307,7 +8312,7 @@ void main() {
     int N  = clamp(int(u_param0 + 0.5), 4, 32);
     int k  = clamp(int(u_param1 + 0.5), 1, 6);
     float sp = clamp(u_param2, 0.0, 1.0);
-    int decay = int(u_param3 + 0.5);
+    float decay_p = clamp(u_param3, 0.0, 1.0);
 
     int s = gh_state(pos, N);
     int new_s;
@@ -8329,8 +8334,12 @@ void main() {
         // Excited or refractory ramp: advance.
         new_s = s + 1;
     } else {
-        // Last state: relax to rest (or decay slowly if requested).
-        new_s = (decay == 1 && hash_temporal(pos, 1) > 0.5) ? s : 0;
+        // Last (refractory) state: reset to rest with probability
+        // decay_p; otherwise persist for another step.  decay_p=1
+        // recovers the classical GH rule (instant reset);
+        // decay_p<1 produces exponentially-decaying refractory
+        // tails which stabilize 3D scroll-wave coherence.
+        new_s = (hash_temporal(pos, 1) < decay_p) ? 0 : s;
     }
 
     float out_v = float(new_s) / float(max(N - 1, 1));
@@ -15175,7 +15184,7 @@ RULE_PRESETS = {
         "label": "3D Greenberg–Hastings (Excitable)",
         "shader": "greenberg_hastings_3d",
         "params": {"States N": 8.0, "Threshold k": 1.0,
-                   "Spontaneous": 0.0001, "Decay": 0.0},
+                   "Spontaneous": 0.0001, "Decay": 1.0},
         "param_ranges": {"States N": (4.0, 32.0), "Threshold k": (1.0, 6.0),
                          "Spontaneous": (0.0, 0.01), "Decay": (0.0, 1.0)},
         "dt": 1.0,
