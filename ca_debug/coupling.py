@@ -136,6 +136,7 @@ def _grade_rule(coupling: dict, delta_norms: np.ndarray) -> dict[str, Any]:
     flags: list[str] = []
     sev = 'ok'
     dead: list[str] = []
+    saturated: list[str] = []
     explosive: list[str] = []
     asym: list[str] = []
     mode_params: list[str] = []
@@ -154,6 +155,8 @@ def _grade_rule(coupling: dict, delta_norms: np.ndarray) -> dict[str, Any]:
                 mode_params.append(pname)
             elif kind == 'init_time':
                 init_params.append(pname)
+            elif info.get('saturated'):
+                saturated.append(pname)
             else:
                 dead.append(pname)
                 sev = _worst(sev, 'med')
@@ -200,10 +203,13 @@ def _grade_rule(coupling: dict, delta_norms: np.ndarray) -> dict[str, Any]:
         flags.append('MODE=' + ','.join(mode_params))
     if init_params:
         flags.append('INIT=' + ','.join(init_params))
+    if saturated:
+        flags.append('SAT=' + ','.join(saturated))
     return {'severity': sev, 'flags': flags,
             'n_dead': len(dead), 'n_explosive': len(explosive),
             'n_asym': len(asym),
-            'n_mode': len(mode_params), 'n_init': len(init_params)}
+            'n_mode': len(mode_params), 'n_init': len(init_params),
+            'n_saturated': len(saturated)}
 
 
 def _worst(a: str, b: str) -> str:
@@ -291,12 +297,66 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
             info[tag] = _per_channel_response(g_base, g, delta_base)
         coupling[pname] = info
 
+    # ── Saturation rescue ──
+    # A "dead" normal param is often actually clamped inside the
+    # shader (e.g. ε² → max(ε², floor) in cahn_hilliard) so a small
+    # ±10% perturb falls inside the clamp and registers as zero
+    # response.  Re-test each dead param at extreme values (full
+    # param_range if available, else ×5 / ÷5) and mark SATURATED if
+    # the response then exceeds the dead threshold.
+    pranges = preset.get('param_ranges') or {}
+    for pname in pname_list:
+        info = coupling[pname]
+        if info.get('kind') != 'normal':
+            continue
+        if info.get('nan_pos') or info.get('nan_neg'):
+            continue
+        plus = info.get('+')
+        minus = info.get('-')
+        if plus is None or minus is None:
+            continue
+        if float(max(plus.max(), minus.max())) >= DEAD_THRESHOLD:
+            continue
+        v = info['value']
+        rng = pranges.get(pname)
+        # Try increasingly extreme values: full design range first,
+        # then 5x outside it, to catch params clamped by shader-internal
+        # length-scale/stability floors that swallow the entire design
+        # range at small probe grid sizes (e.g. cahn_hilliard ε²).
+        if rng and len(rng) == 2:
+            r_lo, r_hi = float(rng[0]), float(rng[1])
+            extremes = [r_hi, r_lo, r_hi * 5.0, r_lo / 5.0 if r_lo > 0 else r_lo - 1.0]
+        else:
+            base = abs(v) if abs(v) > 1e-3 else 1.0
+            extremes = [v + base, v - base, v + 100 * base, v - 100 * base]
+        max_resp_x = 0.0
+        for vp in extremes:
+            if vp == v:
+                continue
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _, g = _evolve(ctx, rule, size=args.size,
+                                   steps=args.steps, seed=args.seed,
+                                   params_override={pname: vp})
+            except Exception:
+                continue
+            if not np.isfinite(g).all():
+                continue
+            r = _per_channel_response(g_base, g, delta_base)
+            max_resp_x = max(max_resp_x, float(r.max()))
+            if max_resp_x >= DEAD_THRESHOLD:
+                break  # found responsiveness, no need to keep probing
+        info['rescue_max'] = max_resp_x
+        if max_resp_x >= DEAD_THRESHOLD:
+            info['saturated'] = True
+
     grade = _grade_rule(coupling, delta_norms)
     # Promote dead-headline-param to 'high' (only for non-mode params).
     headline = pname_list[:4]
     headline_dead = [p for p in headline
                      if p in coupling
                      and coupling[p].get('kind') == 'normal'
+                     and not coupling[p].get('saturated')
                      and coupling[p].get('+') is not None
                      and coupling[p].get('-') is not None
                      and not coupling[p].get('nan_pos')
