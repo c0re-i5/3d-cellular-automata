@@ -79,6 +79,7 @@ def detect_metric_collisions(runs_root: str) -> list[Finding]:
                count(distinct rule) as n_rules,
                string_agg(distinct rule, ', ') as rules
         from runs
+        where kind = 'audit'
         group by score, gol_coherence_max, projection_complexity, slice_mi_max
         having count(distinct rule) > 1
            and score > 0.15                       -- exclude saturation-floor cluster
@@ -116,7 +117,8 @@ def detect_seed_invariance(runs_root: str) -> list[Finding]:
                count(distinct round(final_alive,5)) as n_unique,
                round(avg(score),3) as mean_score
         from runs
-        where size = (select min(size) from runs)
+        where kind = 'audit'
+          and size = (select min(size) from runs where kind='audit')
         group by rule
         having count(distinct seed) >= 3
            and count(distinct round(final_alive,5)) = 1
@@ -148,7 +150,8 @@ def detect_seed_fragility(runs_root: str) -> list[Finding]:
                round(max(score),3) as max_score,
                count(*) as n
         from runs
-        where size = (select min(size) from runs)
+        where kind = 'audit'
+          and size = (select min(size) from runs where kind='audit')
         group by rule
         having count(distinct seed) >= 3 and stddev(score) > 0.10
         order by sd_score desc
@@ -174,7 +177,7 @@ def detect_size_collapse(runs_root: str) -> list[Finding]:
     on a big grid look 'dead' under fraction-based scoring), but some are
     real bugs (init/dt that doesn't scale)."""
     # Need at least two distinct sizes in the corpus to compare.
-    sizes_df = _q("select distinct size from runs order by size", runs_root)
+    sizes_df = _q("select distinct size from runs where kind='audit' order by size", runs_root)
     if len(sizes_df) < 2:
         return []
     s_min = int(sizes_df['size'].iloc[0])
@@ -184,7 +187,7 @@ def detect_size_collapse(runs_root: str) -> list[Finding]:
             select rule,
                    avg(case when size = {s_min} then score end) as score_small,
                    avg(case when size = {s_max} then score end) as score_large
-            from runs group by rule
+            from runs where kind='audit' group by rule
         )
         select rule,
                round(score_small, 3) as score_small,
@@ -229,7 +232,7 @@ def detect_instant_saturation(runs_root: str) -> list[Finding]:
                round(max(r.score), 3) as best_score,
                count(*) as n_runs
         from first_few f join runs r using (run_id)
-        where f.early_alive >= 0.99
+        where r.kind = 'audit' and f.early_alive >= 0.99
         group by r.rule
         having max(r.score) < 0.3
         order by early_alive desc
@@ -256,6 +259,7 @@ def detect_dead_rules(runs_root: str) -> list[Finding]:
         select rule, count(*) as n_runs,
                round(max(score), 3) as max_score
         from runs
+        where kind = 'audit'
         group by rule
         having max(score) < 0.05
         order by rule
@@ -280,7 +284,7 @@ def detect_nan_inf(runs_root: str) -> list[Finding]:
     df = _q("""
         select rule, count(*) as n_bad
         from runs
-        where has_nan or has_inf
+        where kind = 'audit' and (has_nan or has_inf)
         group by rule
         order by n_bad desc
     """, runs_root)
@@ -293,6 +297,172 @@ def detect_nan_inf(runs_root: str) -> list[Finding]:
             detail=f"produced NaN or Inf in {int(row['n_bad'])} runs",
             metrics={"n_bad": int(row['n_bad'])},
         ))
+    return out
+
+
+# ── Discoveries-source detectors ──────────────────────────────────────
+# These read discoveries.json (search-output, not run-bundles) so they
+# answer questions about the SEARCH process rather than the AUDIT process.
+# Discoveries record (rule, params, score, init_variant) but no timeseries.
+DEFAULT_DISCOVERIES = "discoveries.json"
+
+
+def _load_discoveries(path: str) -> list[dict]:
+    """Load discoveries.json; empty list if missing or unreadable."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"[smell] could not read {path}: {e}", file=sys.stderr)
+        return []
+
+
+def _by_rule(records: list[dict]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for r in records:
+        out.setdefault(r.get('rule', '?'), []).append(r)
+    return out
+
+
+def detect_param_insensitive(discoveries_path: str = DEFAULT_DISCOVERIES,
+                             *, min_records: int = 5,
+                             score_sd_threshold: float = 0.02) -> list[Finding]:
+    """Per (rule, init_variant), if score barely moves across ≥min_records
+    samples with random parameter draws, the rule is either insensitive
+    to its tuned params or its scoring is saturated. Either way, search
+    is wasting compute and the harness will mis-rank promotions.
+
+    Wireworld is the canonical case: params span 7× ranges but score
+    pins to 0.819 ± 0.001 across all 11 records.
+    """
+    import statistics
+    recs = _load_discoveries(discoveries_path)
+    if not recs:
+        return []
+    by: dict[tuple[str, str], list[dict]] = {}
+    for r in recs:
+        key = (r.get('rule', '?'), r.get('init_variant') or '<default>')
+        by.setdefault(key, []).append(r)
+    out = []
+    for (rule, iv), rs in by.items():
+        if len(rs) < min_records:
+            continue
+        scores = [r['score'] for r in rs if isinstance(r.get('score'), (int, float))]
+        if len(scores) < min_records:
+            continue
+        sd = statistics.pstdev(scores)
+        if sd >= score_sd_threshold:
+            continue
+        # Compute a quick param-spread sanity number: how varied are the
+        # actual param vectors? If params themselves are constant the
+        # finding is weak. We measure by counting unique tuples.
+        param_keys = sorted({k for r in rs for k in (r.get('params') or {}).keys()})
+        unique_params = {tuple(round(float((r.get('params') or {}).get(k, 0)), 4)
+                               for k in param_keys) for r in rs}
+        if len(unique_params) < max(2, len(rs) // 2):
+            continue  # params themselves don't vary — not a rule-side bug
+        out.append(Finding(
+            kind="param_insensitive",
+            severity="high",
+            subject=f"{rule} ({iv})",
+            detail=f"score sd = {sd:.4f} across {len(rs)} records with "
+                   f"{len(unique_params)} distinct param vectors — "
+                   f"score band [{min(scores):.3f}, {max(scores):.3f}]",
+            metrics={"n_records": len(rs),
+                     "score_sd": round(sd, 5),
+                     "score_min": round(min(scores), 4),
+                     "score_max": round(max(scores), 4),
+                     "n_unique_params": len(unique_params)},
+        ))
+    return out
+
+
+def detect_score_pinned(discoveries_path: str = DEFAULT_DISCOVERIES,
+                        *, min_records: int = 10,
+                        ceiling_threshold: float = 0.5) -> list[Finding]:
+    """Rules whose discoveries never break above a low score ceiling
+    despite many search attempts. Distinct from `param_insensitive` —
+    the score *does* vary, it just never reaches the band the harness
+    considers 'interesting' (≥0.5 by convention). Likely causes:
+      * scoring weights mistuned for this rule's dynamic range
+      * param ranges centered in a degenerate regime
+      * rule itself genuinely uninteresting (then prune from search)
+
+    Sandpile (max 0.32, n=8) and prisoners_dilemma (max 0.45, n=28) are
+    the two current cases.
+    """
+    recs = _load_discoveries(discoveries_path)
+    if not recs:
+        return []
+    out = []
+    for rule, rs in _by_rule(recs).items():
+        scores = [r['score'] for r in rs if isinstance(r.get('score'), (int, float))]
+        if len(scores) < min_records:
+            continue
+        mx = max(scores)
+        if mx >= ceiling_threshold:
+            continue
+        out.append(Finding(
+            kind="score_pinned",
+            severity="med",
+            subject=rule,
+            detail=f"max score = {mx:.3f} across {len(rs)} records "
+                   f"(ceiling = {ceiling_threshold:.2f}) — scoring or "
+                   f"param range needs review",
+            metrics={"n_records": len(rs),
+                     "score_max": round(mx, 4),
+                     "score_median": round(sorted(scores)[len(scores)//2], 4)},
+        ))
+    return out
+
+
+def detect_init_variant_redundant(discoveries_path: str = DEFAULT_DISCOVERIES,
+                                  *, min_per_variant: int = 5,
+                                  ks_p_threshold: float = 0.5) -> list[Finding]:
+    """For rules with multiple init_variants, flag pairs whose score
+    distributions are statistically indistinguishable (KS test p>0.5).
+    Means one variant is dead weight in the search budget — either
+    pick the cheaper one or differentiate them.
+
+    Soft dependency on scipy; if missing, this detector silently
+    returns nothing.
+    """
+    try:
+        from scipy.stats import ks_2samp
+    except ImportError:
+        return []
+    recs = _load_discoveries(discoveries_path)
+    if not recs:
+        return []
+    out = []
+    for rule, rs in _by_rule(recs).items():
+        by_iv: dict[str, list[float]] = {}
+        for r in rs:
+            iv = r.get('init_variant') or '<default>'
+            s = r.get('score')
+            if isinstance(s, (int, float)):
+                by_iv.setdefault(iv, []).append(float(s))
+        ivs = [iv for iv, ss in by_iv.items() if len(ss) >= min_per_variant]
+        if len(ivs) < 2:
+            continue
+        # All pairwise KS tests
+        for i, a in enumerate(ivs):
+            for b in ivs[i+1:]:
+                stat, p = ks_2samp(by_iv[a], by_iv[b])
+                if p < ks_p_threshold:
+                    continue
+                out.append(Finding(
+                    kind="init_variant_redundant",
+                    severity="low",
+                    subject=f"{rule}: {a} ~ {b}",
+                    detail=f"score distributions indistinguishable "
+                           f"(KS p={p:.2f}, n={len(by_iv[a])}/{len(by_iv[b])})",
+                    metrics={"ks_p": round(float(p), 4),
+                             "ks_stat": round(float(stat), 4),
+                             "n_a": len(by_iv[a]), "n_b": len(by_iv[b])},
+                ))
     return out
 
 
@@ -334,22 +504,33 @@ def detect_anomaly_events(runs_root: str) -> list[Finding]:
 
 
 # ── Registry + report ──────────────────────────────────────────────────
-DETECTORS: dict[str, Callable[[str], list[Finding]]] = {
-    "collisions":       detect_metric_collisions,
-    "saturation":       detect_instant_saturation,
-    "dead":             detect_dead_rules,
-    "nan_inf":          detect_nan_inf,
-    "size_collapse":    detect_size_collapse,
-    "seed_fragile":     detect_seed_fragility,
-    "seed_invariant":   detect_seed_invariance,
-    "events":           detect_anomaly_events,
+# Detectors come in two flavours: those that read a runs_root (bundle-
+# derived) and those that read a discoveries.json path. We tag them so
+# the runner can dispatch the right argument.
+DETECTORS: dict[str, Callable] = {
+    "collisions":              detect_metric_collisions,
+    "saturation":              detect_instant_saturation,
+    "dead":                    detect_dead_rules,
+    "nan_inf":                 detect_nan_inf,
+    "size_collapse":           detect_size_collapse,
+    "seed_fragile":            detect_seed_fragility,
+    "seed_invariant":          detect_seed_invariance,
+    "events":                  detect_anomaly_events,
+    "param_insensitive":       detect_param_insensitive,
+    "score_pinned":            detect_score_pinned,
+    "init_variant_redundant":  detect_init_variant_redundant,
+}
+
+DISCOVERY_DETECTORS = {
+    "param_insensitive", "score_pinned", "init_variant_redundant",
 }
 
 SEVERITY_ORDER = {"high": 0, "med": 1, "low": 2}
 
 
 def run_all(runs_root: str = S.DEFAULT_RUNS_ROOT,
-            kinds: list[str] | None = None) -> list[Finding]:
+            kinds: list[str] | None = None,
+            discoveries_path: str = DEFAULT_DISCOVERIES) -> list[Finding]:
     selected = kinds or list(DETECTORS.keys())
     findings: list[Finding] = []
     for name in selected:
@@ -358,7 +539,8 @@ def run_all(runs_root: str = S.DEFAULT_RUNS_ROOT,
             print(f"[smell] unknown detector: {name}", file=sys.stderr)
             continue
         try:
-            findings.extend(det(runs_root))
+            arg = discoveries_path if name in DISCOVERY_DETECTORS else runs_root
+            findings.extend(det(arg))
         except Exception as e:
             print(f"[smell] {name} failed: {e}", file=sys.stderr)
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.kind, f.subject))
@@ -411,6 +593,8 @@ def _cli() -> None:
         description="Detect suspicious patterns in a runs/ tree.")
     ap.add_argument("--runs-root", default=S.DEFAULT_RUNS_ROOT,
                     help="Path to runs directory (default: runs/)")
+    ap.add_argument("--discoveries", default=DEFAULT_DISCOVERIES,
+                    help="Path to discoveries.json (default: discoveries.json)")
     ap.add_argument("--kind", action="append",
                     choices=list(DETECTORS.keys()),
                     help="Run only this detector (repeatable). "
@@ -427,7 +611,8 @@ def _cli() -> None:
             print(f"  {name:<18s}  {doc}")
         return
 
-    findings = run_all(runs_root=args.runs_root, kinds=args.kind)
+    findings = run_all(runs_root=args.runs_root, kinds=args.kind,
+                       discoveries_path=args.discoveries)
 
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))

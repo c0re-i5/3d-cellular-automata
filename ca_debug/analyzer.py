@@ -229,7 +229,18 @@ class RunSet:
         Manifest params/code/env are flattened to `param.*`/`code.*`/`env.*`.
         Derived metrics (from derived.json) are merged at the top level so
         common queries like `select score from runs` work directly.
+
+        Adds a synthetic ``kind`` column distinguishing audit-style bundles
+        (have ``score`` from a scored trial) from recorder/playback bundles
+        (GUI sessions, replays — no score, frames-only). Smell/property
+        queries filter on this so a runs/ tree mixing both bundle types
+        doesn't break SQL bindings.
+
+        Also guarantees baseline audit columns (score, final_alive,
+        has_nan, has_inf, …) always exist — as NaN/false for non-audit
+        bundles — so DuckDB can bind queries against an arbitrary mix.
         """
+        import numpy as np
         import pandas as pd
         rows = []
         for r in self.runs:
@@ -253,7 +264,30 @@ class RunSet:
                 if isinstance(v, (int, float, str, bool, type(None))):
                     m.setdefault(k, v)
             rows.append(m)
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        # Synthetic 'kind': audit bundles have a numeric score from a
+        # completed trial; recorder bundles don't. Use score presence as
+        # the discriminator since it's the canonical audit-only field.
+        if 'score' in df.columns:
+            df['kind'] = np.where(df['score'].notna(), 'audit', 'recording')
+        else:
+            df['kind'] = 'recording'
+        # Guarantee baseline columns exist so SQL bindings always succeed
+        # even on a tree of pure recorder bundles.
+        _AUDIT_COLS = {
+            'score': float, 'final_alive': float, 'median_alive': float,
+            'final_activity': float, 'mean_activity': float,
+            'final_surface': float, 'gol_coherence_max': float,
+            'projection_complexity': float, 'projection_structure': float,
+            'slice_mi_max': float, 'spatial_variation': float,
+            'has_nan': bool, 'has_inf': bool,
+        }
+        for col, typ in _AUDIT_COLS.items():
+            if col not in df.columns:
+                df[col] = pd.NA if typ is float else False
+        return df
 
     @property
     def timeseries(self):
@@ -339,8 +373,10 @@ def sql(query: str, *, runs_root: str = S.DEFAULT_RUNS_ROOT):
         con.register("runs", rs.manifests)
 
     # Parquet views — globs let DuckDB skip files via predicate pushdown.
-    # Each view is only created if at least one matching file exists, so a
-    # runs/ tree with only headless runs (no frames.parquet) doesn't error.
+    # Each view is created either over actual parquet files or as an empty
+    # placeholder; the placeholder lets queries bind even when the runs/
+    # tree is all recorder bundles (no timeseries) or all audit bundles
+    # (no frames). Without it, smell.py errors with 'Table not found'.
     ts_glob = f"{runs_root}/*/{S.TIMESERIES_NAME}"
     fr_glob = f"{runs_root}/*/{S.FRAMES_NAME}"
     if glob(ts_glob):
@@ -349,11 +385,25 @@ def sql(query: str, *, runs_root: str = S.DEFAULT_RUNS_ROOT):
             SELECT regexp_extract(filename, '{runs_root}/([^/]+)/', 1) AS run_id, *
             FROM read_parquet('{ts_glob}', filename=true, union_by_name=true)
         """)
+    else:
+        con.execute("""
+            CREATE VIEW timeseries AS
+            SELECT NULL::VARCHAR AS run_id, NULL::INT AS step,
+                   NULL::DOUBLE AS alive_count, NULL::DOUBLE AS alive_fraction,
+                   NULL::DOUBLE AS activity, NULL::DOUBLE AS surface_density
+            WHERE FALSE
+        """)
     if glob(fr_glob):
         con.execute(f"""
             CREATE VIEW frames AS
             SELECT regexp_extract(filename, '{runs_root}/([^/]+)/', 1) AS run_id, *
             FROM read_parquet('{fr_glob}', filename=true, union_by_name=true)
+        """)
+    else:
+        con.execute("""
+            CREATE VIEW frames AS
+            SELECT NULL::VARCHAR AS run_id, NULL::INT AS step
+            WHERE FALSE
         """)
     return con.execute(query).df()
 
