@@ -213,8 +213,10 @@ def detect_size_collapse(runs_root: str) -> list[Finding]:
 def detect_instant_saturation(runs_root: str) -> list[Finding]:
     """Rules whose alive_fraction reaches 1.0 within the first few steps —
     init not breaking symmetry, threshold mis-tuned for the field range,
-    or runaway dynamics. Cross-checked: only flag if final score is also
-    weak (otherwise the rule is intentionally a filling process like Eden)."""
+    or runaway dynamics. Cross-checked: only flag if the rule's *best*
+    score across all sampled configs is also weak (otherwise the rule
+    is intentionally a filling process like Eden, or starts saturated
+    and burns down to interesting structure like fire/sandpile)."""
     df = _q("""
         with first_few as (
             select t.run_id,
@@ -224,10 +226,12 @@ def detect_instant_saturation(runs_root: str) -> list[Finding]:
         )
         select r.rule,
                round(avg(f.early_alive), 3) as early_alive,
+               round(max(r.score), 3) as best_score,
                count(*) as n_runs
         from first_few f join runs r using (run_id)
-        where f.early_alive >= 0.99 and r.score < 0.3
+        where f.early_alive >= 0.99
         group by r.rule
+        having max(r.score) < 0.3
         order by early_alive desc
     """, runs_root)
     out = []

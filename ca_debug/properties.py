@@ -131,23 +131,39 @@ def check_not_instant_dead(run) -> list[Failure]:
 
 
 def check_not_instant_saturated(run) -> list[Failure]:
-    """If the rule starts with alive_fraction == 1.000 *exactly*, the
-    `is_alive` predicate is mis-calibrated for the field range — the
-    init's continuous-field values trip the discrete threshold from
-    step 0. (This is the bug pattern we found in brusselator/schnakenberg.)"""
+    """If the rule starts with alive_fraction == 1.000 *exactly* AND
+    stays above 0.95 throughout the whole run, the `is_alive` predicate
+    is mis-calibrated for the field range — every cell trips the
+    discrete threshold from step 0 and never falls below it. (This is
+    the bug pattern we found in brusselator/schnakenberg.)
+
+    Rules that start saturated but then evolve interesting dynamics
+    (fire burning out → low alive; sandpile relaxing to SOC → ~0.88)
+    are NOT flagged: their later steps drop well below the saturation
+    floor, so the threshold is detecting *something* — it's just too
+    generous at t=0, which is harmless if the dynamics carry the
+    signal afterwards.
+    """
     ts = run.timeseries
     if ts is None or len(ts) == 0 or 'alive_fraction' not in ts.columns:
         return []
-    first = ts.sort_values('step').iloc[0]
-    af = float(first['alive_fraction'])
-    if af >= 0.999:
-        return [Failure(
-            property="not_instant_saturated", step=int(first['step']),
-            detail=f"alive_fraction = {af:.4f} at step {int(first['step'])} "
-                   f"— predicate likely mis-calibrated for this field's range",
-            metrics={"start_alive": af},
-        )]
-    return []
+    sorted_ts = ts.sort_values('step')
+    af0 = float(sorted_ts['alive_fraction'].iloc[0])
+    if af0 < 0.999:
+        return []
+    # Sustained: minimum alive_fraction across the whole run still
+    # essentially saturated. Anything that drops below 0.95 at any
+    # point is doing real work and not actually a calibration bug.
+    af_min = float(sorted_ts['alive_fraction'].min())
+    if af_min < 0.95:
+        return []
+    return [Failure(
+        property="not_instant_saturated", step=int(sorted_ts['step'].iloc[0]),
+        detail=f"alive_fraction = {af0:.4f} at step 0 and stays "
+               f"≥ {af_min:.3f} throughout — predicate likely "
+               f"mis-calibrated for this field's range",
+        metrics={"start_alive": af0, "min_alive": af_min},
+    )]
 
 
 def check_finite_run(run) -> list[Failure]:
