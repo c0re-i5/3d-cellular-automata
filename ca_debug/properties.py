@@ -280,19 +280,46 @@ def check_seed_respected(rs) -> dict[str, list[Failure]]:
     for (rule, size), grp in df.groupby(['rule', 'size']):
         if grp['seed'].nunique() < 3:
             continue
-        if grp['traj'].nunique() == 1:
-            first_run = grp['run_id'].iloc[0]
-            out.setdefault(first_run, []).append(Failure(
-                property="seed_affects_trajectory",
-                detail=f"all {len(grp)} runs of {rule} at size={size} "
-                       f"produced bit-identical (alive_count, activity) "
-                       f"trajectories across {grp['seed'].nunique()} "
-                       f"distinct seeds for every sampled step — "
-                       f"init and/or dynamics RNG is ignored",
-                metrics={"n_runs": int(len(grp)),
-                         "n_seeds": int(grp['seed'].nunique()),
-                         "n_steps_sampled": len(grp['traj'].iloc[0])},
-            ))
+        if grp['traj'].nunique() != 1:
+            continue
+        # Trajectories are bit-identical. Decide whether that's a
+        # genuine RNG-ignored bug or a degenerate run that other
+        # checks (dead_rule / instant_saturation / sustained_saturation)
+        # already cover. Two degenerate cases to ignore:
+        #
+        #   (a) Dead-at-this-size: alive_count is 0 for every step. The
+        #       rule produces nothing above the alive_threshold here, so
+        #       there's no dynamics to vary. The dead-rule smell handles
+        #       this as a separate finding.
+        #   (b) Converged-saturated: the trajectory ends with alive_count
+        #       at ≥95% of grid volume. The rule filled the grid, which
+        #       is a physical fixed point regardless of seed (e.g. Eden
+        #       growth from a single voxel always fills the box). The
+        #       saturation check handles this elsewhere.
+        traj = grp['traj'].iloc[0]
+        if not traj:
+            continue
+        alives = [t[1] for t in traj if t[1] is not None]
+        if not alives:
+            continue
+        max_alive = max(alives)
+        if max_alive == 0:
+            continue  # case (a): dead at this size
+        vol = int(size) ** 3
+        if alives[-1] >= 0.95 * vol:
+            continue  # case (b): converged saturated
+        first_run = grp['run_id'].iloc[0]
+        out.setdefault(first_run, []).append(Failure(
+            property="seed_affects_trajectory",
+            detail=f"all {len(grp)} runs of {rule} at size={size} "
+                   f"produced bit-identical (alive_count, activity) "
+                   f"trajectories across {grp['seed'].nunique()} "
+                   f"distinct seeds for every sampled step — "
+                   f"init and/or dynamics RNG is ignored",
+            metrics={"n_runs": int(len(grp)),
+                     "n_seeds": int(grp['seed'].nunique()),
+                     "n_steps_sampled": len(grp['traj'].iloc[0])},
+        ))
     return out
 
 
