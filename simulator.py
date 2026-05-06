@@ -18792,12 +18792,34 @@ def init_eden_scattered(size, rng):
 
 
 def init_hodgepodge_random(size, rng):
-    """Uniform random integer states in [0, 1] (normalised). The shader
-    decodes int(round(v * (N-1))) so a uniform float in [0,1] yields a
-    near-uniform integer distribution across the full state range
-    regardless of the N parameter chosen at sim time."""
+    """Mostly-healthy medium with a sparse population of low-level
+    infections that act as nucleation sites for BZ-style spirals.
+
+    The previous implementation (uniform float in [0,1]) decoded to a
+    near-uniform integer distribution across the full N-state range.
+    With the default N=100 every cell started infected, all advanced
+    to the 'ill' (state N-1) band within a few steps, every cell
+    healed to 0 simultaneously, and the field stayed quiescent forever
+    because no infected neighbours remained to seed new waves.
+
+    Real BZ media start essentially uniform with rare perturbations.
+    Here we mark ~30% of cells as low-level infected — encoded in the
+    [0.05, 0.15] band of the [0,1] channel so the shader's
+    round(v * (N-1)) decode produces a low-but-nonzero state across
+    the supported N range (state 1-2 at N=16, state 5-15 at N=100,
+    state 13-38 at N=256). All well below the 'ill' threshold (N-1)
+    and well above 0 (healthy), so they propagate as infection waves
+    instead of immediately collapsing to the all-ill / all-heal
+    cycle.
+
+    Density 30% chosen to give >= k1=2..4 infected neighbours in a
+    26-cell Moore neighbourhood: expected 7.8, so even with k1=4
+    most cells get susceptibility A/k1 >= 1 each step.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = _canonical_noise(size, rng)
+    seed_mask = _canonical_noise(size, rng) < 0.30
+    levels = _canonical_noise(size, rng) * 0.10 + 0.05  # in [0.05, 0.15]
+    data[:, :, :, 0] = np.where(seed_mask, levels, 0.0).astype(np.float32)
     return data
 
 

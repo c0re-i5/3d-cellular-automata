@@ -1865,16 +1865,27 @@ def score_interestingness(metric_history):
     else:
         score += 0.02
 
-    # Blinker penalty: high activity relative to alive count = mass oscillation
-    # Only for discrete CAs — PDEs naturally have activity ≈ alive
+    # Blinker penalty: high activity relative to alive count = mass oscillation.
+    # Only for discrete CAs — PDEs naturally have activity ≈ alive.
+    #
+    # Gated on *low* alive_std: a true global blinker has high activity AND
+    # near-constant alive_count (it just toggles between two states cycle by
+    # cycle). Cyclic CAs / BZ-style media (hodgepodge, greenberg-hastings,
+    # cyclic_ca, ising near criticality, forest_fire, game_of_life_3d) also
+    # have ratio > 1 because every cell cycles through states each step,
+    # but their alive_count varies as wavefronts sweep through — those are
+    # the runs we want to reward, not penalise. alive_std > 0.05 across the
+    # run reliably distinguishes traveling-wave dynamics from period-2 toggle.
     if not continuous_field and repr_alive > 0.10 and late_activity > 0.02:
         act_alive_ratio = late_activity / max(repr_alive, 0.01)
-        if act_alive_ratio > 1.0:
-            score -= 0.25        # global blinker — most cells toggle every step
-        elif act_alive_ratio > 0.6:
-            score -= 0.15        # substantial blinker
-        elif act_alive_ratio > 0.4:
-            score -= 0.05        # mild oscillation
+        is_static_blinker = alive_std < 0.05
+        if is_static_blinker:
+            if act_alive_ratio > 1.0:
+                score -= 0.25    # global blinker — every cell toggles, alive_count flat
+            elif act_alive_ratio > 0.6:
+                score -= 0.15    # substantial blinker
+            elif act_alive_ratio > 0.4:
+                score -= 0.05    # mild oscillation
 
     # Alive count wildly oscillating — softer penalty for PDEs (natural oscillation)
     if alive_std > 0.1:
