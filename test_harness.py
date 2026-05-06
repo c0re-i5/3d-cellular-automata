@@ -2275,10 +2275,20 @@ def cmd_audit(ctx, args):
         preset = RULE_PRESETS[name]
         if preset.get('init') == 'sandbox_empty':
             continue
-        with _trial_recorder(args, name, size=args.size, seed=args.seed,
+        # Honor per-preset default_size when it exceeds the audit default.
+        # Some rules (e.g. crystal_dendritic at 144³) physically need more
+        # resolution to form their characteristic structure — auditing them
+        # at 32/64 produces fake "dead" signals that drown out real bugs.
+        # We shrink, never grow, the user-requested size: --size 128 still
+        # wins. We also cap at 96 to keep audit-grid runtime bounded.
+        run_size = args.size
+        preset_default = int(preset.get('default_size', 0))
+        if preset_default > run_size:
+            run_size = min(preset_default, 96)
+        with _trial_recorder(args, name, size=run_size, seed=args.seed,
                              params=None, dt=None,
                              tags=('audit',)) as rec:
-            result = run_trial(ctx, name, size=args.size, steps=args.steps,
+            result = run_trial(ctx, name, size=run_size, steps=args.steps,
                               seed=args.seed, verbose=args.verbose,
                               recorder=rec)
         results.append(result)
