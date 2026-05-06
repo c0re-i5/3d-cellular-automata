@@ -134,19 +134,72 @@ def _grade(report: dict[str, Any]) -> dict[str, Any]:
 # Runner
 # ---------------------------------------------------------------------------
 
-_SEV_ORDER = {'crit': 0, 'high': 1, 'med': 2, 'ok': 3, 'err': 4}
+_SEV_ORDER = {'crit': 0, 'high': 1, 'med': 2, 'ok': 3, 'err': 4, 'n/a': 5}
+
+
+# Inits whose grids are intentionally empty at t=0 with NO built-in
+# source/perturbation in the rule itself — they only acquire dynamics
+# once the user paints into the field in the GUI, so the headless
+# harness will always score them 0. (Note: `fluid_quiescent` is NOT
+# in this set — fluid rules like volcanic_3d / smoke_wind_3d inject
+# mass via their `Source` param and are scoreable.)
+_INTERACTIVE_ONLY_INITS = {'sandbox_empty'}
+
+
+def _is_scoreable(preset: dict) -> tuple[bool, str]:
+    """Return (scoreable, reason). Non-scoreable rules are reported as
+    'n/a' rather than 'crit' so the triage table reflects only rules
+    we can actually grade."""
+    if preset.get('kind') == 'viewport':
+        return False, 'viewport SDF — no voxel state'
+    variants = preset.get('init_variants') or [preset.get('init')]
+    variants = [v for v in variants if v]
+    if variants and all(v in _INTERACTIVE_ONLY_INITS for v in variants):
+        return False, f'interactive-only init ({variants[0]})'
+    return True, '' 'n/a': 5}
+
+
+# Inits whose grids are intentionally empty / quiescent at t=0 — they
+# only acquire dynamics once the user paints / perturbs the field in
+# the GUI, so the headless harness will always score them 0. Skip
+# triage scoring for any rule whose only init_variant is one of these.
+_INTERACTIVE_ONLY_INITS = {'sandbox_empty', 'fluid_quiescent'}
+
+
+def _is_scoreable(preset: dict) -> tuple[bool, str]:
+    """Return (scoreable, reason). Non-scoreable rules are reported as
+    'n/a' rather than 'crit' so the triage table reflects only rules
+    we can actually grade."""
+    if preset.get('kind') == 'viewport':
+        return False, 'viewport SDF — no voxel state'
+    variants = preset.get('init_variants') or [preset.get('init')]
+    variants = [v for v in variants if v]
+    if variants and all(v in _INTERACTIVE_ONLY_INITS for v in variants):
+        return False, f'interactive-only init ({variants[0]})'
+    return True, ''
 
 
 def _select_rules(args) -> list[str]:
     from simulator import RULE_PRESETS
-    if args.rules:
-        wanted = [r.strip() for r in args.rules.split(',') if r.strip()]
-        bad = [r for r in wanted if r not in RULE_PRESETS]
-        if bad:
-            raise SystemExit(f"unknown rules: {bad}")
-        return wanted
-    rules = list(RULE_PRESETS.keys())
-    if args.skip_flagship:
+    preset = _resolve_composed_preset(rule)
+
+    # Skip rules the headless harness fundamentally cannot score
+    # (viewport SDFs, interactive-only empty inits).
+    scoreable, reason = _is_scoreable(preset)
+    if scoreable is False:
+        grade = {'severity': 'n/a', 'flags': ['NON_SCOREABLE'],
+                 'max_score': float('nan'), 'n_dead': 0, 'n_total': 0,
+                 'note': reason, 'size': args.size}
+        return ({'rule': rule, 'n_trials': 0, 'sections': {},
+                 'errors': [], 'skipped': True, 'reason': reason}, grade, '')
+
+    # Per-rule size selection. With --respect-preset (default), use the
+    # preset's `search_size` (cheap GPU-friendly minimum) or fall back
+    # to `default_size`, but never go below `--size`. This matches what
+    # the harness silently auto-bumps to anyway, but makes the choice
+    # explicit so the report shows the size each rule actually ran at.
+    size = args.size
+    if args.respect_preset:
         rules = [r for r in rules if not r.startswith('flagship_')]
     if args.skip:
         skip = {s.strip() for s in args.skip.split(',') if s.strip()}
@@ -159,6 +212,18 @@ def _run_one(ctx, rule: str, args) -> tuple[dict, dict, str]:
     from ca_debug.microscope import microscope
     from simulator import RULE_PRESETS, _resolve_composed_preset
 
+    preset = _resolve_composed_preset(rule)
+
+    # Skip rules the headless harness fundamentally cannot score
+    # (viewport SDFs, interactive-only empty inits).
+    scoreable, reason = _is_scoreable(preset)
+    if scoreable is False:
+        grade = {'severity': 'n/a', 'flags': ['NON_SCOREABLE'],
+                 'max_score': float('nan'), 'n_dead': 0, 'n_total': 0,
+                 'note': reason, 'size': args.size}
+        return ({'rule': rule, 'n_trials': 0, 'sections': {},
+                 'errors': [], 'skipped': True, 'reason': reason}, grade, '')
+
     # Per-rule size selection. With --respect-preset (default), use the
     # preset's `search_size` (cheap GPU-friendly minimum) or fall back
     # to `default_size`, but never go below `--size`. This matches what
@@ -166,7 +231,6 @@ def _run_one(ctx, rule: str, args) -> tuple[dict, dict, str]:
     # explicit so the report shows the size each rule actually ran at.
     size = args.size
     if args.respect_preset:
-        preset = _resolve_composed_preset(rule)
         pref = preset.get('search_size') or preset.get('default_size')
         if pref:
             size = max(size, int(pref))

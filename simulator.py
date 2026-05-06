@@ -5039,6 +5039,7 @@ void main() {
     //      semi-Lagrangian advection step damps out.  This is the
     //      "alive" term — without it the plume is a fat rising blob.
     if (eps > 0.0) {
+        // Local omega via central difference of the velocity field.
         vec3 vxp = fetch2(pos + ivec3( 1, 0, 0)).xyz;
         vec3 vxm = fetch2(pos + ivec3(-1, 0, 0)).xyz;
         vec3 vyp = fetch2(pos + ivec3( 0, 1, 0)).xyz;
@@ -5050,22 +5051,40 @@ void main() {
             (vzp.x - vzm.x) - (vxp.z - vxm.z),
             (vxp.y - vxm.y) - (vyp.x - vym.x)
         );
-        // |omega| at 6 neighbours, then central-difference grad.
-        float ox_p = length(0.5 * vec3(
-            (fetch2(pos + ivec3(2, 0, 0)).y - fetch2(pos                  ).y) -
-            (fetch2(pos + ivec3(1, 1, 0)).z - fetch2(pos + ivec3(1,-1, 0)).z),
-            (fetch2(pos + ivec3(1, 0, 1)).x - fetch2(pos + ivec3(1, 0,-1)).x) -
-            (fetch2(pos + ivec3(2, 0, 0)).z - fetch2(pos                  ).z),
-            (fetch2(pos + ivec3(1, 1, 0)).y - fetch2(pos + ivec3(1,-1, 0)).y) -
-            (fetch2(pos + ivec3(1, 0, 1)).x - fetch2(pos + ivec3(1, 0,-1)).x)
-        ));
-        // Cheap gradient: just |omega| at me vs +X.  The cross-product
-        // direction matters more than the gradient magnitude precision.
-        float om_self = length(omega);
-        vec3 N = vec3(ox_p - om_self, 0.0, 0.0);
-        // Crude but cheap: re-use omega direction for N when grad is tiny.
-        if (length(N) < 1e-4) N = normalize(omega + vec3(1e-6));
-        else N = normalize(N + vec3(1e-6));
+
+        // Steinhoff–Underhill needs N = grad(|omega|), which is a
+        // proper 3-vector — the previous version forced N onto the
+        // X axis only, which collapsed cross(N, omega) into the YZ
+        // plane and killed the curling-tongue behaviour the
+        // confinement term is supposed to provide.
+        //
+        // Compute |omega| at all 6 axial neighbours via the same
+        // central-difference stencil, then take a central-difference
+        // gradient.  The extra fetches are worth it: vorticity
+        // confinement is the entire "alive" character of the flame.
+        #define OMAG(P) length(0.5 * vec3( \
+            (fetch2((P) + ivec3(0, 1, 0)).z - fetch2((P) + ivec3(0,-1, 0)).z) - \
+            (fetch2((P) + ivec3(0, 0, 1)).y - fetch2((P) + ivec3(0, 0,-1)).y), \
+            (fetch2((P) + ivec3(0, 0, 1)).x - fetch2((P) + ivec3(0, 0,-1)).x) - \
+            (fetch2((P) + ivec3(1, 0, 0)).z - fetch2((P) + ivec3(-1,0, 0)).z), \
+            (fetch2((P) + ivec3(1, 0, 0)).y - fetch2((P) + ivec3(-1,0, 0)).y) - \
+            (fetch2((P) + ivec3(0, 1, 0)).x - fetch2((P) + ivec3(0,-1, 0)).x)))
+        float om_xp = OMAG(pos + ivec3( 1, 0, 0));
+        float om_xm = OMAG(pos + ivec3(-1, 0, 0));
+        float om_yp = OMAG(pos + ivec3( 0, 1, 0));
+        float om_ym = OMAG(pos + ivec3( 0,-1, 0));
+        float om_zp = OMAG(pos + ivec3( 0, 0, 1));
+        float om_zm = OMAG(pos + ivec3( 0, 0,-1));
+        #undef OMAG
+        vec3 N = 0.5 * vec3(om_xp - om_xm, om_yp - om_ym, om_zp - om_zm);
+        float Nlen = length(N);
+        if (Nlen < 1e-6) {
+            // Pure-symmetry fallback: orient the kick perpendicular
+            // to omega itself so the kick is non-zero but small.
+            N = normalize(omega + vec3(1e-6));
+        } else {
+            N = N / Nlen;
+        }
         v_new += eps * cross(N, omega) * u_dt;
     }
 
@@ -5079,9 +5098,18 @@ void main() {
     }
 
     // ── 5. Combustion oxygen consumption (mirror of fire_chem_3d). ─
+    //    The chem pass’s ignition threshold is user-tunable, but the
+    //    flow pass only has 4 param slots (alpha/eps/visc/wind) and
+    //    can’t see it.  Rather than hard-coding 0.20 here — which
+    //    silently de-syncs O₂ consumption from actual combustion
+    //    whenever the user changes T-ignition — use a temperature-
+    //    proxy gate: any cell hot enough to be visibly burning is
+    //    above ~0.05, and the chem pass’s own gate already prevents
+    //    cooler cells from producing the heat in the first place.
+    //    This keeps O₂ depletion co-located with combustion across
+    //    the entire T-ignition range without needing a 5th uniform.
     float fuel  = chem.a;
-    float T_ign = 0.20;  // matches default; not exposed as flow param
-    float gate  = smoothstep(T_ign, T_ign + 0.05, T)
+    float gate  = smoothstep(0.05, 0.15, T)
                 * smoothstep(0.02, 0.10, fuel)
                 * smoothstep(0.02, 0.10, oxy_self);
     float burn  = gate * fuel * oxy_self;
