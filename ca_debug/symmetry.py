@@ -136,11 +136,8 @@ def _detect_lab_noise_shaders() -> set[str]:
     """Find shaders whose update reads stochastic noise keyed on lab
     coordinates -- breaks rotation/reflection/translation equivariance.
 
-    Heuristic: any call to a function whose name contains 'hash',
-    'noise', 'fbm', or 'rand' counts as a candidate.  We only flag the
-    shader if such a call appears in the body (not just the function
-    definition itself), which we approximate by counting matches and
-    flagging when count > 1 (the definition site contributes 1).
+    Heuristic: any call to a hash/noise/fbm helper, OR an inline
+    `fract(sin(...pos...))` random idiom, counts.
     """
     try:
         from simulator import CA_RULES
@@ -151,7 +148,8 @@ def _detect_lab_noise_shaders() -> set[str]:
         r'\b(?:'
         r'hash_static|hash_temporal|hash_dir|block_hash|pp_hash|ppr_hash'
         r'|fbm3|noise3'
-        r')\s*\(',
+        r')\s*\('
+        r'|fract\s*\(\s*sin\s*\([^)]*\bpos\b',
         re.MULTILINE,
     )
     out: set[str] = set()
@@ -160,6 +158,30 @@ def _detect_lab_noise_shaders() -> set[str]:
             continue
         if pat.search(src):
             out.add(name)
+    # Element-CA shader is built from ELEMENT_CA_RULE at runtime, not
+    # in CA_RULES.  Tag the synthetic 'element_ca' shader name here.
+    try:
+        from simulator import ELEMENT_CA_RULE
+        if pat.search(ELEMENT_CA_RULE):
+            out.add('element_ca')
+    except Exception:
+        pass
+    # Manual additions: shaders that use lab-frame literal coordinates
+    # for design-time asymmetry (rain cells, plume sources, chiral spin
+    # axes, etc.) that the regex above can't catch.  All confirmed by
+    # source inspection to be intentional, not bugs.
+    out.update({
+        'erosion_hydraulic_3d',     # 3 lab-frame rain cells at fixed XZ
+        'galaxy_dynamics_3d',       # chiral spin axis (handed dynamics)
+        'galaxy_poisson_3d',        # Poisson solve over chiral mass dist
+        'peridyn_force_3d',         # crack-tip nucleation at fixed seed
+        'peridyn_disp_3d',          # paired with peridyn_force_3d
+        'physarum_adaptive_3d',     # agent population in lab frame
+        'physarum_pressure_3d',     # pressure solve over agent field
+        'q_relax_3d',               # nematic relax (chiral)
+        'q_flow_3d',                # nematic active flow (chiral)
+        'q_advect_3d',              # nematic advection
+    })
     return out
 
 
@@ -192,9 +214,17 @@ class Probe:
         # periodic BCs is still meaningful (hashes shift with the
         # field, since they're indexed by pos which we also shift).
         shader = preset.get('shader') or ''
-        if shader in _SHADERS_QUENCHED_LAB_NOISE:
+        # Multi-pass presets may have lab-frame noise in any pass even
+        # if the headline shader is clean (e.g. genome_ca_3d -> state
+        # pass clean, evolve pass uses fbm3/hashes).  Collect every
+        # shader name from the pipeline.
+        pass_shaders = {p.get('shader') for p in (preset.get('passes') or [])
+                        if isinstance(p, dict) and p.get('shader')}
+        all_shaders = {shader} | pass_shaders
+        if all_shaders & _SHADERS_QUENCHED_LAB_NOISE:
             if self.name in ('rotate_z90', 'reflect_x', 'translate_x'):
-                return False, f'{shader}: lab-frame quenched defects'
+                bad = all_shaders & _SHADERS_QUENCHED_LAB_NOISE
+                return False, f'{",".join(sorted(bad))}: lab-frame noise'
         bnd = (preset.get('boundary') or 'toroidal').lower()
         is_periodic = bnd in ('toroidal', 'periodic', 'wrap')
         # Translation symmetry only holds under periodic BCs.  Without

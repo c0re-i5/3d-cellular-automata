@@ -176,6 +176,21 @@ def _grade_rule(coupling: dict, delta_norms: np.ndarray) -> dict[str, Any]:
                 asym.append(f'{pname}({ratio:.0f}:1)')
                 sev = _worst(sev, 'med')
     if dead:
+        # If EVERY non-mode/non-init param is dead, the run is more
+        # likely too short to express any param's effect than every
+        # single param being broken simultaneously.  Downgrade to
+        # informational ("UNRESPONSIVE") rather than flagging each
+        # param as a bug.
+        all_normal = [p for p, info in coupling.items()
+                      if info.get('kind', 'normal') == 'normal'
+                      and not (info.get('nan_pos') or info.get('nan_neg'))]
+        if all_normal and len(dead) == len(all_normal):
+            return {'severity': 'n/a',
+                    'flags': [f'UNRESPONSIVE (all {len(dead)} params'
+                              f' below threshold; rule may need more steps)'],
+                    'n_dead': len(dead), 'n_explosive': 0,
+                    'n_asym': 0,
+                    'n_mode': len(mode_params), 'n_init': len(init_params)}
         flags.append('DEAD=' + ','.join(dead))
     if explosive:
         flags.append('EXP=' + ','.join(explosive))
