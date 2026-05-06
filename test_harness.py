@@ -2192,8 +2192,17 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
                        if k not in ('history', 'preview', 'params')}
             recorder.set_derived(derived)
             if _abort:
+                # Distinguish *expected* early-termination conditions
+                # (rule died out / saturated → no more signal worth
+                # collecting) from *unexpected* anomalies (NaN/Inf →
+                # the rule went numerically wrong). Logging both as
+                # "anomaly" caused smell.py's event:anomaly detector
+                # to flood with benign early-stops from inert rules
+                # like analytic fractals.
+                kind = ("anomaly" if _abort_reason == 'nan_inf'
+                        else "early_stop")
                 recorder.log_event(
-                    "anomaly", step=int(metric_history[-1]['step']) if metric_history else 0,
+                    kind, step=int(metric_history[-1]['step']) if metric_history else 0,
                     reason=_abort_reason or "abort")
             recorder.log_event(
                 "note", step=int(steps), event_kind="trial_summary",
