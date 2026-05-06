@@ -29,6 +29,14 @@ from imgui_bundle import imgui
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 from element_data import ELEMENT_GPU_DATA, SYMBOLS, NAMES, NUM_ELEMENTS, FLOATS_PER_ELEMENT, WALL_ID
 import entity_arena
+# Unified debug bundle writer. Optional dependency: if pyarrow/pandas are
+# missing the recorder import will fail — we tolerate that and fall back
+# to legacy debug_runs/ + perf_runs/ writers (which are still in place).
+try:
+    from ca_debug import RunRecorder as _RunRecorder
+except Exception as _ca_debug_err:  # noqa: BLE001
+    _RunRecorder = None
+    _ca_debug_import_err = _ca_debug_err
 
 # Per-allocation size limit for a single rgba32f 3D texture, above which
 # the grid falls back to rgba16f. The default is conservative (1 GiB) so
@@ -213,6 +221,24 @@ uniform float u_param2;
 uniform float u_param3;
 uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (Dirichlet, zero outside), 2 = mirror (Neumann, zero-flux)
 uniform int u_frame;     // step counter for temporal noise
+
+// ── Viewport pose (used by procedural "viewport" kind shaders, e.g. fractal
+// zoom-throughs). For ordinary CA shaders these are bound but ignored.
+// u_origin = world-space point at the centre of the cube
+// u_zoom   = half-width of the cube in world units (cube spans u_origin ± u_zoom)
+uniform vec3  u_origin;
+uniform float u_zoom;
+
+// ── Auxiliary uniforms for multi-fractal viewport shaders ─────────
+// u_aux3   = generic vec3 slot (e.g. Julia c-vector)
+// u_aux_a  = generic float (e.g. Mandelbox scale, Menger fold count)
+// u_aux_b  = generic float (e.g. Mandelbox min radius)
+// All three are bound from the named preset params 'Julia cx/cy/cz',
+// 'Box scale', 'Folds', 'Min radius' when present. Optimised out of
+// shaders that don't reference them.
+uniform vec3  u_aux3;
+uniform float u_aux_a;
+uniform float u_aux_b;
 
 // ── Grid-spacing scale factors ──────────────────────────────────────
 // PDE rules use discrete Laplacians on a grid with voxel spacing h = REF/size
@@ -8761,6 +8787,272 @@ void main() {
                                  clamp(dtheta_eff * (1.0/3.14159265), 0.0, 1.0)));
 }
 """,
+
+    "mandelbulb_3d": """
+// 3D Mandelbulb (White-Nylander) — voxel-baked distance-estimator field
+// rendered through the existing volumetric ray-marcher.
+//
+// This is a "viewport" kind preset, not a CA: each step re-bakes the
+// entire field as a stateless function of (world position, viewport
+// pose). u_src is intentionally ignored.
+//
+// Coordinate scheme (driven entirely by host-side viewport state):
+//   uv    = (pos - 0.5*u_size) / (0.5*u_size)        ∈ [-1, 1]^3
+//   c     = u_origin + uv * u_zoom
+//
+// `u_origin` is the world-space point at the centre of the cube and
+// `u_zoom` is its half-width. The simulator advances u_zoom each step
+// (multiplies by the 'Zoom rate' param). Reset rewinds u_zoom but keeps
+// u_origin (so the user's chosen viewing target survives Reset). The
+// Randomize button picks a new u_origin via CPU-side bisection onto the
+// bulb's surface (see _mandelbulb_surface_point in simulator.py).
+//
+// Output channels (default vis_mode = rgba_blend):
+//   ch0 = smooth iteration count / max_iter   (escape-time colour)
+//   ch1 = orbit-trap r_min                    (interior structure colour)
+//   ch2 = inside indicator (1 if never escaped) — drives voxel mode
+//   ch3 = surface opacity ≈ exp(-DE/voxel_size) — high near surface
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float power     = max(2.0, u_param0);            // 8.0 = classic Mandelbulb
+    int   max_iter  = clamp(int(u_param1), 2, 96);   // 8..64 typical
+    // u_param2 is 'Zoom rate' but its effect is applied host-side to
+    // u_zoom; the shader ignores it directly.
+    float bailout   = max(2.0, u_param3);             // 2..16
+
+    // Auto-iter scaling: each zoom-doubling roughly doubles the iteration
+    // budget needed to resolve the surface at that scale. We don't know
+    // the "base" zoom here so we treat zoom < 1.0 as the deepening regime
+    // and add iterations relative to that. Capped at 96 (loop bound).
+    if (u_zoom < 1.0) {
+        int extra = int(4.0 * log2(1.0 / max(u_zoom, 1e-9)));
+        max_iter = clamp(max_iter + extra, 2, 96);
+    }
+
+    vec3 uv = (vec3(pos) - 0.5 * float(u_size)) / (0.5 * float(u_size));
+    vec3 c  = u_origin + uv * u_zoom;
+
+    vec3  z      = c;
+    float dr     = 1.0;     // running derivative for distance estimator
+    float r      = 0.0;
+    float r_trap = 1e30;    // orbit-trap: minimum |z| over the trajectory
+    int   iter   = 0;
+
+    // Bound the loop with a compile-time constant so the GPU can unroll;
+    // gate the early-exit on max_iter at runtime.
+    for (int i = 0; i < 96; ++i) {
+        if (i >= max_iter) break;
+        r = length(z);
+        if (r > bailout) break;
+        dr = pow(r, power - 1.0) * power * dr + 1.0;
+        // Spherical-coordinate iteration (White-Nylander).
+        float theta = acos(clamp(z.z / max(r, 1e-9), -1.0, 1.0)) * power;
+        float phi   = atan(z.y, z.x) * power;
+        float zr    = pow(r, power);
+        z = zr * vec3(sin(theta) * cos(phi),
+                      sin(theta) * sin(phi),
+                      cos(theta)) + c;
+        r_trap = min(r_trap, r);
+        iter = i + 1;
+    }
+
+    bool escaped = (r > bailout);
+
+    // Continuous escape time (smoothes the iteration banding).
+    float smooth_iter = float(iter);
+    if (escaped && r > 1.0) {
+        smooth_iter -= log2(max(log(r) / log(bailout), 1e-6));
+    }
+    float t_escape = clamp(smooth_iter / float(max_iter), 0.0, 1.0);
+
+    // Hubbard-Douady distance estimator for the Mandelbulb.
+    float de = 0.5 * log(max(r, 1e-9)) * r / max(dr, 1e-9);
+
+    // Voxel size in world units == u_zoom / (0.5 * u_size). A voxel is
+    // "on the surface" when DE is within ~1.5 voxels. Normalised so
+    // surface coverage stays roughly constant across zoom depths.
+    float voxel_size = u_zoom / (0.5 * float(u_size));
+    float surface = exp(-clamp(de / max(voxel_size * 1.5, 1e-6), 0.0, 8.0));
+
+    float inside = escaped ? 0.0 : 1.0;
+    float trap   = clamp(r_trap * 0.5, 0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(t_escape, trap, inside, surface));
+}
+""",
+
+    "juliabulb_3d": """
+// 3D Julia bulb voxel-baked field — same iteration as the Mandelbulb
+// but the additive constant `c` is fixed (u_aux3) and z starts from
+// the world position. Picks a single 3-parameter slice of Julia space.
+//
+// Channels match the Mandelbulb (escape time, orbit trap, inside,
+// surface alpha) so the existing volumetric ray-marcher can render it
+// without changes.
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float power     = max(2.0, u_param0);
+    int   max_iter  = clamp(int(u_param1), 2, 96);
+    float bailout   = max(2.0, u_param3);
+    if (u_zoom < 1.0) {
+        int extra = int(4.0 * log2(1.0 / max(u_zoom, 1e-9)));
+        max_iter = clamp(max_iter + extra, 2, 96);
+    }
+
+    vec3 uv = (vec3(pos) - 0.5 * float(u_size)) / (0.5 * float(u_size));
+    vec3 c0 = u_origin + uv * u_zoom;       // world position
+    vec3 c  = u_aux3;                       // fixed Julia constant
+    vec3 z  = c0;
+    float dr = 1.0;
+    float r  = 0.0;
+    float r_trap = 1e30;
+    int iter = 0;
+    for (int i = 0; i < 96; ++i) {
+        if (i >= max_iter) break;
+        r = length(z);
+        if (r > bailout) break;
+        dr = pow(r, power - 1.0) * power * dr + 1.0;
+        float theta = acos(clamp(z.z / max(r, 1e-9), -1.0, 1.0)) * power;
+        float phi   = atan(z.y, z.x) * power;
+        float zr    = pow(r, power);
+        z = zr * vec3(sin(theta) * cos(phi),
+                      sin(theta) * sin(phi),
+                      cos(theta)) + c;
+        r_trap = min(r_trap, r);
+        iter = i + 1;
+    }
+    bool escaped = (r > bailout);
+    float smooth_iter = float(iter);
+    if (escaped && r > 1.0) {
+        smooth_iter -= log2(max(log(r) / log(bailout), 1e-6));
+    }
+    float t_escape = clamp(smooth_iter / float(max_iter), 0.0, 1.0);
+    float de = 0.5 * log(max(r, 1e-9)) * r / max(dr, 1e-9);
+    float voxel_size = u_zoom / (0.5 * float(u_size));
+    float surface = exp(-clamp(de / max(voxel_size * 1.5, 1e-6), 0.0, 8.0));
+    float inside = escaped ? 0.0 : 1.0;
+    float trap   = clamp(r_trap * 0.5, 0.0, 1.0);
+    imageStore(u_dst, pos, vec4(t_escape, trap, inside, surface));
+}
+""",
+
+    "mandelbox_3d": """
+// 3D Mandelbox voxel-bake — Tglad's box-fold + sphere-fold + scale.
+// u_aux_a = scale; u_aux_b = min sphere-fold radius; u_param3 = bailout.
+//
+// Visualization strategy: the Mandelbox in-set is a small compact
+// attractor (just a few lumps) — using it alone for the surface
+// channel produces 7 isolated dots. The iconic Mandelbox interior
+// architecture (corridors, hangars, octahedral chambers) emerges from
+// the *orbit trap*: voxels whose iteration orbit passes close to the
+// origin are "structural" cells along the fractal scaffolding.
+//
+// We composite three signals into the surface channel:
+//   1. Inside fill (compact attractor cores)
+//   2. Orbit-trap proximity (architectural structure throughout the cube)
+//   3. DE shell (sharp boundary detail)
+// Together these fill the bake region with a recognisable Mandelbox.
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    // Cap at 32 iters: scale=-2 makes dr grow as 2^iter, which
+    // overflows fp32 (max ~2^127) past ~120 iters. Truncating early
+    // keeps the distance estimator finite and well-defined for the
+    // near-set cells that form the architectural detail.
+    int   max_iter = clamp(int(u_param1), 2, 32);
+    float scale    = u_aux_a;
+    float min_r    = max(u_aux_b, 0.05);
+    float minR2    = min_r * min_r;
+    float bailout  = max(2.0, u_param3);
+
+    vec3 uv = (vec3(pos) - 0.5 * float(u_size)) / (0.5 * float(u_size));
+    vec3 c  = u_origin + uv * u_zoom;
+    vec3 z  = c;
+    float dr = 1.0;
+    float r_trap = 1e30;
+    int iter = 0;
+    bool escaped = false;
+    for (int i = 0; i < 32; ++i) {
+        if (i >= max_iter) break;
+        z = clamp(z, -1.0, 1.0) * 2.0 - z;          // box fold
+        float r2 = dot(z, z);                        // sphere fold
+        if (r2 < minR2) {
+            float fac = 1.0 / minR2;
+            z *= fac; dr *= fac;
+        } else if (r2 < 1.0) {
+            float fac = 1.0 / r2;
+            z *= fac; dr *= fac;
+        }
+        z = z * scale + c;                           // scale + offset
+        dr = dr * abs(scale) + 1.0;
+        r_trap = min(r_trap, length(z));
+        iter = i + 1;
+        if (length(z) > bailout) { escaped = true; break; }
+    }
+    float r  = length(z);
+    float de = r / max(abs(dr), 1e-9);
+
+    float t_escape = clamp(float(iter) / float(max_iter), 0.0, 1.0);
+    float voxel_size = u_zoom / (0.5 * float(u_size));
+
+    // Mandelbox surface = inverted orbit trap. Unlike Mandelbulb, the
+    // Mandelbox DE is razor-thin and its in-set is sparse, so neither
+    // makes a usable voxel signal alone. The iconic chamber + satellite
+    // architecture lives in cells whose orbit gets pulled close to the
+    // origin during the box-fold/sphere-fold dance. Low r_trap = on
+    // the fractal scaffold; high r_trap = empty space.
+    float inside = escaped ? 0.0 : 1.0;
+    float surface = clamp(1.5 - r_trap, 0.0, 1.0);
+    float trap   = clamp(r_trap * 0.5, 0.0, 1.0);
+    imageStore(u_dst, pos, vec4(t_escape, trap, inside, surface));
+}
+""",
+
+    "menger_3d": """
+// 3D Menger sponge voxel-bake — recursive IFS folding into [-1, 1]^3.
+// u_aux_a = number of folds (cast to int, capped at 12).
+// u_param1 unused (preserved for UI uniformity).
+// Output channels mirror Mandelbulb's so the volumetric renderer can show it.
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec3 uv = (vec3(pos) - 0.5 * float(u_size)) / (0.5 * float(u_size));
+    vec3 z  = u_origin + uv * u_zoom;
+
+    int n = clamp(int(u_aux_a), 1, 12);
+    float d = max(max(abs(z.x), abs(z.y)), abs(z.z)) - 1.0;
+    float r_trap = 1e30;
+    float s = 1.0;
+    for (int i = 0; i < 12; ++i) {
+        if (i >= n) break;
+        vec3 a = mod(z * s, 2.0) - 1.0;
+        s *= 3.0;
+        vec3 r = abs(1.0 - 3.0 * abs(a));
+        float da = max(r.x, r.y);
+        float db = max(r.y, r.z);
+        float dc = max(r.z, r.x);
+        float c = (min(da, min(db, dc)) - 1.0) / s;
+        d = max(d, c);
+        r_trap = min(r_trap, length(a));
+    }
+
+    // Inside-test: sample sign of d. d < 0 means we're inside the sponge
+    // (a kept solid voxel); d > 0 means we're in a removed cell.
+    float inside = (d < 0.0) ? 1.0 : 0.0;
+    float voxel_size = u_zoom / (0.5 * float(u_size));
+    float surface = exp(-clamp(abs(d) / max(voxel_size * 1.5, 1e-6), 0.0, 8.0));
+    float t_escape = clamp(float(n) / 12.0, 0.0, 1.0);
+    float trap = clamp(r_trap, 0.0, 1.0);
+    imageStore(u_dst, pos, vec4(t_escape, trap, inside, surface));
+}
+""",
 }
 
 # ── Element CA: separate compute header with SSBO for element properties ──
@@ -12290,6 +12582,410 @@ void main() {
 """
 
 
+# ── SDF Viewport fragment shader ─────────────────────────────────────────
+# Per-pixel sphere-traced rendering of a procedural SDF. Used by viewport-
+# kind presets (Mandelbulb and friends) for genuine deep-zoom: precision
+# is per-ray, not per-voxel, so we get many more orders of magnitude of
+# zoom range than the voxel-baked path.
+#
+# Coordinate system:
+#   * The fractal lives in absolute world space at "natural" scale (e.g.
+#     the Mandelbulb fits in [-1.5, 1.5]^3).
+#   * `u_origin_hi + u_origin_lo` is the world-space target point we are
+#     orbiting / zooming into. The hi/lo pair is a Veltkamp-style split
+#     to recover ~10× the precision of naked fp32 for the target offset.
+#   * `u_camera_pos` is the camera's offset *relative to* u_origin (small,
+#     typically a few u_zoom units in magnitude). This keeps ray-march
+#     state in the small-numbers regime where fp32 has full precision.
+#   * `u_zoom` is the current scale (also serves as the "near distance"
+#     between camera and target). All geometry epsilons are in units of
+#     u_zoom so resolution stays consistent across zoom depths.
+SDF_VIEWPORT_FRAGMENT_SHADER = """
+#version 430
+in vec2 v_uv;
+out vec4 fragColor;
+
+// Camera (world-space orientation + relative position)
+uniform vec3  u_camera_pos;     // RELATIVE to (u_origin_hi + u_origin_lo)
+uniform mat3  u_camera_rot;
+uniform float u_fov;
+uniform float u_aspect;
+
+// Output / shading
+uniform float u_brightness;
+uniform int   u_colormap;
+
+// Viewport pose — split for precision. p_world = u_origin_hi + u_origin_lo + p_rel
+uniform vec3  u_origin_hi;
+uniform vec3  u_origin_lo;
+uniform float u_zoom;
+
+// Mandelbulb parameters
+uniform float u_power;
+uniform int   u_max_iter;
+uniform float u_bailout;
+
+// Fractal selector. 0=Mandelbulb, 1=Julia bulb, 2=Mandelbox, 3=Menger sponge.
+// Each one shares the per-pixel sphere-tracer + shading; only de() differs.
+uniform int   u_fractal_type;
+// Generic param slot used by some fractals (Julia c-vector, Mandelbox
+// scale/fold, etc.). Each fractal documents its own meaning below.
+uniform vec3  u_aux3;
+uniform float u_aux_a;
+uniform float u_aux_b;
+
+// March budget
+uniform int   u_max_march_steps;
+
+// ── Colormaps (subset of the volumetric shader's set) ─────────────────
+vec3 colormap_fire(float t) {
+    return vec3(
+        clamp(t * 3.0, 0.0, 1.0),
+        clamp(t * 3.0 - 1.0, 0.0, 1.0),
+        clamp(t * 3.0 - 2.0, 0.0, 1.0));
+}
+vec3 colormap_cool(float t) {
+    return vec3(
+        clamp(sin(t * 3.14159 * 0.5) * 0.3, 0.0, 1.0),
+        clamp(t * 0.8, 0.0, 1.0),
+        clamp(0.5 + t * 0.5, 0.0, 1.0));
+}
+vec3 colormap_neon(float t) {
+    float h = t * 4.0;
+    return vec3(
+        clamp(abs(h - 2.0) - 1.0, 0.0, 1.0),
+        clamp(2.0 - abs(h - 1.5), 0.0, 1.0),
+        clamp(2.0 - abs(h - 3.0), 0.0, 1.0)) * (0.5 + t * 0.5);
+}
+vec3 colormap_discrete(float t) {
+    int idx = int(floor(t * 16.0));
+    idx = clamp(idx, 0, 15);
+    float hue = fract(float(idx) * 0.618033988);
+    float s = 0.75, v = 0.95;
+    float cc = v * s;
+    float h = hue * 6.0;
+    float x = cc * (1.0 - abs(mod(h, 2.0) - 1.0));
+    vec3 rgb;
+    if      (h < 1.0) rgb = vec3(cc, x, 0);
+    else if (h < 2.0) rgb = vec3(x, cc, 0);
+    else if (h < 3.0) rgb = vec3(0, cc, x);
+    else if (h < 4.0) rgb = vec3(0, x, cc);
+    else if (h < 5.0) rgb = vec3(x, 0, cc);
+    else              rgb = vec3(cc, 0, x);
+    return rgb + vec3(v - cc);
+}
+vec3 apply_colormap(float t) {
+    if (u_colormap == 0) return colormap_fire(t);
+    if (u_colormap == 1) return colormap_cool(t);
+    if (u_colormap == 3) return colormap_neon(t);
+    if (u_colormap == 4) return colormap_discrete(t);
+    return vec3(t);
+}
+
+// ── Mandelbulb DE (Hubbard-Douady) ────────────────────────────────────
+// p_rel is the ray-space coordinate (small). We add u_origin_lo first
+// (also small, so the sum keeps full fp32 precision) and only add
+// u_origin_hi at the end — exploiting the split to dodge catastrophic
+// cancellation at deep zoom.
+float mandelbulb_de(vec3 p_rel, out float r_trap, out float t_escape) {
+    vec3 c = u_origin_hi + (u_origin_lo + p_rel);
+    vec3 z = c;
+    float dr = 1.0;
+    float r  = 0.0;
+    r_trap   = 1e30;
+    int   iter = 0;
+    int   cap = clamp(u_max_iter, 2, 256);
+    for (int i = 0; i < 256; ++i) {
+        if (i >= cap) break;
+        r = length(z);
+        if (r > u_bailout) break;
+        dr = pow(r, u_power - 1.0) * u_power * dr + 1.0;
+        float theta = acos(clamp(z.z / max(r, 1e-9), -1.0, 1.0)) * u_power;
+        float phi   = atan(z.y, z.x) * u_power;
+        float zr    = pow(r, u_power);
+        z = zr * vec3(sin(theta) * cos(phi),
+                      sin(theta) * sin(phi),
+                      cos(theta)) + c;
+        r_trap = min(r_trap, r);
+        iter = i + 1;
+    }
+    bool escaped = (r > u_bailout);
+    float smooth_iter = float(iter);
+    if (escaped && r > 1.0) {
+        smooth_iter -= log2(max(log(r) / log(u_bailout), 1e-6));
+    }
+    t_escape = clamp(smooth_iter / float(cap), 0.0, 1.0);
+    // Hubbard-Douady distance estimator
+    return 0.5 * log(max(r, 1e-9)) * r / max(dr, 1e-9);
+}
+
+// ── Julia bulb DE ─────────────────────────────────────────────────────
+// Same iteration as Mandelbulb, but c is fixed (u_aux3) and z starts
+// from the world position. Picks out a single Julia "slice" through
+// 3-parameter c-space — different aux3 vectors give wildly different
+// shapes (cauliflowers, lattices, fibrous webs).
+float juliabulb_de(vec3 p_rel, out float r_trap, out float t_escape) {
+    vec3 z = u_origin_hi + (u_origin_lo + p_rel);
+    vec3 c = u_aux3;
+    float dr = 1.0;
+    float r  = 0.0;
+    r_trap   = 1e30;
+    int   iter = 0;
+    int   cap = clamp(u_max_iter, 2, 256);
+    for (int i = 0; i < 256; ++i) {
+        if (i >= cap) break;
+        r = length(z);
+        if (r > u_bailout) break;
+        dr = pow(r, u_power - 1.0) * u_power * dr + 1.0;
+        float theta = acos(clamp(z.z / max(r, 1e-9), -1.0, 1.0)) * u_power;
+        float phi   = atan(z.y, z.x) * u_power;
+        float zr    = pow(r, u_power);
+        z = zr * vec3(sin(theta) * cos(phi),
+                      sin(theta) * sin(phi),
+                      cos(theta)) + c;
+        r_trap = min(r_trap, r);
+        iter = i + 1;
+    }
+    bool escaped = (r > u_bailout);
+    float smooth_iter = float(iter);
+    if (escaped && r > 1.0) {
+        smooth_iter -= log2(max(log(r) / log(u_bailout), 1e-6));
+    }
+    t_escape = clamp(smooth_iter / float(cap), 0.0, 1.0);
+    return 0.5 * log(max(r, 1e-9)) * r / max(dr, 1e-9);
+}
+
+// ── Mandelbox DE (Tglad's box-fold + sphere-fold) ─────────────────────
+// u_aux_a = scale (negative for the classic box; -1.5 to -3 are interesting)
+// u_aux_b = min radius for sphere fold (typically 0.5)
+// Fixed inner radius = 1.0. Bailout uses a hard cap on |z|.
+float mandelbox_de(vec3 p_rel, out float r_trap, out float t_escape) {
+    vec3 c = u_origin_hi + (u_origin_lo + p_rel);
+    vec3 z = c;
+    float scale = u_aux_a;
+    float minR2 = u_aux_b * u_aux_b;
+    float dr = 1.0;
+    r_trap = 1e30;
+    int iter = 0;
+    int cap = clamp(u_max_iter, 2, 256);
+    for (int i = 0; i < 256; ++i) {
+        if (i >= cap) break;
+        // Box fold: reflect each axis into [-1, 1].
+        z = clamp(z, -1.0, 1.0) * 2.0 - z;
+        // Sphere fold.
+        float r2 = dot(z, z);
+        if (r2 < minR2) {
+            float fac = 1.0 / minR2;
+            z *= fac;  dr *= fac;
+        } else if (r2 < 1.0) {
+            float fac = 1.0 / r2;
+            z *= fac;  dr *= fac;
+        }
+        z = z * scale + c;
+        dr = dr * abs(scale) + 1.0;
+        r_trap = min(r_trap, length(z));
+        if (length(z) > 1024.0) break;
+        iter = i + 1;
+    }
+    float r = length(z);
+    t_escape = clamp(float(iter) / float(cap), 0.0, 1.0);
+    return r / abs(dr);
+}
+
+// ── Menger sponge DE ──────────────────────────────────────────────────
+// Classic 3-fold IFS: at each level, fold into the central cube and
+// remove the centre + face-centred cells (modular arithmetic in [-1,1]).
+// u_aux_a = number of fold iterations (cast to int, capped at 12)
+// u_max_iter is unused here but kept for UI uniformity.
+float menger_de(vec3 p_rel, out float r_trap, out float t_escape) {
+    vec3 z = u_origin_hi + (u_origin_lo + p_rel);
+    // Initial bounding cube SDF.
+    float d = max(max(abs(z.x), abs(z.y)), abs(z.z)) - 1.0;
+    r_trap = 1e30;
+    int n = clamp(int(u_aux_a), 1, 12);
+    float s = 1.0;
+    for (int i = 0; i < 12; ++i) {
+        if (i >= n) break;
+        // Fold: bring point into [-1, 1]^3 via |.| and 2-mod
+        vec3 a = mod(z * s, 2.0) - 1.0;
+        s *= 3.0;
+        vec3 r = abs(1.0 - 3.0 * abs(a));
+        // SDF of the 3 perpendicular crosses at this scale level.
+        float da = max(r.x, r.y);
+        float db = max(r.y, r.z);
+        float dc = max(r.z, r.x);
+        float c = (min(da, min(db, dc)) - 1.0) / s;
+        d = max(d, c);
+        r_trap = min(r_trap, length(a));
+    }
+    t_escape = clamp(float(n) / 12.0, 0.0, 1.0);
+    return d;
+}
+
+// Top-level dispatcher.
+float fractal_de(vec3 p_rel, out float r_trap, out float t_escape) {
+    if (u_fractal_type == 1) return juliabulb_de(p_rel, r_trap, t_escape);
+    if (u_fractal_type == 2) return mandelbox_de(p_rel, r_trap, t_escape);
+    if (u_fractal_type == 3) return menger_de(p_rel, r_trap, t_escape);
+    return mandelbulb_de(p_rel, r_trap, t_escape);
+}
+
+// Wrapper for normal/shadow estimation that doesn't need orbit data.
+float de(vec3 p_rel) {
+    float a, b;
+    return fractal_de(p_rel, a, b);
+}
+
+// 4-tap tetrahedral gradient (cheaper than 6-tap central diff).
+vec3 estimate_normal(vec3 p_rel, float eps) {
+    const vec2 k = vec2(1.0, -1.0);
+    return normalize(
+        k.xyy * de(p_rel + k.xyy * eps) +
+        k.yyx * de(p_rel + k.yyx * eps) +
+        k.yxy * de(p_rel + k.yxy * eps) +
+        k.xxx * de(p_rel + k.xxx * eps));
+}
+
+// Soft shadow (Inigo Quilez). Returns visibility ∈ [0, 1].
+// NOTE: distances here are in WORLD units, NOT scaled by u_zoom.
+// With FOV-based zoom the camera stays at a fixed world distance
+// (~2.5) from the bulb regardless of zoom, so shadow rays need a
+// world-scale budget too. Scaling by u_zoom (the old approach)
+// caused shadow rays to terminate before reaching any occluder at
+// deep zoom — plunging the surface into total darkness.
+float soft_shadow(vec3 ro_rel, vec3 rd, float k_soft) {
+    float res = 1.0;
+    float t   = 5e-3;
+    float t_max = 6.0;
+    for (int i = 0; i < 32; i++) {
+        float h = de(ro_rel + rd * t);
+        if (h < 1e-5) return 0.0;
+        res = min(res, k_soft * h / t);
+        t  += clamp(h, 1e-3, 0.4);
+        if (t > t_max) break;
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+// Cheap 5-sample ambient occlusion. World-scale step distances.
+float ao(vec3 p_rel, vec3 n) {
+    float occ = 0.0;
+    float scale = 1.0;
+    for (int i = 1; i <= 5; i++) {
+        float h = 0.02 * float(i);
+        float d = de(p_rel + n * h);
+        occ += (h - d) * scale;
+        scale *= 0.6;
+    }
+    return clamp(1.0 - 1.5 * occ, 0.0, 1.0);
+}
+
+void main() {
+    // NDC → camera-space ray direction
+    vec2 ndc = v_uv * 2.0 - 1.0;
+    ndc.x *= u_aspect;
+    float tan_half = tan(u_fov * 0.5);
+    vec3 rd_cam = normalize(vec3(ndc.x * tan_half, ndc.y * tan_half, -1.0));
+    vec3 rd = normalize(u_camera_rot * rd_cam);
+
+    // Ray origin: camera position relative to viewport target. Already
+    // in fp32-friendly small-magnitude coords (~u_zoom).
+    vec3 ro = u_camera_pos;
+
+    // ── Sphere tracing ────────────────────────────────────────────────
+    // All distances WORLD-space. Camera sits at fixed radius (set per
+    // preset, ~2.5 for Mandelbulb, ~8 for Mandelbox) from the bulb
+    // centre. Zoom is achieved purely by narrowing the FOV — never
+    // by translating the camera, so the camera stays outside the set.
+    float t = 0.0;
+    float t_max = 24.0;                      // safe envelope for largest preset
+    float eps_base = 5e-6;                   // hard floor on hit threshold
+    bool  hit = false;
+    vec3  hit_p = vec3(0.0);
+    float r_trap = 1e30;
+    float t_esc  = 1.0;
+
+    int budget = clamp(u_max_march_steps, 32, 512);
+    for (int i = 0; i < 512; i++) {
+        if (i >= budget) break;
+        vec3 p = ro + rd * t;
+        float rt, te;
+        float d = fractal_de(p, rt, te);
+        // Pixel-cone epsilon: a ray's footprint grows linearly with t,
+        // proportional to per-pixel angular width ≈ u_fov / N (with N≈720
+        // image pixels we approximate the constant as 1.5e-3).
+        float eps = max(eps_base, t * u_fov * 1.5e-3);
+        if (d < eps) {
+            hit = true;
+            hit_p = p;
+            r_trap = rt;
+            t_esc = te;
+            break;
+        }
+        // Slight under-step (×0.95) for safety against DE under-estimates.
+        t += d * 0.95;
+        if (t > t_max) break;
+    }
+
+    if (!hit) {
+        // Background: subtle vertical gradient
+        float sky_t = clamp(0.5 + rd.y * 0.5, 0.0, 1.0);
+        vec3 sky = mix(vec3(0.02, 0.025, 0.04),
+                       vec3(0.06, 0.08, 0.13), sky_t);
+        fragColor = vec4(sky, 1.0);
+        return;
+    }
+
+    // ── Shading ───────────────────────────────────────────────────────
+    float t_hit = length(hit_p - ro);
+    // Normal-estimation eps: pixel-cone-sized so we don't smear sub-pixel
+    // detail. Hard floor at 5e-6 (the DE precision wall in fp32).
+    float eps_n = max(5e-6, t_hit * u_fov * 1.5e-3);
+    vec3  n = estimate_normal(hit_p, eps_n);
+
+    // Single key light (soft shadowed) + fixed fill + AO.
+    vec3 key_dir = normalize(vec3(0.55, 0.75, 0.45));
+    vec3 fill_dir = normalize(vec3(-0.4, 0.3, -0.6));
+    vec3 back_dir = normalize(vec3(0.0, -0.4, 0.7));   // rim from below/behind
+    float diff = max(dot(n, key_dir), 0.0);
+    float fill = max(dot(n, fill_dir), 0.0) * 0.35;
+    float rim  = max(dot(n, back_dir), 0.0) * 0.25;    // edges glow softly
+    float occ = ao(hit_p, n);
+    float shad = soft_shadow(hit_p + n * eps_n * 4.0, key_dir, 16.0);
+
+    // Orbit-trap colour modulation: r_trap (min |z| over the orbit) varies
+    // smoothly with c, so it paints rich bands on the surface.
+    vec3 base = apply_colormap(t_esc);
+    float trap = clamp(r_trap, 0.0, 1.0);
+    vec3 trap_tint = 0.5 + 0.5 * cos(6.2831 * trap + vec3(0.0, 2.094, 4.188));
+    base = mix(base, trap_tint, 0.45);
+
+    // Brighter ambient so deep crevices stay legible. Pure AO on a fractal
+    // surface plunges everything to black because EVERY point sits in
+    // some local concavity \u2014 the AO term is unforgiving. Lift the floor
+    // (mix occ towards 1 by 0.3) so we can still read the geometry.
+    vec3 ambient = vec3(0.18, 0.20, 0.26);
+    float occ_lifted = mix(occ, 1.0, 0.3);
+    float lit = diff * shad + fill + rim;
+    vec3 color = base * (ambient + lit) * occ_lifted * u_brightness;
+
+    // Specular highlight \u2014 a touch of sheen on the surface gives the
+    // viewer's eye something to track as the camera orbits, especially
+    // useful when AO crushes the diffuse term in deep crevices.
+    vec3 view_dir = normalize(-rd);
+    vec3 half_dir = normalize(view_dir + key_dir);
+    float spec = pow(max(dot(n, half_dir), 0.0), 24.0) * shad * 0.35;
+    color += vec3(spec);
+
+    // Subtle distance fog in WORLD units (decouple from u_zoom).
+    float fog = 1.0 - exp(-t_hit / 6.0);
+    color = mix(color, vec3(0.04, 0.05, 0.08), clamp(fog, 0.0, 1.0));
+
+    fragColor = vec4(color, 1.0);
+}
+"""
+
+
 # ── Rule presets ──────────────────────────────────────────────────────
 
 
@@ -14606,6 +15302,200 @@ RULE_PRESETS = {
         "voxel_threshold": 0.7,
         "vis_range": (0.5, 1.0),
         "boundary": "toroidal",
+    },
+
+    "mandelbulb_3d": {
+        "label": "3D Mandelbulb (Zoom)",
+        "shader": "mandelbulb_3d",
+        # Procedural / stateless viewport (not a CA). The simulator
+        # treats kind=="viewport" specially:
+        #   - viewport_origin / viewport_zoom are exposed uniforms (u_origin
+        #     / u_zoom) initialised from viewport_origin / viewport_zoom_base
+        #   - per step viewport_zoom *= params['Zoom rate']
+        #   - Reset rewinds zoom but KEEPS origin
+        #   - Randomize picks a new on-surface origin (CPU bisection),
+        #     does NOT fuzz the param sliders
+        "kind": "viewport",
+        "sdf_type": 0,
+        "viewport_origin": (-0.521, 0.221, 0.7),  # known surface point
+        "viewport_zoom_base": 1.6,                # half-width at frame 0
+        "viewport_zoom_param": "Zoom rate",
+        "params": {"Power": 8.0, "Max iter": 64.0,
+                   "Zoom rate": 0.985, "Bailout": 4.0},
+        "param_ranges": {"Power": (2.0, 16.0),
+                         "Max iter": (4.0, 200.0),
+                         # 1.0 = freeze; <1 zoom in; >1 zoom out.
+                         # Narrow band so the slider stays useful.
+                         # Default 0.985 ≈ smooth cinematic descent;
+                         # auto-cycle re-targets at zoom 8e-3 (~120
+                         # steps) so the camera never stalls on the
+                         # fp32 garble floor (~5e-4).
+                         "Zoom rate": (0.85, 1.05),
+                         "Bailout": (2.0, 16.0)},
+        "dt": 1.0,
+        # Field is independent of u_src; "init" just clears the texture.
+        "init": "zero",
+        "init_variants": ["zero"],
+        "description": ("Per-pixel sphere-traced 3D Mandelbulb "
+                        "(Hubbard–Douady DE). Each step advances the "
+                        "viewport zoom (zoom *= 'Zoom rate' per step). "
+                        "Reset rewinds the zoom but keeps your viewing "
+                        "target. Randomize picks a new surface point — "
+                        "every click = a new vista. Try Power=2 "
+                        "(Mandelbrot-bulb), 8 (classic), or 12 "
+                        "(crystalline). At deep zooms crank Max iter "
+                        "for more surface detail. Camera-relative "
+                        "coords + hi/lo origin split give many orders "
+                        "of magnitude more zoom range than the legacy "
+                        "voxel-baked path."),
+        "vis_channels": ["Escape time", "Orbit trap", "Inside", "Surface α"],
+        # ch3 (surface) gives a nice soft-shell density when not using
+        # vis_mode; with vis_mode='rgba_blend' ch0/1/2 paint the colour
+        # and ch3 is the alpha — best of both.
+        "vis_default": 3,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        # Per-pixel SDF ray-march: full deep-zoom precision, no voxel grid.
+        "render_mode": "sdf_viewport",
+        "voxel_threshold": 0.5,
+        "vis_range": (0.0, 1.0),
+        # Field is generated, not advected — boundary mode is irrelevant.
+        "boundary": "clamped",
+    },
+
+    "juliabulb_3d": {
+        "label": "3D Julia Bulb (Zoom)",
+        "shader": "juliabulb_3d",
+        "kind": "viewport",
+        "sdf_type": 1,
+        # Julia-bulb is a Mandelbulb fixed-c slice. The c-vector picks
+        # which slice. (-0.291, -0.399, 0.339) gives a richly fibrous
+        # shape; nudge the components for very different topologies.
+        # Default origin is a known surface point of that c-slice so
+        # voxel mode shows the boundary on first load (deep-interior
+        # origins render as a solid cube).
+        "viewport_origin": (0.898, -0.247, 0.017),
+        "viewport_zoom_base": 1.6,
+        "viewport_zoom_param": "Zoom rate",
+        "params": {"Power": 8.0, "Max iter": 64.0,
+                   "Zoom rate": 0.985, "Bailout": 4.0,
+                   # Default Julia c chosen for rich filigree (not a near-
+                   # solid blob like the inner-set values around (-0.4, 0.6)
+                   # which produce a featureless cube in voxel mode).
+                   "Julia cx": -0.291, "Julia cy": -0.399, "Julia cz": 0.339},
+        "param_ranges": {"Power": (2.0, 16.0),
+                         "Max iter": (4.0, 200.0),
+                         "Zoom rate": (0.85, 1.05),
+                         "Bailout": (2.0, 16.0),
+                         "Julia cx": (-1.0, 1.0),
+                         "Julia cy": (-1.0, 1.0),
+                         "Julia cz": (-1.0, 1.0)},
+        "dt": 1.0,
+        "init": "zero",
+        "init_variants": ["zero"],
+        "description": ("Per-pixel sphere-traced Julia bulb. Same "
+                        "iteration as Mandelbulb but c is fixed by "
+                        "(Julia cx, cy, cz) and z starts from world "
+                        "position. Picks a single 3-parameter slice "
+                        "through Julia space — slide cx/cy/cz to "
+                        "morph between cauliflowers, lattice webs, "
+                        "fibrous knots, and whisker tangles."),
+        "vis_channels": ["Escape time", "Orbit trap", "Inside", "Surface α"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "render_mode": "sdf_viewport",
+        "voxel_threshold": 0.5,
+        "vis_range": (0.0, 1.0),
+        "boundary": "clamped",
+    },
+
+    "mandelbox_3d": {
+        "label": "3D Mandelbox (Zoom)",
+        "shader": "mandelbox_3d",
+        "kind": "viewport",
+        "sdf_type": 2,
+        # Bake the whole in-set centered at origin. Same scale as SDF
+        # view so the two render modes show the same fractal.
+        # cam_radius is large enough to sit OUTSIDE the [-2, 2]^3
+        # bounding region so SDF view shows the whole Mandelbox from
+        # a comparable framing to voxel mode.
+        "cam_radius": 6.0,
+        "viewport_origin": (0.0, 0.0, 0.0),
+        "viewport_zoom_base": 2.0,
+        "viewport_zoom_param": "Zoom rate",
+        # Match the SDF tracer's bailout. Iter capped at 32 because
+        # scale=-2 makes dr grow as 2^iter — beyond 120 iters the
+        # distance-estimator overflows fp32 and corrupts the surface
+        # signal. 32 iters resolves the main chambers cleanly.
+        "params": {"Box scale": -2.0, "Min radius": 0.5,
+                   "Max iter": 24.0, "Zoom rate": 0.985,
+                   "Bailout": 1024.0, "Power": 8.0},
+        "param_ranges": {"Box scale": (-3.5, 3.5),
+                         "Min radius": (0.2, 1.0),
+                         "Max iter": (4.0, 32.0),
+                         "Zoom rate": (0.85, 1.05),
+                         "Bailout": (2.0, 1024.0),
+                         "Power": (2.0, 16.0)},
+        "dt": 1.0,
+        "init": "zero",
+        "init_variants": ["zero"],
+        "description": ("Tglad's Mandelbox: alternating box-fold + "
+                        "sphere-fold + scale. Generates crystalline "
+                        "spaceship-hangar geometry: long corridors, "
+                        "octahedral chambers, recursive scaffolding. "
+                        "Try Box scale = -1.5 (denser), -2.0 (classic), "
+                        "or -3.0 (sparser cathedral). Min radius "
+                        "controls the curvature of the spherical fold."),
+        "vis_channels": ["Escape time", "Orbit trap", "Inside", "Surface α"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "render_mode": "sdf_viewport",
+        "voxel_threshold": 0.5,
+        "vis_range": (0.0, 1.0),
+        "boundary": "clamped",
+    },
+
+    "menger_3d": {
+        "label": "3D Menger Sponge (Zoom)",
+        "shader": "menger_3d",
+        "kind": "viewport",
+        "sdf_type": 3,
+        # Menger sponge lives in [-1, 1]^3. Bake [-1.1, 1.1]^3 around
+        # origin so the whole symmetric sponge sits in the cube with
+        # a thin margin — gives a clean, recognizable sponge silhouette.
+        "cam_radius": 4.0,
+        "viewport_origin": (0.0, 0.0, 0.0),
+        "viewport_zoom_base": 1.1,
+        "viewport_zoom_param": "Zoom rate",
+        "params": {"Folds": 8.0, "Max iter": 12.0,
+                   "Zoom rate": 0.985, "Bailout": 2.0,
+                   "Power": 3.0},
+        "param_ranges": {"Folds": (2.0, 12.0),
+                         "Max iter": (4.0, 32.0),
+                         "Zoom rate": (0.85, 1.05),
+                         "Bailout": (2.0, 8.0),
+                         "Power": (2.0, 8.0)},
+        "dt": 1.0,
+        "init": "zero",
+        "init_variants": ["zero"],
+        "description": ("Classic Menger sponge: at each level, divide "
+                        "the cube into 27 sub-cubes and remove the 7 "
+                        "centre + face-centred cells, recurse. 'Folds' "
+                        "controls how many levels of recursion the "
+                        "shader unrolls — more folds = finer holes "
+                        "all the way down. The auto-cycle bisection "
+                        "picks corner-cluster targets so each new "
+                        "vista lands on a freshly-revealed sub-cube."),
+        "vis_channels": ["Depth", "Cross trap", "Inside", "Surface α"],
+        "vis_default": 3,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "render_mode": "sdf_viewport",
+        "voxel_threshold": 0.5,
+        "vis_range": (0.0, 1.0),
+        "boundary": "clamped",
     },
 }
 
@@ -19777,6 +20667,181 @@ def _fence_delete(fence):
 #       'init': 'fear_seed',  # optional
 #   }
 
+
+# ── Viewport surface-finders ────────────────────────────────────────────
+# Pure-Python escape iterations used to pick a new ZOOM_ORIGIN that lies on
+# (or just inside) the fractal's surface, given the user's current params.
+# Called by Simulator._randomize_params for kind=="viewport" presets.
+
+def _mandelbulb_inside(c, power=8.0, bailout=4.0, max_iter=200):
+    """Return True if c is inside the Mandelbulb set under the supplied
+    iteration bound. Mirrors the GLSL shader's iteration exactly."""
+    z = np.asarray(c, dtype=np.float64).copy()
+    for _ in range(max_iter):
+        r = float(np.linalg.norm(z))
+        if r > bailout:
+            return False
+        if r < 1e-9:
+            return True
+        # GLSL acos clamps via length; mirror that.
+        zr_z = max(-1.0, min(1.0, z[2] / r))
+        theta = np.arccos(zr_z) * power
+        phi = np.arctan2(z[1], z[0]) * power
+        zr = r ** power
+        z = zr * np.array([np.sin(theta) * np.cos(phi),
+                           np.sin(theta) * np.sin(phi),
+                           np.cos(theta)]) + c
+    return True
+
+
+def _juliabulb_inside(c, jc, power=8.0, bailout=4.0, max_iter=200):
+    """Inside-test for Julia bulb at constant `jc` (the GLSL `u_aux3`).
+    Same iteration as Mandelbulb but z is initialised to the world point
+    and the additive term is the fixed `jc`."""
+    z = np.asarray(c, dtype=np.float64).copy()
+    jc = np.asarray(jc, dtype=np.float64)
+    for _ in range(max_iter):
+        r = float(np.linalg.norm(z))
+        if r > bailout:
+            return False
+        if r < 1e-9:
+            return True
+        zr_z = max(-1.0, min(1.0, z[2] / r))
+        theta = np.arccos(zr_z) * power
+        phi = np.arctan2(z[1], z[0]) * power
+        zr = r ** power
+        z = zr * np.array([np.sin(theta) * np.cos(phi),
+                           np.sin(theta) * np.sin(phi),
+                           np.cos(theta)]) + jc
+    return True
+
+
+def _mandelbox_inside(c, scale=-2.0, min_r=0.5, max_iter=32):
+    """Inside-test for Tglad's Mandelbox. Iterates the box-fold +
+    sphere-fold + scale and reports True when the orbit stays bounded."""
+    z = np.asarray(c, dtype=np.float64).copy()
+    c0 = z.copy()
+    minR2 = min_r * min_r
+    for _ in range(max_iter):
+        z = np.clip(z, -1.0, 1.0) * 2.0 - z
+        r2 = float(np.dot(z, z))
+        if r2 < minR2:
+            z *= 1.0 / minR2
+        elif r2 < 1.0:
+            z *= 1.0 / r2
+        z = z * scale + c0
+        if float(np.linalg.norm(z)) > 1024.0:
+            return False
+    return True
+
+
+def _generic_surface_point(inside_fn, inside_seed, max_radius=2.5,
+                           rng=None, max_attempts=64,
+                           bisect_steps=40, valid_lo_range=(0.05, 0.95)):
+    """Bisect from a known-interior point outward along random rays to
+    find a surface point. `inside_fn(p)` returns True iff p is inside.
+    `inside_seed` is the starting interior point. Returns a vec3 numpy
+    array — always succeeds, falls back to inside_seed if no bisection
+    lands cleanly within `valid_lo_range * max_radius`.
+    """
+    if rng is None:
+        rng = np.random
+    inside_seed = np.asarray(inside_seed, dtype=np.float64)
+    lo_min = valid_lo_range[0] * max_radius
+    lo_max = valid_lo_range[1] * max_radius
+    fallback = inside_seed.copy()
+    for _ in range(max_attempts):
+        d = rng.normal(size=3)
+        n = float(np.linalg.norm(d))
+        if n < 1e-9:
+            continue
+        d = d / n
+        lo, hi = 0.0, max_radius
+        for _ in range(bisect_steps):
+            mid = 0.5 * (lo + hi)
+            if inside_fn(inside_seed + d * mid):
+                lo = mid
+            else:
+                hi = mid
+        if lo_min < lo < lo_max:
+            return inside_seed + d * lo
+        # Save the most-outside-the-noise hit as a fallback.
+        if 0.01 < lo < max_radius * 0.99:
+            fallback = inside_seed + d * lo
+    return fallback
+
+
+def _menger_surface_point(rng=None):
+    """Menger sponge is a deterministic IFS — pick a random *visible*
+    sub-cube center and return its corner (always on the surface).
+    The sponge sits in [-1, 1]^3; level-1 keeps 20 of 27 sub-cubes
+    (removes 6 face-centres + 1 cube-centre)."""
+    if rng is None:
+        rng = np.random
+    # Level-1 visible cell offsets (corner-and-edge cells of the 3x3x3).
+    cells = []
+    for ix in (-1, 0, 1):
+        for iy in (-1, 0, 1):
+            for iz in (-1, 0, 1):
+                # Removed: cells touching ≥2 face-centres of the cube.
+                # Equivalent: keep cells where at most 1 of (ix,iy,iz)==0.
+                zeros = (ix == 0) + (iy == 0) + (iz == 0)
+                if zeros <= 1:
+                    cells.append((ix, iy, iz))
+    pick = cells[rng.randint(len(cells))]
+    base = np.array([pick[0] * 2.0 / 3.0,
+                     pick[1] * 2.0 / 3.0,
+                     pick[2] * 2.0 / 3.0])
+    # Nudge to the corner facing outward so the FOV-cone catches the
+    # sub-sponge nicely.
+    nudge = np.array([0.33 if pick[0] != 0 else 0.0,
+                      0.33 if pick[1] != 0 else 0.0,
+                      0.33 if pick[2] != 0 else 0.0])
+    return base + nudge * np.sign([pick[0] or 1, pick[1] or 1, pick[2] or 1])
+
+
+def _mandelbulb_surface_point(power=8.0, bailout=4.0, max_iter=200, rng=None,
+                              max_attempts=64):
+    """Pick a random point on the Mandelbulb surface by bisecting from the
+    origin (which is reliably inside the set) outward along a random ray.
+
+    Returns a numpy vec3. Always succeeds — origin is always inside, and the
+    set has bounded radius < 1.5, so at distance 2.0 we are reliably outside.
+    """
+    if rng is None:
+        rng = np.random
+    inside_pt = np.array([0.0, 0.0, 0.0])
+    # Verify origin is interior under current params; if not (extreme power
+    # values can shift the topology), fall back to a known-good seed.
+    if not _mandelbulb_inside(inside_pt, power, bailout, max_iter):
+        inside_pt = np.array([-0.3, 0.0, 0.7])
+        # Final fallback: accept whatever we get.
+        if not _mandelbulb_inside(inside_pt, power, bailout, max_iter):
+            return inside_pt
+    for _ in range(max_attempts):
+        # Uniform random direction on the sphere.
+        d = rng.normal(size=3)
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            continue
+        d = d / n
+        # Bisect outward from inside_pt along d to find the surface.
+        lo, hi = 0.0, 2.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            pt = inside_pt + d * mid
+            if _mandelbulb_inside(pt, power, bailout, max_iter):
+                lo = mid
+            else:
+                hi = mid
+        surf = inside_pt + d * lo
+        # Sanity: make sure we landed on a non-trivial boundary point.
+        if 0.05 < lo < 1.9:
+            return surf
+    # Last resort: known-good back-tendril point.
+    return np.array([-0.521, 0.221, 0.7])
+
+
 def _resolve_composed_preset(name):
     """Return a fully-resolved preset dict for `name`, expanding any
     `compose` field into a concatenated passes list. If the named preset
@@ -19946,7 +21011,13 @@ class Simulator:
             self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
 
-        # Voxel rendering settings
+        # ── Viewport pose (procedural "viewport" kind, e.g. fractal zoom) ──
+        # u_origin = world-space centre of the cube
+        # u_zoom   = half-width of the cube in world units
+        # For ordinary CA rules these are bound but unused. Initial values
+        # come from the preset; Reset restores them; Randomize for viewport
+        # rules picks a new on-surface origin (see _randomize_params).
+        self._apply_viewport_defaults(self.preset)
         self.voxel_gap = float(self.preset.get('voxel_gap', 0.1))  # 0=touching, 0.2=20% gap
         # Honour the preset's pinned voxel_threshold at startup. Without
         # this, __init__ ran with a hard-coded 0.5 default and the
@@ -20213,6 +21284,38 @@ class Simulator:
         self._up_u_half_res.value = 0
         self._upsample_vao = self.ctx.simple_vertex_array(self._upsample_prog, self.vbo, 'in_pos')
 
+        # ── SDF viewport program (per-pixel sphere-traced fractals) ─────
+        # Used by viewport-kind presets (e.g. Mandelbulb) for genuine deep
+        # zoom. Bypasses the voxel grid entirely.
+        self._sdf_prog = self.ctx.program(
+            vertex_shader=VERTEX_SHADER,
+            fragment_shader=SDF_VIEWPORT_FRAGMENT_SHADER,
+        )
+        sp = self._sdf_prog
+        self._sdfp_u_camera_pos = sp['u_camera_pos']
+        self._sdfp_u_camera_rot = sp['u_camera_rot']
+        self._sdfp_u_fov = sp['u_fov']
+        self._sdfp_u_aspect = sp['u_aspect']
+        self._sdfp_u_brightness = sp['u_brightness']
+        self._sdfp_u_colormap = sp['u_colormap']
+        self._sdfp_u_origin_hi = sp['u_origin_hi']
+        self._sdfp_u_origin_lo = sp['u_origin_lo']
+        # u_zoom may be optimised out by the GLSL compiler now that the
+        # shader's marching distances are world-space (the only remaining
+        # consumer of u_zoom would be unused). Tolerate its absence so
+        # the program still loads.
+        self._sdfp_u_zoom = sp.get('u_zoom', None)
+        self._sdfp_u_power = sp['u_power']
+        self._sdfp_u_max_iter = sp['u_max_iter']
+        self._sdfp_u_bailout = sp['u_bailout']
+        self._sdfp_u_max_march_steps = sp['u_max_march_steps']
+        # Multi-fractal uniforms (may be optimised out for some types).
+        self._sdfp_u_fractal_type = sp.get('u_fractal_type', None)
+        self._sdfp_u_aux3 = sp.get('u_aux3', None)
+        self._sdfp_u_aux_a = sp.get('u_aux_a', None)
+        self._sdfp_u_aux_b = sp.get('u_aux_b', None)
+        self._sdf_vao = self.ctx.simple_vertex_array(self._sdf_prog, self.vbo, 'in_pos')
+
         # Compile compute raymarcher
         self._compute_ray_prog = self.ctx.compute_shader(COMPUTE_RAYMARCH_SHADER)
         self._init_compute_ray_uniforms()
@@ -20292,6 +21395,17 @@ class Simulator:
         self._debug_active_threshold = 0.5
         self._debug_sample_interval = 5  # capture every N sim steps
         self._debug_steps_since_sample = 0
+        # Voxel-grid snapshots (npz dumps to runs/<id>/snapshots/).
+        self._snapshot_auto = False
+        self._snapshot_interval = 50  # auto-snapshot every N sim steps
+        self._steps_since_snapshot = 0
+        self._last_snapshot_path = None
+        # Replay mode: when active, _drain_replay_events() applies recorded
+        # events.jsonl entries at their original step counts. Disabled by
+        # default; main() sets these up when --replay is given.
+        self._replay_events = []
+        self._replay_active = False
+        self._replay_idx = 0
         # Adaptive histogram bounds: seeded from the first capture, then
         # updated with EMA so bins don't constantly flicker.
         self._debug_hist_min = [-1.0, -1.0, -1.0, -1.0]
@@ -20301,6 +21415,21 @@ class Simulator:
         self._debug_history = deque(maxlen=2048)
         # Latest decoded snapshot (also the most recent entry of history)
         self._debug_latest = None
+
+        # Unified run recorder — writes a runs/<id>/ bundle alongside the
+        # legacy debug_runs/ + perf_runs/ + recordings/ files. Skipped in
+        # headless mode (the test harness owns its own recorder when used).
+        # Initialised here, opened lazily by _open_run() so we have the
+        # final rule/preset/seed/init resolved.
+        self._run_recorder = None
+        self._frame_counter_for_recorder = 0
+        if not self.headless and _RunRecorder is not None:
+            try:
+                self._open_run(reason="startup")
+            except Exception as e:
+                # Recorder is optional — never let it block startup.
+                print(f"[ca_debug] disabled: {e!r}", flush=True)
+                self._run_recorder = None
 
         # Voxel SSBOs — size dynamically based on grid
         self._alloc_voxel_buffer(self.size)
@@ -21861,6 +22990,35 @@ class Simulator:
         self._alloc_accel_textures(self.dims)
 
     def _get_camera_pos(self):
+        # Viewport presets: compute camera position in voxel-cube world
+        # coords using the same SDF camera math as _get_view_proj_viewport
+        # so lighting/shading matches the projection used to draw cubes.
+        if self._is_viewport_kind():
+            zoom = float(max(self.viewport_zoom, 1e-30))
+            cam_radius = float(self.preset.get('cam_radius', 2.5))
+            target_world = np.asarray(self.viewport_origin, dtype=np.float64)
+            t_norm = float(np.linalg.norm(target_world))
+            if t_norm < 1e-9:
+                n_out = np.array([0.0, 0.0, 1.0])
+            else:
+                n_out = target_world / t_norm
+            world_up = np.array([0.0, 1.0, 0.0])
+            tan_a = np.cross(n_out, world_up)
+            ta_n = np.linalg.norm(tan_a)
+            if ta_n < 1e-6:
+                tan_a = np.array([1.0, 0.0, 0.0])
+            else:
+                tan_a = tan_a / ta_n
+            tan_b = np.cross(n_out, tan_a)
+            tan_b = tan_b / max(np.linalg.norm(tan_b), 1e-30)
+            phi = max(-1.0, min(1.0, self.cam_phi))
+            cp_o = math.cos(phi); sp_o = math.sin(phi)
+            ct_o = math.cos(self.cam_theta); st_o = math.sin(self.cam_theta)
+            cam_dir = (cp_o * n_out
+                       + sp_o * (ct_o * tan_a + st_o * tan_b))
+            cam_dir = cam_dir / max(np.linalg.norm(cam_dir), 1e-30)
+            cube_center = np.array([0.5, 0.5, 0.5])
+            return cube_center + cam_dir * (cam_radius / (2.0 * zoom))
         x = self.cam_dist * math.cos(self.cam_phi) * math.sin(self.cam_theta)
         y = self.cam_dist * math.sin(self.cam_phi)
         z = self.cam_dist * math.cos(self.cam_phi) * math.cos(self.cam_theta)
@@ -22287,8 +23445,19 @@ class Simulator:
                 rot = self._get_camera_rot()
                 right = rot[:, 0]
                 up = rot[:, 1]
-                self.cam_target -= right * dx * 0.002 * self.cam_dist
-                self.cam_target += up * dy * 0.002 * self.cam_dist
+                if self._is_viewport_kind():
+                    # Viewport fractals: panning translates the viewport
+                    # origin in fractal space (cam_target is unused).
+                    # Scale by viewport_zoom so pan speed feels constant
+                    # at any zoom depth.
+                    scale = float(self.viewport_zoom) * 0.002
+                    self.viewport_origin = (
+                        np.asarray(self.viewport_origin, dtype=np.float64)
+                        - right * dx * scale
+                        + up * dy * scale)
+                else:
+                    self.cam_target -= right * dx * 0.002 * self.cam_dist
+                    self.cam_target += up * dy * 0.002 * self.cam_dist
 
     def _scroll_cb(self, window, xoffset, yoffset):
         if self._prev_scroll_cb:
@@ -22356,6 +23525,11 @@ class Simulator:
                 'boundary': prog['u_boundary'] if 'u_boundary' in prog else None,
                 'frame': prog['u_frame'] if 'u_frame' in prog else None,
                 'pass': prog['u_pass'] if 'u_pass' in prog else None,
+                'origin': prog['u_origin'] if 'u_origin' in prog else None,
+                'zoom': prog['u_zoom'] if 'u_zoom' in prog else None,
+                'aux3': prog['u_aux3'] if 'u_aux3' in prog else None,
+                'aux_a': prog['u_aux_a'] if 'u_aux_a' in prog else None,
+                'aux_b': prog['u_aux_b'] if 'u_aux_b' in prog else None,
                 'params': [prog[f'u_param{i}'] if f'u_param{i}' in prog else None
                            for i in range(4)],
                 # Cache prog handle for entity-arena uniform pushes that
@@ -22493,6 +23667,27 @@ class Simulator:
                 cu['frame'].value = self.step_count
             if cu['pass'] is not None:
                 cu['pass'].value = pass_idx
+            if cu['origin'] is not None:
+                vo = self.viewport_origin
+                cu['origin'].value = (float(vo[0]), float(vo[1]), float(vo[2]))
+            if cu['zoom'] is not None:
+                cu['zoom'].value = float(self.viewport_zoom)
+            if cu['aux3'] is not None:
+                cu['aux3'].value = (
+                    float(self.params.get('Julia cx', -0.4)),
+                    float(self.params.get('Julia cy', 0.6)),
+                    float(self.params.get('Julia cz', 0.0)))
+            if cu['aux_a'] is not None:
+                # Mandelbox uses 'Box scale'; Menger uses 'Folds'. Pick
+                # whichever the preset declares — fall back to 1.0.
+                if 'Box scale' in self.params:
+                    cu['aux_a'].value = float(self.params['Box scale'])
+                elif 'Folds' in self.params:
+                    cu['aux_a'].value = float(self.params['Folds'])
+                else:
+                    cu['aux_a'].value = 1.0
+            if cu['aux_b'] is not None:
+                cu['aux_b'].value = float(self.params.get('Min radius', 0.5))
             for i, cu_p in enumerate(cu['params']):
                 if cu_p is None:
                     continue
@@ -22607,10 +23802,78 @@ class Simulator:
         self._cull_valid = False
         self._accel_textures_valid = False
 
+        # Auto-snapshot: dump the live grid to runs/<id>/snapshots/ at
+        # the configured cadence. No-op when disabled or no recorder.
+        if self._snapshot_auto and self._run_recorder is not None:
+            self._steps_since_snapshot += 1
+            if self._steps_since_snapshot >= self._snapshot_interval:
+                self._steps_since_snapshot = 0
+                self._take_voxel_snapshot()
+
+        # Viewport rules advance their pose with simulation time, decoupled
+        # from u_frame so pause/scrub/rewind are well-defined. The per-step
+        # zoom multiplier comes from the named param (default 'Zoom rate').
+        if self._is_viewport_kind():
+            zr = float(self.params.get(self.viewport_zoom_param, 1.0))
+            # Clamp to keep things sensible: 0.5x..2x per step is plenty.
+            zr = max(0.5, min(2.0, zr))
+            self.viewport_zoom *= zr
+            # Hard floor so we don't underflow into denormals at extreme depth.
+            self.viewport_zoom = max(self.viewport_zoom, 1e-30)
+            # Slow orbit while zooming. Without this the camera dives
+            # straight into a single point and the surface looks like a
+            # static wall growing on screen — you can't tell the bulb
+            # is being zoomed into vs the camera just translating
+            # toward a flat surface. A small theta rotation per step
+            # spirals the camera in instead, revealing the curvature
+            # and surface microstructure as you descend.
+            if zr < 1.0 and getattr(self, '_viewport_auto_orbit', True):
+                # Slow continuous orbit so the camera spirals into the
+                # target rather than diving straight in. Magnitude tuned
+                # to give a clear sense of motion across ~120 steps
+                # (one zoom cycle) without making the ride feel jittery.
+                self.cam_theta += 0.004
+                self.cam_phi += 0.0012 * math.sin(self.step_count * 0.011)
+            # Auto-cycle: per-pixel SDF holds clean detail for ~1.5 orders
+            # of magnitude before two compounding problems hit:
+            #   * fp32 precision: orbit values truncate, surface dissolves
+            #   * scale exhaustion: visible patch becomes featureless
+            #     (the bulb is locally smooth at small enough scale)
+            # Auto-cycle: per-pixel SDF holds clean detail until either
+            # fp32 precision dies or the visible patch becomes featureless.
+            # The Veltkamp split (origin_hi + origin_lo) buys ~3 extra
+            # decimal digits, putting the practical floor near 1e-4.
+            # Default 1e-3 = ~440 steps per cycle at Zoom rate 0.985,
+            # well clear of garble. UI exposes this as a slider.
+            cycle_floor = float(getattr(self, '_viewport_cycle_floor', 1e-3))
+            if (zr < 1.0 and self.viewport_zoom < cycle_floor
+                    and getattr(self, '_viewport_autocycle', True)):
+                try:
+                    new_origin = self._pick_viewport_surface_origin()
+                    if new_origin is not None:
+                        self.viewport_origin = np.asarray(new_origin,
+                                                          dtype=np.float64)
+                        self.viewport_zoom = self.viewport_zoom_base
+                        # Reset the orbit so the new vista starts
+                        # head-on (camera along the outward normal).
+                        # phi=0 means "camera dead-on the normal";
+                        # theta is irrelevant when phi=0 but reset
+                        # for cleanliness.
+                        self.cam_phi = 0.0
+                        self.cam_theta = 0.0
+                except Exception:
+                    # Bisection failure shouldn't kill the sim; just
+                    # rewind in place.
+                    self.viewport_zoom = self.viewport_zoom_base
+
     def _reset(self):
         self._cull_valid = False
         self._accel_textures_valid = False
         self.step_count = 0
+        # For viewport rules, rewind the zoom animation but keep the user's
+        # chosen origin (the viewing target). No noise init is meaningful.
+        if self._is_viewport_kind():
+            self.viewport_zoom = self.viewport_zoom_base
         rng = np.random.RandomState(self.seed)
         init_name = getattr(self, '_current_init', self.preset['init'])
         if isinstance(init_name, str) and '+' in init_name:
@@ -22703,12 +23966,208 @@ class Simulator:
         self._score_metrics = {}
         self._cpu_grid = None
         self._cpu_grid_dirty = True
+        # Rotate the run bundle: the previous run's state is no longer
+        # reachable (step_count == 0, init regenerated), so any further
+        # samples belong to a logically-new experiment.
+        if not self.headless and _RunRecorder is not None:
+            try:
+                self._open_run(reason="reset")
+            except Exception as e:  # noqa: BLE001
+                print(f"[ca_debug] reopen on reset failed: {e!r}", flush=True)
+
+    def _open_run(self, *, reason: str = "open") -> None:
+        """Close any open run, then start a fresh runs/<id>/ bundle.
+
+        Called from __init__ ("startup"), _reset() ("reset"), and any other
+        site where the simulation logically restarts (rule change, size
+        change, randomize). Cheap on the hot path: just creates a directory
+        and writes the manifest. All actual data flushes are batched.
+        """
+        if _RunRecorder is None:
+            return
+        # Close prior run cleanly so its parquet files are flushed.
+        self._close_run(reason=reason)
+        preset = self.preset
+        self._run_recorder = _RunRecorder.create(
+            rule=self.rule_name,
+            size=int(self.size),
+            dt=float(self.dt),
+            seed=int(self.seed),
+            params=dict(self.params),
+            producer="gui",
+            label=preset.get("label", self.rule_name),
+            description=preset.get("description", ""),
+            init_variant=str(self._current_init) if self._current_init else None,
+            preset_keys=list(preset.keys()),
+            renderer_mode=str(self.renderer_mode),
+            colormap=getattr(self, "colormap", None),
+            tags=[reason],
+            gl_ctx=self.ctx,
+        )
+        self._run_recorder.log_event(
+            "restart" if reason == "reset" else "note",
+            step=0, reason=reason,
+        )
+        # Best-effort LRU cleanup so unbounded development sessions don't
+        # fill the disk. Pinned runs (manifest tag "pinned" or "discovery")
+        # and runs newer than the keep window are always retained.
+        try:
+            self._prune_old_runs(keep=int(os.environ.get("CA_DEBUG_KEEP_RUNS", "50")))
+        except Exception as e:  # noqa: BLE001
+            print(f"[ca_debug] prune failed: {e!r}", flush=True)
+
+    def _prune_old_runs(self, *, keep: int = 50) -> None:
+        """Delete oldest runs/<id>/ bundles beyond `keep`, skipping pinned.
+
+        Pinned = manifest contains a tag in {"pinned", "discovery", "keep"}
+        OR a top-level "pinned": True flag. The currently-open run dir is
+        always kept (it would be insane to delete the bundle we're writing).
+        Cheap: O(N) directory scan + manifest read.
+        """
+        from ca_debug import schema as _S
+        from pathlib import Path as _Path
+        runs_dir = _Path("runs")
+        if not runs_dir.is_dir():
+            return
+        active = self._run_recorder.run_dir.resolve() if self._run_recorder else None
+        candidates = []
+        for p in runs_dir.iterdir():
+            if not p.is_dir():
+                continue
+            if active is not None and p.resolve() == active:
+                continue
+            mpath = p / _S.MANIFEST_NAME
+            if not mpath.is_file():
+                continue
+            try:
+                m = json.loads(mpath.read_text())
+            except Exception:
+                continue
+            tags = set(m.get("tags") or [])
+            if m.get("pinned") or tags & {"pinned", "discovery", "keep"}:
+                continue
+            candidates.append((mpath.stat().st_mtime, p))
+        # Drop oldest first; retain the newest `keep`.
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, p in candidates[keep:]:
+            try:
+                shutil.rmtree(p)
+            except Exception as e:  # noqa: BLE001
+                print(f"[ca_debug] could not prune {p.name}: {e!r}", flush=True)
+
+    def _close_run(self, *, reason: str = "close") -> None:
+        """Flush + close the active recorder, if any. Idempotent."""
+        rec = self._run_recorder
+        if rec is None:
+            return
+        try:
+            rec.update_manifest(ended_reason=reason)
+        except Exception:
+            pass
+        try:
+            rec.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"[ca_debug] close failed: {e!r}", flush=True)
+        self._run_recorder = None
 
     def _sync_quantum_K(self):
         """Auto-set ħ/2m = size/50 for quantum shaders so Bohr radius a₀ = size/25 matches init."""
         shader = self.preset.get('shader', '')
         if shader.startswith('schrodinger') and 'ħ/2m' in self.params:
             self.params['ħ/2m'] = self.size / 50.0
+
+    # ── Viewport (procedural / non-CA) support ────────────────────────────
+    # A preset with `kind: "viewport"` is a stateless per-voxel function of
+    # (world position, viewport pose) — typified by `mandelbulb_3d`. The
+    # simulator treats these specially:
+    #   * `_apply_viewport_defaults` (called from __init__ and _change_rule)
+    #     seeds `viewport_origin` (vec3) and `viewport_zoom` (scalar) from
+    #     the preset, defaulting to a centred unit cube for non-viewport rules.
+    #   * `_step_sim` advances `viewport_zoom *= zoom_rate_param` per step
+    #     when kind == "viewport", so the zoom progresses with simulation
+    #     time without piggy-backing on `step_count` (lets pause/scrub work).
+    #   * `_reset` restores `viewport_zoom` to base but PRESERVES origin —
+    #     the user's chosen viewing target survives Reset, only the zoom-in
+    #     animation rewinds.
+    #   * `_randomize_params` for viewport rules picks a new ZOOM_ORIGIN by
+    #     CPU-side bisection onto the set's surface, instead of randomising
+    #     the param sliders (which would change the set itself, invalidating
+    #     the chosen origin).
+    def _apply_viewport_defaults(self, preset):
+        """Initialise viewport_origin / viewport_zoom from preset.
+
+        Honours preset keys:
+          'viewport_origin'    : 3-tuple, world-space cube centre (default 0,0,0)
+          'viewport_zoom_base' : scalar, half-width of cube at frame 0 (default 1.0)
+          'viewport_zoom_param': name of param controlling per-step zoom multiplier
+                                 (default 'Zoom rate'). Looked up in self.params.
+        """
+        vo = preset.get('viewport_origin', (0.0, 0.0, 0.0))
+        self.viewport_origin = np.asarray(vo, dtype=np.float64)
+        self.viewport_zoom_base = float(preset.get('viewport_zoom_base', 1.0))
+        self.viewport_zoom = self.viewport_zoom_base
+        self.viewport_zoom_param = preset.get('viewport_zoom_param', 'Zoom rate')
+        # Viewport renderers interpret cam_phi/theta as offsets from the
+        # target's outward normal (NOT as world-space angles like the
+        # CA renderers do). Reset to the head-on view so the first
+        # frame sees the surface dead-on rather than at some leftover
+        # CA orbit angle.
+        if self._is_viewport_kind():
+            self.cam_phi = 0.0
+            self.cam_theta = 0.0
+
+    def _is_viewport_kind(self):
+        return self.preset.get('kind') == 'viewport'
+
+    def _pick_viewport_surface_origin(self, rng=None):
+        """For viewport kind, pick a new origin lying on the set's surface.
+
+        Dispatches on the preset's `sdf_type`:
+          0 = Mandelbulb (CPU port of GLSL escape test)
+          1 = Julia bulb (same iteration, fixed c)
+          2 = Mandelbox (Tglad's box+sphere fold)
+          3 = Menger sponge (deterministic IFS, no bisection needed)
+        Returns a vec3 numpy array.
+        """
+        sdf_type = int(self.preset.get('sdf_type', 0))
+        params = self.params
+        if sdf_type == 0:
+            return _mandelbulb_surface_point(
+                power=float(params.get('Power', 8.0)),
+                bailout=float(params.get('Bailout', 4.0)),
+                max_iter=int(params.get('Max iter', 24)),
+                rng=rng,
+            )
+        if sdf_type == 1:
+            jc = (float(params.get('Julia cx', -0.4)),
+                  float(params.get('Julia cy', 0.6)),
+                  float(params.get('Julia cz', 0.0)))
+            power = float(params.get('Power', 8.0))
+            bailout = float(params.get('Bailout', 4.0))
+            max_iter = int(params.get('Max iter', 24))
+            # Origin (0,0,0) is inside for most reasonable Julia c-vectors;
+            # if not, fall back to jc itself which sits inside by construction.
+            seed = np.array([0.0, 0.0, 0.0])
+            if not _juliabulb_inside(seed, jc, power, bailout, max_iter):
+                seed = -np.asarray(jc, dtype=np.float64) * 0.3
+            inside_fn = lambda p: _juliabulb_inside(
+                p, jc, power, bailout, max_iter)
+            return _generic_surface_point(inside_fn, seed,
+                                          max_radius=2.0, rng=rng)
+        if sdf_type == 2:
+            scale = float(params.get('Box scale', -2.0))
+            min_r = float(params.get('Min radius', 0.5))
+            max_iter = int(params.get('Max iter', 16))
+            inside_fn = lambda p: _mandelbox_inside(p, scale, min_r, max_iter)
+            # Mandelbox is centred at origin; centre is interior under all
+            # standard scales we expose.
+            return _generic_surface_point(inside_fn,
+                                          np.array([0.0, 0.0, 0.0]),
+                                          max_radius=4.0, rng=rng)
+        if sdf_type == 3:
+            return _menger_surface_point(rng=rng)
+        # Fallback: keep current origin.
+        return np.asarray(self.viewport_origin, dtype=np.float64)
 
     def _change_rule(self, rule_name):
         self.rule_name = rule_name
@@ -22726,6 +24185,8 @@ class Simulator:
             self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
         self.voxel_gap = float(self.preset.get('voxel_gap', 0.1))
+        # Reset viewport pose to the new preset's defaults (no-op for CA rules).
+        self._apply_viewport_defaults(self.preset)
         # Apply preset's preferred grid size if specified and current size is smaller
         pref_size = self.preset.get('default_size')
         if pref_size and self.size < pref_size:
@@ -23064,6 +24525,17 @@ void main() {
         # Scale score interval with grid volume to avoid GPU readback stutter
         # 32³→20, 64³→30, 128³→60, 256³→120
         self._score_interval = max(20, (new_size // 32) * 15)
+        # _change_size resets step_count to 0 but bypasses _reset(), so the
+        # recorder doesn't auto-rotate. Rotate explicitly so per-grid-size
+        # measurements end up in separate bundles (key for size-scaling
+        # comparison reports).
+        if not self.headless and _RunRecorder is not None:
+            try:
+                self._open_run(reason="size_change")
+                if self._run_recorder is not None:
+                    self._run_recorder.update_manifest(size=int(new_size))
+            except Exception as e:  # noqa: BLE001
+                print(f"[ca_debug] reopen on size change failed: {e!r}", flush=True)
 
     def _colormap_semantic_labels(self):
         """Return (low_label, high_label, description) based on current rule."""
@@ -23276,6 +24748,37 @@ void main() {
 
     def _randomize_params(self):
         """Randomize all parameters within their defined ranges, including dt if applicable."""
+        # Viewport rules: keep the user's current viewpoint (origin, zoom,
+        # camera angles) and only fuzz the shape-defining params — Julia c,
+        # Mandelbox scale/min-radius, Menger folds, etc. This lets you park
+        # at an interesting view and cycle through fractal variants from
+        # there. Use the "New vista" button to instead jump to a fresh
+        # on-surface origin. Power/Max iter/Bailout/Zoom rate are skipped
+        # because changing them mid-zoom is jarring (Power especially
+        # remaps the whole set).
+        if self._is_viewport_kind():
+            ranges = self.preset.get('param_ranges', {})
+            skip = {"Power", "Max iter", "Bailout", "Zoom rate"}
+            for name, (lo, hi) in ranges.items():
+                if name in skip or name.startswith("unused"):
+                    continue
+                if hi < lo:
+                    lo, hi = hi, lo
+                if isinstance(lo, int) and isinstance(hi, int):
+                    self.params[name] = lo if hi == lo else random.randint(lo, hi)
+                else:
+                    self.params[name] = float(lo) if hi == lo else random.uniform(lo, hi)
+            # Force a re-bake of the voxel field on next step (params
+            # changed) but leave camera/origin/zoom alone. Reset
+            # step_count so the new variant starts at frame 0 (matches
+            # the pre-viewport-change behavior of Randomize: a fresh
+            # run, paused or playing per the current pause state).
+            self.step_count = 0
+            self.viewport_zoom = self.viewport_zoom_base
+            self._cpu_grid_dirty = True
+            self._cull_valid = False
+            self._accel_textures_valid = False
+            return
         ranges = self.preset['param_ranges']
         for name, (lo, hi) in ranges.items():
             if name.startswith("unused"):
@@ -23620,6 +25123,14 @@ void main() {
         }
         self._debug_latest = snap
         self._debug_history.append(snap)
+        # Mirror into the unified run bundle. Per-step row, ~50 cols.
+        # Failure here must never break the sim (e.g. parquet write hiccup).
+        if self._run_recorder is not None:
+            try:
+                self._run_recorder.log_step(self.step_count, snap)
+            except Exception as e:  # noqa: BLE001
+                print(f"[ca_debug] log_step failed: {e!r}", flush=True)
+                self._run_recorder = None  # disable further attempts
 
     def _update_score(self):
         """Compute live interestingness score entirely on the GPU.
@@ -23855,8 +25366,189 @@ void main() {
             if t_disp_start is not None:
                 sub['dispatch'] = time.perf_counter() - t_disp_start
 
+    def _render_sdf_viewport(self):
+        """Per-pixel sphere-traced render of the active SDF viewport preset.
+
+        Bypasses the voxel grid entirely: rays evaluate the procedural
+        distance estimator directly at screen-pixel resolution. Coordinates
+        are kept relative to ``self.viewport_origin`` (split into hi/lo
+        halves) so fp32 has full precision near the target — letting us
+        zoom many orders of magnitude past the voxel-baked path.
+        """
+        sub = getattr(self, '_render_sub', None)
+        _t = time.perf_counter() if sub is not None else 0.0
+
+        target_fbo = self.ctx.fbo if self.ctx.fbo is not None else self.ctx.screen
+        target_fbo.use()
+        self.ctx.viewport = self.ctx.viewport
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.BLEND)
+        self.ctx.clear(0.02, 0.025, 0.04)
+
+        # Camera placement strategy:
+        #   * Keep the camera at a FIXED safe distance from the target
+        #     (cam_radius ≈ 2.5 × bulb-radius), so it can never orbit
+        #     *into* the surface even at deep zoom. Naively scaling
+        #     distance with zoom (the original approach) caused the
+        #     orbit radius to shrink past the bulb's local thickness,
+        #     putting the camera inside the fractal and rendering as
+        #     a flat inside-set colour.
+        #   * Orbit around the target's OUTWARD NORMAL — never around
+        #     the world origin. Orbiting around the world origin would
+        #     swing the camera behind the bulb, so it would end up
+        #     looking at the target THROUGH the rest of the fractal
+        #     (rays hit the near surface first, not the target).
+        #   * Implement "zoom" by NARROWING THE FOV. The viewport
+        #     target stays centred on screen, but a smaller FOV
+        #     magnifies the patch around it — exactly how a long
+        #     telephoto lens or a Mandelbrot deep-zoom video works.
+        zoom = float(max(self.viewport_zoom, 1e-30))
+        # Per-fractal safe orbit radius. Each set has a different
+        # bounding-sphere size; the camera must orbit OUTSIDE that
+        # sphere or it will end up inside the geometry, rendering as
+        # a flat inside-set blob.
+        cam_radius = float(self.preset.get('cam_radius', 2.5))
+        target_world = np.asarray(self.viewport_origin, dtype=np.float64)
+        # Outward normal at the target (radial from world origin).
+        # If the target sits at exactly the world origin (degenerate),
+        # fall back to +Z so the camera placement stays well-defined.
+        t_norm = float(np.linalg.norm(target_world))
+        if t_norm < 1e-9:
+            n_out = np.array([0.0, 0.0, 1.0])
+        else:
+            n_out = target_world / t_norm
+        # Build a tangent frame at the target. `tan_a` and `tan_b`
+        # are two orthogonal in-plane axes; theta orbits in the
+        # tan_a/tan_b plane around n_out, phi tilts away from n_out.
+        world_up = np.array([0.0, 1.0, 0.0])
+        tan_a = np.cross(n_out, world_up)
+        ta_n = np.linalg.norm(tan_a)
+        if ta_n < 1e-6:
+            tan_a = np.array([1.0, 0.0, 0.0])
+        else:
+            tan_a = tan_a / ta_n
+        tan_b = np.cross(n_out, tan_a)
+        tan_b = tan_b / max(np.linalg.norm(tan_b), 1e-30)
+        # Orbit offset: clamp |phi| to <60° so the camera never tips
+        # past the horizon and ends up on the wrong hemisphere.
+        phi = max(-1.0, min(1.0, self.cam_phi))
+        cp_o = math.cos(phi)
+        sp_o = math.sin(phi)
+        ct_o = math.cos(self.cam_theta)
+        st_o = math.sin(self.cam_theta)
+        # cam_dir is a unit vector in the OUTWARD hemisphere of n_out.
+        cam_dir = (cp_o * n_out
+                   + sp_o * (ct_o * tan_a + st_o * tan_b))
+        cam_dir = cam_dir / max(np.linalg.norm(cam_dir), 1e-30)
+        cam_world = target_world + cam_dir * cam_radius
+        # Look directly at the target.
+        forward = target_world - cam_world
+        f_norm = float(np.linalg.norm(forward))
+        if f_norm < 1e-30:
+            forward = -n_out
+        else:
+            forward = forward / f_norm
+        right = np.cross(forward, world_up)
+        rn = np.linalg.norm(right)
+        if rn < 1e-6:
+            right = np.array([1.0, 0.0, 0.0])
+        else:
+            right = right / rn
+        up = np.cross(right, forward)
+        up = up / max(np.linalg.norm(up), 1e-30)
+        cam_rot = np.column_stack([right, up, -forward]).astype(np.float32)
+        # Camera position relative to viewport_origin (small magnitude
+        # → fp32-friendly inside the DE).
+        offset = (cam_world - target_world).astype(np.float64)
+
+        # Veltkamp-style hi/lo split of the viewport origin. Casting the
+        # fp64 origin to fp32 truncates ~7 decimal digits; the residual
+        # carries the rest. In the shader we add (lo + p_rel) FIRST so the
+        # small terms accumulate before being added to the large hi term —
+        # the standard compensated-sum trick. Buys ~3 extra decimal digits
+        # of usable zoom range.
+        origin_f64 = np.asarray(self.viewport_origin, dtype=np.float64)
+        origin_hi = origin_f64.astype(np.float32)
+        origin_lo = (origin_f64 - origin_hi.astype(np.float64)).astype(np.float32)
+
+        params = self.params
+        power = float(params.get('Power', 8.0))
+        bailout = float(params.get('Bailout', 4.0))
+        user_iter = int(params.get('Max iter', 64))
+
+        # Auto-scale iteration count with zoom depth. Mandelbulb features
+        # at scale s only resolve if the orbit has run long enough to
+        # reach that scale: roughly iter ≈ -log_power(s). At Power=8 the
+        # field decays super-quickly so 64 iters covers ~7 orders of
+        # magnitude, but the Hubbard-Douady DE saturates much earlier
+        # without enough headroom — extra iterations cost almost nothing
+        # because escape happens in the first few. Cap at 256 (shader's
+        # hard limit).
+        if zoom < 1.0:
+            depth_iter = int(round(user_iter + 14.0 * (-math.log10(zoom))))
+        else:
+            depth_iter = user_iter
+        eff_iter = max(2, min(256, max(user_iter, depth_iter)))
+
+        self._sdfp_u_camera_pos.value = tuple(offset.astype(np.float32))
+        self._sdfp_u_camera_rot.value = tuple(cam_rot.T.flatten())
+        # Zoom by NARROWING the FOV. Camera distance to the target
+        # patch is ~cam_radius (≈ 2.5) since the camera sits outside
+        # the bulb. To magnify a feature of width ≈ zoom, the half-FOV
+        # must equal zoom / cam_radius. Floored so we never collapse
+        # to literally 0° (fp32 trig artifacts).
+        target_world_arr = np.asarray(self.viewport_origin, dtype=np.float64)
+        cam_to_target = float(np.linalg.norm(cam_world - target_world_arr))
+        sdf_fov = max(2.0 * zoom / max(cam_to_target, 1e-6), 1e-6)
+        self._sdfp_u_fov.value = sdf_fov
+        self._sdfp_u_aspect.value = self.width / max(self.height, 1)
+        self._sdfp_u_brightness.value = float(self.brightness)
+        self._sdfp_u_colormap.value = int(self.colormap)
+        self._sdfp_u_origin_hi.value = tuple(origin_hi)
+        self._sdfp_u_origin_lo.value = tuple(origin_lo)
+        if self._sdfp_u_zoom is not None:
+            self._sdfp_u_zoom.value = zoom
+        self._sdfp_u_power.value = power
+        self._sdfp_u_max_iter.value = eff_iter
+        self._sdfp_u_bailout.value = bailout
+        self._sdfp_u_max_march_steps.value = 192
+
+        # Fractal-type dispatch. Each viewport preset exposes a 'sdf_type'
+        # key (0=Mandelbulb, 1=Julia, 2=Mandelbox, 3=Menger sponge) plus
+        # any auxiliary params used by that DE.
+        sdf_type = int(self.preset.get('sdf_type', 0))
+        if self._sdfp_u_fractal_type is not None:
+            self._sdfp_u_fractal_type.value = sdf_type
+        if self._sdfp_u_aux3 is not None:
+            cx = float(params.get('Julia cx', -0.4))
+            cy = float(params.get('Julia cy', 0.6))
+            cz = float(params.get('Julia cz', 0.0))
+            self._sdfp_u_aux3.value = (cx, cy, cz)
+        if self._sdfp_u_aux_a is not None:
+            # Mandelbox: scale (negative); Menger: fold count.
+            if sdf_type == 2:
+                self._sdfp_u_aux_a.value = float(params.get('Box scale', -2.0))
+            elif sdf_type == 3:
+                self._sdfp_u_aux_a.value = float(params.get('Folds', 6.0))
+            else:
+                self._sdfp_u_aux_a.value = 1.0
+        if self._sdfp_u_aux_b is not None:
+            self._sdfp_u_aux_b.value = float(params.get('Min radius', 0.5))
+
+        self._sdf_vao.render(moderngl.TRIANGLE_STRIP)
+        if sub is not None:
+            sub['dispatch'] = time.perf_counter() - _t
+
     def _get_view_proj(self):
         """Build a view-projection matrix for voxel rendering."""
+        # For viewport-kind fractals (Mandelbulb/Julia/Mandelbox/Menger),
+        # mirror the SDF camera EXACTLY so voxel mode shows the same
+        # framing — same orbit, same zoom, same FOV — just discretised
+        # to the voxel grid. Otherwise voxel and SDF would render the
+        # same data from different cameras and look completely unlike
+        # each other.
+        if self._is_viewport_kind():
+            return self._get_view_proj_viewport()
         cam_pos = self._get_camera_pos()
         cam_rot = self._get_camera_rot()
 
@@ -23887,6 +25579,111 @@ void main() {
         proj[3, 2] = -1.0
 
         # Transpose: numpy is row-major, GLSL mat4 expects column-major
+        vp_row_major = proj @ view
+        return vp_row_major.T.flatten(), vp_row_major
+
+    def _get_view_proj_viewport(self):
+        """View-projection that mirrors the SDF viewport camera, mapped
+        into voxel-cube world space [0,1]^3.
+
+        The compute bake fills the 3D texture so that voxel-grid coord
+        v ∈ [0, size] corresponds to fractal coord
+            f = viewport_origin + (v / size * 2 - 1) * viewport_zoom
+        i.e. fractal_origin maps to cube center (0.5, 0.5, 0.5) and the
+        cube edge (1.0) maps to viewport_origin + viewport_zoom.
+
+        The SDF camera sits at fractal coord
+            cam_fractal = viewport_origin + cam_dir * cam_radius
+        with half-FOV ≈ viewport_zoom / cam_radius (it narrows the FOV
+        to magnify a window of width ~viewport_zoom around the target).
+
+        Translating cam_fractal into voxel-cube world coords gives
+            cam_voxel = 0.5 + cam_dir * cam_radius / (2 * viewport_zoom)
+        and the matching half-FOV that frames a feature of voxel-world
+        width 0.5 (half the cube) at that distance is the same angle.
+        """
+        zoom = float(max(self.viewport_zoom, 1e-30))
+        cam_radius = float(self.preset.get('cam_radius', 2.5))
+        target_world = np.asarray(self.viewport_origin, dtype=np.float64)
+
+        # Outward normal at the target (radial from world origin).
+        t_norm = float(np.linalg.norm(target_world))
+        if t_norm < 1e-9:
+            n_out = np.array([0.0, 0.0, 1.0])
+        else:
+            n_out = target_world / t_norm
+        # Tangent frame at the target — same as the SDF camera setup.
+        world_up = np.array([0.0, 1.0, 0.0])
+        tan_a = np.cross(n_out, world_up)
+        ta_n = np.linalg.norm(tan_a)
+        if ta_n < 1e-6:
+            tan_a = np.array([1.0, 0.0, 0.0])
+        else:
+            tan_a = tan_a / ta_n
+        tan_b = np.cross(n_out, tan_a)
+        tan_b = tan_b / max(np.linalg.norm(tan_b), 1e-30)
+        phi = max(-1.0, min(1.0, self.cam_phi))
+        cp_o = math.cos(phi); sp_o = math.sin(phi)
+        ct_o = math.cos(self.cam_theta); st_o = math.sin(self.cam_theta)
+        cam_dir = (cp_o * n_out
+                   + sp_o * (ct_o * tan_a + st_o * tan_b))
+        cam_dir = cam_dir / max(np.linalg.norm(cam_dir), 1e-30)
+
+        # Map the camera position from fractal space to voxel-cube
+        # world space. Cube center is (0.5, 0.5, 0.5); a fractal-space
+        # offset of `cam_radius` corresponds to a voxel-world offset of
+        # cam_radius / (2 * zoom).
+        cube_center = np.array([0.5, 0.5, 0.5])
+        cam_offset_voxel = cam_dir * (cam_radius / (2.0 * zoom))
+        cam_pos = (cube_center + cam_offset_voxel).astype(np.float64)
+        target_voxel = cube_center.astype(np.float64)
+
+        forward = target_voxel - cam_pos
+        f_norm = float(np.linalg.norm(forward))
+        if f_norm < 1e-30:
+            forward = -n_out
+        else:
+            forward = forward / f_norm
+        right = np.cross(forward, world_up)
+        rn = np.linalg.norm(right)
+        if rn < 1e-6:
+            right = np.array([1.0, 0.0, 0.0])
+        else:
+            right = right / rn
+        up = np.cross(right, forward)
+        up = up / max(np.linalg.norm(up), 1e-30)
+
+        view = np.eye(4, dtype=np.float32)
+        view[0, :3] = right
+        view[1, :3] = up
+        view[2, :3] = -forward
+        view[0, 3] = -float(np.dot(right, cam_pos))
+        view[1, 3] = -float(np.dot(up, cam_pos))
+        view[2, 3] =  float(np.dot(forward, cam_pos))
+
+        # Match SDF's narrow-FOV-as-zoom: half-FOV = zoom / cam_radius.
+        # Floor so we never collapse to 0° at extreme zoom.
+        half_fov = max(zoom / max(cam_radius, 1e-6), 1e-4)
+        # full vertical FOV (radians) — atan-corrected for accuracy at
+        # wide angles (≈half_fov for narrow, ~pi/2 saturates wide).
+        fov_y = 2.0 * math.atan(half_fov)
+        # Auto-fit at fov ≥ ~60°: cap so the cube at distance
+        # cam_radius/(2*zoom) is always visible.
+        fov_y = min(fov_y, math.radians(120.0))
+
+        aspect = self.width / max(self.height, 1)
+        # Near/far scale with cam distance so deep-zoom doesn't clip.
+        cam_dist_world = float(np.linalg.norm(cam_offset_voxel))
+        near = max(1e-6, cam_dist_world * 0.001)
+        far = max(10.0, cam_dist_world * 4.0 + 10.0)
+        f = 1.0 / math.tan(fov_y * 0.5)
+        proj = np.zeros((4, 4), dtype=np.float32)
+        proj[0, 0] = f / aspect
+        proj[1, 1] = f
+        proj[2, 2] = (far + near) / (near - far)
+        proj[2, 3] = (2 * far * near) / (near - far)
+        proj[3, 2] = -1.0
+
         vp_row_major = proj @ view
         return vp_row_major.T.flatten(), vp_row_major
 
@@ -24206,6 +26003,8 @@ void main() {
         self._render_sub = {}
         if self.renderer_mode == 'voxel':
             self._render_voxels()
+        elif self.renderer_mode == 'sdf_viewport':
+            self._render_sdf_viewport()
         elif self._use_compute_ray:
             self._render_volume_compute()
         else:
@@ -24246,6 +26045,13 @@ void main() {
             bool(self._has_glyphs()),
             # Iso-surface re-extracts every frame; force re-render.
             bool(self._has_iso_surface()),
+            # Viewport-kind state (origin/zoom evolve over time and on
+            # randomize). Only included when actually relevant so it
+            # doesn't bust the cache for every other rule.
+            (round(float(self.viewport_origin[0]), 7),
+             round(float(self.viewport_origin[1]), 7),
+             round(float(self.viewport_origin[2]), 7),
+             float(self.viewport_zoom)) if self._is_viewport_kind() else 0,
         )
 
     def _ensure_scene_cache(self):
@@ -24531,6 +26337,31 @@ void main() {
         imgui.text_colored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0),
             f"-> debug_runs/")
 
+        # ── Voxel snapshots (run bundle) ─────────────────────────────
+        imgui.separator()
+        imgui.text("Voxel snapshots")
+        rec_ok = self._run_recorder is not None
+        if not rec_ok:
+            imgui.text_colored(imgui.ImVec4(0.7, 0.5, 0.5, 1.0),
+                "(no active run recorder)")
+        if imgui.button("Snapshot now"):
+            if rec_ok:
+                self._take_voxel_snapshot()
+        imgui.same_line()
+        changed, val = imgui.checkbox("Auto", self._snapshot_auto)
+        if changed:
+            self._snapshot_auto = val
+            self._steps_since_snapshot = 0
+        imgui.same_line()
+        imgui.set_next_item_width(120)
+        changed, val = imgui.slider_int("every N steps",
+                                         self._snapshot_interval, 1, 1000)
+        if changed:
+            self._snapshot_interval = val
+        if self._last_snapshot_path:
+            imgui.text_colored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0),
+                f"last: {self._last_snapshot_path}")
+
         imgui.end()
 
     def _debug_save_snapshot(self):
@@ -24566,8 +26397,91 @@ void main() {
                 json.dump(payload, f)
             print(f"[debug] saved {len(self._debug_history)} samples -> {path}",
                   flush=True)
+            if self._run_recorder is not None:
+                try:
+                    self._run_recorder.log_event(
+                        "note", step=self.step_count,
+                        event_kind="debug_snapshot_saved", path=path,
+                        n_samples=len(self._debug_history))
+                except Exception: pass
         except Exception as e:
             print(f"[debug] save failed: {e!r}", flush=True)
+
+    def _take_voxel_snapshot(self):
+        """Read the live grid back to CPU and dump it via the run recorder.
+
+        No-op (returns None) if no recorder is active. Refreshes the CPU
+        cache if stale; the cached read is reused by other consumers
+        (raymarcher, brush) so this is essentially free when not stale.
+        """
+        if self._run_recorder is None:
+            return None
+        try:
+            size = self.size
+            if self._cpu_grid_dirty or self._cpu_grid is None:
+                src_tex = self.tex_a if self.ping == 0 else self.tex_b
+                self._cpu_grid = np.frombuffer(
+                    src_tex.read(), dtype=self._tex_np_dtype
+                ).reshape(size, size, size, 4).copy()
+                self._cpu_grid_dirty = False
+            path = self._run_recorder.snapshot(
+                self.step_count, self._cpu_grid,
+                dtype_native=str(self._tex_np_dtype))
+            self._last_snapshot_path = str(path.relative_to(
+                self._run_recorder.run_dir))
+            return path
+        except Exception as e:
+            print(f"[snapshot] failed: {e!r}", flush=True)
+            return None
+
+    def _drain_replay_events(self):
+        """Apply any pending replay events whose step <= current step.
+
+        Drives the replay mode (`--replay`). Walks the pre-loaded
+        ``_replay_events`` list (sorted by step) and applies each event
+        kind we know how to reproduce. Unknown kinds are skipped silently
+        so future event types don't break older replays.
+        """
+        events = self._replay_events
+        n = len(events)
+        while self._replay_idx < n:
+            ev = events[self._replay_idx]
+            ev_step = int(ev.get("step", 0))
+            if ev_step > self.step_count:
+                break
+            self._replay_idx += 1
+            kind = ev.get("kind", "")
+            try:
+                if kind == "param_change":
+                    key = ev.get("key")
+                    val = ev.get("to")
+                    if key == "dt":
+                        self.dt = float(val)
+                    elif key in self.params:
+                        # Coerce to the slot's existing type to keep
+                        # int/float discipline.
+                        self.params[key] = type(self.params[key])(val)
+                elif kind == "rule_change":
+                    new_rule = ev.get("to")
+                    if new_rule and new_rule != self.rule_name:
+                        self._change_rule(new_rule)
+                elif kind == "restart":
+                    self._reset()
+                elif kind == "randomize":
+                    # _reset() also re-randomizes the grid (it re-runs the
+                    # init shader with the current seed); good enough.
+                    self._reset()
+                elif kind == "renderer_mode":
+                    mode = ev.get("to") or ev.get("mode")
+                    if mode and hasattr(self, "renderer_mode"):
+                        self.renderer_mode = mode
+                # Other kinds (note, snapshot, recording_*, anomaly,
+                # discovery_save) are observational and not reproduced.
+            except Exception as e:
+                print(f"[replay] event {kind} @ step {ev_step} failed: {e!r}",
+                      flush=True)
+        # End-of-stream: leave replay flag on so we don't reset _replay_idx,
+        # but no more events will be applied.
 
     def _draw_perf_overlay(self, history):
         """Tiny always-on-top window showing per-section frame timings.
@@ -24693,6 +26607,13 @@ void main() {
             with open(path, 'w') as f:
                 json.dump(payload, f)
             print(f"[perf] saved {len(history)} frames -> {path}", flush=True)
+            if self._run_recorder is not None:
+                try:
+                    self._run_recorder.log_event(
+                        "note", step=self.step_count,
+                        event_kind="perf_log_saved", path=path,
+                        n_frames=len(history))
+                except Exception: pass
             return path
         except Exception as e:
             print(f"[perf] save failed: {e!r}", flush=True)
@@ -24716,6 +26637,12 @@ void main() {
                 preset = RULE_PRESETS[name]
                 is_selected = (name == self.rule_name)
                 if imgui.selectable(preset['label'], is_selected)[0]:
+                    if name != self.rule_name and self._run_recorder is not None:
+                        try:
+                            self._run_recorder.log_event(
+                                "rule_change", step=self.step_count,
+                                from_=self.rule_name, to=name)
+                        except Exception: pass
                     self._change_rule(name)
                 if is_selected:
                     imgui.set_item_default_focus()
@@ -24766,10 +26693,22 @@ void main() {
             if isinstance(lo, int) and isinstance(hi, int) and lo != hi:
                 changed, new_val = imgui.slider_int(name, int(val), lo, hi)
                 if changed:
+                    if self._run_recorder is not None:
+                        try:
+                            self._run_recorder.log_event(
+                                "param_change", step=self.step_count,
+                                key=name, from_=int(val), to=int(new_val))
+                        except Exception: pass
                     self.params[name] = new_val
             else:
                 changed, new_val = imgui.slider_float(name, float(val), float(lo), float(hi))
                 if changed:
+                    if self._run_recorder is not None:
+                        try:
+                            self._run_recorder.log_event(
+                                "param_change", step=self.step_count,
+                                key=name, from_=float(val), to=float(new_val))
+                        except Exception: pass
                     self.params[name] = new_val
 
         # Time step — respect the preset's safe range when one is declared,
@@ -24784,6 +26723,12 @@ void main() {
             "Time step", float(self.dt), dt_lo, dt_hi, "%.4f",
             flags=imgui.SliderFlags_.logarithmic)
         if changed:
+            if self._run_recorder is not None:
+                try:
+                    self._run_recorder.log_event(
+                        "param_change", step=self.step_count,
+                        key="dt", from_=float(self.dt), to=float(new_dt))
+                except Exception: pass
             self.dt = new_dt
 
         changed, new_speed = imgui.slider_int("Steps/batch", self.sim_speed, 1, 20)
@@ -24815,12 +26760,24 @@ void main() {
             self._step_sim()
         imgui.same_line()
         if imgui.button("Reset [R]"):
+            if self._run_recorder is not None:
+                try:
+                    self._run_recorder.log_event("restart", step=self.step_count, source="button")
+                except Exception: pass
             self._reset()
         imgui.same_line()
         if imgui.button("Randomize"):
+            if self._run_recorder is not None:
+                try:
+                    self._run_recorder.log_event("randomize", step=self.step_count, source="button")
+                except Exception: pass
             self._randomize_params()
         imgui.same_line()
         if imgui.button("Mutate"):
+            if self._run_recorder is not None:
+                try:
+                    self._run_recorder.log_event("randomize", step=self.step_count, source="mutate")
+                except Exception: pass
             self._mutate_params()
 
         changed, new_seed = imgui.input_int("Seed", self.seed)
@@ -25040,13 +26997,17 @@ void main() {
 
         # Renderer mode toggle
         imgui.text("Renderer:")
-        renderer_modes = ["Volumetric", "Voxel"]
-        cur_idx = 1 if self.renderer_mode == 'voxel' else 0
+        renderer_modes = ["Volumetric", "Voxel", "SDF Viewport"]
+        mode_keys = ['volumetric', 'voxel', 'sdf_viewport']
+        try:
+            cur_idx = mode_keys.index(self.renderer_mode)
+        except ValueError:
+            cur_idx = 0
         if imgui.begin_combo("##renderer_mode", renderer_modes[cur_idx]):
             for i, label in enumerate(renderer_modes):
                 is_sel = (i == cur_idx)
                 if imgui.selectable(label, is_sel)[0]:
-                    self.renderer_mode = 'voxel' if i == 1 else 'volumetric'
+                    self.renderer_mode = mode_keys[i]
                 if is_sel:
                     imgui.set_item_default_focus()
             imgui.end_combo()
@@ -25062,6 +27023,67 @@ void main() {
                 if is_sel:
                     imgui.set_item_default_focus()
             imgui.end_combo()
+
+        # Viewport-rule-only controls. These govern the procedural
+        # zoom-into-fractal experience (auto-orbit during zoom, auto-cycle
+        # to a fresh vista when zoom hits the precision floor, and the
+        # depth threshold at which cycling kicks in).
+        if self._is_viewport_kind():
+            # Initialise tunables on first access so the UI's toggles
+            # have something to read.
+            if not hasattr(self, '_viewport_auto_orbit'):
+                self._viewport_auto_orbit = True
+            if not hasattr(self, '_viewport_autocycle'):
+                self._viewport_autocycle = True
+            if not hasattr(self, '_viewport_cycle_floor'):
+                self._viewport_cycle_floor = 1e-3
+            ch_o, new_o = imgui.checkbox("Auto orbit",
+                                         self._viewport_auto_orbit)
+            if ch_o:
+                self._viewport_auto_orbit = new_o
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Slowly orbit the camera around the target while\n"
+                    "zooming, so the surface curvature is visible. Turn\n"
+                    "OFF to lock the camera angle on a single feature.")
+            ch_c, new_c = imgui.checkbox("Auto cycle",
+                                         self._viewport_autocycle)
+            if ch_c:
+                self._viewport_autocycle = new_c
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Once zoom drops below the cycle floor, hop to a new\n"
+                    "random surface point so we never run out of detail.\n"
+                    "Turn OFF to zoom indefinitely (will eventually hit\n"
+                    "the fp32 precision wall and pixelate).")
+            ch_f, new_f = imgui.slider_float(
+                "Cycle floor (log10)",
+                math.log10(max(self._viewport_cycle_floor, 1e-30)),
+                -8.0, -1.0)
+            if ch_f:
+                self._viewport_cycle_floor = float(10.0 ** new_f)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Zoom value below which the auto-cycler hops to a new\n"
+                    "vista. -3 = ~1e-3 (deep, near precision wall).\n"
+                    "-1 = ~1e-1 (shallow, very safe).")
+            # Manual reset / new-vista buttons let the user choose when
+            # to hop without disabling auto-cycle entirely.
+            if imgui.button("New vista"):
+                try:
+                    new_o = self._pick_viewport_surface_origin()
+                    if new_o is not None:
+                        self.viewport_origin = np.asarray(new_o,
+                                                          dtype=np.float64)
+                        self.viewport_zoom = self.viewport_zoom_base
+                        self.cam_phi = 0.0
+                        self.cam_theta = 0.0
+                except Exception:
+                    pass
+            imgui.same_line()
+            if imgui.button("Rewind zoom"):
+                self.viewport_zoom = self.viewport_zoom_base
+            imgui.separator()
 
         if self.renderer_mode == 'voxel':
             # Voxel-specific settings
@@ -25695,6 +27717,13 @@ void main() {
 
         self._rec_msg = f"Recording {w}x{h}@{self._rec_fps}fps"
         self._rec_msg_time = time.time()
+        if self._run_recorder is not None:
+            try:
+                self._run_recorder.log_event(
+                    "recording_start", step=self.step_count,
+                    path=self._rec_filename, width=int(w), height=int(h),
+                    fps=int(self._rec_fps))
+            except Exception: pass
 
     def _stop_recording(self):
         """Finish recording and close ffmpeg."""
@@ -25782,6 +27811,14 @@ void main() {
         duration = time.time() - self._rec_start_time
         self._rec_msg = f"Saved {self._rec_filename} ({self._rec_frame_count} frames, {duration:.1f}s)"
         self._rec_msg_time = time.time()
+        if self._run_recorder is not None:
+            try:
+                self._run_recorder.log_event(
+                    "recording_stop", step=self.step_count,
+                    path=self._rec_filename,
+                    n_frames=int(self._rec_frame_count),
+                    duration_s=float(duration))
+            except Exception: pass
 
         # Sidecar write must never crash the simulator on stop — the video
         # is already saved, missing metadata is recoverable.
@@ -25804,11 +27841,24 @@ void main() {
         self.ctx.viewport = (0, 0, self._rec_width, self._rec_height)
 
         try:
-            # Render the scene (same as screen, just different resolution)
+            # Render the scene (same as screen, just different resolution).
+            # Mirror _render()'s dispatch so SDF-viewport presets (Mandelbox,
+            # Mandelbulb, Juliabulb, Menger when in sdf_viewport mode) record
+            # the per-pixel sphere-traced view instead of falling back to the
+            # voxel-bake volume renderer.
             if self.renderer_mode == 'voxel':
                 self._render_voxels()
+            elif self.renderer_mode == 'sdf_viewport':
+                self._render_sdf_viewport()
+            elif self._use_compute_ray:
+                self._render_volume_compute()
             else:
                 self._render_volume()
+            # Overlays (particles/glyphs/iso) — match _render() so the
+            # recording shows the same scene composition as the window.
+            self._render_particles()
+            self._render_glyphs()
+            self._render_iso_surface()
         finally:
             # Restore screen state even if rendering fails
             self.ctx.screen.use()
@@ -26009,6 +28059,8 @@ void main() {
 
                     if should_step:
                         for _ in range(self.sim_speed):
+                            if self._replay_active:
+                                self._drain_replay_events()
                             self._step_sim()
                             # Debug stats: throttled GPU dispatch per step
                             self._dispatch_debug_stats()
@@ -26076,6 +28128,18 @@ void main() {
                 dt_frame = time.perf_counter() - t0
                 sec['total'] = dt_frame
                 section_history.append(sec)
+                # Mirror per-frame timings into the run bundle. Cheap:
+                # buffered, parquet-flushed every 512 rows.
+                if self._run_recorder is not None:
+                    try:
+                        self._frame_counter_for_recorder += 1
+                        self._run_recorder.log_frame(
+                            self._frame_counter_for_recorder, sec,
+                            step=self.step_count,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[ca_debug] log_frame failed: {e!r}", flush=True)
+                        self._run_recorder = None
                 frame_times.append(dt_frame)
                 if len(frame_times) > 60:
                     frame_times.pop(0)
@@ -26119,6 +28183,14 @@ void main() {
                 self._stop_recording()
             except Exception:
                 pass
+
+        # 1b. Flush + close the unified run bundle BEFORE we lose the GL
+        #     context (RunRecorder may want a final ctx.info read for the
+        #     env block, and snapshot writers may still own GPU readbacks).
+        try:
+            self._close_run(reason="shutdown")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ca_debug] shutdown close failed: {e!r}", flush=True)
 
         # 2. Flush all in-flight GPU work. Without this, a still-running
         #    compute dispatch can outlive its program object and crash the
@@ -26651,6 +28723,13 @@ def main():
     parser.add_argument('--seed', type=int, default=None,
                         help='Override seed before reset (applies to audit '
                              'and non-audit runs)')
+    parser.add_argument('--replay', type=str, default=None,
+                        help='Replay a previously recorded run bundle: '
+                             'reproduces the rule/seed/initial params from '
+                             'manifest.json, then applies events.jsonl '
+                             '(param_change/rule_change/restart/randomize) '
+                             'at the same step counts. Read-only; does not '
+                             'open a new recorder.')
     args = parser.parse_args()
 
     # Parse --dims if provided.
@@ -26696,6 +28775,48 @@ def main():
             glfw.terminate()
         except Exception:
             pass
+        return
+
+    # Replay mode: bootstrap from a run bundle, schedule its events.
+    if args.replay:
+        from pathlib import Path
+        bundle = Path(args.replay)
+        if not bundle.is_dir():
+            print(f"Replay bundle not found: {bundle}")
+            sys.exit(1)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        events_path = bundle / "events.jsonl"
+        events = []
+        if events_path.exists():
+            for line in events_path.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except Exception:
+                        pass
+        # Sort by step (events are already in time order, but be defensive).
+        events.sort(key=lambda e: int(e.get("step", 0)))
+
+        rule = manifest.get("rule", args.rule)
+        sim = Simulator(size=int(manifest.get("size", args.size)),
+                        rule=rule,
+                        force_precision=_resolve_precision(args), dims=dims)
+        # Restore initial seed/dt/params from manifest before any reset.
+        if "seed" in manifest:
+            sim.seed = int(manifest["seed"])
+        if "dt" in manifest:
+            sim.dt = float(manifest["dt"])
+        for k, v in (manifest.get("params") or {}).items():
+            if k in sim.params:
+                sim.params[k] = type(sim.params[k])(v)
+        sim._reset()
+        # Hand the queue to the simulator; main loop drains it.
+        sim._replay_events = events
+        sim._replay_active = True
+        print(f"[replay] {bundle.name}: rule={rule} seed={sim.seed} "
+              f"events={len(events)}")
+        sim.run()
         return
 
     # Load discovery params if specified
