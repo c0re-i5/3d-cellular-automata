@@ -5,3 +5,7 @@ PyOpenGL>=3.1
 imgui-bundle>=1.6
 scipy>=1.10
 trimesh>=4.0
+# Data analysis / debug bundle format
+pyarrow>=14.0
+pandas>=2.0
+duckdb>=0.10

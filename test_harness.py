@@ -30,6 +30,14 @@ import warnings
 import numpy as np
 import entity_arena
 
+# Optional unified run-bundle writer. Test harness can opt into producing
+# one runs/<id>/ bundle per trial (parquet timeseries + manifest + events)
+# alongside the legacy discoveries.json output. Pure best-effort.
+try:
+    from ca_debug import RunRecorder as _RunRecorder
+except Exception:
+    _RunRecorder = None
+
 try:
     from OpenGL import GL  # type: ignore
 except Exception:  # pragma: no cover -- already optional in step()
@@ -667,6 +675,15 @@ class HeadlessRunner:
             self.measure_mode = 'deviation'  # "alive" = cells deviating from spatial mean
             self.alive_threshold = 0.1  # captures Turing spots/stripes without over-counting
             self.change_threshold = 0.02  # PDE field: need meaningful structural change
+        elif shader in ('brusselator_3d', 'schnakenberg_3d'):
+            # Continuous reaction-diffusion concentration fields (range ~[0,2]).
+            # Without this branch they fell through to the discrete default
+            # (alive_threshold=0.5) which marked every cell alive from step 0,
+            # masking real Turing pattern formation and tanking their score.
+            self.measure_channel = 0  # activator (U)
+            self.measure_mode = 'deviation'  # Turing spots: deviation from spatial mean
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.02
         elif shader == 'kuramoto_3d':
             self.measure_channel = 0  # phase [0,1]
             self.measure_mode = 'phase_coherence'  # alive = domain boundary cells
@@ -1901,603 +1918,33 @@ def score_interestingness(metric_history):
 
 # ── Structural analysis (slice / projection metrics) ──────────────────
 
-def _binary_slice(grid_3d, axis, index, threshold=0.5):
-    """Extract a 2D binary slice from a 3D grid along the given axis."""
-    if axis == 0:
-        s = grid_3d[index, :, :]
-    elif axis == 1:
-        s = grid_3d[:, index, :]
-    else:
-        s = grid_3d[:, :, index]
-    return (s > threshold).astype(np.float32)
-
-
-def _gol_2d_step(grid_2d):
-    """One step of 2D Game of Life on a binary grid. Toroidal boundary."""
-    padded = np.pad(grid_2d, 1, mode='wrap')
-    neighbors = (
-        padded[:-2, :-2] + padded[:-2, 1:-1] + padded[:-2, 2:] +
-        padded[1:-1, :-2] +                     padded[1:-1, 2:] +
-        padded[2:, :-2]  + padded[2:, 1:-1]  + padded[2:, 2:]
-    )
-    birth = (grid_2d == 0) & (neighbors == 3)
-    survive = (grid_2d == 1) & ((neighbors == 2) | (neighbors == 3))
-    return (birth | survive).astype(np.float32)
-
-
-def slice_gol_coherence(grid, channel=0, axis=2, threshold=0.5):
-    """Measure how well consecutive Z-slices follow 2D GoL rules.
-
-    Returns a value in [0, 1] where 1.0 means each slice is the exact
-    GoL successor of the previous slice. This detects whether the 3D
-    structure embeds a 2D GoL spacetime.
-    """
-    vol = grid[:, :, :, channel]
-    size = vol.shape[axis]
-    if size < 2:
-        return 0.0
-
-    # Binarize once and move the stacking axis to front so b[i] is the
-    # i-th slice. Vectorized GoL step across ALL slices in a single pass
-    # (replaces the 31-iteration Python loop + scipy.pad-per-slice that
-    # used to dominate analyze_structure).
-    b = (vol > threshold).astype(np.int8)
-    b = np.moveaxis(b, axis, 0)  # (size, H, W)
-    # 8-neighbor sum with toroidal wrap via np.roll (no pad allocation).
-    rp1 = np.roll(b, 1, axis=1); rm1 = np.roll(b, -1, axis=1)
-    cp1 = np.roll(b, 1, axis=2); cm1 = np.roll(b, -1, axis=2)
-    n = (rp1 + rm1 + cp1 + cm1 +
-         np.roll(rp1, 1, axis=2) + np.roll(rp1, -1, axis=2) +
-         np.roll(rm1, 1, axis=2) + np.roll(rm1, -1, axis=2))
-    predicted = ((b == 0) & (n == 3)) | ((b == 1) & ((n == 2) | (n == 3)))
-    # Compare predicted[i] to actual slice[i+1].
-    pred_cur = predicted[:-1]
-    actual_next = b[1:].astype(bool)
-    # Skip trivial pairs (both dead or both saturated).
-    alive_cur  = b[:-1].mean(axis=(1, 2))
-    alive_next = b[1:].mean(axis=(1, 2))
-    trivial = ((alive_cur < 0.01) & (alive_next < 0.01)) | \
-              ((alive_cur > 0.99) & (alive_next > 0.99))
-    agreement = (pred_cur == actual_next).mean(axis=(1, 2))
-    valid = ~trivial
-    return float(agreement[valid].mean()) if valid.any() else 0.0
-
-
-def projection_entropy(grid, channel=0, threshold=0.01):
-    """Compute Shannon entropy of max-projection along each axis.
-
-    Returns dict with 'entropy_x', 'entropy_y', 'entropy_z' (each 0-1 normalized)
-    and 'projection_complexity' (mean entropy).
-    """
-    vol = grid[:, :, :, channel]
-    vol = np.abs(vol)  # handle wave-type CAs
-
-    entropies = {}
-    for ax, name in enumerate(['x', 'y', 'z']):
-        proj = np.max(vol, axis=ax)
-        # Normalize to [0, 1]
-        pmax = proj.max()
-        if pmax > threshold:
-            proj = proj / pmax
-        else:
-            entropies[f'entropy_{name}'] = 0.0
-            continue
-        # Discretize into bins for entropy
-        bins = 16
-        hist, _ = np.histogram(proj.ravel(), bins=bins, range=(0, 1))
-        hist = hist / hist.sum()
-        hist = hist[hist > 0]
-        ent = -np.sum(hist * np.log2(hist))
-        # Normalize by max possible entropy
-        entropies[f'entropy_{name}'] = float(ent / np.log2(bins))
-
-    entropies['projection_complexity'] = float(np.mean([
-        entropies['entropy_x'], entropies['entropy_y'], entropies['entropy_z']
-    ]))
-    return entropies
-
-
-def projection_structure(grid, channel=0):
-    """Measure spatial structure in projections (edge density, not just entropy).
-
-    Returns dict with 'structure_x/y/z' and 'projection_structure' mean.
-    Higher values = more internal spatial pattern (edges, boundaries).
-    """
-    vol = np.abs(grid[:, :, :, channel])
-
-    structures = {}
-    for ax, name in enumerate(['x', 'y', 'z']):
-        proj = np.max(vol, axis=ax)
-        pmax = proj.max()
-        if pmax < 0.01:
-            structures[f'structure_{name}'] = 0.0
-            continue
-        proj = proj / pmax
-        # Sobel-like edge measure
-        dx = np.abs(np.diff(proj, axis=0))
-        dy = np.abs(np.diff(proj, axis=1))
-        edge_density = (dx.mean() + dy.mean()) / 2.0
-        structures[f'structure_{name}'] = float(edge_density)
-
-    structures['projection_structure'] = float(np.mean([
-        structures['structure_x'], structures['structure_y'], structures['structure_z']
-    ]))
-    return structures
-
-
-def slice_mutual_info(grid, channel=0, axis=2, n_samples=8, threshold=0.5):
-    """Measure mutual information between evenly-spaced slices along an axis.
-
-    High MI = slices are related (the 3D structure has depth coherence).
-    Low MI = slices are independent (random 3D noise).
-    Returns value in [0, 1].
-    """
-    vol = grid[:, :, :, channel]
-    size = vol.shape[axis]
-    if size < n_samples:
-        n_samples = size
-
-    indices = np.linspace(0, size - 1, n_samples, dtype=int)
-    slices = [_binary_slice(vol, axis, i, threshold).ravel() for i in indices]
-
-    # Pairwise normalized MI
-    mis = []
-    bins = 2  # binary slices
-    for i in range(len(slices)):
-        for j in range(i + 1, len(slices)):
-            # Joint histogram
-            joint = slices[i] * bins + slices[j]
-            hist = np.bincount(joint.astype(int), minlength=bins * bins).astype(float)
-            hist /= hist.sum()
-            hist = hist.reshape(bins, bins)
-
-            # Marginals
-            px = hist.sum(axis=1)
-            py = hist.sum(axis=0)
-
-            # MI = sum p(x,y) * log(p(x,y) / (p(x)*p(y)))
-            mi = 0.0
-            for xi in range(bins):
-                for yi in range(bins):
-                    if hist[xi, yi] > 0 and px[xi] > 0 and py[yi] > 0:
-                        mi += hist[xi, yi] * np.log2(hist[xi, yi] / (px[xi] * py[yi]))
-            mis.append(mi)
-
-    return float(np.mean(mis)) if mis else 0.0
-
-
-def spatial_variation(grid, channel=0, n_blocks=8):
-    """Measure spatial heterogeneity by dividing grid into blocks and comparing density.
-
-    Returns a value in [0, 1] where 0 = spatially uniform (global oscillator)
-    and 1 = highly heterogeneous (distinct spatial patterns).
-
-    Divides the grid into n_blocks^3 sub-volumes, computes mean absolute value
-    per block, then returns the coefficient of variation (std/mean) clamped to [0,1].
-    """
-    vol = np.abs(grid[:, :, :, channel])
-    sz = vol.shape[0]
-    bsz = max(1, sz // n_blocks)
-    # When the grid divides evenly, do a single vectorized block-reduce
-    # instead of the Python triple loop (common case; 8× faster).
-    if sz == bsz * n_blocks:
-        block_means = vol.reshape(n_blocks, bsz, n_blocks, bsz, n_blocks, bsz)\
-                         .mean(axis=(1, 3, 5)).ravel()
-    else:
-        # Fallback for non-divisible sizes.
-        block_means = []
-        for ix in range(0, sz, bsz):
-            for iy in range(0, sz, bsz):
-                for iz in range(0, sz, bsz):
-                    block = vol[ix:ix+bsz, iy:iy+bsz, iz:iz+bsz]
-                    block_means.append(block.mean())
-        block_means = np.array(block_means)
-    mean_val = block_means.mean()
-    if mean_val < 1e-6:
-        return 0.0
-    cv = float(block_means.std() / mean_val)
-    return min(cv, 1.0)
-
-
-def analyze_structure(grid, channel=0):
-    """Run all structural analysis on a grid snapshot.
-
-    Returns a dict with all slice/projection metrics.
-    """
-    result = {}
-    result['gol_coherence_z'] = slice_gol_coherence(grid, channel, axis=2)
-    result['gol_coherence_y'] = slice_gol_coherence(grid, channel, axis=1)
-    result['gol_coherence_x'] = slice_gol_coherence(grid, channel, axis=0)
-    result['gol_coherence_max'] = max(
-        result['gol_coherence_z'], result['gol_coherence_y'], result['gol_coherence_x']
-    )
-    result.update(projection_entropy(grid, channel))
-    result.update(projection_structure(grid, channel))
-    result['slice_mi_z'] = slice_mutual_info(grid, channel, axis=2)
-    result['slice_mi_y'] = slice_mutual_info(grid, channel, axis=1)
-    result['slice_mi_x'] = slice_mutual_info(grid, channel, axis=0)
-    result['slice_mi_max'] = max(
-        result['slice_mi_z'], result['slice_mi_y'], result['slice_mi_x']
-    )
-    result['spatial_variation'] = spatial_variation(grid, channel)
-    return result
-
-
-# ── Advanced dynamics metrics (period, gliders, growth, symmetry) ─────
-
-def _grid_hash(binary_grid):
-    """Fast hash of a binary grid for period detection."""
-    return hash(binary_grid.tobytes())
-
-
-def detect_period(grid_snapshots, channel=0, threshold=0.5):
-    """Detect exact periodicity in a sequence of grid snapshots.
-
-    Returns dict with:
-      period: cycle length (0 = no period found)
-      period_start: step index where cycle starts
-      period_score: 0-1, how clean the period is (1 = perfect cycle)
-    """
-    # Binarize snapshots and hash them
-    hashes = []
-    for g in grid_snapshots:
-        binary = (g[:, :, :, channel] > threshold).astype(np.uint8)
-        hashes.append(_grid_hash(binary))
-
-    # Look for repeated hashes (period detection)
-    n = len(hashes)
-    best_period = 0
-    best_start = 0
-    best_confirmations = 0
-
-    # Check periods from 1 to n//3 (need at least 3 repetitions to confirm)
-    max_period = min(n // 3, 200)
-    for p in range(1, max_period + 1):
-        # Check from the end backwards for this period
-        for start in range(n - 2 * p, max(0, n - 4 * p) - 1, -1):
-            confirmations = 0
-            valid = True
-            for k in range(start, n - p, p):
-                if hashes[k] == hashes[k + p]:
-                    confirmations += 1
-                else:
-                    valid = False
-                    break
-            if valid and confirmations >= 2 and confirmations > best_confirmations:
-                best_period = p
-                best_start = start
-                best_confirmations = confirmations
-
-    period_score = 0.0
-    if best_period > 0:
-        # Score: short periods are more remarkable, more confirmations = more confident
-        period_score = min(1.0, best_confirmations / 5.0) * min(1.0, 20.0 / best_period)
-
-        # Devalue trivial period-2 global oscillation:
-        # If most of the grid is alive and toggles every step, period=2 is boring
-        if best_period <= 2 and len(grid_snapshots) >= 2:
-            last = grid_snapshots[-1]
-            alive_frac = (last[:, :, :, channel] > threshold).mean()
-            if alive_frac > 0.2:
-                # Check if activity is global (compare last two snapshots)
-                prev = grid_snapshots[-2]
-                changed = ((last[:, :, :, channel] > threshold) !=
-                          (prev[:, :, :, channel] > threshold)).mean()
-                if changed > 0.3:  # >30% of grid changes = global oscillation
-                    period_score *= 0.1  # nearly zero for boring global blink
-
-    return {
-        'period': best_period,
-        'period_start': best_start,
-        'period_score': float(period_score),
-    }
-
-
-def detect_translation(grid_snapshots, channel=0, threshold=0.5):
-    """Detect translating structures (gliders/spaceships) via FFT cross-correlation.
-
-    Uses FFT-based phase correlation to find the dominant shift between
-    time-separated snapshots, then scores consistency across frame pairs.
-
-    Returns dict with:
-      translation_score: 0-1 (1 = perfect glider-like translation)
-      translation_speed: cells/step of detected translation
-      translation_dir: (dx, dy, dz) unit direction
-    """
-    if len(grid_snapshots) < 10:
-        return {'translation_score': 0.0, 'translation_speed': 0.0, 'translation_dir': (0, 0, 0)}
-
-    # Use snapshots from the second half (after transient)
-    half = len(grid_snapshots) // 2
-    snaps = grid_snapshots[half:]
-    size = snaps[0].shape[0]
-
-    # Binarize
-    bins = [(g[:, :, :, channel] > threshold).astype(np.float32) for g in snaps]
-
-    # Don't bother if grid is mostly empty or mostly full
-    alive = bins[-1].mean()
-    if alive < 0.005 or alive > 0.5:
-        return {'translation_score': 0.0, 'translation_speed': 0.0, 'translation_dir': (0, 0, 0)}
-
-    # FFT-based phase correlation to find dominant shift
-    best_score = 0.0
-    best_shift = (0, 0, 0)
-    best_dt = 1
-
-    for dt_steps in [2, 4, 8]:
-        if dt_steps >= len(bins):
-            continue
-
-        # Accumulate cross-correlation across frame pairs for this dt
-        pairs = list(range(0, len(bins) - dt_steps, max(1, dt_steps)))
-        if not pairs:
-            continue
-
-        # Average the cross-power spectrum across pairs for robustness
-        accum = None
-        for i in pairs:
-            fa = np.fft.rfftn(bins[i])
-            fb = np.fft.rfftn(bins[i + dt_steps])
-            cross = fa * np.conj(fb)
-            # Normalize to get phase correlation (avoid div by zero)
-            mag = np.abs(cross)
-            mag[mag < 1e-12] = 1e-12
-            if accum is None:
-                accum = cross / mag
-            else:
-                accum += cross / mag
-
-        corr = np.fft.irfftn(accum, s=(size, size, size))
-
-        # Zero out the DC (no-shift) peak — we want actual translation
-        corr[0, 0, 0] = 0.0
-
-        # Find peak within ±3 cells (matching original shift_range)
-        peak_val = 0.0
-        peak_shift = (0, 0, 0)
-        for dx in range(-3, 4):
-            for dy in range(-3, 4):
-                for dz in range(-3, 4):
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
-                    val = corr[dx % size, dy % size, dz % size]
-                    if val > peak_val:
-                        peak_val = val
-                        peak_shift = (dx, dy, dz)
-
-        # Normalize: max possible is len(pairs) (perfect correlation at every pair)
-        norm_score = peak_val / max(len(pairs), 1)
-
-        # Verify with IoU on a few pairs to convert to a true overlap score
-        if norm_score > 0.1:
-            overlaps = []
-            check_pairs = pairs[:min(4, len(pairs))]
-            dx, dy, dz = peak_shift
-            for i in check_pairs:
-                a = bins[i]
-                b = bins[i + dt_steps]
-                b_shifted = np.roll(np.roll(np.roll(b, -dx, axis=0), -dy, axis=1), -dz, axis=2)
-                union_sum = np.maximum(a, b_shifted).sum()
-                if union_sum > 10:
-                    overlaps.append(float((a * b_shifted).sum() / union_sum))
-            if overlaps:
-                iou_score = np.mean(overlaps)
-                if iou_score > best_score:
-                    best_score = iou_score
-                    best_shift = peak_shift
-                    best_dt = dt_steps
-
-    speed = np.sqrt(best_shift[0]**2 + best_shift[1]**2 + best_shift[2]**2) / best_dt if best_dt > 0 else 0
-
-    return {
-        'translation_score': float(best_score),
-        'translation_speed': float(speed),
-        'translation_dir': best_shift,
-    }
-
-
-def detect_growth(metric_history):
-    """Detect monotonic growth patterns (guns, replicators).
-
-    Returns dict with:
-      growth_score: 0-1 (1 = steady monotonic growth from sparse start)
-      growth_rate: alive cells gained per step
-      growth_type: 'none', 'linear', 'accelerating', 'decelerating'
-    """
-    if len(metric_history) < 10:
-        return {'growth_score': 0.0, 'growth_rate': 0.0, 'growth_type': 'none'}
-
-    alive = np.array([m['alive_ratio'] for m in metric_history])
-
-    # Need to start sparse
-    if alive[0] > 0.3:
-        return {'growth_score': 0.0, 'growth_rate': 0.0, 'growth_type': 'none'}
-
-    # Check for sustained growth: alive count should increase over time
-    # Split into quarters and check each is higher than the previous
-    n = len(alive)
-    quarters = [alive[i*n//4:(i+1)*n//4].mean() for i in range(4)]
-
-    monotonic_quarters = sum(1 for i in range(3) if quarters[i+1] > quarters[i] * 1.02)
-    if monotonic_quarters < 2:
-        return {'growth_score': 0.0, 'growth_rate': 0.0, 'growth_type': 'none'}
-
-    # Growth rate
-    growth = alive[-1] - alive[0]
-    if growth < 0.01:
-        return {'growth_score': 0.0, 'growth_rate': 0.0, 'growth_type': 'none'}
-
-    # Classify growth type
-    mid = alive[n//2]
-    expected_linear_mid = (alive[0] + alive[-1]) / 2
-    if mid > expected_linear_mid * 1.1:
-        growth_type = 'accelerating'
-    elif mid < expected_linear_mid * 0.9:
-        growth_type = 'decelerating'
-    else:
-        growth_type = 'linear'
-
-    # Score: steady growth is more interesting than explosive growth
-    # Penalize if it just fills everything
-    if alive[-1] > 0.9:
-        score = 0.2  # filled up — not that interesting
-    elif alive[-1] > 0.5:
-        score = 0.5
-    else:
-        score = 0.8  # grew but didn't saturate — possible gun/replicator
-
-    # Bonus for linearity (suggests structured replication)
-    diffs = np.diff(alive)
-    positive_diffs = diffs[diffs > 0]
-    if len(positive_diffs) > 5:
-        cv = np.std(positive_diffs) / (np.mean(positive_diffs) + 1e-10)
-        if cv < 0.3:
-            score = min(1.0, score + 0.2)  # very regular growth
-
-    rate = growth / len(alive)
-
-    return {
-        'growth_score': float(score),
-        'growth_rate': float(rate),
-        'growth_type': growth_type,
-    }
-
-
-def analyze_clusters(grid, channel=0, threshold=0.5):
-    """Analyze connected components in the grid (cluster analysis).
-
-    Finds discrete structures, measures their sizes and isolation.
-
-    Returns dict with:
-      n_clusters: number of connected components
-      cluster_score: 0-1 (high = multiple well-separated interesting clusters)
-      largest_cluster_frac: fraction of alive cells in largest cluster
-      mean_cluster_size: average cluster size in cells
-    """
-    from scipy import ndimage
-
-    vol = (grid[:, :, :, channel] > threshold).astype(np.int32)
-    alive = vol.sum()
-    if alive < 5:
-        return {'n_clusters': 0, 'cluster_score': 0.0,
-                'largest_cluster_frac': 0.0, 'mean_cluster_size': 0}
-
-    # Label connected components (6-connectivity)
-    structure = np.zeros((3, 3, 3), dtype=np.int32)
-    structure[1, 1, :] = 1
-    structure[1, :, 1] = 1
-    structure[:, 1, 1] = 1
-    labels, n_clusters = ndimage.label(vol, structure=structure)
-
-    if n_clusters == 0:
-        return {'n_clusters': 0, 'cluster_score': 0.0,
-                'largest_cluster_frac': 0.0, 'mean_cluster_size': 0}
-
-    # Cluster sizes
-    sizes = ndimage.sum(vol, labels, range(1, n_clusters + 1))
-    sizes = np.array(sizes, dtype=float)
-    largest = sizes.max()
-    mean_size = sizes.mean()
-
-    # Score: multiple medium-sized clusters is most interesting
-    # (single blob = boring, dust = boring, multiple structures = gliders!)
-    alive_frac = alive / max(1, grid.shape[0] * grid.shape[1] * grid.shape[2])
-    if n_clusters == 1:
-        score = 0.1  # single blob
-    elif n_clusters > 1000:
-        score = 0.05  # dust/noise
-    elif n_clusters > 50 and alive_frac > 0.2:
-        score = 0.05  # many clusters + high alive = noise, not discrete structures
-    else:
-        # Ideal: 2-50 clusters, not dominated by one huge one
-        size_variety = 1.0 - (largest / alive)  # 0 = one cluster has everything
-        count_score = min(1.0, n_clusters / 10.0) * min(1.0, 50.0 / max(n_clusters, 1))
-        score = 0.3 * count_score + 0.4 * size_variety + 0.3 * min(1.0, mean_size / 100.0)
-
-    return {
-        'n_clusters': int(n_clusters),
-        'cluster_score': float(min(1.0, score)),
-        'largest_cluster_frac': float(largest / alive),
-        'mean_cluster_size': float(mean_size),
-    }
-
-
-def measure_symmetry(grid, channel=0, threshold=0.5):
-    """Measure rotational and reflective symmetry of the grid.
-
-    Returns dict with:
-      symmetry_score: 0-1 (1 = perfectly symmetric under all transforms)
-      reflection_score: avg reflective symmetry (x, y, z mirrors)
-      rotation_score: avg rotational symmetry (90° rotations)
-    """
-    vol = (grid[:, :, :, channel] > threshold).astype(np.float32)
-    alive = vol.sum()
-    if alive < 5:
-        return {'symmetry_score': 0.0, 'reflection_score': 0.0, 'rotation_score': 0.0}
-
-    total = vol.size
-
-    # Reflective symmetry along each axis
-    ref_scores = []
-    for ax in range(3):
-        flipped = np.flip(vol, axis=ax)
-        agreement = np.sum(vol == flipped) / total
-        ref_scores.append(agreement)
-
-    # 90° rotational symmetry (rotate around each axis)
-    rot_scores = []
-    # Around Z axis
-    rotated = np.rot90(vol, k=1, axes=(0, 1))
-    rot_scores.append(np.sum(vol == rotated) / total)
-    # Around Y axis
-    rotated = np.rot90(vol, k=1, axes=(0, 2))
-    rot_scores.append(np.sum(vol == rotated) / total)
-    # Around X axis
-    rotated = np.rot90(vol, k=1, axes=(1, 2))
-    rot_scores.append(np.sum(vol == rotated) / total)
-
-    ref_mean = float(np.mean(ref_scores))
-    rot_mean = float(np.mean(rot_scores))
-
-    # Combined score — subtract the baseline agreement for a random grid
-    # (for sparse grids, random agreement is ~(1-alive_frac)^2 + alive_frac^2)
-    alive_frac = alive / total
-    baseline = (1 - alive_frac)**2 + alive_frac**2
-    sym_score = max(0.0, (ref_mean + rot_mean) / 2.0 - baseline) / max(0.01, 1.0 - baseline)
-
-    return {
-        'symmetry_score': float(min(1.0, sym_score)),
-        'reflection_score': float(max(0, ref_mean - baseline) / max(0.01, 1.0 - baseline)),
-        'rotation_score': float(max(0, rot_mean - baseline) / max(0.01, 1.0 - baseline)),
-    }
-
-
-def analyze_dynamics(grid_snapshots, metric_history, channel=0, threshold=0.5):
-    """Run all advanced dynamics analysis on a time series of grid snapshots.
-
-    Returns a dict with period, translation, growth, cluster, and symmetry metrics.
-    """
-    result = {}
-    result.update(detect_period(grid_snapshots, channel, threshold))
-    result.update(detect_translation(grid_snapshots, channel, threshold))
-    result.update(detect_growth(metric_history))
-    result.update(analyze_clusters(grid_snapshots[-1], channel, threshold))
-    result.update(measure_symmetry(grid_snapshots[-1], channel, threshold))
-    return result
+# ── Structural & dynamics analyses (extracted to ca_debug.analyses) ───
+# Re-exported here so existing call sites in this module continue to work
+# unchanged. The canonical home is ca_debug/analyses.py.
+from ca_debug.analyses import (
+    _binary_slice, slice_gol_coherence, projection_entropy,
+    projection_structure, slice_mutual_info, spatial_variation,
+    analyze_structure, _grid_hash, detect_period, detect_translation,
+    detect_growth, analyze_clusters, measure_symmetry, analyze_dynamics,
+)
 
 
 # ── Run a single trial ────────────────────────────────────────────────
 
 def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
               params=None, dt=None, verbose=False, capture_dynamics=False,
-              init_density=None, init_override=None, target_signature=None):
+              init_density=None, init_override=None, target_signature=None,
+              recorder=None):
     """Run a CA for N steps, sample metrics every interval, return summary.
 
     If capture_dynamics=True, stores grid snapshots every sample_interval
     and runs advanced dynamics analysis (period, translation, growth, clusters,
     symmetry).  This uses more memory but enables detection of gliders,
     oscillators, guns, etc.
+
+    If `recorder` (a `ca_debug.RunRecorder`) is given, every metric sample is
+    mirrored via `log_step` and the trial-end aggregate is written via
+    `set_derived`. Caller owns the recorder lifecycle (create/close).
     """
     _t_wall0 = time.perf_counter() if _PROFILE_ENABLED else 0.0
     _t0 = _t_wall0
@@ -2582,6 +2029,15 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
 
             if capture_dynamics:
                 grid_snapshots.append(grid.copy())
+
+            # Mirror sample into the run bundle. metrics.py aliases will
+            # canonicalise alive_ratio -> alive_fraction etc.
+            if recorder is not None:
+                try:
+                    recorder.log_step(int(step), m)
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[ca_debug] harness log_step failed: {_e!r}", flush=True)
+                    recorder = None
 
             if verbose:
                 print(f"  step {step:4d}: alive={m['alive_count']:6d} "
@@ -2710,7 +2166,86 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
         _profile_totals['wall'] += time.perf_counter() - _t_wall0
         _profile_totals['trials'] += 1
 
+    # Mirror trial-end aggregates into the run bundle. The `derived.json`
+    # blob is the natural home for everything that's *not* a per-step row:
+    # final scores, structure analysis, dynamics analysis, target match.
+    if recorder is not None:
+        # Stamp the bundle's run_id back onto the result so downstream
+        # consumers (discoveries.json) can link forward to the bundle.
+        try:
+            result['_run_id'] = recorder.manifest.get('run_id')
+            result['_run_dir'] = str(recorder.run_dir)
+        except Exception: pass
+        try:
+            derived = {k: v for k, v in result.items()
+                       if k not in ('history', 'preview', 'params')}
+            recorder.set_derived(derived)
+            if _abort:
+                recorder.log_event(
+                    "anomaly", step=int(metric_history[-1]['step']) if metric_history else 0,
+                    reason=_abort_reason or "abort")
+            recorder.log_event(
+                "note", step=int(steps), event_kind="trial_summary",
+                score=float(score),
+                final_alive=float(final['alive_ratio']),
+                final_activity=float(final['activity']),
+                aborted=bool(_abort),
+                abort_reason=_abort_reason,
+            )
+        except Exception as _e:  # noqa: BLE001
+            print(f"[ca_debug] harness set_derived failed: {_e!r}", flush=True)
+
     return result
+
+
+def make_trial_recorder(rule_name, *, size, seed, params, dt, label=None,
+                        tags=None, runs_root="runs"):
+    """Allocate a per-trial RunRecorder. Returns None if ca_debug is missing.
+
+    Caller is responsible for closing it (preferably via a context manager:
+    `with make_trial_recorder(...) as rec: run_trial(..., recorder=rec)`).
+    """
+    if _RunRecorder is None:
+        return None
+    try:
+        return _RunRecorder.create(
+            rule=rule_name,
+            size=int(size),
+            dt=float(dt) if dt is not None else 0.0,
+            seed=int(seed),
+            params=dict(params or {}),
+            producer="harness",
+            label=label or rule_name,
+            tags=list(tags or ()),
+            runs_root=runs_root,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[ca_debug] make_trial_recorder failed: {e!r}", flush=True)
+        return None
+
+
+import contextlib as _contextlib  # noqa: E402
+
+@_contextlib.contextmanager
+def _trial_recorder(args, rule, *, size, seed, params, dt, tags=()):
+    """Context manager that yields a RunRecorder when --record is set, else None.
+
+    Used by sweep/search/explore inner loops so each trial gets a bundle
+    only when the user opted in (a 1000-trial search would otherwise leave
+    1000 directories on disk).
+    """
+    rec = None
+    if getattr(args, 'record', False):
+        rec = make_trial_recorder(
+            rule, size=size, seed=seed, params=params, dt=dt,
+            tags=tags, runs_root=getattr(args, 'runs_root', 'runs'),
+        )
+    try:
+        yield rec
+    finally:
+        if rec is not None:
+            try: rec.close()
+            except Exception: pass
 
 
 # ── Commands ──────────────────────────────────────────────────────────
@@ -2723,8 +2258,12 @@ def cmd_audit(ctx, args):
 
     results = []
     for name in RULE_PRESETS:
-        result = run_trial(ctx, name, size=args.size, steps=args.steps,
-                          seed=args.seed, verbose=args.verbose)
+        with _trial_recorder(args, name, size=args.size, seed=args.seed,
+                             params=None, dt=None,
+                             tags=('audit',)) as rec:
+            result = run_trial(ctx, name, size=args.size, steps=args.steps,
+                              seed=args.seed, verbose=args.verbose,
+                              recorder=rec)
         results.append(result)
 
         status = "OK"
@@ -2775,15 +2314,32 @@ def cmd_test(ctx, args):
         print(f"  init override: {init_override}")
     if overrides:
         print(f"  param overrides: {overrides}")
-    result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                      seed=args.seed, verbose=True,
-                      params=base if base else None,
-                      dt=getattr(args, 'dt', None),
-                      init_override=init_override)
+    # Single-trial diagnostic mode — always record. Trivially cheap (one
+    # bundle), and the analyzer (`python -m ca_debug.analyzer show <run>`)
+    # is the natural follow-up after a `test` invocation.
+    rec = make_trial_recorder(
+        args.rule, size=args.size, seed=args.seed,
+        params=base if base else None, dt=getattr(args, 'dt', None),
+        tags=['harness', 'cmd_test'],
+        runs_root=getattr(args, 'runs_root', 'runs'),
+    )
+    try:
+        result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                          seed=args.seed, verbose=True,
+                          params=base if base else None,
+                          dt=getattr(args, 'dt', None),
+                          init_override=init_override,
+                          recorder=rec)
+    finally:
+        if rec is not None:
+            try: rec.close()
+            except Exception: pass
     print()
     print(f"Score: {result['score']:.3f}")
     print(f"Params: {result['params']}")
     print(f"dt: {result['dt']}")
+    if rec is not None:
+        print(f"Run bundle: {rec.run_dir}")
 
 
 def randomize_params(preset, rng):
@@ -3155,7 +2711,41 @@ def _make_discovery(r):
     # Convert tuple to list for JSON serialization
     if 'translation_dir' in r:
         d['translation_dir'] = list(r['translation_dir'])
+    # Forward link into the run bundle (when --record was on for the
+    # producing trial). Lets discoveries.json double as an index into
+    # runs/.
+    if r.get('_run_id'):
+        d['run_id'] = r['_run_id']
+    if r.get('_run_dir'):
+        d['run_dir'] = r['_run_dir']
     return d
+
+
+def _pin_discovery_bundles(discoveries, *, tag="discovery"):
+    """Re-open each discovery's bundle and add `tag` to its manifest tags.
+
+    LRU prune in the GUI respects the `discovery` tag, so this prevents
+    interesting runs from being rotated out. No-op for discoveries that
+    have no `run_dir` (e.g. produced without --record).
+    """
+    if _RunRecorder is None:
+        return
+    for d in discoveries:
+        run_dir = d.get('run_dir')
+        if not run_dir:
+            continue
+        try:
+            from pathlib import Path
+            p = Path(run_dir)
+            if not p.exists():
+                continue
+            rec = _RunRecorder.open(p)
+            tags = list(rec.manifest.get('tags') or [])
+            if tag not in tags:
+                tags.append(tag)
+                rec.update_manifest(tags=tags)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[ca_debug] pin {run_dir}: {_e!r}", flush=True)
 
 
 def _is_quality(result, min_score=0.15):
@@ -3224,9 +2814,11 @@ def cmd_sweep(ctx, args):
         params = randomize_params(preset, rng)
         trial_seed = int(rng.randint(0, 10_000_000))
 
-        result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                          seed=trial_seed, params=params, verbose=False,
-                          capture_dynamics=dynamics)
+        with _trial_recorder(args, args.rule, size=args.size, seed=trial_seed,
+                             params=params, dt=None, tags=['sweep']) as rec:
+            result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                              seed=trial_seed, params=params, verbose=False,
+                              capture_dynamics=dynamics, recorder=rec)
         results.append(result)
 
         if result['score'] >= 0.3 or (trial + 1) % 20 == 0:
@@ -3271,6 +2863,7 @@ def cmd_sweep(ctx, args):
             with open(save_path, 'w') as f:
                 json.dump(existing, f, indent=2)
             print(f"\nSaved {len(discoveries)} discoveries to {save_path}")
+            _pin_discovery_bundles(discoveries)
         else:
             print("\nNo discoveries above threshold to save.")
 
@@ -3580,10 +3173,13 @@ def cmd_search(ctx, args):
 
     def evaluate(params, init_density, trial_dt, trial_init):
         trial_seed = int(rng.randint(0, 10_000_000))
-        r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                      seed=trial_seed, params=params, dt=trial_dt, verbose=False,
-                      capture_dynamics=dynamics, init_density=init_density,
-                      init_override=trial_init, target_signature=target_sig)
+        with _trial_recorder(args, args.rule, size=args.size, seed=trial_seed,
+                             params=params, dt=trial_dt, tags=['search']) as rec:
+            r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                          seed=trial_seed, params=params, dt=trial_dt, verbose=False,
+                          capture_dynamics=dynamics, init_density=init_density,
+                          init_override=trial_init, target_signature=target_sig,
+                          recorder=rec)
         if trial_init:
             r['init_variant'] = trial_init
         if init_density is not None:
@@ -3844,6 +3440,7 @@ def cmd_search(ctx, args):
             n_deduped = len(candidates) - len(discoveries)
             dedup_msg = f" ({n_deduped} duplicates removed)" if n_deduped > 0 else ""
             print(f"\nSaved {len(discoveries)} discoveries to {save_path}{dedup_msg}")
+            _pin_discovery_bundles(discoveries)
 
     _profile_print()
 
@@ -3951,10 +3548,13 @@ def cmd_promote(ctx, args):
         init_var    = d.get('init_variant')
         seed        = int(d.get('seed', i))
         try:
-            r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                          seed=seed, params=params, dt=dt,
-                          init_density=init_dens, init_override=init_var,
-                          capture_dynamics=dynamics, verbose=False)
+            with _trial_recorder(args, args.rule, size=args.size, seed=seed,
+                                 params=params, dt=dt, tags=['promote']) as rec:
+                r = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                              seed=seed, params=params, dt=dt,
+                              init_density=init_dens, init_override=init_var,
+                              capture_dynamics=dynamics, verbose=False,
+                              recorder=rec)
         except Exception as e:
             print(f"  [{i+1}/{len(candidates)}] FAIL: {e}")
             continue
@@ -3983,6 +3583,7 @@ def cmd_promote(ctx, args):
         with open(save_path, 'w') as f:
             json.dump(existing, f, indent=2)
         print(f"\nKept {len(survivors)}/{len(candidates)}; saved to {save_path}")
+        _pin_discovery_bundles(survivors)
     elif args.save:
         # Touch an empty list so downstream merge tools always find the file.
         save_path = args.save
@@ -4021,9 +3622,11 @@ def cmd_explore(ctx, args):
             params = randomize_params(preset, rng)
 
         trial_seed = int(rng.randint(0, 10_000_000))
-        result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
-                          seed=trial_seed, params=params, verbose=False,
-                          capture_dynamics=dynamics)
+        with _trial_recorder(args, args.rule, size=args.size, seed=trial_seed,
+                             params=params, dt=None, tags=['explore']) as rec:
+            result = run_trial(ctx, args.rule, size=args.size, steps=args.steps,
+                              seed=trial_seed, params=params, verbose=False,
+                              capture_dynamics=dynamics, recorder=rec)
 
         best_results.append(result)
         best_results.sort(key=lambda r: _get_metric(r, metric), reverse=True)
@@ -4054,6 +3657,7 @@ def cmd_explore(ctx, args):
 
     print()
     print(f"Saved {len(discoveries)} discoveries (indices {new_start_idx}-{new_start_idx + len(discoveries) - 1})")
+    _pin_discovery_bundles(discoveries)
     print()
     print(f"{'#':>3} {'Score':>5} {'GoL':>5} {'ProjC':>5} {'Struct':>5} {'MI':>5}  {metric}")
     print("─" * 60)
@@ -4086,6 +3690,12 @@ def main():
     parser.add_argument('--steps', type=int, default=100, help='Simulation steps (default: 100)')
     parser.add_argument('--seed', type=int, default=42, help='RNG seed')
     parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--record', action='store_true',
+                        help='Write a runs/<id>/ bundle per trial '
+                             '(parquet timeseries + manifest + events). '
+                             'Default: off; on for `test` regardless.')
+    parser.add_argument('--runs-root', type=str, default='runs',
+                        help='Root directory for run bundles (default: runs)')
 
     sub = parser.add_subparsers(dest='command')
 

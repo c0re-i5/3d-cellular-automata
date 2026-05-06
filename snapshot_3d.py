@@ -188,6 +188,47 @@ def cmd_record(args):
     print(f'\nwrote {len(steps)} snapshots + series to {out_dir}/')
 
 
+def cmd_bundle(args):
+    """Multi-step capture into a unified runs/<id>/ bundle via RunRecorder.
+
+    This is the modern replacement for `record`. The npz format inside
+    snapshots/ is byte-compatible with what `record` writes, so all of
+    inspect/diff/compare/audit-channels work against either layout.
+    """
+    from ca_debug import RunRecorder
+    steps = sorted({int(s) for s in args.steps.split(',') if s.strip()})
+    if not steps:
+        sys.exit('--steps requires at least one integer')
+    sim = _build_sim(args.rule, args.size, args.seed)
+    rec = RunRecorder.create(
+        rule=args.rule,
+        size=int(sim.W),
+        dt=float(getattr(sim, 'dt', 0.0)),
+        seed=int(args.seed),
+        params={k: float(v) for k, v in (sim.params or {}).items()},
+        producer="snapshot-cli",
+        runs_root=args.runs_root,
+        tags=("snapshot-cli",),
+    )
+    snap_set = set(steps)
+    cur = 0
+    if cur in snap_set:
+        rec.snapshot(cur, _read_voxels(sim),
+                     dtype_native=str(sim._tex_np_dtype))
+    while cur < steps[-1]:
+        sim._step_sim()
+        cur += 1
+        sim.step_count = cur
+        if cur in snap_set:
+            v = _read_voxels(sim)
+            rec.snapshot(cur, v, dtype_native=str(sim._tex_np_dtype))
+            print(f'  captured t={cur:6d}  alive_ch0='
+                  f'{(v[..., 0] > 0.05).mean():.4f}')
+    rec.close()
+    sim.ctx.release()
+    print(f'\nwrote {len(steps)} snapshots to {rec.run_dir}/')
+
+
 # ───────────────────────────── inspect ─────────────────────────────
 
 def _hist_ascii(x: np.ndarray, bins: int = 16, width: int = 40) -> str:
@@ -607,6 +648,16 @@ def main(argv=None):
     pr.add_argument('--seed', type=int, default=42)
     pr.add_argument('--out-dir', type=str, default=None)
     pr.set_defaults(func=lambda a: cmd_record(_with_default_dir(a)))
+
+    pb = sub.add_parser('bundle',
+                        help='multi-checkpoint sequence into a runs/<id>/ bundle')
+    pb.add_argument('rule')
+    pb.add_argument('--steps', type=str, required=True,
+                    help='comma list: e.g. 0,10,50,100,200,500')
+    pb.add_argument('--size', type=int, default=64)
+    pb.add_argument('--seed', type=int, default=42)
+    pb.add_argument('--runs-root', type=str, default='runs')
+    pb.set_defaults(func=cmd_bundle)
 
     pi = sub.add_parser('inspect', help='analyse one snapshot')
     pi.add_argument('file')
