@@ -21175,7 +21175,41 @@ class Simulator:
         self._rec_process = None     # ffmpeg subprocess
         self._rec_start_time = 0.0
         self._rec_frame_count = 0
-        self._rec_fps = 60
+        # Output FPS. 24 = cinematic, 30 = web standard, 60 = smooth
+        # motion. The number we pass to ffmpeg's -framerate; the offline
+        # video plays back at this rate regardless of how fast the
+        # simulator + render loop runs in real time.
+        self._rec_fps_options = [24, 30, 60]
+        self._rec_fps_idx = 2  # 60 fps default
+        self._rec_fps = self._rec_fps_options[self._rec_fps_idx]
+        # Capture cadence:
+        #   'realtime'  — one video frame per render frame (legacy);
+        #                 video duration = wall-clock recording time.
+        #                 Length varies wildly between rules because
+        #                 render FPS depends on grid size, render mode,
+        #                 sim_speed, etc.
+        #   'per_step'  — one video frame per `_rec_steps_per_frame`
+        #                 sim steps (default 1.0).  Output FPS is then
+        #                 a pure function of frame count, so video
+        #                 duration is reproducible across rules.
+        # `per_step` is the new default since it solves the "this CA
+        # recorded as 3s and that one as 90s" inconsistency.
+        self._rec_capture_mode = 'per_step'
+        self._rec_steps_per_frame = 1.0   # >1 = time-lapse, <1 = slow-mo
+        self._rec_step_accum = 0.0        # fractional step counter
+        # Auto-stop the recording after this many seconds of OUTPUT
+        # video (i.e. _rec_frame_count >= duration * fps).  0 = manual
+        # stop only.
+        self._rec_auto_stop_sec = 0.0
+        self._rec_auto_stop_options = [
+            ('Manual stop', 0.0),
+            ('10 seconds',  10.0),
+            ('30 seconds',  30.0),
+            ('60 seconds',  60.0),
+            ('2 minutes',   120.0),
+            ('5 minutes',   300.0),
+        ]
+        self._rec_auto_stop_idx = 0
         # Output resolution presets. Lower resolutions cut bandwidth
         # roughly proportionally to pixel count: 720p is ~1/4 the bytes
         # of 1440p, 1080p is ~1/2. ffmpeg encodes whatever frame size we
@@ -26890,9 +26924,19 @@ void main() {
             imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.8, 0.1, 0.1, 1.0))
             imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(1.0, 0.2, 0.2, 1.0))
             elapsed = time.time() - self._rec_start_time
-            if imgui.button(f"  Stop Recording ({elapsed:.0f}s)  "):
+            video_sec = self._rec_frame_count / max(self._rec_fps, 1)
+            if imgui.button(
+                    f"  Stop Recording  (real {elapsed:.0f}s | "
+                    f"video {video_sec:.1f}s / {self._rec_frame_count}f)  "):
                 self._stop_recording()
             imgui.pop_style_color(2)
+            # Show progress when an auto-stop target is set.
+            if self._rec_auto_stop_sec > 0:
+                pct = min(1.0, video_sec / self._rec_auto_stop_sec)
+                imgui.same_line()
+                imgui.progress_bar(
+                    pct, imgui.ImVec2(180, 0),
+                    f'{video_sec:.1f}/{self._rec_auto_stop_sec:g}s')
         else:
             if imgui.button("Record Video [F5]"):
                 self._start_recording()
@@ -26913,6 +26957,77 @@ void main() {
             if changed:
                 _, w, h = self._rec_resolutions[self._rec_resolution_idx]
                 self._rec_width, self._rec_height = w, h
+
+            # Output FPS
+            fps_labels = [f'{f} fps' for f in self._rec_fps_options]
+            imgui.set_next_item_width(120)
+            changed, self._rec_fps_idx = imgui.combo(
+                "FPS", self._rec_fps_idx, fps_labels)
+            if changed:
+                self._rec_fps = self._rec_fps_options[self._rec_fps_idx]
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Output video framerate.\n"
+                    "  24 = cinematic / film look\n"
+                    "  30 = web standard\n"
+                    "  60 = smooth high-motion (default)")
+
+            # Capture mode + cadence
+            mode_labels = ['Per sim step  (consistent duration)',
+                           'Real-time     (wall-clock duration)']
+            mode_idx = 0 if self._rec_capture_mode == 'per_step' else 1
+            imgui.set_next_item_width(260)
+            changed, mode_idx = imgui.combo(
+                "Cadence", mode_idx, mode_labels)
+            if changed:
+                self._rec_capture_mode = (
+                    'per_step' if mode_idx == 0 else 'realtime')
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Per sim step: lock 1 video frame to N sim steps.\n"
+                    "  Video duration is reproducible across rules\n"
+                    "  regardless of how fast the sim runs in real time.\n"
+                    "Real-time: capture every render frame.\n"
+                    "  Duration tracks wall-clock recording length.")
+
+            if self._rec_capture_mode == 'per_step':
+                imgui.set_next_item_width(120)
+                spf_changed, new_spf = imgui.slider_float(
+                    "Steps/frame", float(self._rec_steps_per_frame),
+                    0.1, 10.0, '%.2f',
+                    flags=imgui.SliderFlags_.logarithmic)
+                if spf_changed:
+                    self._rec_steps_per_frame = max(0.1, float(new_spf))
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "How many sim steps per video frame.\n"
+                        "  1.0  = 1 step → 1 frame (default)\n"
+                        "  >1   = time-lapse (e.g. 4.0 = 4× speed)\n"
+                        "  <1   = slow-motion (e.g. 0.5 = 2× slow)")
+
+            # Auto-stop target
+            stop_labels = [s[0] for s in self._rec_auto_stop_options]
+            imgui.set_next_item_width(160)
+            changed, self._rec_auto_stop_idx = imgui.combo(
+                "Auto-stop", self._rec_auto_stop_idx, stop_labels)
+            if changed:
+                self._rec_auto_stop_sec = (
+                    self._rec_auto_stop_options[self._rec_auto_stop_idx][1])
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Stop recording once the OUTPUT video reaches this\n"
+                    "duration.  At 60 fps with steps/frame=1.0 that's\n"
+                    "60 sim steps per second of video.")
+
+            # Show projected sim-steps cost in per-step + auto-stop mode
+            # so users know how long the sim has to run.
+            if (self._rec_auto_stop_sec > 0
+                    and self._rec_capture_mode == 'per_step'):
+                target_frames = int(self._rec_auto_stop_sec * self._rec_fps)
+                target_steps = int(target_frames * self._rec_steps_per_frame)
+                imgui.text_disabled(
+                    f"  → {target_frames} frames "
+                    f"({target_steps} sim steps)")
         if self._rec_msg and time.time() - self._rec_msg_time < 5.0:
             imgui.same_line()
             imgui.text_colored(imgui.ImVec4(0.5, 1.0, 0.5, 1.0), self._rec_msg)
@@ -27718,23 +27833,35 @@ void main() {
         # --- Encoder selection.  NVENC is ~5-10x faster than libx264 medium
         #     and runs entirely on the GPU's dedicated encoder block, so it
         #     does not contend with the simulator's compute/render workload.
+        # Quality knobs are set for "publish-grade" output: visually
+        # near-lossless on noisy/high-frequency CA content (Lenia foam,
+        # Schrödinger interference, Cahn-Hilliard sponges) without bloating
+        # filesizes past ~50-100 MB/min at 1440p60.
         codec = os.environ.get('CA_RECORDING_CODEC', 'nvenc').lower()
         if codec == 'nvenc' or codec == 'h264_nvenc':
             enc_args = [
                 '-c:v', 'h264_nvenc',
-                '-preset', 'p5',          # quality / speed balance (p1=fastest, p7=best)
+                '-preset', 'p6',          # near-best (p7 = slowest)
                 '-tune', 'hq',
                 '-rc', 'vbr',
-                '-cq', '21',              # ~equivalent to libx264 -crf 21
+                '-cq', '19',              # ~visually lossless (was 21)
                 '-b:v', '0',              # let -cq drive bitrate
+                '-maxrate', '120M',       # cap so VBR can't run wild on high-entropy frames
+                '-bufsize', '240M',
                 '-profile:v', 'high',
+                '-rc-lookahead', '32',
+                '-spatial-aq', '1',       # adaptive quantization for fine detail
+                '-temporal-aq', '1',
+                '-bf', '3',               # B-frames boost compression
+                '-b_ref_mode', 'middle',
                 '-pix_fmt', 'yuv420p',
             ]
         else:
             enc_args = [
                 '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '23',
+                '-preset', 'slow',        # was medium
+                '-crf', '20',             # was 23 (lower = higher quality)
+                '-tune', 'film',          # works well for smooth synthetic gradients
                 '-pix_fmt', 'yuv420p',
                 '-threads', str(min(os.cpu_count() or 4, 8)),
             ]
@@ -27784,6 +27911,7 @@ void main() {
         self._recording = True
         self._rec_start_time = time.time()
         self._rec_frame_count = 0
+        self._rec_step_accum = 0.0
 
         # Background writer thread to avoid blocking main loop on pipe writes.
         # Queue holds up to 120 frames (~2 s @ 60 fps) to absorb transient
@@ -27796,15 +27924,45 @@ void main() {
             daemon=True)
         self._rec_write_thread.start()
 
-        self._rec_msg = f"Recording {w}x{h}@{self._rec_fps}fps"
+        mode_label = ('per sim step'
+                      if self._rec_capture_mode == 'per_step'
+                      else 'realtime')
+        spf_label = (f' x{self._rec_steps_per_frame:g}'
+                     if self._rec_capture_mode == 'per_step'
+                       and self._rec_steps_per_frame != 1.0
+                     else '')
+        autostop_label = (f' (auto-stop {self._rec_auto_stop_sec:g}s)'
+                          if self._rec_auto_stop_sec > 0 else '')
+        self._rec_msg = (f"Recording {w}x{h}@{self._rec_fps}fps "
+                         f"[{mode_label}{spf_label}]{autostop_label}")
         self._rec_msg_time = time.time()
         if self._run_recorder is not None:
             try:
                 self._run_recorder.log_event(
                     "recording_start", step=self.step_count,
                     path=self._rec_filename, width=int(w), height=int(h),
-                    fps=int(self._rec_fps))
+                    fps=int(self._rec_fps),
+                    capture_mode=self._rec_capture_mode,
+                    steps_per_frame=float(self._rec_steps_per_frame),
+                    auto_stop_sec=float(self._rec_auto_stop_sec))
             except Exception: pass
+
+    def _rec_check_autostop(self):
+        """Stop the recording if the configured target duration is reached.
+
+        Called once per video frame captured.  No-op when
+        ``_rec_auto_stop_sec == 0`` (manual stop only).
+        """
+        if not self._recording:
+            return
+        if self._rec_auto_stop_sec <= 0:
+            return
+        target = int(self._rec_auto_stop_sec * self._rec_fps)
+        if self._rec_frame_count >= target:
+            self._stop_recording()
+            self._rec_msg = (
+                f"Recording auto-stopped at {self._rec_auto_stop_sec:g}s")
+            self._rec_msg_time = time.time()
 
     def _stop_recording(self):
         """Finish recording and close ffmpeg."""
@@ -28145,6 +28303,12 @@ void main() {
                             self._step_sim()
                             # Debug stats: throttled GPU dispatch per step
                             self._dispatch_debug_stats()
+                            # Per-step recording: tick the step accumulator
+                            # so the post-render capture block can pull off
+                            # however many video frames are owed.
+                            if (self._recording
+                                    and self._rec_capture_mode == 'per_step'):
+                                self._rec_step_accum += 1.0
 
                         # Live scoring (periodic GPU reduction — no full readback)
                         self._score_frame += 1
@@ -28187,9 +28351,29 @@ void main() {
                                 sec[f'render.{k}'] = v
                 sec['render'] = time.perf_counter() - t_render_start
 
-                # Capture frame for video (scene only, before UI overlay)
+                # Capture frame for video (scene only, before UI overlay).
+                # Two cadences:
+                #   realtime — capture every render frame (legacy).
+                #   per_step — capture once per `_rec_steps_per_frame`
+                #              sim steps; consume the accumulator until
+                #              it goes below 1 frame's worth.
                 if self._recording:
-                    self._record_frame()
+                    if self._rec_capture_mode == 'realtime':
+                        self._record_frame()
+                        self._rec_check_autostop()
+                    else:
+                        # Cap the inner loop so a huge sim_speed combined
+                        # with a tiny steps_per_frame can't lock the main
+                        # loop trying to flush hundreds of frames at once.
+                        spf = max(self._rec_steps_per_frame, 1e-3)
+                        guard = 32
+                        while (self._recording
+                               and self._rec_step_accum >= spf
+                               and guard > 0):
+                            self._record_frame()
+                            self._rec_step_accum -= spf
+                            guard -= 1
+                            self._rec_check_autostop()
 
                 # Render UI
                 t_ui_start = time.perf_counter()
