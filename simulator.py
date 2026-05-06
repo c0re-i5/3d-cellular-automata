@@ -13311,8 +13311,14 @@ RULE_PRESETS = {
         "shader": "smoothlife_3d",
         "params": {"Birth center": 0.22, "Birth range": 0.05,
                    "Survive center": 0.22, "Survive range": 0.08},
-        "param_ranges": {"Birth center": (0.05, 0.45), "Birth range": (0.005, 0.20),
-                         "Survive center": (0.05, 0.45), "Survive range": (0.005, 0.20)},
+        # Birth/Survive *range* is the half-width of the sigmoid window:
+        # below ~0.03 the sigmoid degenerates to a hard step and any
+        # density fluctuation falls outside the band, causing instant
+        # extinction. The microscope (3 of 4 random param vectors → 0)
+        # showed Pearson r=+0.997 (Birth range) and +0.947 (Survive
+        # range) with score, so floors lifted from 0.005 to 0.03.
+        "param_ranges": {"Birth center": (0.05, 0.45), "Birth range": (0.03, 0.20),
+                         "Survive center": (0.05, 0.45), "Survive range": (0.03, 0.20)},
         "dt": 0.15,
         "dt_range": (0.01, 0.8),
         # random_smooth is globally smoothed uniform noise with mean ~0.5,
