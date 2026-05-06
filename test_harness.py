@@ -740,6 +740,17 @@ class HeadlessRunner:
             self.measure_mode = 'wave'
             self.alive_threshold = 0.01
             self.change_threshold = 0.001
+        elif shader == 'q_relax_3d':
+            # 3D active nematic: pair 1 = (Qxx, Qyy, Qxy, Qxz). The Q-tensor
+            # components are signed continuous fields that swing through zero;
+            # the discrete default (alive_threshold=0.5) marked huge regions
+            # alive based on raw value, masking the 1-D disclination lines.
+            # 'deviation' mode picks them up cleanly as departures from the
+            # spatial mean of the order-parameter component.
+            self.measure_channel = 0  # Qxx
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.005
         elif shader in ('viscous_fingers_3d', 'viscous_transport_3d'):
             self.measure_channel = 0  # saturation
             self.measure_mode = 'deviation'  # detect finger fronts vs uniformly saturated
@@ -2258,6 +2269,12 @@ def cmd_audit(ctx, args):
 
     results = []
     for name in RULE_PRESETS:
+        # Skip presets that have no autonomous dynamics (interactive-only
+        # sandboxes that start empty and require user paint input). These
+        # always score 0 and pollute the dead-rule signal.
+        preset = RULE_PRESETS[name]
+        if preset.get('init') == 'sandbox_empty':
+            continue
         with _trial_recorder(args, name, size=args.size, seed=args.seed,
                              params=None, dt=None,
                              tags=('audit',)) as rec:
