@@ -6272,11 +6272,19 @@ void main() {
     // range Jacobi/SOR diverges. ω=1 is plain Jacobi, ω∈(1,2) accelerates.
     float omega = clamp(u_param3, 0.0, 1.95);
 
-    // Jacobi step for ∇²V = -α|ψ|² discretized as (sum_V - 6V)/h² = -α|ψ|².
-    // Solving for V: V = (sum_V + h²·α·|ψ|²) / 6. The h_sq factor is
-    // essential for resolution independence — without it the coupling is
-    // 4× too weak at size 64 and 4× too strong at size 256.
-    float V_jacobi = (sum_V + h_sq * alpha * prob) / 6.0;
+    // Jacobi step. Treats α as a dimensionless coupling tuned at
+    // REF_SIZE so that the visual character of the self-interaction
+    // is consistent across grid sizes.
+    //
+    // A naive physical Poisson solve V = (sum + α|ψ|²/h_sq)/6 would
+    // make coupling 9× weaker at size 192 (h_sq=2.25) and 16× stronger
+    // at size 32 (h_sq=0.0625), inverting the desired behaviour. An
+    // earlier version had the opposite sign error (V = (sum + h_sq·
+    // α|ψ|²)/6) which made the size-192 coupling ~5× too strong and
+    // caused the wavefunction to runaway-explode within ~200 steps.
+    // The size-invariant form below matches the REF_SIZE=128 design
+    // point that α=5.0 was tuned against.
+    float V_jacobi = (sum_V + alpha * prob) / 6.0;
     V = mix(V, V_jacobi, omega);
 
     // ── Schrödinger Yee leapfrog ──
@@ -6308,7 +6316,20 @@ void main() {
 
     psi_r = clamp(psi_r, -1e3, 1e3);
     psi_i = clamp(psi_i, -1e3, 1e3);
-    V    = clamp(V,    -1e3, 1e3);
+
+    // Hard stability clamp on V. Yee leapfrog requires
+    // dt·(H_kinetic + V_scale·|V|) < 2. With H_kinetic = hbar_2m·12·h_sq
+    // (Nyquist of 7-pt Laplacian on 3D grid), this caps |V| at:
+    //   |V|_max = (2/dt − hbar_2m·12·h_sq) / V_scale
+    // We use 1.6 instead of 2.0 to leave a 20% safety margin against
+    // marginal-stability slow growth observed at sizes ≥160. Without
+    // this clamp the wavefunction runs away (dt·H>2) once Poisson
+    // coupling drives V to its steady state, with the explosion onset
+    // sweeping from step ~320 at size 160 to step ~100 at size 192.
+    float V_cap = max(0.5, (1.6 / max(u_dt, 1e-6)
+                            - hbar_2m * 12.0 * h_sq)
+                           / max(V_scale, 1e-6));
+    V = clamp(V, -V_cap, V_cap);
 
     prob = psi_r * psi_r + psi_i * psi_i;
     imageStore(u_dst, pos, vec4(psi_r, psi_i, V, prob));
