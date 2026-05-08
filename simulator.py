@@ -3350,6 +3350,24 @@ void main() {
     float eps2_floor = 1.0 / (8.0 * h_sq);
     float eps2_eff = max(eps2, eps2_floor);
 
+    // Linear-stability CEILING on ε² for the staggered (lap_mu lags one
+    // frame) explicit biharmonic. The substep loop below CANNOT rescue
+    // this instability — `lap_c`/`lap_mu` are computed once per frame
+    // and reused across sub-iterations, so the spatial coupling that
+    // drives the blow-up is never refined.
+    //
+    // Linearising at Nyquist k: |∇⁴c|_max scales as h_sq² in code units
+    // (each ∇² carries an h_sq factor since h_sq = (N/REF_SIZE)² grows
+    // with N). Explicit-Euler stability ⇒ dt·M·ε²·h_sq² < 2/C with C
+    // empirically ≈ 40 (calibrated by sweeping size×ε² with the
+    // nucleation preset; see `ca_debug.scale_sweep`). With a 2× safety
+    // margin:  ε² ≤ 0.025 / (M·dt·h_sq²).
+    // Without this, fine grids (≥160) explode on presets with high ε²
+    // (e.g. nucleation's overridden ε² = 0.581 saturates the field
+    // within ~20 frames at size 192).
+    float eps2_ceiling = 0.025 / max(mobility * u_dt * h_sq * h_sq, 1e-6);
+    eps2_eff = min(eps2_eff, max(eps2_floor, eps2_ceiling));
+
     // CFL safety on the biharmonic explicit step:
     //   dt < 1 / (72 · M · ε² · h_sq²).
     // Sub-step internally if user-chosen dt exceeds this so the scheme can't

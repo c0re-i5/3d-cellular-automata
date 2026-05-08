@@ -74,6 +74,72 @@ def _solid_block_signature(g: np.ndarray, threshold: float = 0.5) -> dict:
     return {'alive_frac': frac, 'bbox_fill': bbox_fill, 'bbox_dims': box_dims}
 
 
+def _trajectory_signature(traj: list[float]) -> dict:
+    """Compact summary used to A/B trajectories at different sizes.
+
+    Two trajectories are ~equivalent if all four numbers are close;
+    they diverge in physically meaningful ways otherwise."""
+    import statistics
+    if not traj:
+        return {'mean': 0.0, 'std': 0.0, 'tail': 0.0, 'p2p_tail': 0.0}
+    tail = traj[len(traj) // 2:]   # second half = post-transient
+    return {
+        'mean': float(statistics.fmean(traj)),
+        'std': float(statistics.pstdev(traj)) if len(traj) > 1 else 0.0,
+        'tail': float(statistics.fmean(tail)),
+        'p2p_tail': float(max(tail) - min(tail)),
+    }
+
+
+def _divergence(sig_small: dict, sig_large: dict) -> float:
+    """L1 distance between two trajectory signatures, normalised so a
+    perfectly-matching pair scores ~0 and a 'collapsed to cube' vs
+    'period-2 blink' pair scores >> 1."""
+    keys = ('tail', 'p2p_tail', 'mean', 'std')
+    return sum(abs(sig_small[k] - sig_large[k]) for k in keys)
+
+
+def _scan_all_rules(ctx, sizes: list[int], steps: int, seed: int,
+                    ) -> list[dict]:
+    """For every preset, compare the trajectory signature at the
+    smallest size against every larger size. Returns rows sorted by
+    max divergence, descending. Skips presets that fail to run."""
+    from simulator import RULE_PRESETS
+    rows: list[dict] = []
+    rule_names = sorted(RULE_PRESETS.keys())
+    base_size = sizes[0]
+    for i, name in enumerate(rule_names):
+        # Skip composed/agent/entity rules — they often have
+        # default_size constraints that auto-bump and confound the comparison.
+        p = RULE_PRESETS[name]
+        if p.get('compose') or p.get('passes'):
+            # Multi-pass: still try, but tag.
+            pass
+        try:
+            sigs: dict[int, dict] = {}
+            for size in sizes:
+                traj, _, _ = _run_one(ctx, name, size=size, steps=steps,
+                                       seed=seed)
+                sigs[size] = _trajectory_signature(traj)
+        except Exception as e:
+            rows.append({'rule': name, 'status': f'ERR: {type(e).__name__}',
+                         'max_div': float('nan'), 'divs': {}})
+            continue
+        # Compare every larger size against base_size.
+        divs = {s: _divergence(sigs[base_size], sigs[s]) for s in sizes[1:]}
+        max_div = max(divs.values()) if divs else 0.0
+        rows.append({'rule': name, 'status': 'ok', 'max_div': max_div,
+                     'divs': divs, 'sigs': sigs})
+        # Lightweight progress
+        if (i + 1) % 5 == 0 or i + 1 == len(rule_names):
+            print(f"  ... {i+1}/{len(rule_names)} scanned",
+                  file=__import__('sys').stderr)
+    rows.sort(key=lambda r: (-r['max_div']
+                             if r['max_div'] == r['max_div']
+                             else 0))
+    return rows
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--rule', default='game_of_life_3d')
@@ -86,12 +152,35 @@ def main(argv=None):
                         'diff the trajectories')
     p.add_argument('--print-traj', action='store_true',
                    help='print full per-step alive ratio')
+    p.add_argument('--all-rules', action='store_true',
+                   help='scan every preset; print divergence-ranked table')
+    p.add_argument('--top', type=int, default=20,
+                   help='--all-rules: how many top-divergence rows to print')
+    p.add_argument('--threshold', type=float, default=0.15,
+                   help='--all-rules: highlight rows with max_div > threshold')
     args = p.parse_args(argv)
 
     sizes = [int(s) for s in args.sizes.split(',')]
 
     import moderngl
     ctx = moderngl.create_standalone_context(require=430)
+
+    if args.all_rules:
+        print(f"\n=== scale_sweep --all-rules sizes={sizes} steps={args.steps} ===\n")
+        rows = _scan_all_rules(ctx, sizes, args.steps, args.seed)
+        sz_cols = '  '.join(f'div@{s}' for s in sizes[1:])
+        print(f"\n{'rule':<32}  {'max_div':>8}  {sz_cols}  status")
+        print('-' * (44 + 9 * len(sizes)))
+        for r in rows[:args.top]:
+            divs_str = '  '.join(
+                f"{r['divs'].get(s, float('nan')):>6.3f}" for s in sizes[1:])
+            flag = ' <<<' if (r['max_div'] == r['max_div']
+                               and r['max_div'] > args.threshold) else ''
+            print(f"{r['rule']:<32}  {r['max_div']:>8.3f}  {divs_str}  "
+                  f"{r['status']}{flag}")
+        print(f"\n{sum(1 for r in rows if r['max_div'] > args.threshold)} rules "
+              f"diverge by > {args.threshold} between size {sizes[0]} and a larger size")
+        return 0
 
     print(f"\n=== scale_sweep: {args.rule} seed={args.seed} steps={args.steps} ===\n")
     fmt_hdr = (f"{'size':>5}  {'mode':<8}  {'alive[0]':>9}  {'alive[mid]':>10}  "
