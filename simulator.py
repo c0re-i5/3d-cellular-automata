@@ -2814,21 +2814,49 @@ void main() {
     // Where v_thresh = (v + b) / a is the dynamic excitation threshold.
     // The cubic in u has roots at 0, v_thresh, 1: bistable for
     // 0 < v_thresh < 1, with sharp travelling fronts because eps << 1.
-    float v_thresh = (v + b) / max(a, 1e-3);  // guard: u_param0 is user-settable
-    float du = u * (1.0 - u) * (u - v_thresh) / max(epsilon, 0.001);
-    float dv = u - v;
+    // (Reaction terms are recomputed inside the substep loop below so
+    // the kinetics see the same u, v that the diffusion update sees.)
 
-    float new_u = u + (du + D_u * lap_u) * u_dt;
-    // Small v-diffusion maintains spatial heterogeneity in recovery
-    float new_v = v + (dv + D_u * 0.05 * lap_v) * u_dt;
+    // Diffusion CFL for 19-point isotropic Laplacian on a 3D grid:
+    // max |λ_h| ≈ 4/h² (Nyquist eigenvalue of the discrete Laplacian).
+    // For explicit Euler, dt·D·|λ_h| < 2 ⇒ dt_eff ≤ 0.5/(D·h_sq).
+    // Without this, fine grids (size ≥ 180 with default D=1.5, dt=0.05)
+    // overshoot during the diffusion update: sub-threshold cells get
+    // pushed past v_thresh by neighbour leakage, ignite, and the
+    // medium locks into uniform u=1 (a stable fixed point of the
+    // reaction kinetics). We sub-step the explicit update so the
+    // *physical* dt stays the same but each integration micro-step
+    // satisfies CFL.
+    float dt_diff_max = 0.5 / max(D_u * h_sq, 1e-6);
+    int n_sub = int(ceil(u_dt / dt_diff_max));
+    n_sub = clamp(n_sub, 1, 8);
+    float dt_sub = u_dt / float(n_sub);
+
+    float new_u = u;
+    float new_v = v;
+    for (int si = 0; si < n_sub; si++) {
+        float v_thresh_i = (new_v + b) / max(a, 1e-3);
+        float du_i = new_u * (1.0 - new_u) * (new_u - v_thresh_i) / max(epsilon, 0.001);
+        float dv_i = new_u - new_v;
+        new_u = new_u + (du_i + D_u * lap_u) * dt_sub;
+        new_v = new_v + (dv_i + D_u * 0.05 * lap_v) * dt_sub;
+        new_u = clamp(new_u, 0.0, 1.0);
+        new_v = clamp(new_v, 0.0, 1.5);
+    }
 
     // Stochastic nucleation: rare random excitation of resting cells.
-    // Probability ~2e-5 per cell per frame -> at 256^3 about 340 spontaneous
-    // wavefronts per frame, sparse enough to act as scattered pacemaker
-    // sites rather than a uniform fog. (Earlier 0.998 threshold gave
-    // probability 2e-3 -> 33000 events/frame, which collided into noise.)
+    // The probability is computed PER REFERENCE VOLUME so that the
+    // total nucleation rate (events / frame) is size-independent. The
+    // raw 2e-5 per-cell rate was tuned at REF_SIZE=128 (≈ 42 events/
+    // frame); without rescaling, size 192 sees 27× more cells and
+    // 27× more events, which exceeds the refractory-extinction rate
+    // and the entire medium locks into uniform excitation (u → 1
+    // everywhere, a stable fixed point of the Barkley kinetics). The
+    // 1/h_sq^1.5 factor cancels the (size/REF_SIZE)³ cell-count growth.
+    float nuc_rate = 2.0e-5 / max(pow(h_sq, 1.5), 1e-6);
+    float nuc_thresh = 1.0 - clamp(nuc_rate, 0.0, 0.5);
     float nuc = hash_temporal(pos, 0);
-    if (nuc > 0.99998 && u < 0.1 && v < 0.1) {
+    if (nuc > nuc_thresh && u < 0.1 && v < 0.1) {
         new_u = 1.0;
     }
 
