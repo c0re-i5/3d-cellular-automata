@@ -21,6 +21,12 @@ import sys
 import numpy as np
 
 
+# --all-rules trajectory readback budget per size. See _scan_all_rules
+# for the rationale: ≈12 samples is enough for blowup/freeze classifi-
+# cation but ~5× cheaper than the previous "readback every step" mode.
+SCAN_TRAJECTORY_SAMPLES = 12
+
+
 def _alive_ratio(grid: np.ndarray, threshold: float = 0.5) -> float:
     return float((grid[..., 0] > threshold).mean())
 
@@ -132,24 +138,27 @@ def _health_verdict(h_small: dict, h_large: dict) -> str:
     if h_large['nan_frac'] > 0:
         return 'nan'
     # Saturated to one extreme — classic explicit-scheme blow-up.
-    # A *real* blow-up has TWO signatures, both required:
+    # A *real* blow-up has THREE signatures, all required:
     #   1. clip-fraction grew significantly at the larger grid, AND
     #   2. std SHRANK — the field lost dynamic range (collapsed onto
-    #      the saturated value).
-    # Without (2) we get false-positives on rules whose dynamics are
-    # intrinsically sparse — most cells at 0 background, e.g.
-    # `causal_ca`, `bz_excitable` — where rising large-grid background
-    # fraction looks like clip-growth but is actually just more empty
-    # volume *with richer wavefronts living in it*. In those cases std
-    # grows along with clip_lo because the wavefronts have more space
-    # to fragment.
+    #      the saturated value), AND
+    #   3. saturation is at the HIGH end (clip_hi) — true numerical
+    #      blow-ups hit max/+inf, not min/0. Pure clip_lo growth
+    #      means the field is dispersing into a bigger empty volume,
+    #      which is benign (e.g. `physarum` chemotrails, sparse
+    #      emitters in 3D — the trail mass is conserved, just
+    #      diluted across 27× more voxels at size 192 vs 64).
+    # Without (2)+(3) we get false-positives on rules whose dynamics
+    # are intrinsically sparse — most cells at 0 background, e.g.
+    # `causal_ca`, `bz_excitable`, `physarum` — where rising large-
+    # grid background fraction looks like clip-growth but is actually
+    # just more empty volume *with richer wavefronts living in it*.
     std_collapsed = h_large['std'] < 0.5 * max(h_small['std'], 1e-6)
-    for side in ('clip_hi', 'clip_lo'):
-        if (h_large[side] > 0.30
-                and h_large[side] > h_small[side] + 0.15
-                and h_small[side] < 0.50
-                and std_collapsed):
-            return 'blowup'
+    if (h_large['clip_hi'] > 0.30
+            and h_large['clip_hi'] > h_small['clip_hi'] + 0.15
+            and h_small['clip_hi'] < 0.50
+            and std_collapsed):
+        return 'blowup'
     # Field died / froze where smaller did not.
     if h_large['frozen'] and not h_small['frozen']:
         return 'frozen'
@@ -205,9 +214,11 @@ def _scan_all_rules(ctx, sizes: list[int], steps: int, seed: int,
     transient timing.
     """
     from simulator import RULE_PRESETS
+    import sys
     rows: list[dict] = []
     rule_names = sorted(RULE_PRESETS.keys())
     base_size = sizes[0]
+    interrupted = False
     for i, name in enumerate(rule_names):
         # Skip composed/agent/entity rules — they often have
         # default_size constraints that auto-bump and confound the comparison.
@@ -222,15 +233,28 @@ def _scan_all_rules(ctx, sizes: list[int], steps: int, seed: int,
                 if scale_steps:
                     run_steps = max(steps,
                                     int(round(steps * size / base_size)))
-                    samples = steps
                 else:
                     run_steps = steps
-                    samples = None
+                # Cap trajectory readbacks. Each readback at size 192 is
+                # ~28 MB (192³ × 4 channels × float32) and triggers a full
+                # GPU→CPU stall. ≈12 evenly-spaced samples are plenty to
+                # spot blowup/freeze trajectories while keeping the all-
+                # rules scan dominated by GPU compute, not PCIe traffic.
+                samples = min(SCAN_TRAJECTORY_SAMPLES, run_steps)
                 traj, _, gN = _run_one(ctx, name, size=size,
                                        steps=run_steps,
                                        seed=seed, samples=samples)
                 sigs[size] = _trajectory_signature(traj)
                 healths[size] = _health_signature(gN)
+        except KeyboardInterrupt:
+            # Surface partial results: bail out of the scan loop without
+            # losing the rows already collected. The caller's table-print
+            # logic handles a short list fine.
+            print(f"  ... interrupted at {i+1}/{len(rule_names)} "
+                  f"(while scanning {name!r}); returning partial results",
+                  file=sys.stderr)
+            interrupted = True
+            break
         except Exception as e:
             rows.append({'rule': name, 'status': f'ERR: {type(e).__name__}',
                          'max_div': float('nan'), 'divs': {},
@@ -250,10 +274,16 @@ def _scan_all_rules(ctx, sizes: list[int], steps: int, seed: int,
         # Lightweight progress
         if (i + 1) % 5 == 0 or i + 1 == len(rule_names):
             print(f"  ... {i+1}/{len(rule_names)} scanned",
-                  file=__import__('sys').stderr)
+                  file=sys.stderr)
     rows.sort(key=lambda r: (-r['max_div']
                              if r['max_div'] == r['max_div']
                              else 0))
+    if interrupted:
+        # Tag the result so the caller can annotate the printout.
+        rows.append({'rule': '__interrupted__', 'status': 'partial',
+                     'max_div': float('-inf'), 'divs': {},
+                     'verdict': 'healthy', '_partial': True,
+                     '_scanned': len(rows), '_total': len(rule_names)})
     return rows
 
 
@@ -298,7 +328,14 @@ def main(argv=None):
               f"steps={args.steps} [{mode_tag}] ===\n")
         rows = _scan_all_rules(ctx, sizes, args.steps, args.seed,
                                 scale_steps=scale_steps)
+        # Detect partial-results sentinel from KeyboardInterrupt path.
+        partial_info = next((r for r in rows if r.get('_partial')), None)
+        rows = [r for r in rows if not r.get('_partial')]
         sz_cols = '  '.join(f'div@{s}' for s in sizes[1:])
+        if partial_info is not None:
+            print(f"\n*** PARTIAL: scanned "
+                  f"{partial_info['_scanned']}/{partial_info['_total']} "
+                  f"before Ctrl-C ***")
         print(f"\n{'rule':<32}  {'max_div':>8}  {sz_cols}  {'verdict':<8}  notes")
         print('-' * (60 + 9 * len(sizes)))
         bug_verdicts = {'nan', 'blowup', 'frozen', 'error'}
