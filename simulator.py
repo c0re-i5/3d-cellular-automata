@@ -21896,6 +21896,22 @@ class Simulator:
     # ──────────────────────────────────────────────────────────────
     # Block-sparse compute dispatch
     # ──────────────────────────────────────────────────────────────
+    def _maybe_recompile_for_sparse_flip(self):
+        """Trigger a CA shader recompile if the current params would
+        change sparse-dispatch eligibility relative to what was baked
+        in at the last compile. Cheap no-op when the status is already
+        consistent (the common case)."""
+        compiled = getattr(self, '_sparse_compiled_eligible', None)
+        if compiled is None:
+            return
+        if bool(self._sparse_supported()) != bool(compiled):
+            try:
+                self._compile_compute()
+            except Exception as e:
+                # Don't crash the GUI on a transient compile error;
+                # the next param edit will retry.
+                print(f"[sparse_flip] recompile failed: {e!r}")
+
     def _sparse_supported(self):
         """A rule is eligible for sparse dispatch when:
           - the preset opts in via ``sparse_dispatch: True``
@@ -21903,6 +21919,10 @@ class Simulator:
             and our compute workgroup mapping breaks)
           - it's a single-pass voxel rule (multi-pass / agent / entity
             rules need per-pass enablement which is a future extension)
+          - the rule preserves the "empty stays empty" invariant
+            (vacuum cells outside the dilated active set are never
+            visited by the kernel, so any rule whose params allow
+            birth-from-vacuum produces a static-cube pathology)
 
         IMPORTANT: this runtime check MUST mirror the compile-time
         ``sparse_eligible`` check in ``_compile_pass`` exactly. Any
@@ -21924,6 +21944,19 @@ class Simulator:
             return False
         if self._pass_specs[0].get('kind', 'voxel') != 'voxel':
             return False
+        # Vacuum-spawn guard: Life-family rules (game_of_life_3d shader)
+        # support `Birth min == 0`, meaning a dead cell with 0 alive
+        # neighbours becomes alive. Sparse dispatch only visits blocks
+        # in the live-set + 1-block dilation halo; far-vacuum blocks are
+        # skipped entirely, so they can never receive a birth-from-zero
+        # event. Result: the live region just grows by one halo per step
+        # and equilibrates into a static cube. Disable sparse dispatch
+        # for any params that would spawn life from true vacuum.
+        shader = self._pass_specs[0].get('shader', '')
+        if shader == 'game_of_life_3d':
+            params = getattr(self, 'params', {}) or self.preset.get('params', {})
+            if int(params.get('Birth min', 1)) <= 0:
+                return False
         return True
 
     def _alloc_sparse_dispatch(self, size_or_dims):
@@ -22288,12 +22321,19 @@ class Simulator:
             #     ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
             # If a future shader uses a different pattern it must either
             # adopt one of these forms or set sparse_dispatch=False.
+            # Vacuum-spawn guard — see _sparse_supported() for rationale.
+            _params = getattr(self, 'params', {}) or self.preset.get('params', {})
+            _vacuum_spawn = (
+                key == 'game_of_life_3d'
+                and int(_params.get('Birth min', 1)) <= 0
+            )
             sparse_eligible = (
                 self.preset.get('sparse_dispatch', False)
                 and len(self._pass_specs) == 1
                 and self._pass_specs[0].get('kind', 'voxel') == 'voxel'
                 and self.size >= 128
                 and kind == 'voxel'
+                and not _vacuum_spawn
                 # Honor the runtime toggle at compile time. Shaders are
                 # rewritten textually to use the sparse SSBO; the rewrite
                 # is incompatible with dense dispatch (gl_WorkGroupID would
@@ -22301,6 +22341,9 @@ class Simulator:
                 # runtime requires a recompile via _compile_compute().
                 and getattr(self, 'sparse_dispatch_enabled', True)
             )
+            # Stash the compiled state so live param edits can detect a
+            # mismatch with _sparse_supported() and trigger a recompile.
+            self._sparse_compiled_eligible = sparse_eligible
             if sparse_eligible:
                 # Helpers that fetch the virtual workgroup coord from
                 # the SSBO, plus textual rewrites of the canonical
@@ -26815,6 +26858,10 @@ void main() {
                                 key=name, from_=int(val), to=int(new_val))
                         except Exception: pass
                     self.params[name] = new_val
+                    # Sparse dispatch eligibility can flip when a Life-rule
+                    # Birth-min slider crosses 0↔1 (vacuum-spawn guard).
+                    # Recompile so dispatch-time and compile-time agree.
+                    self._maybe_recompile_for_sparse_flip()
             else:
                 changed, new_val = imgui.slider_float(name, float(val), float(lo), float(hi))
                 if changed:
@@ -26825,6 +26872,7 @@ void main() {
                                 key=name, from_=float(val), to=float(new_val))
                         except Exception: pass
                     self.params[name] = new_val
+                    self._maybe_recompile_for_sparse_flip()
 
         # Time step — respect the preset's safe range when one is declared,
         # otherwise fall back to the historical wide [0.001, 2.0] window.
