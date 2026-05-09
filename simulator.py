@@ -14123,6 +14123,10 @@ RULE_PRESETS = {
         "dt_range": (0.005, 0.08),
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        # Near-isotropic single-seed growth is physically slow at the
+        # default dt: takes ~3000 steps to reach 1% fill, ~6000 to look
+        # like a visible crystal. The 200-step audit horizon misses it.
+        "audit_steps": 3000,
         "description": "Compact crystal — near-isotropic surface energy gives smooth rounded growth front.",
         "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
@@ -14218,6 +14222,11 @@ RULE_PRESETS = {
         "default_size": 144,
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        # Dendritic growth is faster than the near-isotropic
+        # crystal_growth preset (eps=2.5 anisotropy drives 6 fast tip
+        # arms) but still needs ~1500 steps for the arms to become
+        # measurable in audit terms.
+        "audit_steps": 1500,
         "description": "Dendritic crystal — Mullins-Sekerka tip-splitting produces 6 axis-aligned branching arms.",
         "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
@@ -14643,6 +14652,10 @@ RULE_PRESETS = {
         "dt": 0.2,
         "dt_range": (0.05, 0.5),
         "init": "sandbox_empty",
+        # Intentionally empty for user brush-mode building; would always
+        # fail the audit's 'never reached alive>0.001' check.
+        "audit_skip": True,
+        "audit_skip_reason": "intentionally empty preset for brush mode",
         "description": "Empty sandbox — press B to enter brush mode and build!",
         "vis_channels": ["Element", "Temperature"],
         "vis_default": 0,
