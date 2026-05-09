@@ -372,30 +372,33 @@ CHANNEL_DESCRIPTION_MAX = 1000
 
 CHANNEL_DESCRIPTION = f"""3D cellular automata, simulated in real time on the GPU.
 
-Every video on this channel is a single run of an open-source
-volumetric simulator with 97 hand-tuned presets:
+Every video is a single run of an open-source volumetric simulator
+with 97 hand-tuned presets, including:
 
-• Life-like CAs   — Game of Life, SmoothLife, Larger-than-Life
-• Continuous CAs  — Lenia, Multi-channel Lenia
-• Reaction-diff.  — Gray-Scott, Belousov-Zhabotinsky, Schnakenberg
-• Crystal growth  — dendritic, faceted, snowflake, DLA
-• Fluid dynamics  — Navier-Stokes smoke, Rayleigh-Bénard, viscous
-                    fingers, Lattice Boltzmann
-• Quantum         — Schrödinger orbitals, tunneling, double-slit,
-                    Dirac equation
-• Active matter   — Vicsek flocking, active nematics, predator-prey
-• Bio-networks    — slime mold (Physarum), mycelium, lichen
-• Excitable media — BZ scroll waves, Greenberg-Hastings, FitzHugh-N.
-• Plus: peridynamic fracture, Cahn-Hilliard phase separation, Ising
-  spins, Kuramoto oscillators, Element chemistry, and more.
+• Life-like      — Game of Life, SmoothLife, Larger-than-Life
+• Continuous     — Lenia (single & multi-channel)
+• Reaction-diff  — Gray-Scott, Belousov-Zhabotinsky, Schnakenberg
+• Crystal growth — dendritic, faceted, snowflake, DLA
+• Fluids         — Navier-Stokes, Rayleigh-Bénard, Lattice Boltzmann
+• Quantum        — Schrödinger orbitals, tunneling, Dirac equation
+• Active matter  — Vicsek flocking, active nematics, predator-prey
+• Bio networks   — slime mold (Physarum), mycelium, lichen
+• Excitable      — BZ scroll waves, Greenberg-Hastings, FitzHugh-N.
+• Plus peridynamic fracture, Cahn-Hilliard, Ising spins, Kuramoto
+  oscillators, sandpile criticality, and Element chemistry.
 
-Every preset is the result of an automated parameter search over
-millions of configurations, scored by an interestingness metric.
+Every preset was discovered by an automated parameter search.
 
-Source code: {REPO_URL}
+Source: {REPO_URL}
 """
 
 
 def channel_description() -> str:
-    """Return the channel About text, trimmed to YouTube's 1000-char cap."""
-    return CHANNEL_DESCRIPTION.strip()[:CHANNEL_DESCRIPTION_MAX]
+    """Return the channel About text. Errors if it exceeds YouTube's cap."""
+    text = CHANNEL_DESCRIPTION.strip()
+    if len(text) > CHANNEL_DESCRIPTION_MAX:
+        raise ValueError(
+            f'CHANNEL_DESCRIPTION is {len(text)} chars, exceeds '
+            f'YouTube limit of {CHANNEL_DESCRIPTION_MAX}. Trim it in '
+            f'metadata.py rather than letting the print get cut off.')
+    return text
