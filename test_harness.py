@@ -2293,6 +2293,28 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
         result['init_density'] = init_density
     result.update(structure)
 
+    # Spatial-uniformity damper: a CA whose final state is essentially
+    # homogeneous across the volume isn't producing structure, no matter
+    # how high the alive/activity/surface bell-curves rate it.  This
+    # catches the second systemic scoring failure mode found in the
+    # 2026-05 audit:
+    #   - nucleation:        100% of discoveries had sv < 0.011
+    #   - xy_spin_3d:        78% had sv < 0.05  (all spins aligned)
+    #   - brusselator_3d:    p90 sv = 0.008  (uniform limit-cycle)
+    #   - schnakenberg_3d:   33% had sv < 0.10
+    #   - fitzhugh_nagumo:   p50 sv = 0.091   (uniform excitable medium)
+    # vs healthy rules where top discoveries land sv ≥ 0.20:
+    #   kuramoto p50=0.375, lenia p50=0.852, bz p50=1.0, wave p50=1.0,
+    #   gray_scott p50=1.0, phase_separation p50=0.804.
+    #
+    # Linear ramp from 0.10× at sv=0 to 1.00× at sv=0.15, no change above.
+    # Floor of 0.10 (not 0) preserves ranking within the punished band.
+    sv = result.get('spatial_variation', 1.0)
+    if sv < 0.15:
+        sv_factor = max(0.10, sv / 0.15)
+        result['score'] *= sv_factor
+        result['spatial_uniformity_factor'] = sv_factor
+
     # Live-stream thumbnail (CPU reduce on a grid we already had to read
     # back; never raises, returns None on failure).
     preview = _make_preview(grid, channel=channel, mode=measure_mode)
