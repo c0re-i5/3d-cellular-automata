@@ -12332,7 +12332,17 @@ void main() {
         // HSV_PHASE: (ch0, ch1) treated as a 2-vector
         float a = raw.r, b = raw.g;
         float mag = length(vec2(a, b));
-        float val = clamp((mag - u_aux_lo) * aux_scale, 0.0, 1.0);
+        // Inverted aux range (lo > hi) flips amplitude→opacity so that
+        // *defect cores* (low |A| in an oscillator otherwise saturated
+        // at |A|≈1) render bright and the bulk vanishes — essential
+        // for CGLE/BZ where the spiral filaments live at |A|<<1.
+        float val;
+        if (u_aux_hi >= u_aux_lo) {
+            val = clamp((mag - u_aux_lo) * aux_scale, 0.0, 1.0);
+        } else {
+            float inv_scale = 1.0 / (u_aux_lo - u_aux_hi);
+            val = clamp(1.0 - (mag - u_aux_hi) * inv_scale, 0.0, 1.0);
+        }
         float hue = atan(b, a) / 6.2831853 + 0.5;  // wrap to [0,1]
         colour  = hsv2rgb(vec3(hue, 1.0, val));
         density = val;
@@ -14463,6 +14473,11 @@ RULE_PRESETS = {
         "vis_default": 2,
         "vis_abs": False,
         "vis_mode": "hsv_phase",  # ch0=Re(A), ch1=Im(A) → hue = arg(A)
+        # Inverted aux range (lo>hi): bulk |A|≈1 renders transparent,
+        # defect cores (|A|<0.6) render bright → visualises the actual
+        # spiral filaments instead of the opaque oscillator background.
+        "vis_aux_range": (1.0, 0.4),
+        "render_mode": "volumetric",
         "boundary": "toroidal",
     },
     "bz_turbulence": {
@@ -14737,7 +14752,14 @@ RULE_PRESETS = {
             {"shader": "em_yee_B_3d", "writes": ["p2"]},
         ],
         "extra_fields": 1,
-        "params": {"Wave speed": 0.7, "Damping": 2.0,
+        # Damping is a *global* sigma added to every cell on top of the
+        # per-cell σ painted by the init.  In vacuum the Yee scheme is
+        # already energy-conserving and there's a baked-in 0.002·dt
+        # vacuum loss in the shader, so the default here must be 0 —
+        # the previous default of 2.0 killed E-fields by ~10 %/step
+        # (exp(-2·0.05) ≈ 0.905) and made every variant render dead
+        # within ~50 steps.
+        "params": {"Wave speed": 0.7, "Damping": 0.0,
                    "Frequency": 0.5, "Amplitude": 0.5},
         "param_ranges": {"Wave speed": (0.05, 1.0),  # CFL: c·dt < h/√3
                          "Damping": (0.0, 15.0),
@@ -15360,7 +15382,13 @@ RULE_PRESETS = {
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "volumetric",
-        "vis_range": (0.0, 4.0),
+        # Baseline ρ=1 floods the box at vis_range (0,4): every voxel
+        # has alpha≈0.25 → 64-deep accumulation = opaque cube. Lifting
+        # vis_lo above the baseline lets the shock-front overdensities
+        # stand out against transparent background, and the upper bound
+        # matches the blast-peak ρ≈3 + KH ρ≈2.5 (shocktube rescaled
+        # so its high-pressure side also crosses 1.0).
+        "vis_range": (1.05, 3.0),
         "boundary": "wrap",
     },
 
@@ -15369,7 +15397,12 @@ RULE_PRESETS = {
         "shader": "smallworld_ca_3d",
         # Single-pass binary CA on a Watts-Strogatz-rewired 3D lattice.
         # Channel R = state, B = per-cell rewire activity trace.
-        "params": {"Rewire p": 0.0, "Birth": 3.0, "Surv lo": 2.0, "Surv hi": 3.0},
+        # Defaults: B2/S3-4 with rewire p=0.10 — measured (size 64,
+        # density 30% init) to settle to ~15% live with ~30% flip-rate
+        # per step, i.e. genuinely active dynamics that also showcase
+        # the small-world shortcut channel. The previous defaults
+        # (B3/S2-3, p=0) decayed to a frozen 5% lattice in <50 steps.
+        "params": {"Rewire p": 0.10, "Birth": 2.0, "Surv lo": 3.0, "Surv hi": 4.0},
         # Birth/Surv params are integer counts in [0, 6] (we have 6
         # face neighbours). The slider exposes them as floats; the
         # shader rounds. Rewire probability slides 0..1 to span the
@@ -16009,16 +16042,20 @@ RULE_PRESETS = {
         "vis_channels": ["u (field)", "v (velocity)"],
         "vis_default": 0,
         "vis_abs": True,
-        "vis_mode": "bipolar",
-        "vis_aux_range": (0.0, 6.28),
+        # rgb_channels mode renders length(u, v) → always nonzero
+        # whenever the breather has *any* energy. The previous
+        # bipolar+abs(u) renderer went black at u-zero-crossings of
+        # the oscillation (every ~25 steps), making the breather
+        # appear to flicker on/off.
+        "vis_mode": "rgb_channels",
+        "vis_aux_range": (0.0, 0.5),
         "render_mode": "volumetric",
-        # Field u winds through multiples of 2π across kink walls; abs
-        # gives values up to ~2π. Without remap the walls render the
-        # entire box as opaque haze.
-        "vis_range": (3.0, 6.28),
-        # Voxel mode: only show cells near a kink wall (|u| above the
-        # bulk vacuum of ~π/2). Otherwise the whole box renders.
-        "voxel_threshold": 4.0,
+        # Channel range tuned for the breather IC: |u|, |v| ≲ 0.4.
+        # Was (3.0, 6.28) which black-boxed the breather completely.
+        "vis_range": (0.005, 0.4),
+        # Voxel mode threshold: anything above 0.02 counts as "near
+        # excited region". Was 4.0 which filtered the breather away.
+        "voxel_threshold": 0.02,
         "boundary": "toroidal",
     },
 
@@ -19448,16 +19485,30 @@ def init_quantum_tunneling(size, rng):
 
 def init_quantum_double_slit(size, rng):
     """Wavepacket approaching a double-slit barrier — produces interference pattern.
-    The barrier has two gaps that act as coherent sources."""
+    The barrier has two gaps that act as coherent sources.
+
+    Sign convention: this shader's exp(-iωt) leapfrog gives v_g = +∂ω/∂(-k),
+    i.e. *negative* k corresponds to a packet moving in +x. Confirmed by
+    direct centroid measurement; with kx in (-2.5, -1.5) and ℏ/2m = 2.5
+    the packet drifts toward x = +0.25·size at ~0.05 cells/step.
+    Earlier kx ∈ (+0.6, +1.0) made the packet drift backwards (away
+    from the slits), so no interference ever formed.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     c = size / 2.0
-    sigma = size * 0.07
+    sigma = max(3.0, size * 0.05)   # tighter than 7 % so the packet
+                                    # stays compact long enough to
+                                    # actually reach the slits.
 
-    # Plane wave packet moving in +x direction
-    cx = c - size * 0.25
+    # Plane wave packet: start close to the barrier (15 % off-centre)
+    # so it traverses to the wall well within 1500 steps even at the
+    # modest group velocity allowed by the lattice.
+    cx = c - size * 0.15
     cy = c
     cz = c
-    kx = rng.uniform(0.6, 1.0)
+    # Negative kx in (-2.5, -1.5) gives forward motion in this shader's
+    # sign convention without crossing the lattice Nyquist (k_max ≈ π).
+    kx = -rng.uniform(1.5, 2.5)
 
     psi_r, psi_i = _gaussian_wavepacket(size, cx, cy, cz, sigma, kx=kx)
     data[:, :, :, 0] = psi_r
@@ -19713,8 +19764,12 @@ def _euler_primitives(name, size):
         rho = np.empty((size, size, size), dtype=np.float32)
         p   = np.empty((size, size, size), dtype=np.float32)
         half = size // 2
-        rho[:half] = 1.0;    rho[half:] = 0.125
-        p[:half]   = 1.0;    p[half:]   = 0.1
+        # Classic Sod ratios (8:1 density, 10:1 pressure) but rescaled
+        # so that the high-pressure side has ρ>1 — keeps the rule's
+        # default vis_range (1.05, 3.0) able to render the shocktube
+        # variant without the inert cube look.
+        rho[:half] = 2.5;    rho[half:] = 0.3125
+        p[:half]   = 2.5;    p[half:]   = 0.25
         vel = np.zeros((size, size, size, 3), dtype=np.float32)
         return rho, vel, p
     if name == 'kelvin_helmholtz':
