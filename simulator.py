@@ -15628,8 +15628,14 @@ RULE_PRESETS = {
             {"shader": "copy_voxel",     "kind": "voxel", "writes": ["p1"]},
             {"shader": "langton_ant_3d", "kind": "agent", "writes": []},
         ],
-        "agent_count": 1,
-        "agent_init": "langton_center",
+        # A flock of ants with random starting cells + directions: each
+        # run looks different (the canonical single-ant start is fully
+        # deterministic and produces the identical trail every time —
+        # not very interesting on a fresh blank grid).  Multiple ants
+        # also fan out fast enough that the trail patterns interact,
+        # which is the point of the 3D extension.
+        "agent_count": 24,
+        "agent_init": "agent_random_scatter",
         "params": {"_a": 0.0, "_b": 0.0, "_c": 0.0, "_d": 0.0},
         "param_ranges": {"_a": (0.0, 1.0), "_b": (0.0, 1.0),
                          "_c": (0.0, 1.0), "_d": (0.0, 1.0)},
@@ -15637,17 +15643,18 @@ RULE_PRESETS = {
         "dt_range": (1.0, 1.0),
         "init": "blank_voxels",
         "init_variants": ["blank_voxels"],
-        "description": ("3D Langton's ant — a single mobile turtle walks the "
-                        "voxel grid, flipping each cell's binary colour as it "
-                        "passes and turning based on the cell's prior colour. "
-                        "Demonstrates the engine's agent-SSBO infrastructure: "
-                        "voxel passes preserve the grid, agent passes mutate "
-                        "individual cells in place via a 1-D dispatch over "
-                        "the agent buffer. The 3D turning rule is a simple "
-                        "permutation on the 6 axis directions; it is not the "
-                        "canonical 2D Langton (no canonical 3D extension "
-                        "exists), but it preserves the key invariant that "
-                        "exactly one cell flips per agent per step."),
+        "description": ("3D Langton's ant — a flock of mobile turtles walks "
+                        "the voxel grid, each flipping its current cell's "
+                        "binary colour and turning based on the cell's prior "
+                        "colour. Demonstrates the engine's agent-SSBO "
+                        "infrastructure: voxel passes preserve the grid, "
+                        "agent passes mutate individual cells in place via a "
+                        "1-D dispatch over the agent buffer. The 3D turning "
+                        "rule is a simple permutation on the 6 axis "
+                        "directions; it is not the canonical 2D Langton "
+                        "(no canonical 3D extension exists), but it preserves "
+                        "the key invariant that exactly one cell flips per "
+                        "agent per step."),
         "vis_channels": ["Colour", "_", "_", "_"],
         "vis_default": 0,
         "vis_abs": False,
