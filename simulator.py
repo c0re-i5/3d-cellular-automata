@@ -15032,6 +15032,7 @@ RULE_PRESETS = {
         "label": "Hydrogen Atom",
         "shader": "schrodinger_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
         "dt": 0.02,
@@ -15049,6 +15050,7 @@ RULE_PRESETS = {
         "label": "Atomic Orbital",
         "shader": "schrodinger_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
         "dt": 0.02,
@@ -15090,6 +15092,7 @@ RULE_PRESETS = {
         "label": "Quantum Wavepacket",
         "shader": "schrodinger_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
         "dt": 0.02,
@@ -15106,6 +15109,7 @@ RULE_PRESETS = {
         "label": "Quantum Oscillator",
         "shader": "schrodinger_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
         "dt": 0.02,
@@ -15122,6 +15126,7 @@ RULE_PRESETS = {
         "label": "Quantum Tunneling",
         "shader": "schrodinger_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 10.0)},
         "dt": 0.02,
@@ -15138,6 +15143,7 @@ RULE_PRESETS = {
         "label": "Double Slit",
         "shader": "schrodinger_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 10.0)},
         "dt": 0.02,
@@ -15154,6 +15160,7 @@ RULE_PRESETS = {
         "label": "Molecular Bond",
         "shader": "schrodinger_molecule_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "Nuclear charge": 1.0, "Separation": 8.0, "Softening": 1.5},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "Nuclear charge": (0.5, 4.0),
                          "Separation": (2.0, 20.0), "Softening": (0.5, 4.0)},
@@ -15172,6 +15179,7 @@ RULE_PRESETS = {
         "label": "Antibonding Orbital",
         "shader": "schrodinger_molecule_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "Nuclear charge": 1.0, "Separation": 8.0, "Softening": 1.5},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "Nuclear charge": (0.5, 4.0),
                          "Separation": (2.0, 20.0), "Softening": (0.5, 4.0)},
@@ -15190,6 +15198,7 @@ RULE_PRESETS = {
         "label": "Self-Interacting QM",
         "shader": "schrodinger_poisson_3d",
         "default_size": 192,
+        "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0, "Coupling α": 5.0, "Relaxation ω": 0.8},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0),
                          "Coupling α": (0.1, 50.0), "Relaxation ω": (0.1, 1.5)},
@@ -16495,75 +16504,14 @@ RULE_PRESETS['flagship_dual_lenia'] = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Preset overrides (loaded from preset_overrides.json if present)
-#
-# This lets data-driven tuning (apply_preset_tuning.py) update default
-# `params`/`dt`/`default_size` without editing source. Format:
-#   {"<rule_name>": {"params": {...optional...}, "dt": <optional>,
-#                    "default_size": <optional>, "search_size": <optional>}}
-# Only the listed keys per rule are merged; everything else is preserved.
-# Set CA_DISABLE_PRESET_OVERRIDES=1 to bypass (e.g. for regression baselines).
-# ─────────────────────────────────────────────────────────────────────────
-def _apply_preset_overrides():
-    import json as _json
-    import os as _os
-    if _os.environ.get('CA_DISABLE_PRESET_OVERRIDES', '0') == '1':
-        return 0, []
-    here = _os.path.dirname(_os.path.abspath(__file__))
-    path = _os.path.join(here, 'preset_overrides.json')
-    if not _os.path.isfile(path):
-        return 0, []
-    try:
-        with open(path) as f:
-            raw = _json.load(f)
-    except Exception as e:
-        print(f"[preset_overrides] failed to load {path}: {e}")
-        return 0, []
-    overrides = raw.get('overrides', raw) if isinstance(raw, dict) else {}
-    # Excludelist: rules where median-of-top-discoveries pushes the rule
-    # into a chaotic / personality-erasing regime. Keep their pristine
-    # source defaults; the patcher will keep regenerating these into the
-    # JSON, so we filter at load time. To re-include one, remove it here.
-    blocked = raw.get('excludelist', [
-        'lenia_3d',         # patch dt 0.05→0.181 violates source's stability comment
-        'element_ca',       # patch jumps to high-energy chemistry regime
-        # Physics-PDE rules: random-search params (e.g. Damping=9.3 on
-        # em_wave) routinely fight the underlying physics. Keep
-        # hand-tuned defaults regardless of what the patcher writes.
-        'em_wave', 'wave_3d', 'sine_gordon_3d',
-        'dirac_3d', 'compressible_euler_3d',
-        'quantum_hydrogen', 'quantum_orbital', 'quantum_element',
-        'quantum_wavepacket', 'quantum_harmonic', 'quantum_tunneling',
-        'quantum_double_slit', 'quantum_molecule', 'quantum_antibonding',
-        'quantum_selfinteract',
-    ])
-    applied = []
-    skipped = []
-    for rule, patch in overrides.items():
-        if rule in blocked:
-            skipped.append((rule, 'excludelist'))
-            continue
-        if rule not in RULE_PRESETS:
-            skipped.append((rule, 'unknown rule'))
-            continue
-        preset = RULE_PRESETS[rule]
-        if 'params' in patch and isinstance(patch['params'], dict):
-            cur = dict(preset.get('params', {}))
-            for k, v in patch['params'].items():
-                if k in cur:
-                    cur[k] = v
-            preset['params'] = cur
-        for key in ('dt', 'default_size', 'search_size'):
-            if key in patch:
-                preset[key] = patch[key]
-        applied.append(rule)
-    return len(applied), skipped
+# Source-of-truth policy: RULE_PRESETS above is authoritative. We previously
+# loaded preset_overrides.json here to merge auto-tuner output, but that
+# layer hid bugs (random-search "discoveries" replaced physics-correct
+# defaults with numerically-degenerate ones; e.g. em_wave Damping=9.3 made
+# the field die in 5 steps which "looked stable" to the scoring heuristic).
+# If a default is wrong, fix it in source. discoveries.json + the search
+# tools remain useful as *suggestions* but never patch the runtime.
 
-_OVR_N, _OVR_SKIP = _apply_preset_overrides()
-if _OVR_N or _OVR_SKIP:
-    print(f"[preset_overrides] applied {_OVR_N} rule patches"
-          + (f"; skipped {len(_OVR_SKIP)}: {_OVR_SKIP}" if _OVR_SKIP else ""))
 
 
 # ── Initialization patterns (all return 4-channel: size x size x size x 4) ──
