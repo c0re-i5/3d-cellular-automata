@@ -16527,8 +16527,16 @@ def _apply_preset_overrides():
     # JSON, so we filter at load time. To re-include one, remove it here.
     blocked = raw.get('excludelist', [
         'lenia_3d',         # patch dt 0.05→0.181 violates source's stability comment
-        'sine_gordon_3d',   # patch turns elegant solitons into forced chaos
         'element_ca',       # patch jumps to high-energy chemistry regime
+        # Physics-PDE rules: random-search params (e.g. Damping=9.3 on
+        # em_wave) routinely fight the underlying physics. Keep
+        # hand-tuned defaults regardless of what the patcher writes.
+        'em_wave', 'wave_3d', 'sine_gordon_3d',
+        'dirac_3d', 'compressible_euler_3d',
+        'quantum_hydrogen', 'quantum_orbital', 'quantum_element',
+        'quantum_wavepacket', 'quantum_harmonic', 'quantum_tunneling',
+        'quantum_double_slit', 'quantum_molecule', 'quantum_antibonding',
+        'quantum_selfinteract',
     ])
     applied = []
     skipped = []
@@ -19463,11 +19471,15 @@ def init_quantum_tunneling(size, rng):
     c = size / 2.0
     sigma = size * 0.07
 
-    # Wavepacket starts on the left, moving right
+    # Wavepacket starts on the left, moving right.
+    # Sign convention: schrodinger_3d shader uses exp(-iωt) leapfrog,
+    # so NEGATIVE kx gives +x group velocity (see init_quantum_double_slit
+    # docstring for derivation). With kx>0 the packet drifted backward
+    # away from the barrier and never tunneled.
     cx = c - size * 0.2
     cy = c
     cz = c
-    kx = rng.uniform(0.5, 1.2)  # rightward momentum
+    kx = -rng.uniform(0.5, 1.2)  # rightward momentum (sign-flipped for shader convention)
 
     psi_r, psi_i = _gaussian_wavepacket(size, cx, cy, cz, sigma, kx=kx)
     data[:, :, :, 0] = psi_r
