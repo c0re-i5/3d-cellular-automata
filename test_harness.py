@@ -1303,6 +1303,20 @@ class HeadlessRunner:
                 kind = 'blast'
             rho, vel, p = _euler_primitives(kind, size)
             arr = _euler_pair2_from_primitives(rho, vel, p)
+        elif init_name == 'dirac_pair2_auto':
+            # Dirac χ (lower bispinor) packed in lockstep with φ
+            # using the same primitive builder, so the full 4-spinor
+            # is consistent at t=0.
+            from simulator import _dirac_primitives
+            current = getattr(self, '_active_init_name',
+                              self.preset.get('init', 'dirac_wavepacket'))
+            kind = current[len('dirac_'):] if current.startswith('dirac_') else 'wavepacket'
+            mapping = {'wavepacket':         'wavepacket_rest',
+                       'moving_wavepacket':  'wavepacket_moving',
+                       'collision':          'wavepacket_collision'}
+            primname = mapping.get(kind, 'wavepacket_rest')
+            _, chi = _dirac_primitives(primname, size)
+            arr = chi
         return arr
 
     def step(self):

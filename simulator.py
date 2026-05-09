@@ -7357,6 +7357,212 @@ void main() {
 }
 """,
 
+    "dirac_3d_phi": """
+// ── Full 3+1D Dirac equation, pass 1 of 2 (upper bispinor φ) ─────────
+// The Dirac equation in natural units (ℏ = 1) decomposes the 4-spinor
+// ψ = (φ, χ) into two 2-component "bispinors":
+//
+//     ∂_t φ = − σ·∇ χ − i m φ
+//     ∂_t χ = − σ·∇ φ + i m χ
+//
+// where σ = (σ_x, σ_y, σ_z) are the Pauli matrices and m the rest
+// mass (in inverse-time units c²·m/ℏ; our `mass` param subsumes c²/ℏ).
+// We integrate with a symplectic Yee-leapfrog scheme: this pass
+// updates φ from OLD χ; the second pass (`dirac_3d_chi`) then
+// updates χ from the just-written NEW φ. Reading φ at the new
+// half-time-step in the χ update is what makes the integrator
+// time-reversible and probability-preserving on long runs.
+//
+// Channel layout (each component is complex; Re/Im interleaved):
+//   pair 1 = φ : R = Re φ_↑, G = Im φ_↑, B = Re φ_↓, A = Im φ_↓
+//   pair 2 = χ : R = Re χ_↑, G = Im χ_↑, B = Re χ_↓, A = Im χ_↓
+// (`↑` and `↓` index the two-component spinor structure of φ and χ
+// individually; the *full* 4-spinor's spin/helicity emerges from
+// the joint state of φ and χ.)
+//
+// CFL-style stability bound: dt · (c·2√3/Δx + m) < 2. With our
+// voxel-units (Δx=1), c=u_param0=0.5, m=u_param1=0.5 the bound
+// is dt < 2/(0.5·3.46 + 0.5) ≈ 0.91, so dt=0.4 is comfortably
+// stable. Going larger excites the +ω/−ω alias and the wave-
+// function grows exponentially.
+//
+// u_param0 = c   (light speed in voxel/step units; usually 0.3–0.7)
+// u_param1 = m   (mass in 1/step units; 0 = massless Weyl limit)
+// u_param2 = absorbing-boundary strength α ∈ [0,1] (0 = no damping;
+//            applies a small per-step decay near the cube faces so
+//            outgoing wavepackets don't reflect off the periodic
+//            wrap and interfere with the primary packet)
+// u_param3 = unused
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+// Apply the Pauli operator σ·∇ to a 2-spinor field stored as
+// (Re_↑, Im_↑, Re_↓, Im_↓) in either pair (selected by `which`,
+// 0 = pair 1, 1 = pair 2). Returns Re/Im of (σ·∇ ψ)_↑↓ as a vec4.
+//
+// Acting on ψ = (ψ_↑, ψ_↓):
+//   (σ·∇ ψ)_↑ = ∂_z ψ_↑ + (∂_x − i ∂_y) ψ_↓
+//   (σ·∇ ψ)_↓ = (∂_x + i ∂_y) ψ_↑ − ∂_z ψ_↓
+// Centred differences for ∂_i.
+vec4 sigma_dot_grad_pair2(ivec3 pos) {
+    vec4 xp = fetch2(pos + ivec3( 1, 0, 0));
+    vec4 xm = fetch2(pos + ivec3(-1, 0, 0));
+    vec4 yp = fetch2(pos + ivec3( 0, 1, 0));
+    vec4 ym = fetch2(pos + ivec3( 0,-1, 0));
+    vec4 zp = fetch2(pos + ivec3( 0, 0, 1));
+    vec4 zm = fetch2(pos + ivec3( 0, 0,-1));
+
+    // Re ψ_↑, Im ψ_↑, Re ψ_↓, Im ψ_↓ partials.
+    vec4 dx = 0.5 * (xp - xm);
+    vec4 dy = 0.5 * (yp - ym);
+    vec4 dz = 0.5 * (zp - zm);
+
+    // (σ·∇ ψ)_↑ = ∂_z ψ_↑ + (∂_x − i ∂_y) ψ_↓
+    //   real: dz.r + dx.b + dy.a       (−i times im part is +real of im, etc.)
+    //   imag: dz.g + dx.a − dy.b
+    // (σ·∇ ψ)_↓ = (∂_x + i ∂_y) ψ_↑ − ∂_z ψ_↓
+    //   real: dx.r − dy.g − dz.b
+    //   imag: dx.g + dy.r − dz.a
+    return vec4(
+        dz.r + dx.b + dy.a,
+        dz.g + dx.a - dy.b,
+        dx.r - dy.g - dz.b,
+        dx.g + dy.r - dz.a);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float c     = u_param0;
+    float m     = u_param1;
+    float alpha = clamp(u_param2, 0.0, 1.0);
+
+    vec4 phi_old = fetch(pos);            // φ
+    // χ enters only through σ·∇ χ (computed from pair 2 neighbours).
+    vec4 sgc     = sigma_dot_grad_pair2(pos);
+
+    // ∂_t φ = − c (σ·∇) χ − i m φ.
+    // Strang-style splitting per step, *with the mass evolved by an
+    // EXACT unitary rotation* rather than a forward-Euler step (which
+    // grows the norm as (1+m²dt²) every step — the integrator looks
+    // stable for short runs and explodes within a few hundred):
+    //   φ ← exp(−i m dt) φ           (mass: pure phase, |φ| invariant)
+    //   φ ← φ − dt · c σ·∇ χ         (kinetic: leapfrogged with χ pass)
+    float ph    = m * u_dt;
+    float cph   = cos(ph);
+    float sph   = sin(ph);
+    // exp(−i ph) (a + i b) = (a cos + b sin) + i (b cos − a sin).
+    vec4 phi_rot;
+    phi_rot.r =  cph * phi_old.r + sph * phi_old.g;
+    phi_rot.g =  cph * phi_old.g - sph * phi_old.r;
+    phi_rot.b =  cph * phi_old.b + sph * phi_old.a;
+    phi_rot.a =  cph * phi_old.a - sph * phi_old.b;
+
+    vec4 phi_new = phi_rot - (u_dt * c) * sgc;
+
+    // Optional sponge layer near the box faces: smoothly multiply by a
+    // factor in [1−α, 1] within ~6 voxels of any face. Lets you watch
+    // wavepackets move out of the simulation domain without seeing the
+    // periodic-wrap echo come back through the centre.
+    if (alpha > 0.0) {
+        vec3 d = min(vec3(pos), vec3(u_size - 1) - vec3(pos));
+        float edge = min(min(d.x, d.y), d.z);
+        float sponge_w = max(float(u_size) * 0.06, 1.0);
+        float sponge = 1.0 - alpha * exp(-edge / sponge_w);
+        phi_new *= sponge;
+    }
+
+    imageStore(u_dst, pos, phi_new);
+}
+""",
+
+    "dirac_3d_chi": """
+// Full 3+1D Dirac, pass 2 of 2 (lower bispinor χ).
+//
+//     ∂_t χ = − c σ·∇ φ + i m χ
+//
+// σ·∇ acts on the JUST-WRITTEN φ (pair 1, post-pingpong) — that's the
+// Yee-leapfrog "second half-step" that gives the integrator its time-
+// reversibility. Reads χ_old from pair 2.
+
+// Same Pauli·grad operator as in pass 1, but acting on pair 1 (φ).
+vec4 sigma_dot_grad_pair1(ivec3 pos) {
+    vec4 xp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 xm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 yp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 ym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 zp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 zm = fetch(pos + ivec3( 0, 0,-1));
+
+    vec4 dx = 0.5 * (xp - xm);
+    vec4 dy = 0.5 * (yp - ym);
+    vec4 dz = 0.5 * (zp - zm);
+
+    return vec4(
+        dz.r + dx.b + dy.a,
+        dz.g + dx.a - dy.b,
+        dx.r - dy.g - dz.b,
+        dx.g + dy.r - dz.a);
+}
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float c     = u_param0;
+    float m     = u_param1;
+    float alpha = clamp(u_param2, 0.0, 1.0);
+
+    vec4 chi_old = imageLoad(u_src2, pos);    // χ from pair-2 source
+    vec4 sgp     = sigma_dot_grad_pair1(pos); // σ·∇ on the NEW φ
+
+    // ∂_t χ = − c (σ·∇) φ + i m χ.
+    // Mass term evolved exactly by exp(+i m dt) (opposite sign to φ
+    // because χ couples to −m in the Dirac β matrix).  Without this
+    // exact rotation the forward-Euler mass step pumps norm into the
+    // wavefunction at rate (1 + m²dt²) per step.
+    float ph    = m * u_dt;
+    float cph   = cos(ph);
+    float sph   = sin(ph);
+    // exp(+i ph) (a + i b) = (a cos − b sin) + i (b cos + a sin).
+    vec4 chi_rot;
+    chi_rot.r =  cph * chi_old.r - sph * chi_old.g;
+    chi_rot.g =  cph * chi_old.g + sph * chi_old.r;
+    chi_rot.b =  cph * chi_old.b - sph * chi_old.a;
+    chi_rot.a =  cph * chi_old.a + sph * chi_old.b;
+
+    vec4 chi_new = chi_rot - (u_dt * c) * sgp;
+
+    if (alpha > 0.0) {
+        vec3 d = min(vec3(pos), vec3(u_size - 1) - vec3(pos));
+        float edge = min(min(d.x, d.y), d.z);
+        float sponge_w = max(float(u_size) * 0.06, 1.0);
+        float sponge = 1.0 - alpha * exp(-edge / sponge_w);
+        chi_new *= sponge;
+    }
+
+    imageStore(u_dst2, pos, chi_new);
+}
+""",
+
     # ── Smoke / vapor variants of stable_fluids ────────────────────────
     # These three shaders are drop-in replacements for the FIRST pass of
     # the smoke pipeline.  div / jacobi / project are reused unchanged.
@@ -15201,6 +15407,60 @@ RULE_PRESETS = {
         "boundary": "wrap",
     },
 
+    "dirac_3d": {
+        "label": "3+1D Dirac Equation",
+        "shader": "dirac_3d_phi",
+        # Yee-leapfrog: pass 1 advances φ from old (φ, χ); pass 2 then
+        # advances χ from the just-written NEW φ. The two writes target
+        # different texture pairs, so each pair ping-pongs once per
+        # step in lockstep.
+        "passes": [
+            {"shader": "dirac_3d_phi", "writes": ["p1"]},
+            {"shader": "dirac_3d_chi", "writes": ["p2"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "dirac_pair2_auto",
+        "params": {"c (light)": 0.5, "Mass": 0.5, "Absorber": 0.0, "_": 0.0},
+        "param_ranges": {"c (light)": (0.0, 1.0),
+                         "Mass":      (0.0, 2.0),
+                         "Absorber":  (0.0, 0.5),
+                         "_":         (0.0, 1.0)},
+        # CFL: dt·(c·2√3 + m) < 2 (Δx=1). Defaults give bound ≈ 0.91;
+        # dt = 0.4 sits at CFL ≈ 0.44 — comfortably stable for the
+        # leapfrog scheme even with momentum-kicked wavepackets.
+        "default_size": 96,
+        "dt": 0.4,
+        "dt_range": (0.05, 0.6),
+        "init": "dirac_wavepacket",
+        "init_variants": ["dirac_wavepacket",
+                          "dirac_moving_wavepacket",
+                          "dirac_collision"],
+        "description": ("Full 3+1D Dirac equation for a 4-component "
+                        "spinor ψ = (φ, χ), integrated with a "
+                        "symplectic Yee-leapfrog: pass 1 updates the "
+                        "upper bispinor φ from the old χ, pass 2 "
+                        "updates χ from the just-written new φ. The "
+                        "spatial Pauli operator σ·∇ is discretised "
+                        "by central differences. Three init "
+                        "variants showcase positive-energy free-"
+                        "particle physics: Gaussian at rest "
+                        "(stationary, modulo Schrödinger dispersion), "
+                        "Gaussian with momentum kick (translates "
+                        "ballistically at v = pc²/E), and head-on "
+                        "two-packet collision (interference of "
+                        "spinor components). Probability density "
+                        "|ψ|² is conserved exactly to round-off "
+                        "by the leapfrog (the integrator is "
+                        "norm-preserving); visualise it via the "
+                        "absolute-value channel."),
+        "vis_channels": ["Re ψ↑", "Im ψ↑", "Re ψ↓", "Im ψ↓"],
+        "vis_default": 0,
+        "vis_abs": True,
+        "render_mode": "volumetric",
+        "vis_range": (0.0, 0.02),
+        "boundary": "wrap",
+    },
+
     "smoke_wind_3d": {
         "label": "3D Smoke (Wind-Blown)",
         "shader": "smoke_wind_3d",
@@ -19492,6 +19752,113 @@ def _euler_pair2_from_primitives(rho, vel, p, gamma=1.4):
     return np.stack([E, p, speed, np.zeros_like(E)], axis=-1).astype(np.float32)
 
 
+def _dirac_primitives(name, size):
+    """Return (φ, χ) — both shape (size, size, size, 4) — for a named
+    Dirac initial condition. Components are interleaved Re/Im of the
+    two spinor components: (Re_↑, Im_↑, Re_↓, Im_↓).
+
+    For each variant we construct ψ = N · envelope(x) · u_spinor(p, s)
+    where `u_spinor` is the positive-energy plane-wave spinor evaluated
+    at the packet's mean momentum p, so the wavepacket is initially
+    almost-pure positive-energy (near-zero antiparticle component).
+    Quasi-zitterbewegung still appears at order m/E from the
+    envelope's k-space spread.
+    """
+    xs, ys, zs = np.indices((size, size, size)).astype(np.float32)
+    cx = cy = cz = size * 0.5
+    sigma = max(size * 0.10, 2.0)
+    g = np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2 + (zs - cz) ** 2)
+               / (2.0 * sigma * sigma)).astype(np.float32)
+
+    def positive_energy_spinor(px, py, pz, m=0.5):
+        # Standard spin-up positive-energy free-particle u(p,↑) up to N:
+        #   φ = (1, 0)
+        #   χ = (1/(E+m)) * σ·p (1, 0) = (p_z, p_x + i p_y) / (E + m)
+        # We return the four (complex) entries as a tuple of complex
+        # scalars to multiply by the envelope.
+        E = np.sqrt(px*px + py*py + pz*pz + m*m)
+        denom = (E + m)
+        chi_up   = pz / denom
+        chi_down = (px + 1j*py) / denom
+        return (1.0+0j, 0.0+0j,            # φ_↑, φ_↓
+                chi_up, chi_down)          # χ_↑, χ_↓
+
+    if name == 'wavepacket_rest':
+        spinor = positive_energy_spinor(0.0, 0.0, 0.0, m=0.5)
+        plane  = np.ones_like(g, dtype=np.complex64)
+    elif name == 'wavepacket_moving':
+        kx = 2.0 * np.pi * 4.0 / size              # 4 wavelengths across box
+        spinor = positive_energy_spinor(kx, 0.0, 0.0, m=0.5)
+        plane  = np.exp(1j * kx * xs).astype(np.complex64)
+    elif name == 'wavepacket_collision':
+        # Two wavepackets, opposite kx, offset along x.
+        kx = 2.0 * np.pi * 4.0 / size
+        sigma2 = max(size * 0.07, 2.0)
+        gA = np.exp(-((xs - size*0.30)**2 + (ys-cy)**2 + (zs-cz)**2)
+                    / (2.0 * sigma2 * sigma2)).astype(np.float32)
+        gB = np.exp(-((xs - size*0.70)**2 + (ys-cy)**2 + (zs-cz)**2)
+                    / (2.0 * sigma2 * sigma2)).astype(np.float32)
+        sA = positive_energy_spinor( kx, 0.0, 0.0, m=0.5)
+        sB = positive_energy_spinor(-kx, 0.0, 0.0, m=0.5)
+        psi = [
+            gA * sA[0] * np.exp(1j*kx*xs) + gB * sB[0] * np.exp(-1j*kx*xs),
+            gA * sA[1] * np.exp(1j*kx*xs) + gB * sB[1] * np.exp(-1j*kx*xs),
+            gA * sA[2] * np.exp(1j*kx*xs) + gB * sB[2] * np.exp(-1j*kx*xs),
+            gA * sA[3] * np.exp(1j*kx*xs) + gB * sB[3] * np.exp(-1j*kx*xs),
+        ]
+        phi = np.zeros((size, size, size, 4), dtype=np.float32)
+        chi = np.zeros((size, size, size, 4), dtype=np.float32)
+        phi[..., 0] = psi[0].real;  phi[..., 1] = psi[0].imag
+        phi[..., 2] = psi[1].real;  phi[..., 3] = psi[1].imag
+        chi[..., 0] = psi[2].real;  chi[..., 1] = psi[2].imag
+        chi[..., 2] = psi[3].real;  chi[..., 3] = psi[3].imag
+        # Normalise to unit total probability.
+        norm = np.sqrt((phi**2).sum() + (chi**2).sum())
+        if norm > 0:
+            phi /= norm; chi /= norm
+        return phi, chi
+    else:
+        raise ValueError(f"unknown dirac init '{name}'")
+
+    psi = [g * plane * s for s in spinor]
+    phi = np.zeros((size, size, size, 4), dtype=np.float32)
+    chi = np.zeros((size, size, size, 4), dtype=np.float32)
+    phi[..., 0] = psi[0].real;  phi[..., 1] = psi[0].imag
+    phi[..., 2] = psi[1].real;  phi[..., 3] = psi[1].imag
+    chi[..., 0] = psi[2].real;  chi[..., 1] = psi[2].imag
+    chi[..., 2] = psi[3].real;  chi[..., 3] = psi[3].imag
+    norm = np.sqrt((phi**2).sum() + (chi**2).sum())
+    if norm > 0:
+        phi /= norm; chi /= norm
+    return phi, chi
+
+
+def init_dirac_wavepacket(size, rng):
+    """Dirac equation: Gaussian wavepacket at rest, spin-up,
+    positive-energy free-particle spinor. Should remain stationary
+    apart from natural Schrödinger-like dispersion (broadening) and
+    a small zitterbewegung tremble at order m/E from the envelope's
+    momentum-space spread."""
+    return _dirac_primitives('wavepacket_rest', size)[0]
+
+
+def init_dirac_moving_wavepacket(size, rng):
+    """Dirac equation: Gaussian wavepacket with momentum kick
+    k_x = 4·2π/L, spin-up, positive-energy. Translates ballistically
+    across the box at the corresponding group velocity v = pc²/E,
+    spreading over time as a relativistic free particle."""
+    return _dirac_primitives('wavepacket_moving', size)[0]
+
+
+def init_dirac_collision(size, rng):
+    """Dirac equation: two counter-propagating wavepackets meeting
+    at the cube centre. Their interference at the meeting point
+    visualises the spinor character of the wavefunction —
+    interference fringes appear in some channels and disappear in
+    others depending on relative spin alignment."""
+    return _dirac_primitives('wavepacket_collision', size)[0]
+
+
 def init_smallworld_random(size, rng):
     """Small-world CA: uniformly-random binary seed at ~30% live density.
     The standard initial condition for a 3D B/S CA — gives the rule
@@ -20385,6 +20752,9 @@ INIT_FUNCS = {
     'euler_kelvin_helmholtz': init_euler_kelvin_helmholtz,
     'smallworld_random': init_smallworld_random,
     'smallworld_blob':   init_smallworld_blob,
+    'dirac_wavepacket':         init_dirac_wavepacket,
+    'dirac_moving_wavepacket':  init_dirac_moving_wavepacket,
+    'dirac_collision':          init_dirac_collision,
     # 2026-05 additions
     'sandpile_uniform': init_sandpile_uniform,
     'sandpile_critical': init_sandpile_critical,
@@ -23083,6 +23453,20 @@ class Simulator:
                 kind = 'blast'
             rho, vel, p = _euler_primitives(kind, self.size)
             return _euler_pair2_from_primitives(rho, vel, p)
+        if init_name == 'dirac_pair2_auto':
+            # Dirac χ (lower bispinor) packed by the same primitive
+            # builder used for φ, so the full 4-spinor is consistent
+            # at t=0. Mirrors `_active_init_name` exactly so the
+            # variant cycler doesn't desync the two pairs.
+            current = getattr(self, '_current_init', None) \
+                      or self.preset.get('init', 'dirac_wavepacket')
+            kind = current[len('dirac_'):] if current.startswith('dirac_') else 'wavepacket'
+            mapping = {'wavepacket':         'wavepacket_rest',
+                       'moving_wavepacket':  'wavepacket_moving',
+                       'collision':          'wavepacket_collision'}
+            primname = mapping.get(kind, 'wavepacket_rest')
+            phi, chi = _dirac_primitives(primname, self.size)
+            return chi
         if isinstance(init_name, str) and init_name.startswith('mesh:'):
             return init_mesh_from_spec(init_name, self.size,
                                        np.random.RandomState(self.seed))
