@@ -24960,8 +24960,24 @@ class Simulator:
                     self.compute_progs[pass_idx].run(groups, 1, 1)
             else:
                 # ── Block-sparse vs dense voxel dispatch ──
-                if (self.preset.get('sparse_dispatch', False)
-                        and self._sparse_supported()
+                # Use the COMPILED eligibility (baked into the shader at
+                # _compile_pass time) — not the live _sparse_supported()
+                # check — to decide dispatch. Otherwise a param change
+                # that flips eligibility but hasn't yet triggered a
+                # recompile produces a shader/dispatch mismatch: shader
+                # text-rewritten to read workgroup coords from the sparse
+                # SSBO, but dispatcher uses dense indices → reads garbage
+                # → "tiny rectangular prism near origin" pathology.
+                # Recompile-on-flip is wired into _reset() and slider
+                # hooks; this guarantees correctness even if a future
+                # param-write path forgets to trigger one.
+                _compiled_sparse = getattr(
+                    self, '_sparse_compiled_eligible', None)
+                if _compiled_sparse is None:
+                    _compiled_sparse = (
+                        self.preset.get('sparse_dispatch', False)
+                        and self._sparse_supported())
+                if (_compiled_sparse
                         and getattr(self, 'sparse_dispatch_enabled', True)):
                     # Build active-block list from current sim state, then
                     # indirect-dispatch over the compact list. The shader
@@ -25102,6 +25118,12 @@ class Simulator:
         self._cull_valid = False
         self._accel_textures_valid = False
         self.step_count = 0
+        # Sparse-dispatch eligibility can flip when params change via any
+        # path that bypasses the slider hooks (randomize, mutate, load
+        # discovery, load state). The slider path already recompiles
+        # eagerly; this catches everything else. Cheap no-op when the
+        # compiled state already matches.
+        self._maybe_recompile_for_sparse_flip()
         # For viewport rules, rewind the zoom animation but keep the user's
         # chosen origin (the viewing target). No noise init is meaningful.
         if self._is_viewport_kind():
