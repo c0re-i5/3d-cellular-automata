@@ -15802,9 +15802,14 @@ RULE_PRESETS = {
     "causal_ca": {
         "label": "Causal Light Cones",
         "shader": "causal_ca",
-        "params": {"Pulse rate": 0.6, "Decay": 0.02, "Echo": 0.85, "Threshold": 0.02},
+        # Decay=0 + low threshold lets the wavefront propagate the full
+        # diameter of the world before the (1/6 per neighbour) numerical
+        # attenuation drops it below the arrival-latch threshold.
+        # Earlier defaults (Decay=0.02, Threshold=0.02) caused the wave
+        # to die out within ~5 cells of each source.
+        "params": {"Pulse rate": 0.6, "Decay": 0.0, "Echo": 0.85, "Threshold": 0.001},
         "param_ranges": {"Pulse rate": (0.05, 2.0), "Decay": (0.0, 0.3),
-                         "Echo": (0.0, 0.99), "Threshold": (0.001, 0.2)},
+                         "Echo": (0.0, 0.99), "Threshold": (0.0005, 0.2)},
         "dt": 1.0,
         "dt_range": (1.0, 1.0),
         "init": "causal_two_sources",

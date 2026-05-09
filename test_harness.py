@@ -633,6 +633,7 @@ class HeadlessRunner:
 
         # Rule-type-aware measurement config
         shader = self.preset['shader']
+        is_agent_rule = self.preset.get('agent_count', 0) > 0
         if self.is_element_ca:
             self.measure_channel = 0
             self.measure_mode = 'element'  # non-vacuum = alive
@@ -690,7 +691,12 @@ class HeadlessRunner:
         elif shader == 'kuramoto_3d':
             self.measure_channel = 0  # phase [0,1]
             self.measure_mode = 'phase_coherence'  # alive = domain boundary cells
-            self.alive_threshold = 0.35  # boundary cells: high local phase incoherence
+            # 0.35 was too strict — only the very cores of phase
+            # singularities registered, and a near-synchronized field
+            # (the actual healthy outcome of Kuramoto coupling) read as
+            # 'dead'. 0.15 captures the broader domain-boundary skin
+            # while still excluding the synchronized bulk.
+            self.alive_threshold = 0.15
             self.change_threshold = 0.02  # continuous field
         elif shader == 'flocking_3d':
             self.measure_channel = 0  # density rho
@@ -986,6 +992,38 @@ class HeadlessRunner:
             self.measure_mode = 'continuous'
             self.alive_threshold = 0.001
             self.change_threshold = 0.0005
+        elif shader == 'causal_ca':
+            # Measure the cumulative 'arrival' channel (ch1), which
+            # latches the frame-of-first-illumination for every cell
+            # the light cone has reached. This grows monotonically with
+            # time, so a near-zero late-step alive ratio means the
+            # wavefront stalled — exactly the failure mode we want to
+            # catch. The wavefront channel (ch0) is too transient to
+            # measure stably.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.0005
+            self.change_threshold = 0.0001
+        elif shader in ('pp_lattice_move', 'pp_lattice_repro'):
+            # 4-state lattice (0=empty, 0.25=food, 0.5=prey, 0.75=pred).
+            # The discrete>0.5 default only catches prey+pred; we want
+            # to count any non-empty cell so the food-saturated
+            # carrying capacity also reads alive.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.05
+        elif is_agent_rule:
+            # Agent-driven rule with a non-trivial voxel shader (e.g.
+            # smugglers_3d). The grid carries sparse trails / stashes
+            # / contamination written by agents in the SSBO, so the
+            # alive ratio is naturally low even when the simulation is
+            # working. Use a permissive non-zero threshold to count
+            # the agent-touched voxels.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.01
+            self.change_threshold = 0.005
         else:
             # Discrete CAs (game_of_life_3d)
             self.measure_channel = 0
