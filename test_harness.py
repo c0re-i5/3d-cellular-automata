@@ -1960,6 +1960,33 @@ def score_interestingness(metric_history):
     if late_activity < 0.0001:
         return max(0.15, 0.35 * min(peak_activity * 3, 1.0))
 
+    # Static-cluster penalty: a non-trivial alive population whose count
+    # has stopped changing AND whose per-step activity has decayed below
+    # the discrete activity sweet-spot (~0.01) is a still-life lump.
+    # This catches the "rectangular prism" failure mode where a
+    # localized init (game_of_life_centered, life_fbm_*) settles into a
+    # stable cluster that occupies a chunk of the volume — the alive
+    # bell-curve, surface bell-curve and activity bell-curve all award
+    # high partial credit, but the run is visually frozen.
+    #
+    # Detection criteria (all must hold):
+    #   * non-trivial population: repr_alive > 0.01
+    #   * activity has decayed: late_activity < mean_activity / 4
+    #     (rules out steady-state PDEs which have late ≈ mean)
+    #   * activity is well below the discrete sweet spot: late < 0.001
+    #   * alive count has stopped changing: alive_std < 0.01
+    #     (rules out wavefront / reaction-diffusion dynamics with low
+    #     per-step pixel activity but global redistribution)
+    if (repr_alive > 0.01
+            and not continuous_field
+            and mean_activity > 0
+            and late_activity < mean_activity * 0.25
+            and late_activity < 0.001
+            and alive_std < 0.01):
+        # Partial credit scaled by peak activity (gives credit for
+        # transient evolution that produced an interesting endpoint).
+        return max(0.18, 0.40 * min(peak_activity * 3, 1.0))
+
     score = 0.0
 
     # Alive ratio: smooth bell curve using repr_alive (best of median/final).
