@@ -944,6 +944,45 @@ class HeadlessRunner:
             self.measure_mode = 'deviation'
             self.alive_threshold = 0.1
             self.change_threshold = 0.005
+        elif shader in ('dirac_3d_phi', 'dirac_3d_chi'):
+            # 4-component spinor; values are signed and small (~0.1
+            # peak for a Gaussian wavepacket). The discrete default
+            # (alive_threshold=0.5) marks every cell dead. Use 'wave'
+            # mode (abs-of-value) on the upper-real component, which
+            # carries most of the probability mass for the default
+            # init_variants.
+            self.measure_channel = 0
+            self.measure_mode = 'wave'
+            self.alive_threshold = 0.005
+            self.change_threshold = 0.001
+        elif shader == 'lenia_multi_3d':
+            # Multi-channel Lenia: continuous density fields per
+            # channel, range ~[0, 1]. Same measurement profile as
+            # single-channel lenia_3d.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.005
+        elif shader == 'smoke_wind_3d':
+            # Compressible smoke transport: density field ρ ≥ 0 with
+            # a buoyant source. Catch the rising plume as deviation
+            # from the quiescent baseline.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.005
+        elif shader == 'noop':
+            # Agent-only rule whose state lives in the SSBO, not the
+            # voxel grid (e.g. wandering_voxels_3d). The grid stays
+            # mostly empty by design — the action is in the agents.
+            # Use a permissive threshold so the few cells the agents
+            # touch register as alive instead of being mis-flagged
+            # 'dead'. This is a coarse approximation; the ideal fix
+            # is to surface agent-population metrics here.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.001
+            self.change_threshold = 0.0005
         else:
             # Discrete CAs (game_of_life_3d)
             self.measure_channel = 0
