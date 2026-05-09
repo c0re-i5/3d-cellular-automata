@@ -14401,12 +14401,19 @@ RULE_PRESETS = {
     "lenia_multi": {
         "label": "Multi-channel Lenia",
         "shader": "lenia_multi_3d",
-        "params": {"Growth center": 0.14, "Growth width": 0.025,
+        "params": {"Growth center": 0.14, "Growth width": 0.045,
                    "Kernel radius": 4.0, "Cross coupling": 0.5},
         "param_ranges": {"Growth center": (0.02, 0.5), "Growth width": (0.003, 0.12),
                          "Kernel radius": (1.5, 6.0), "Cross coupling": (0.0, 2.0)},
         "dt": 0.05,
         "dt_range": (0.01, 0.3),
+        # Multi-channel Lenia needs a large enough world for the
+        # cross-channel kernel to find structured signal. At size < ~64
+        # the FBM init's spectrum doesn't have the wavelengths the
+        # kernel selects for, and the population dies. 80 is the
+        # minimum that produces self-sustaining structure for the
+        # kernel-radius=4 default.
+        "default_size": 80,
         # FBM per-channel init fills the previously-empty regions with
         # sub-threshold activity so cross-channel coupling has signal to
         # work with everywhere, eliminating the "holes with no voxels"
@@ -15902,8 +15909,8 @@ RULE_PRESETS = {
         ],
         "extra_fields": 1,
         "field2_init": "zero",
-        "params": {"Disorder A": 0.3, "Elastic K": 0.4, "Mobility Γ": 0.4, "Activity ζ": 0.3},
-        "param_ranges": {"Disorder A": (0.0, 1.0), "Elastic K": (0.0, 1.0),
+        "params": {"Disorder A": -0.3, "Elastic K": 0.4, "Mobility Γ": 0.4, "Activity ζ": 0.3},
+        "param_ranges": {"Disorder A": (-1.0, 1.0), "Elastic K": (0.0, 1.0),
                          "Mobility Γ": (0.05, 1.0), "Activity ζ": (-1.0, 1.0)},
         "dt": 0.2,
         "dt_range": (0.05, 0.5),
@@ -16103,7 +16110,7 @@ RULE_PRESETS = {
     "prisoners_dilemma_3d": {
         "label": "3D Spatial Prisoner's Dilemma",
         "shader": "prisoners_dilemma_3d",
-        "params": {"Temptation b": 1.85, "Mutation": 0.001,
+        "params": {"Temptation b": 1.70, "Mutation": 0.001,
                    "Tie keep": 1.0, "Exclude self": 0.0},
         "param_ranges": {"Temptation b": (1.0, 2.5), "Mutation": (0.0, 0.05),
                          "Tie keep": (0.0, 1.0), "Exclude self": (0.0, 1.0)},
@@ -16113,10 +16120,13 @@ RULE_PRESETS = {
         "description": ("Nowak–May spatial PD on a 3D Moore-26 lattice. Each "
                         "round, every cell scores against its neighbours under "
                         "the (1, b, 0, 0) payoff matrix and adopts the strategy "
-                        "of its highest-scoring local neighbour. At b ≈ 1.85 the "
-                        "boundary between cooperators and defectors becomes "
-                        "spatio-temporally chaotic — cooperation persists in the "
-                        "face of greedy invasion."),
+                        "of its highest-scoring local neighbour. The Moore-26 "
+                        "neighbourhood is much harsher than the 2D Moore-8 case "
+                        "(each defector preys on 26 neighbours), so the "
+                        "chaotic-coexistence regime sits around b ≈ 1.65–1.75 "
+                        "rather than the classic 2D value of 1.85. Cooperation "
+                        "persists in the face of greedy invasion as a "
+                        "spatio-temporally chaotic frontier."),
         "vis_channels": ["Strategy", "Score", "Coop fraction", "Changed"],
         "vis_default": 0,
         "vis_abs": False,

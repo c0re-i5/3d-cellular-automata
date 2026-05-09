@@ -496,7 +496,10 @@ void main() {
             vec4 prev = imageLoad(u_prev, pos);
             bool changed = abs(v - prev[u_channel]) > u_change_thr;
             if (u_is_element != 0 && !changed) {
-                changed = abs(cur.y - prev.y) > 1.0;
+                // Temperature shimmer from heat diffusion is sub-degree
+                // every step at high baseline temperatures; only count
+                // genuinely large swings (melting/reaction fronts).
+                changed = abs(cur.y - prev.y) > 25.0;
             }
             if (changed) atomicAdd(s_activity, 1u);
         }
@@ -1810,8 +1813,12 @@ def compute_metrics(grid, prev_grid, runner):
         prev_ch = prev_grid[:, :, :, runner.measure_channel]
         changed = np.abs(ch - prev_ch) > runner.change_threshold
         if mode == 'element':
-            # Also count temperature changes as activity
-            temp_changed = np.abs(grid[:, :, :, 1] - prev_grid[:, :, :, 1]) > 1.0
+            # Also count temperature changes as activity, but only
+            # genuinely large swings — at high baseline temperatures
+            # heat diffusion produces sub-degree shimmer in every cell
+            # every step. A 25 K threshold ignores that diffusion noise
+            # while still catching melting/reaction fronts.
+            temp_changed = np.abs(grid[:, :, :, 1] - prev_grid[:, :, :, 1]) > 25.0
             changed = changed | temp_changed
         activity = changed.sum() / total
 
