@@ -7243,6 +7243,120 @@ void main() {
 }
 """,
 
+    "smallworld_ca_3d": """
+// ── 3D Small-World cellular automaton ────────────────────────────────
+// A binary outer-totalistic CA on a 3D lattice whose 6-face adjacency
+// has been Watts-Strogatz-rewired: every face edge of every cell is,
+// with a fixed probability `u_rewire` (param 0), statically remapped
+// to a uniformly random voxel anywhere in the cube. The remapping is
+// computed from a position+edge-index hash, so the rewired graph is
+// QUENCHED — fixed for the lifetime of the run, not regenerated each
+// frame. This makes the rule a faithful CA on a small-world graph
+// rather than a noisy lattice CA.
+//
+// At u_rewire = 0 the dynamics reduce to a regular 3D-life-style CA
+// (B/S thresholds set by params 1..3 below). At u_rewire = 1 the
+// neighbourhood is fully random — equivalent to a directed Erdős-
+// Rényi graph CA where spatial structure cannot persist. Between
+// the two extremes the rule explores the small-world regime where
+// patterns retain local clustering but inherit shortcut-driven
+// global mixing — visually, stable lattice oscillators turn into
+// fluid blobs that swap mass across the cube.
+//
+// State: channel R holds the binary state (0/1, soft floor below
+// 0.5 = dead). Channel B traces the per-cell rewire activity (the
+// sum of remote-neighbour reads that returned alive) so the volume
+// renderer can colour the small-world activity overlay separately
+// from the lattice-local pattern.
+//
+// u_param0 = rewire probability p in [0, 1]
+// u_param1 = birth lower count   (e.g. 5)  — alive neighbours needed
+// u_param2 = survive lower count (e.g. 4)
+// u_param3 = survive upper count (e.g. 7)
+// (cells outside [survive_lo, survive_hi] die; cells with exactly
+// `birth_lo` alive neighbours come to life — a compact 3D B/S rule.)
+
+// 1-D integer hash helper. Returns a uniform-ish uint from a 4-tuple
+// of position+edge-index inputs. Used both to decide whether to
+// rewire each edge AND to pick the random target voxel.
+uint sw_hash(int x, int y, int z, int k) {
+    uint h = uint(x) * 374761393u + uint(y) * 668265263u
+           + uint(z) * 2147483647u + uint(k) * 1971011u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return h;
+}
+
+ivec3 sw_random_voxel(ivec3 pos, int edge_idx) {
+    uint h = sw_hash(pos.x, pos.y, pos.z, edge_idx);
+    int sz = u_size;
+    return ivec3(int(h % uint(sz)),
+                 int((h / uint(sz)) % uint(sz)),
+                 int((h / uint(sz * sz)) % uint(sz)));
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float p_rew = clamp(u_param0, 0.0, 1.0);
+    int birth_lo = int(round(u_param1));
+    int surv_lo  = int(round(u_param2));
+    int surv_hi  = int(round(u_param3));
+
+    int alive_count = 0;
+    int rewired_alive = 0;     // diagnostic: how many ALIVE neighbours
+                               // arrived via shortcuts.
+
+    // Iterate the 6 face neighbours. `edge_idx` 0..5 indexes into the
+    // hash so each (cell, neighbour) pair gets its own deterministic
+    // rewire decision and remap target.
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int side = -1; side <= 1; side += 2) {
+            int edge_idx = axis * 2 + (side > 0 ? 1 : 0);
+
+            // Per-edge rewire roll. Cast hash to a [0,1) float so we
+            // can compare against p_rew directly. We seed with
+            // edge_idx + 1024 to keep this draw independent of the
+            // remap-target draw using edge_idx + 0.
+            uint hroll = sw_hash(pos.x, pos.y, pos.z, edge_idx + 1024);
+            float roll = float(hroll & 0xFFFFFFu) / float(0x1000000u);
+
+            ivec3 q;
+            bool is_rewired = roll < p_rew;
+            if (is_rewired) {
+                q = sw_random_voxel(pos, edge_idx);
+            } else {
+                ivec3 step_v = ivec3(0); step_v[axis] = side;
+                q = pos + step_v;
+            }
+
+            // Boundary handling reuses the standard fetch() helper for
+            // the LATTICE neighbours and just clamps for the rewired
+            // remote ones (which we generated in-bounds anyway).
+            int n = (fetch(q).r > 0.5) ? 1 : 0;
+            alive_count   += n;
+            if (is_rewired) rewired_alive += n;
+        }
+    }
+
+    bool was_alive = fetch(pos).r > 0.5;
+    bool will_live;
+    if (was_alive) {
+        will_live = (alive_count >= surv_lo) && (alive_count <= surv_hi);
+    } else {
+        will_live = (alive_count == birth_lo);
+    }
+
+    // Pack new state in R; rewired-alive count (0..6) → [0,1] in B for
+    // diagnostic visualisation. The renderer can pick channel 0 for
+    // the lattice picture or channel 2 for the small-world overlay.
+    float r_new = will_live ? 1.0 : 0.0;
+    float trace = float(rewired_alive) / 6.0;
+    imageStore(u_dst, pos, vec4(r_new, 0.0, trace, 0.0));
+}
+""",
+
     # ── Smoke / vapor variants of stable_fluids ────────────────────────
     # These three shaders are drop-in replacements for the FIRST pass of
     # the smoke pipeline.  div / jacobi / project are reused unchanged.
@@ -15044,6 +15158,49 @@ RULE_PRESETS = {
         "boundary": "wrap",
     },
 
+    "smallworld_ca_3d": {
+        "label": "3D Small-World CA",
+        "shader": "smallworld_ca_3d",
+        # Single-pass binary CA on a Watts-Strogatz-rewired 3D lattice.
+        # Channel R = state, B = per-cell rewire activity trace.
+        "params": {"Rewire p": 0.0, "Birth": 3.0, "Surv lo": 2.0, "Surv hi": 3.0},
+        # Birth/Surv params are integer counts in [0, 6] (we have 6
+        # face neighbours). The slider exposes them as floats; the
+        # shader rounds. Rewire probability slides 0..1 to span the
+        # full lattice → small-world → random-graph transition.
+        "param_ranges": {"Rewire p": (0.0, 1.0),
+                         "Birth":    (0.0, 6.0),
+                         "Surv lo":  (0.0, 6.0),
+                         "Surv hi":  (0.0, 6.0)},
+        "default_size": 96,
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),       # Discrete CA — dt is logical step count.
+        "init": "smallworld_random",
+        "init_variants": ["smallworld_random", "smallworld_blob"],
+        "description": ("Outer-totalistic binary CA on a Watts-Strogatz "
+                        "small-world graph: each face edge of every "
+                        "voxel has a fixed independent probability "
+                        "p_rewire of being statically remapped to a "
+                        "uniformly random voxel anywhere in the cube. "
+                        "The remapping is determined by a positional "
+                        "hash, so the rewired graph is QUENCHED — the "
+                        "same shortcuts persist for the lifetime of "
+                        "the run. p=0 recovers a regular 3D B/S "
+                        "lifelike CA; p=1 collapses the spatial "
+                        "structure into a random-graph CA. The "
+                        "intermediate regime exhibits the classical "
+                        "small-world phenomenology: local clustering "
+                        "with global mixing through long-range "
+                        "shortcuts."),
+        "vis_channels": ["State", "_", "Rewire trace", "_"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "voxel_filter": "nearest",
+        "vis_range": (0.0, 1.0),
+        "boundary": "wrap",
+    },
+
     "smoke_wind_3d": {
         "label": "3D Smoke (Wind-Blown)",
         "shader": "smoke_wind_3d",
@@ -19335,6 +19492,40 @@ def _euler_pair2_from_primitives(rho, vel, p, gamma=1.4):
     return np.stack([E, p, speed, np.zeros_like(E)], axis=-1).astype(np.float32)
 
 
+def init_smallworld_random(size, rng):
+    """Small-world CA: uniformly-random binary seed at ~30% live density.
+    The standard initial condition for a 3D B/S CA — gives the rule
+    enough alive cells to immediately exercise both the lattice
+    update path AND (under non-zero rewire) the shortcut neighbour
+    reads, without overwhelming any reasonable B/S threshold."""
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    if hasattr(rng, 'random') and not isinstance(rng, np.random.RandomState):
+        r = rng.random((size, size, size), dtype=np.float32)
+    else:
+        r = rng.random_sample((size, size, size)).astype(np.float32)
+    arr[..., 0] = (r < 0.30).astype(np.float32)
+    return arr
+
+
+def init_smallworld_blob(size, rng):
+    """Small-world CA: dense central blob in an otherwise empty cube.
+    Useful for visualising how a localised cluster either bleeds out
+    spatially (low rewire) or instantly teleports to scattered
+    voxels across the volume (high rewire)."""
+    arr = np.zeros((size, size, size, 4), dtype=np.float32)
+    cx = cy = cz = size // 2
+    radius = max(2, size // 8)
+    xs, ys, zs = np.indices((size, size, size))
+    mask = ((xs - cx) ** 2 + (ys - cy) ** 2 + (zs - cz) ** 2) <= radius ** 2
+    n = int(mask.sum())
+    if hasattr(rng, 'random') and not isinstance(rng, np.random.RandomState):
+        r = rng.random(n, dtype=np.float32)
+    else:
+        r = rng.random_sample(n).astype(np.float32)
+    arr[..., 0][mask] = (r < 0.55).astype(np.float32)
+    return arr
+
+
 def init_euler_blast(size, rng):
     """Compressible Euler — Sedov-style 3D blast wave. A small
     high-pressure / high-density sphere at the centre of a uniform
@@ -20192,6 +20383,8 @@ INIT_FUNCS = {
     'euler_blast': init_euler_blast,
     'euler_shocktube': init_euler_shocktube,
     'euler_kelvin_helmholtz': init_euler_kelvin_helmholtz,
+    'smallworld_random': init_smallworld_random,
+    'smallworld_blob':   init_smallworld_blob,
     # 2026-05 additions
     'sandpile_uniform': init_sandpile_uniform,
     'sandpile_critical': init_sandpile_critical,
