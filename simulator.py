@@ -7031,6 +7031,218 @@ void main() {
 }
 """,
 
+    "compressible_euler_3d": """
+// ── 3D Compressible Euler equations (ideal gas, γ=1.4) ──────────────
+// Hyperbolic conservation law with five conserved quantities:
+//     ∂ρ/∂t       + ∂(ρu_j)/∂x_j               = 0   (mass)
+//     ∂(ρu_i)/∂t  + ∂(ρu_i u_j + p δ_ij)/∂x_j  = 0   (momentum, 3 eqns)
+//     ∂E/∂t       + ∂((E+p) u_j)/∂x_j          = 0   (total energy)
+// closed by the ideal-gas equation of state
+//     p = (γ-1) (E − ½ ρ |u|²)
+//
+// This single dispatch writes BOTH texture pairs (declared via
+// "writes": ["p1", "p2"]) so the conserved 5-vector U is updated in
+// one go using only old-state reads. Channel layout:
+//     pair 1 (visible):  R=ρ,    G=ρu_x, B=ρu_y, A=ρu_z
+//     pair 2 (auxiliary): R=E,   G=p,    B=|u|,  A=ω·u (helicity)
+// The two auxiliary channels are diagnostics for visualisation; only
+// E enters the next step's flux computation.
+//
+// Numerics: 6-face Lax-Friedrichs flux. Robust (TVD on monotone data),
+// dissipative enough to capture shocks without spurious oscillations,
+// but smears contact discontinuities. CFL bound:
+//     dt · max(|u| + c) / Δx  ≤  1     (with Δx = 1 cell)
+// where c = sqrt(γp/ρ) is the local sound speed. The shader caps
+// in-cell pressure and density at small positive floors to keep the
+// EOS well-defined under the inevitable numerical noise near vacuum.
+//
+// u_param0 = γ (heat ratio; 1.4 air, 1.67 monatomic, 1.1 near-iso)
+// u_param1 = artificial viscosity coefficient (0..1) — extra LF damping
+//            on velocity gradients. Set 0 for clean shocks, raise to
+//            tame KH instabilities.
+// u_param2 = body-force gravity g (in -z direction)
+// u_param3 = source amplitude (small density/pressure injector at
+//            the centre — set 0 for inert evolution after init)
+//
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+// Floors keep the EOS well-defined when shocks momentarily push values
+// toward vacuum (density) or unphysical states (negative pressure).
+const float RHO_FLOOR = 1e-4;
+const float P_FLOOR   = 1e-4;
+const float E_FLOOR   = 1e-4;
+
+// Pressure from conserved (ρ, ρu, E) under ideal-gas EOS.
+float pressure_of(float rho, vec3 mom, float E, float gamma) {
+    float ke = 0.5 * dot(mom, mom) / max(rho, RHO_FLOOR);
+    return max((gamma - 1.0) * (E - ke), P_FLOOR);
+}
+
+// Pack (ρ, ρu, E) at a neighbour cell from the two source images.
+struct State { float rho; vec3 mom; float E; float p; float c; };
+
+State load_state(ivec3 q, float gamma) {
+    vec4 a = fetch(q);                    // pair 1: ρ, ρu_x, ρu_y, ρu_z
+    vec4 b = fetch2(q);                   // pair 2: E, p_old, |u|, helicity
+    State s;
+    s.rho = max(a.r, RHO_FLOOR);
+    s.mom = a.gba;
+    s.E   = max(b.r, E_FLOOR);
+    s.p   = pressure_of(s.rho, s.mom, s.E, gamma);
+    s.c   = sqrt(max(gamma * s.p / s.rho, 0.0));
+    return s;
+}
+
+// Flux vector projected onto axis `axis` (0=x, 1=y, 2=z). Returns the
+// (5-component) flux as a (vec4 mass+momentum, float energy) pair.
+void flux_axis(in State s, int axis, out vec4 Fcons, out float Fenergy) {
+    float u_n = s.mom[axis] / s.rho;
+    Fcons.x   = s.mom[axis];                        // ρ·u_n
+    Fcons.yzw = s.mom * u_n;                        // ρu_i · u_n
+    Fcons[axis + 1] += s.p;                         // + p δ_in (momentum-axis term)
+    Fenergy = (s.E + s.p) * u_n;                    // (E+p) u_n
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float gamma   = clamp(u_param0, 1.05, 2.0);
+    float art_visc = max(u_param1, 0.0);
+    float gravity  = u_param2;
+    float source_amp = u_param3;
+
+    State Sc = load_state(pos, gamma);
+
+    // Update accumulators in conservative form U_new = U_old - dt · ∇·F.
+    // We sum (F_left - F_right) across the three axes; for a unit-spaced
+    // grid this is exactly the divergence of the flux.
+    vec4  dU_cons   = vec4(0.0);
+    float dU_energy = 0.0;
+
+    // 3 axes × 2 sides each.
+    for (int axis = 0; axis < 3; ++axis) {
+        ivec3 step_v = ivec3(0); step_v[axis] = 1;
+        for (int side = -1; side <= 1; side += 2) {
+            ivec3 q = pos + side * step_v;
+            State Sn = load_state(q, gamma);
+
+            // Lax-Friedrichs face flux between centre cell (Sc) and
+            // neighbour (Sn), evaluated at the cell-face midpoint.
+            // F_LF = 0.5·(F_L + F_R) − 0.5·α·(U_R − U_L)
+            //   α = max( |u_L·n̂| + c_L,  |u_R·n̂| + c_R )
+            //   sign convention: side = +1 means the neighbour is at
+            //   the +axis face; "L" is the upwind cell.
+            State SL = (side > 0) ? Sc : Sn;
+            State SR = (side > 0) ? Sn : Sc;
+
+            float uL_n = SL.mom[axis] / SL.rho;
+            float uR_n = SR.mom[axis] / SR.rho;
+            float alpha = max(abs(uL_n) + SL.c, abs(uR_n) + SR.c);
+            // Optional artificial viscosity: bump α so KH/RT roll-ups
+            // don't go grid-resolved and ring; bias it by the local
+            // velocity-gradient magnitude so quiet regions stay clean.
+            float du_grad = abs(uR_n - uL_n);
+            alpha += art_visc * du_grad;
+
+            vec4  FL_cons; float FL_energy;
+            vec4  FR_cons; float FR_energy;
+            flux_axis(SL, axis, FL_cons, FL_energy);
+            flux_axis(SR, axis, FR_cons, FR_energy);
+
+            vec4  F_cons   = 0.5 * (FL_cons   + FR_cons)
+                           - 0.5 * alpha * (vec4(SR.rho, SR.mom) - vec4(SL.rho, SL.mom));
+            float F_energy = 0.5 * (FL_energy + FR_energy)
+                           - 0.5 * alpha * (SR.E - SL.E);
+
+            // The flux ENTERING the cell from its `side` face contributes
+            // with sign −side: outflow at +side reduces U, outflow at -side
+            // (which is +side from the neighbour's perspective) too.
+            dU_cons   += float(-side) * F_cons;
+            dU_energy += float(-side) * F_energy;
+        }
+    }
+
+    // Body force: gravity acts on momentum (z) and energy (work term).
+    if (gravity != 0.0) {
+        dU_cons.w   -= gravity * Sc.rho;            // momentum_z source
+        dU_energy   -= gravity * Sc.mom.z;          // ρ u_z g
+    }
+
+    // Optional small-source injector at the cube centre (kept in the
+    // shader so presets can drive an "exhaust" without a custom shader).
+    if (source_amp > 0.0) {
+        vec3 c = vec3(u_size) * 0.5;
+        vec3 d = (vec3(pos) + 0.5) - c;
+        float r2 = dot(d, d);
+        float falloff = exp(-r2 / pow(float(u_size) * 0.06, 2.0));
+        dU_cons.x   += source_amp * falloff;            // density injection
+        dU_energy   += source_amp * 2.0 * falloff;      // proportional energy
+    }
+
+    // Forward-Euler conservative update with CFL-bounded dt. The caller
+    // is responsible for choosing u_dt small enough; we additionally
+    // clamp the step so it cannot drive density negative even on a
+    // grossly oversized step.
+    vec4  U_old   = vec4(Sc.rho, Sc.mom);
+    float E_old   = Sc.E;
+    vec4  U_new   = U_old + u_dt * dU_cons;
+    float E_new   = E_old + u_dt * dU_energy;
+
+    // Hard floors — outside the EOS validity domain we substitute the
+    // floor and zero the local momentum (a regularising "vacuum patch").
+    if (U_new.x < RHO_FLOOR) {
+        U_new = vec4(RHO_FLOOR, 0.0, 0.0, 0.0);
+        E_new = E_FLOOR;
+    }
+    // Energy floor: E must satisfy E ≥ ½ρ|u|² + P_FLOOR/(γ-1) so that the
+    // ideal-gas EOS yields a non-negative pressure. Lax-Friedrichs can
+    // overshoot energy fluxes near strong shocks; without this floor a
+    // single negative-pressure cell sets c=NaN and the next step
+    // propagates the NaN globally in one dispatch.
+    float E_min = 0.5 * dot(U_new.yzw, U_new.yzw) / max(U_new.x, RHO_FLOOR)
+                + P_FLOOR / (gamma - 1.0);
+    E_new = max(E_new, E_min);
+
+    // Diagnostics for pair 2 visualisation: pressure (G), |u| (B), and
+    // a cheap helicity proxy ω·u (A) computed on the OLD state so the
+    // numbers correspond to the cell we just stepped FROM.
+    float p_new = pressure_of(U_new.x, U_new.yzw, E_new, gamma);
+    float u_mag = length(U_new.yzw) / max(U_new.x, RHO_FLOOR);
+
+    vec3 vp = fetch(pos + ivec3( 1, 0, 0)).gba / max(fetch(pos + ivec3( 1, 0, 0)).r, RHO_FLOOR);
+    vec3 vm = fetch(pos + ivec3(-1, 0, 0)).gba / max(fetch(pos + ivec3(-1, 0, 0)).r, RHO_FLOOR);
+    vec3 vyp = fetch(pos + ivec3( 0, 1, 0)).gba / max(fetch(pos + ivec3( 0, 1, 0)).r, RHO_FLOOR);
+    vec3 vym = fetch(pos + ivec3( 0,-1, 0)).gba / max(fetch(pos + ivec3( 0,-1, 0)).r, RHO_FLOOR);
+    vec3 vzp = fetch(pos + ivec3( 0, 0, 1)).gba / max(fetch(pos + ivec3( 0, 0, 1)).r, RHO_FLOOR);
+    vec3 vzm = fetch(pos + ivec3( 0, 0,-1)).gba / max(fetch(pos + ivec3( 0, 0,-1)).r, RHO_FLOOR);
+    vec3 omega = 0.5 * vec3(
+        (vyp.z - vym.z) - (vzp.y - vzm.y),
+        (vzp.x - vzm.x) - (vp.z  - vm.z ),
+        (vp.y  - vm.y ) - (vyp.x - vym.x));
+    vec3 u_new = U_new.yzw / max(U_new.x, RHO_FLOOR);
+    float helicity = dot(omega, u_new);
+
+    imageStore(u_dst,  pos, U_new);
+    imageStore(u_dst2, pos, vec4(E_new, p_new, u_mag, helicity));
+}
+""",
+
     # ── Smoke / vapor variants of stable_fluids ────────────────────────
     # These three shaders are drop-in replacements for the FIRST pass of
     # the smoke pipeline.  div / jacobi / project are reused unchanged.
@@ -14789,6 +15001,49 @@ RULE_PRESETS = {
         "boundary": "clamped",
     },
 
+    "compressible_euler_3d": {
+        "label": "3D Compressible Euler (Blast)",
+        "shader": "compressible_euler_3d",
+        # Single-dispatch update of all five conserved variables.
+        # `writes: ["p1", "p2"]` causes both texture pairs to ping-pong
+        # in lockstep, so the shader's reads from u_src/u_src2 see a
+        # consistent old state and the writes to u_dst/u_dst2 land on
+        # the matched destination half of each pair.
+        "passes": [
+            {"shader": "compressible_euler_3d", "writes": ["p1", "p2"]},
+        ],
+        "extra_fields": 1,
+        "field2_init": "euler_pair2_auto",
+        "params": {"Gamma": 1.4, "Art. visc.": 0.05, "Gravity": 0.0, "Source": 0.0},
+        "param_ranges": {"Gamma": (1.05, 2.0), "Art. visc.": (0.0, 1.0),
+                         "Gravity": (-0.05, 0.05), "Source": (0.0, 0.5)},
+        # CFL: dt·(|u| + c)/Δx ≤ 1. With reference c≈√(γp/ρ)≈√(1.4·25/4)≈3
+        # and post-shock |u|≈2, max wave speed is ≈5. dt=0.05 gives a
+        # CFL of ~0.25 — comfortably stable for the blast initial
+        # condition, where momentum and energy build up fast.
+        "default_size": 96,
+        "dt": 0.05,
+        "dt_range": (0.005, 0.3),
+        "init": "euler_blast",
+        "init_variants": ["euler_blast", "euler_shocktube",
+                          "euler_kelvin_helmholtz"],
+        "description": ("Three-dimensional compressible Euler equations: "
+                        "ideal-gas hydrodynamics with conservative mass, "
+                        "momentum and energy. A 6-face Lax-Friedrichs flux "
+                        "captures shocks robustly (at the price of "
+                        "smearing contacts); per-cell EOS keeps p, ρ "
+                        "above small positive floors so vacuum patches "
+                        "regularise rather than crash. Three init "
+                        "variants: a Sedov spherical blast, a 3-D Sod "
+                        "shock tube, and a Kelvin-Helmholtz shear layer."),
+        "vis_channels": ["Density", "Mom_x", "Mom_y", "Mom_z"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "vis_range": (0.0, 4.0),
+        "boundary": "wrap",
+    },
+
     "smoke_wind_3d": {
         "label": "3D Smoke (Wind-Blown)",
         "shader": "smoke_wind_3d",
@@ -19013,6 +19268,108 @@ def init_fluid_turbulent(size, rng):
     return data
 
 
+def _euler_primitives(name, size):
+    """Return primitive variables (ρ, v⃗, p) for a named compressible-Euler
+    initial condition. Used by BOTH the pair-1 init functions (which need
+    ρ, ρu) and the pair-2 string handlers in `_make_field_init` (which
+    need E, p, |u|), so the two pairs stay perfectly consistent at t=0.
+
+    Parameters
+    ----------
+    name : str
+        One of {'blast', 'shocktube', 'kelvin_helmholtz'}.
+    size : int
+        Cubic grid edge length.
+    """
+    if name == 'blast':
+        rho = np.ones((size, size, size), dtype=np.float32)
+        vel = np.zeros((size, size, size, 3), dtype=np.float32)
+        p   = np.full((size, size, size), 0.1, dtype=np.float32)
+        cx = cy = cz = size // 2
+        radius = max(2, size // 12)
+        xs, ys, zs = np.indices((size, size, size))
+        mask = ((xs - cx) ** 2 + (ys - cy) ** 2 + (zs - cz) ** 2) <= radius ** 2
+        rho[mask] = 4.0
+        p[mask]   = 25.0
+        return rho, vel, p
+    if name == 'shocktube':
+        rho = np.empty((size, size, size), dtype=np.float32)
+        p   = np.empty((size, size, size), dtype=np.float32)
+        half = size // 2
+        rho[:half] = 1.0;    rho[half:] = 0.125
+        p[:half]   = 1.0;    p[half:]   = 0.1
+        vel = np.zeros((size, size, size, 3), dtype=np.float32)
+        return rho, vel, p
+    if name == 'kelvin_helmholtz':
+        xs, ys, zs = np.indices((size, size, size)).astype(np.float32)
+        rho = np.where((zs > size * 0.25) & (zs < size * 0.75), 2.0, 1.0)
+        vel = np.zeros((size, size, size, 3), dtype=np.float32)
+        vel[..., 0] = np.where((zs > size * 0.25) & (zs < size * 0.75), 0.5, -0.5)
+        amp = 0.05
+        pert = amp * np.sin(2.0 * np.pi * xs / size) * np.sin(2.0 * np.pi * ys / size)
+        band = np.exp(-((zs - size * 0.25) ** 2) / (size * 0.04) ** 2) \
+             + np.exp(-((zs - size * 0.75) ** 2) / (size * 0.04) ** 2)
+        vel[..., 2] = pert * band
+        p = np.full((size, size, size), 2.5, dtype=np.float32)
+        return rho.astype(np.float32), vel.astype(np.float32), p.astype(np.float32)
+    raise ValueError(f"unknown euler init '{name}'")
+
+
+def _euler_pair1_from_primitives(rho, vel):
+    """Pack (ρ, ρu_x, ρu_y, ρu_z) — pair-1 conserved variables."""
+    rho = np.maximum(rho.astype(np.float32), 1e-4)
+    vel = vel.astype(np.float32)
+    momentum = rho[..., None] * vel
+    return np.concatenate([rho[..., None], momentum], axis=-1).astype(np.float32)
+
+
+def _euler_pair2_from_primitives(rho, vel, p, gamma=1.4):
+    """Pack (E, p, |u|, 0) — pair-2 energy + diagnostic init."""
+    rho = np.maximum(rho.astype(np.float32), 1e-4)
+    vel = vel.astype(np.float32)
+    p   = np.maximum(p.astype(np.float32),   1e-4)
+    momentum = rho[..., None] * vel
+    ke = 0.5 * np.sum(momentum * momentum, axis=-1) / rho
+    E  = p / (gamma - 1.0) + ke
+    speed = np.sqrt(np.sum(vel * vel, axis=-1))
+    return np.stack([E, p, speed, np.zeros_like(E)], axis=-1).astype(np.float32)
+
+
+def init_euler_blast(size, rng):
+    """Compressible Euler — Sedov-style 3D blast wave. A small
+    high-pressure / high-density sphere at the centre of a uniform
+    quiescent atmosphere drives a spherical shock outward. Classic
+    test for any compressible-flow code: the shock should stay
+    spherical (no grid-aligned artefacts from the Lax-Friedrichs
+    flux), the post-shock region should remain hot and rarefied,
+    and reflected waves off the periodic boundary should interact
+    cleanly without stair-stepping. (Pair-1 channels only; pair 2
+    is initialised by `_make_field_init('euler_blast_pair2')`.)"""
+    return _euler_pair1_from_primitives(*_euler_primitives('blast', size)[:2])
+
+
+def init_euler_shocktube(size, rng):
+    """Compressible Euler — 3D Sod shock tube. Splits the box into a
+    high-pressure left half (ρ=1, p=1) and low-pressure right half
+    (ρ=0.125, p=0.1) at rest. After release, a rightward shock,
+    contact discontinuity, and leftward rarefaction develop — the
+    canonical 1-D Riemann problem played out across the third
+    spatial dimension. Visualising the density / pressure / Mach
+    panels side-by-side reveals the three-wave structure."""
+    return _euler_pair1_from_primitives(*_euler_primitives('shocktube', size)[:2])
+
+
+def init_euler_kelvin_helmholtz(size, rng):
+    """Compressible Euler — Kelvin-Helmholtz instability. Two
+    counter-flowing slabs (slow at the top & bottom, fast in the
+    middle) with a small sinusoidal velocity perturbation along the
+    interface. The shear layer rolls up into the iconic "cat's eye"
+    vortices, ideally with sharp braid lines and slow secondary
+    instabilities. Sensitive to numerical viscosity — a perfect
+    visual stress-test for the artificial-viscosity slider."""
+    return _euler_pair1_from_primitives(*_euler_primitives('kelvin_helmholtz', size)[:2])
+
+
 def init_rayleigh_benard(size, rng):
     """Rayleigh-Bénard: tiny random temperature perturbation across the
     full volume to break symmetry.  Without this, the initially uniform
@@ -19832,6 +20189,9 @@ INIT_FUNCS = {
     'fluid_quiescent': init_fluid_quiescent,
     'fluid_turbulent': init_fluid_turbulent,
     'rayleigh_benard': init_rayleigh_benard,
+    'euler_blast': init_euler_blast,
+    'euler_shocktube': init_euler_shocktube,
+    'euler_kelvin_helmholtz': init_euler_kelvin_helmholtz,
     # 2026-05 additions
     'sandpile_uniform': init_sandpile_uniform,
     'sandpile_critical': init_sandpile_critical,
@@ -22510,6 +22870,26 @@ class Simulator:
             mask = rng.random((self.size, self.size, self.size), dtype=np.float32) < 0.05
             arr[..., 0] = mask.astype(np.float32)
             return arr
+        if init_name in ('euler_blast_pair2',
+                         'euler_shocktube_pair2',
+                         'euler_kelvin_helmholtz_pair2'):
+            # Compressible Euler pair-2 init: build E from the same
+            # primitives the pair-1 init function used so the two
+            # textures are conservation-consistent at t=0.
+            kind = init_name[len('euler_'):-len('_pair2')]
+            rho, vel, p = _euler_primitives(kind, self.size)
+            return _euler_pair2_from_primitives(rho, vel, p)
+        if init_name == 'euler_pair2_auto':
+            # Mirror the rule's CURRENT pair-1 init so the variant
+            # cycler keeps the two textures consistent: when the user
+            # toggles from blast → shocktube → KH, pair 2 follows.
+            current = getattr(self, '_current_init', None) \
+                      or self.preset.get('init', 'euler_blast')
+            kind = current[len('euler_'):] if current.startswith('euler_') else 'blast'
+            if kind not in ('blast', 'shocktube', 'kelvin_helmholtz'):
+                kind = 'blast'
+            rho, vel, p = _euler_primitives(kind, self.size)
+            return _euler_pair2_from_primitives(rho, vel, p)
         if isinstance(init_name, str) and init_name.startswith('mesh:'):
             return init_mesh_from_spec(init_name, self.size,
                                        np.random.RandomState(self.seed))

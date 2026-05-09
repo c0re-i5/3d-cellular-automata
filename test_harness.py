@@ -1096,6 +1096,13 @@ class HeadlessRunner:
         # Init volume
         rng = np.random.RandomState(seed)
         init_name = init_override if init_override else self.preset['init']
+        # Stash so _make_field2_init() can mirror the (possibly overridden)
+        # pair-1 IC when it constructs pair 2 — without this the two pairs
+        # disagree whenever the variant cycler swaps pair-1's init mid-run
+        # (e.g., switching the compressible-Euler scenario from blast →
+        # shocktube would otherwise leave a blast E field paired with a
+        # shocktube ρ).
+        self._active_init_name = init_name
         # Special init schemes that don't live in INIT_FUNCS — `lsystem:...`
         # rasterises a turtle-graphics L-system into the volume; `mesh:...`
         # voxelises a built-in or .obj/.glb mesh. Both are used by the
@@ -1283,6 +1290,19 @@ class HeadlessRunner:
             arr[..., 1] = 0.7 + r[..., 1] * 0.6
             arr[..., 2] = (r[..., 2] - 0.5) * 0.6
             arr[..., 3] = r[..., 3]
+        elif init_name == 'euler_pair2_auto':
+            # Compressible Euler pair-2 init: build E from the same
+            # primitives the rule's pair-1 init used so the two
+            # textures are conservation-consistent at t=0.
+            from simulator import (_euler_primitives,
+                                   _euler_pair2_from_primitives)
+            current = getattr(self, '_active_init_name',
+                              self.preset.get('init', 'euler_blast'))
+            kind = current[len('euler_'):] if current.startswith('euler_') else 'blast'
+            if kind not in ('blast', 'shocktube', 'kelvin_helmholtz'):
+                kind = 'blast'
+            rho, vel, p = _euler_primitives(kind, size)
+            arr = _euler_pair2_from_primitives(rho, vel, p)
         return arr
 
     def step(self):
