@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 80+ distinct compute shaders, and 94 built-in presets — from classic Game of Life to quantum mechanics, peridynamic fracture, Saffman–Taylor viscous fingering, and active nematic chirality. Ships with a five-probe physical-correctness suite (`ca_debug.*`) that audits every preset for shader hygiene, spatial equivariance, parameter coupling, conservation laws, and edge-case behaviour.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 60+ distinct compute shaders, and 97 built-in presets — from classic Game of Life to quantum mechanics, peridynamic fracture, Saffman–Taylor viscous fingering, and active nematic chirality. Ships with a five-probe physical-correctness suite (`ca_debug.*`) that audits every preset for shader hygiene, spatial equivariance, parameter coupling, conservation laws, and edge-case behaviour.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -10,7 +10,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 ## Features
 
 ### Simulation
-- **80+ GPU compute shaders** powering 94 built-in presets
+- **60+ GPU compute shaders** powering 97 built-in presets (including 12 hand-curated flagship recordings)
 - **Multi-pass physics** — presets can chain several shaders per logical step (e.g. 8× pressure-Jacobi + 1× transport for viscous fingers, 4× Poisson + 1× dynamics for galaxy formation), with per-pass parameter remapping and a second ping-pong texture pair (`u_src2`/`u_dst2`) for auxiliary fields like pressure, fear, magnetic flux, or strain
 - **Grid sizes 32³ to 512³** with dynamic resizing (auto-switches rgba32f → rgba16f at large sizes)
 - **Resolution-independent physics** — h² Laplacian scaling and h⁻¹ gradient scaling keeps behavior consistent across grid sizes

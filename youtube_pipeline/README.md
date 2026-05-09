@@ -67,6 +67,34 @@ A browser will open and ask you to grant the app upload permission to your YouTu
 
 # Daemon mode: scan queue every 30 s
 .venv/bin/python -m youtube_pipeline --watch
+
+# Print the YouTube channel "About" description and exit
+# (paste into YouTube Studio → Customisation → Basic info → Description)
+.venv/bin/python -m youtube_pipeline --print-channel-description
+```
+
+## Generated metadata
+
+For each upload the pipeline builds:
+
+- **Title** — `{label}: {hook} | 3D Cellular Automata` for long-form,
+  `{label} — 3D {category} #Shorts` for vertical recordings. The
+  `{hook}` is auto-extracted from the first em-dash clause of the
+  preset's in-app description (e.g. `Vicsek-style active matter`,
+  `Wavepacket hits a potential barrier`); category is mapped from the
+  rule name (`Reaction-Diffusion`, `Quantum Mechanics`, `Active Matter`,
+  `Crystal Growth`, …).
+- **Description** — full preset description, "What you're seeing"
+  one-liner with grid size + duration + frame count, parameter table,
+  run details (rule shader, category, renderer, resolution, seed, dt,
+  discovery score), the project blurb, source-code link, hashtags.
+- **Tags** — generic CA / simulation / GPU tags plus the rule name,
+  label and category, trimmed to YouTube's 500-char total.
+
+To preview what would be generated without uploading:
+
+```bash
+.venv/bin/python -m youtube_pipeline --dry-run --file path/to/recording.mp4
 ```
 
 ## How it works
@@ -93,7 +121,9 @@ Override file (any subset of these keys):
 {
   "title": "Custom title here",
   "description": "Custom description here",
-  "tags": ["custom", "tags"]
+  "tags": ["custom", "tags"],
+  "shorts": false,
+  "category_id": "28"
 }
 ```
 

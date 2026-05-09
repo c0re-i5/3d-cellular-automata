@@ -290,7 +290,16 @@ def main(argv: list[str] | None = None) -> int:
                    help='Daemon mode: poll queue every 30 s.')
     p.add_argument('--force', action='store_true',
                    help='Ignore the .upload_limit cooldown marker.')
+    p.add_argument('--print-channel-description', action='store_true',
+                   help='Print the YouTube channel About text to stdout '
+                   'and exit. Paste into YouTube Studio → Customisation '
+                   '→ Basic info → Description.')
     args = p.parse_args(argv)
+
+    if args.print_channel_description:
+        from .metadata import channel_description
+        print(channel_description())
+        return 0
 
     if args.watch:
         try:
