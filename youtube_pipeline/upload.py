@@ -219,7 +219,8 @@ def upload_one(youtube, mp4_path: Path, privacy: str,
 
 
 def run_once(privacy: str, dry_run: bool, only: Path | None,
-             force: bool = False) -> int:
+             force: bool = False, reddit: bool = False,
+             reddit_max_per_day: int = 4) -> int:
     """Process the queue once. Returns process exit code."""
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     # Bail early if a previous run hit a quota/limit error. Marker
@@ -267,9 +268,22 @@ def run_once(privacy: str, dry_run: bool, only: Path | None,
             print(f'  ✗ failed ({e.resp.status} {reason or ""}): {message}',
                   file=sys.stderr)
             failures += 1
+            continue
         except Exception as e:  # noqa: BLE001 — surface anything to user
             print(f'  ✗ failed: {e}', file=sys.stderr)
             failures += 1
+            continue
+        # Optional Reddit cross-post. Only fires on a successful upload
+        # (continue statements above skip it on failure). Daily cap and
+        # all error handling live inside reddit_pipeline so a Reddit
+        # hiccup never breaks the YouTube loop.
+        if reddit and not dry_run:
+            try:
+                from reddit_pipeline.submit import submit_for_file
+                submit_for_file(mp4.name, max_per_day=reddit_max_per_day)
+            except Exception as e:  # noqa: BLE001
+                print(f'  (reddit cross-post skipped: {e})',
+                      file=sys.stderr)
     # rc=2 lets --watch back off instead of polling every 30 s into the
     # same quota error.
     if aborted:
@@ -290,6 +304,14 @@ def main(argv: list[str] | None = None) -> int:
                    help='Daemon mode: poll queue every 30 s.')
     p.add_argument('--force', action='store_true',
                    help='Ignore the .upload_limit cooldown marker.')
+    p.add_argument('--reddit', action='store_true',
+                   help='After each successful upload, cross-post to '
+                   'r/3DCellularAutomata via reddit_pipeline (subject '
+                   'to its daily cap).')
+    p.add_argument('--reddit-max-per-day', type=int, default=4,
+                   help='Daily cap for Reddit cross-posts (default: 4). '
+                   'Once hit, further uploads in this run skip Reddit '
+                   'silently.')
     p.add_argument('--print-channel-description', action='store_true',
                    help='Print the YouTube channel About text to stdout '
                    'and exit. Paste into YouTube Studio → Customisation '
@@ -305,7 +327,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             while True:
                 rc = run_once(args.privacy, args.dry_run, args.file,
-                              force=args.force)
+                              force=args.force, reddit=args.reddit,
+                              reddit_max_per_day=args.reddit_max_per_day)
                 if rc == 2:
                     # Limit marker is set — don't poll. User clears it
                     # manually when ready.
@@ -316,4 +339,6 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             print('\n(stopped)')
             return 0
-    return run_once(args.privacy, args.dry_run, args.file, force=args.force)
+    return run_once(args.privacy, args.dry_run, args.file, force=args.force,
+                    reddit=args.reddit,
+                    reddit_max_per_day=args.reddit_max_per_day)

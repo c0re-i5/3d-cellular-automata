@@ -9,12 +9,18 @@ only on the `youtube-pipeline` branch alongside the YouTube uploader.
 1. Reads `recordings/upload_log.jsonl` (written by `youtube_pipeline`)
    to find recordings that are already on YouTube.
 2. Skips entries already in `recordings/reddit_log.jsonl`.
-3. Skips Shorts by default (they post 3-5/day; we don't want to flood
-   the sub). Pass `--include-shorts` to override.
-4. For each remaining entry, locates the sidecar JSON under
+3. Posts Shorts by default (they are the primary content stream).
+   Pass `--no-shorts` for long-form-only.
+4. Enforces a daily cap (`--max-per-day`, default **4**) by counting
+   today's entries in `reddit_log.jsonl`. Once hit, further runs are
+   no-ops until tomorrow.
+5. For each remaining entry, locates the sidecar JSON under
    `recordings/uploaded/YYYY-MM-DD/`, builds a Reddit submission, and
    posts it to r/3DCellularAutomata as a YouTube link with a markdown
    reproduction comment.
+
+Jobs are processed **newest-first**, so a fresh upload posts within
+hours instead of the daily cap getting eaten by an old backlog.
 
 ## One-time setup
 
@@ -72,23 +78,42 @@ Inspect the titles, bodies, and flair selections.
 
 ## Usage
 
+### Chained with the YouTube uploader (recommended)
+
+Add `--reddit` to your existing upload loop and the cross-post fires
+automatically after each successful YouTube upload, throttled by the
+daily cap:
+
 ```bash
-# Post the next unposted long-form recording (default: 1 per invocation).
+for f in recordings/upload_queue/*.mp4; do
+  python -m youtube_pipeline --privacy public --reddit --file "$f"
+  sleep 3
+done
+```
+
+Uploading 5 Shorts in a row only posts 4 to Reddit (cap hit on the
+5th); tomorrow the counter resets. Reddit failures never abort the
+YouTube loop. Use `--reddit-max-per-day N` to change the cap.
+
+### Standalone
+
+```bash
+# Post the newest unposted recording (default: 1 per invocation).
 .venv/bin/python -m reddit_pipeline
 
 # Preview what would be posted without contacting Reddit.
-.venv/bin/python -m reddit_pipeline --dry-run
+.venv/bin/python -m reddit_pipeline --dry-run --limit 5
 
 # Post one specific recording by filename.
 .venv/bin/python -m reddit_pipeline --file 20260501_120000_Crystal_Snowflake_2560x1440.mp4
 
-# Also post Shorts (off by default — would otherwise spam the sub).
-.venv/bin/python -m reddit_pipeline --include-shorts
+# Long-form only (skip Shorts).
+.venv/bin/python -m reddit_pipeline --no-shorts
 
-# Post up to 3 in one invocation.
-.venv/bin/python -m reddit_pipeline --limit 3
+# Adjust the daily cap.
+.venv/bin/python -m reddit_pipeline --max-per-day 6
 
-# Daemon mode: poll every 6 hours.
+# Daemon mode: poll every 6 hours, respecting the daily cap.
 .venv/bin/python -m reddit_pipeline --watch
 ```
 
@@ -96,14 +121,16 @@ Inspect the titles, bodies, and flair selections.
 
 The defaults are intentionally conservative:
 
-- **`--limit 1`** per invocation
+- **`--limit 1`** per invocation (one post per call)
+- **`--max-per-day 4`** hard daily ceiling, even with `--watch`
 - **6-hour** poll interval in `--watch` mode
-- **Shorts off** by default
+- **Newest-first** — fresh uploads post promptly, old ones quietly
+  age out rather than draining a backlog into the sub
 
 Reddit's spam filter penalises high-frequency self-promo, especially
-from new accounts. A single thoughtful post per day from the bot,
+from new accounts. A few thoughtful posts per day from the bot,
 combined with you participating in the sub manually, will perform
-much better than auto-flooding.
+much better than auto-flooding the queue.
 
 ## Per-recording overrides
 
