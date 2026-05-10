@@ -19,6 +19,10 @@ recordings/
 youtube_pipeline/credentials/
 youtube_pipeline/__pycache__/
 
+# Reddit submission pipeline (private branch only)
+reddit_pipeline/credentials/
+reddit_pipeline/__pycache__/
+
 # Discoveries — generated at runtime, not committed
 discoveries.json
 discoveries.json.lock
