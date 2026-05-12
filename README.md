@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 60+ distinct compute shaders, and 97 built-in presets — from classic Game of Life to quantum mechanics, peridynamic fracture, Saffman–Taylor viscous fingering, and active nematic chirality. Ships with a five-probe physical-correctness suite (`ca_debug.*`) that audits every preset for shader hygiene, spatial equivariance, parameter coupling, conservation laws, and edge-case behaviour.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with a five-probe physical-correctness suite (`ca_debug.*`) that audits every preset for shader hygiene, spatial equivariance, parameter coupling, conservation laws, and edge-case behaviour, plus an end-to-end recording → YouTube → Reddit publishing pipeline.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -10,7 +10,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 ## Features
 
 ### Simulation
-- **60+ GPU compute shaders** powering 97 built-in presets (including 12 hand-curated flagship recordings)
+- **70+ GPU compute shaders** powering 100+ built-in presets (including 12 hand-curated flagship recordings)
 - **Multi-pass physics** — presets can chain several shaders per logical step (e.g. 8× pressure-Jacobi + 1× transport for viscous fingers, 4× Poisson + 1× dynamics for galaxy formation), with per-pass parameter remapping and a second ping-pong texture pair (`u_src2`/`u_dst2`) for auxiliary fields like pressure, fear, magnetic flux, or strain
 - **Grid sizes 32³ to 512³** with dynamic resizing (auto-switches rgba32f → rgba16f at large sizes)
 - **Resolution-independent physics** — h² Laplacian scaling and h⁻¹ gradient scaling keeps behavior consistent across grid sizes
@@ -57,6 +57,26 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 - **UI progress bar** when an auto-stop target is set; status line shows real-time + video duration during capture
 - **Opt-in only** — recording requires `CA_RECORDING_ENABLED=1` in the environment; F5 is a no-op without it
 
+### Publishing Pipeline
+- **`youtube_pipeline/`** — OAuth 2.0 + chunked resumable upload of
+  `recordings/*.mp4` to YouTube. Reads each clip's sidecar JSON to
+  build the title, description, tags, and category; auto-detects
+  vertical aspect ratio for Shorts; supports per-recording
+  `_overrides.json` for one-off metadata tweaks. Run with
+  `python -m youtube_pipeline` (see `youtube_pipeline/README.md` for
+  Google Cloud Console + OAuth flow).
+- **`reddit_pipeline/`** — PRAW link submission of uploaded videos to a
+  subreddit, with a markdown reproduction comment containing the rule
+  name, parameters, seed, and grid size. Reads
+  `recordings/upload_log.jsonl` to find what's been uploaded to
+  YouTube and dedupes against `reddit_log.jsonl`. Run with
+  `python -m reddit_pipeline` or chain via `python -m youtube_pipeline
+  --reddit` after upload. Defaults to the daily-cap-aware Shorts
+  workflow.
+- **Credentials are gitignored** — `**/credentials/`, `*.client_secret*`,
+  and `token.json` never enter the repo. The pipeline code is public,
+  the secrets stay local.
+
 ### Discovery System
 - **Save discoveries** — store interesting parameter sets with interestingness score and metrics
 - **Discovery browser** — scrollable list grouped by rule, sortable by score or recency
@@ -84,11 +104,13 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 | **Classic** | Game of Life, SmoothLife | Discrete and continuous life-like automata |
 | **Reaction-Diffusion** | Gray-Scott, BZ, Barkley, Morphogen, BZ Turbulence | Chemical pattern formation — spots, spirals, scroll waves |
 | **Continuous** | Lenia, Multi-channel Lenia | Kernel-based continuous CAs with lifelike organisms |
-| **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×6) | Wave equations, full-vector electromagnetics, quantum mechanics |
-| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic) | Phase separation, anisotropic solidification, brittle fracture, channelised erosion |
-| **Biology** | Predator-Prey, Flocking (Reynolds + predator), Physarum (adaptive flux), Mycelium (anastomosing), Lichen | Population dynamics, swarm behaviour, biological transport networks |
-| **Astrophysics** | Galaxy Formation | Self-gravity (Jacobi-Poisson) + semi-Lagrangian gas dynamics |
-| **Chemistry** | Element CA, Viscous Fingers (Saffman–Taylor), Fire (combustion fluid) | 118-element particle chemistry, two-phase porous flow, reactive flow with vorticity confinement |
+| **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×6), Schrödinger–Poisson, 3+1D Dirac (4-spinor leapfrog) | Wave equations, full-vector electromagnetics, single-particle and self-interacting QM, relativistic spin-½ evolution |
+| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic), Active Nematic (Q-tensor) | Phase separation, anisotropic solidification, brittle fracture, channelised erosion, defect-driven liquid-crystal flow |
+| **Biology** | Predator-Prey, Flocking (Reynolds + predator), Physarum (adaptive flux), Mycelium (anastomosing), Lichen, Wandering Voxels (entity_arena demo) | Population dynamics, swarm behaviour, biological transport networks, validation harness for the entity-arena GPU substrate |
+| **Astrophysics** | Galaxy Formation, Compressible Euler (Sod / Kelvin–Helmholtz / blast) | Self-gravity (Jacobi-Poisson) + semi-Lagrangian gas dynamics, finite-volume conservative compressible flow |
+| **Chemistry** | Element CA, Viscous Fingers (Saffman–Taylor), Fire (combustion fluid), Smoke + Wind | 118-element particle chemistry, two-phase porous flow, reactive flow with vorticity confinement, advected scalar with prescribed wind field |
+| **Networks** | Small-World CA (Watts–Strogatz on a 3D lattice) | Discrete CA on a graph that interpolates regular-lattice ↔ random-graph topology |
+| **Geometric** | Mandelbulb, Mandelbox, Menger Sponge | Distance-estimator viewport SDFs (no voxel state — demonstrates the viewport renderer path) |
 
 ## Getting Started
 
@@ -151,10 +173,6 @@ python simulator.py --discovery discoveries.json --discovery-index 5  # load sav
 # Enable video recording (opt-in; requires ffmpeg on PATH)
 export CA_RECORDING_ENABLED=1
 python simulator.py
-
-# Disable the runtime preset_overrides.json patch layer for a clean baseline
-export CA_DISABLE_PRESET_OVERRIDES=1
-python simulator.py
 ```
 
 ### Headless Testing
@@ -182,19 +200,33 @@ Each probe accepts `--rules <comma-separated>` to scope to a single preset, and 
 ## Architecture
 
 ```
-simulator.py            — Main simulator: GLSL shaders, rendering, UI (~28 500 lines)
+simulator.py            — Main simulator: GLSL shaders, rendering, UI (~31 000 lines)
 element_data.py         — Periodic table data for the Element Chemistry rule
+entity_arena.py         — GPU substrate for typed voxel-resident agents
+                          (predator/prey, wandering teams) with spatial-hash
+                          neighbour queries and SSBO-backed entity storage
+nca_trainer.py          — Offline trainer for the 3D neural CA preset; exports
+                          MLP weights to .npz for runtime loading
+trained_nca/            — Pre-trained NCA weight blobs (sphere, torus targets)
 test_harness.py         — Headless parameter sweep and discovery engine (~4 200 lines)
 snapshot_3d.py          — Headless renderer + multi-channel auditor (PNG strips, channel-utilisation reports)
-preset_overrides.json   — JSON patch layer applied at simulator import time:
-                          tweak any field of any preset (params, ranges, dt, init,
-                          even shader name) without editing simulator.py.
-                          Disable with CA_DISABLE_PRESET_OVERRIDES=1.
 ca_debug/               — Unified debug + data-capture + correctness-probe package
-                          (see Quality Assurance section below).
+                          (see Quality Assurance section below). Includes
+                          `ca_debug/scratch/` — informal investigation scripts
+                          accumulated while hunting specific bugs (density
+                          audit, particle SSBO probe, per-rule validators).
+youtube_pipeline/       — OAuth + chunked resumable upload of `recordings/`
+                          MP4s to YouTube. Reads sidecar JSON for titles,
+                          descriptions, and Shorts detection. See
+                          `youtube_pipeline/README.md` for OAuth setup.
+reddit_pipeline/        — PRAW link-submission of uploaded videos to a
+                          subreddit, with markdown reproduction comment
+                          and dedupe log. Reads `recordings/upload_log.jsonl`.
 ```
 
-> `discoveries.json` and the batch search scripts are personal workflow tooling and are gitignored; they are not part of the repository.
+> Credentials live under `*/credentials/` (gitignored). Discovery files,
+> recordings, and personal batch-search shell scripts are also gitignored
+> and not part of the repository.
 
 All compute shaders are embedded in `simulator.py` as GLSL source strings, compiled at runtime via moderngl. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
 
@@ -239,7 +271,26 @@ Probes share a common headless harness in `ca_debug/recorder.py` and emit termin
 Summary: crit=0 high=0 med=2 ok=84 n/a=0 err=0
 ```
 
-The `preset_overrides.json` layer (see Architecture above) lets you patch a probe-flagged regression without editing `simulator.py` — useful for keeping a discovered visually-stunning parameter set alive even when the underlying default has been re-tuned.
+### Investigation scratchpad
+
+`ca_debug/scratch/` collects the informal scripts written while hunting
+specific bugs — they are not part of CI and may break when their target
+rule's preset changes, but they document the methodology used to validate
+the 100+ presets. Highlights:
+
+- **`density_audit.py`** — mirrors the GPU view shader's density math on
+  the CPU and flags rules whose voxels saturate or vanish under their
+  declared `vis_mode`. Found five solid-cube / uniform-haze rendering
+  bugs in a single audit pass.
+- **`particle_debug.py`** — reads the particle SSBO and deposit texture
+  each frame. Caught an uninitialised-deposit-buffer bug that made every
+  particle-coupled CA preset read $1.88 \times 10^{31}$ + NaN garbage on
+  its first step.
+- **`validate_*.py`** — per-rule analytic / lattice-solution checks
+  (Ising, Langton's ant, Margolus block CA, fluid projection,
+  predator-prey lattice, sparse dispatch).
+- **`audit_*.py` / `probe_*.py` / `sweep_*.py`** — per-rule
+  investigations, mostly crystal-growth dendritic-tip kinetics.
 
 ### Multi-channel field layout
 
