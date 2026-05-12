@@ -183,7 +183,15 @@ def _status_host():
 # additional GPU work, ~3-4 KB extra in the status JSON. Disabled when
 # CA_HARNESS_PREVIEW=0.
 _PREVIEW_ENABLED = os.environ.get('CA_HARNESS_PREVIEW', '1') == '1'
-_PREVIEW_SIZE = 32   # output is _PREVIEW_SIZE × _PREVIEW_SIZE RGB
+# 'iso'      → axonometric voxel render (shows 3D structure: scrolls,
+#              gliders, slabs, dendrites, etc. — much more revealing
+#              than a flat projection at the cost of a few ms / trial)
+# 'maxproj'  → legacy max-projection along Z (flat 2D heatmap)
+_PREVIEW_MODE_ENV = os.environ.get('CA_HARNESS_PREVIEW_MODE', 'iso').lower()
+# Iso renders into a slightly larger canvas because the diamond fits a
+# square sub-region; max-projection uses the full square.
+_PREVIEW_SIZE_ISO = 40
+_PREVIEW_SIZE_MAXPROJ = 32
 
 # Inferno-style 8-stop colormap. RGB triples in [0,1]. Indexing via
 # fractional-bin lookup with linear interpolation (numpy handles it).
@@ -237,14 +245,18 @@ def _grid_signature(grid, channel=0, n_bins=32):
 
 
 def _make_preview(grid, channel=0, mode='continuous'):
-    """Render a 32x32 RGB thumbnail of the final state, base64-encoded.
+    """Render a tiny RGB thumbnail of the final state, base64-encoded.
 
-    Uses max-projection along z of the chosen measurement channel,
-    coloured by an inferno-like ramp. Works for any rule because we
-    just normalise per-frame to its observed [min, max] range before
-    colormapping.
+    Two render paths, selected at process start by CA_HARNESS_PREVIEW_MODE:
 
-    Returns a dict {'w', 'h', 'cmap', 'b64'} or None on failure.
+    - 'iso' (default): axonometric voxel render with a Z-buffered
+      painter's algorithm. Reveals 3D structure (scroll filaments,
+      gliders, dendrites, layered shells) that a flat projection
+      collapses into mush.
+    - 'maxproj' (legacy): max-projection along Z with inferno colormap.
+      Cheaper, flatter, fine for purely 2D-like rules.
+
+    Returns a dict {'w', 'h', 'cmap', 'b64', 'mode'} or None on failure.
     """
     if not _PREVIEW_ENABLED:
         return None
@@ -263,51 +275,195 @@ def _make_preview(grid, channel=0, mode='continuous'):
         elif mode == 'deviation':
             ch = np.abs(ch - ch.mean())
 
-        # Max-projection along z gives a more "structural" view than a
-        # middle slice (catches off-centre solitons, gliders, etc.).
-        proj = ch.max(axis=2).astype(np.float32)
-
-        # Block-mean downsample to PREVIEW_SIZE × PREVIEW_SIZE.
-        H, W = proj.shape
-        ps = _PREVIEW_SIZE
-        # Crop to a multiple of ps then reshape-and-mean. Cheap and
-        # correct for the typical 32/64/96/128/192/256 grids.
-        H2 = (H // ps) * ps if H >= ps else H
-        W2 = (W // ps) * ps if W >= ps else W
-        proj = proj[:H2, :W2]
-        if H2 >= ps and W2 >= ps:
-            proj = proj.reshape(ps, H2 // ps, ps, W2 // ps).mean(axis=(1, 3))
-        else:
-            # Grid smaller than thumbnail: nearest-neighbour upsample.
-            ys = np.linspace(0, H2 - 1, ps).astype(int)
-            xs = np.linspace(0, W2 - 1, ps).astype(int)
-            proj = proj[ys][:, xs]
-
-        # Per-frame normalise to [0, 1].
-        v_lo = float(proj.min())
-        v_hi = float(proj.max())
-        if v_hi - v_lo < 1e-6:
-            norm = np.zeros_like(proj)
-        else:
-            norm = (proj - v_lo) / (v_hi - v_lo)
-
-        # Colormap lookup with linear interpolation between stops.
-        n_stops = _PREVIEW_CMAP.shape[0]
-        idx = np.clip(norm * (n_stops - 1), 0.0, n_stops - 1 - 1e-6)
-        i0 = idx.astype(np.int32)
-        frac = (idx - i0).astype(np.float32)[..., None]
-        rgb = (1.0 - frac) * _PREVIEW_CMAP[i0] + frac * _PREVIEW_CMAP[i0 + 1]
-        rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-
-        import base64
-        return {
-            'w':    int(ps),
-            'h':    int(ps),
-            'cmap': 'inferno',
-            'b64':  base64.b64encode(rgb_u8.tobytes()).decode('ascii'),
-        }
+        if _PREVIEW_MODE_ENV == 'iso':
+            return _make_isometric_preview(ch)
+        return _make_maxproj_preview(ch)
     except Exception:
         return None
+
+
+def _make_maxproj_preview(field3d):
+    """Legacy: Z-axis max-projection + inferno colormap → 32×32 RGB."""
+    # Max-projection along z gives a more "structural" view than a
+    # middle slice (catches off-centre solitons, gliders, etc.).
+    proj = field3d.max(axis=2).astype(np.float32)
+
+    # Block-mean downsample to PREVIEW_SIZE × PREVIEW_SIZE.
+    H, W = proj.shape
+    ps = _PREVIEW_SIZE_MAXPROJ
+    # Crop to a multiple of ps then reshape-and-mean. Cheap and
+    # correct for the typical 32/64/96/128/192/256 grids.
+    H2 = (H // ps) * ps if H >= ps else H
+    W2 = (W // ps) * ps if W >= ps else W
+    proj = proj[:H2, :W2]
+    if H2 >= ps and W2 >= ps:
+        proj = proj.reshape(ps, H2 // ps, ps, W2 // ps).mean(axis=(1, 3))
+    else:
+        # Grid smaller than thumbnail: nearest-neighbour upsample.
+        ys = np.linspace(0, H2 - 1, ps).astype(int)
+        xs = np.linspace(0, W2 - 1, ps).astype(int)
+        proj = proj[ys][:, xs]
+
+    rgb_u8 = _colormap_apply(proj)
+    import base64
+    return {
+        'w':    int(ps),
+        'h':    int(ps),
+        'cmap': 'inferno',
+        'mode': 'maxproj',
+        'b64':  base64.b64encode(rgb_u8.tobytes()).decode('ascii'),
+    }
+
+
+def _make_isometric_preview(field3d, out_size: int = _PREVIEW_SIZE_ISO,
+                            alpha_threshold: float = 0.08):
+    """Axonometric voxel render → out_size × out_size RGB.
+
+    Camera convention: looking down at the cube from the upper-front-
+    right (standard SimCity / Diablo iso). For a voxel at (x, y, z) in
+    the source grid (W = x-axis, H = y-axis, D = z-axis):
+
+        screen_x = (x + (D - 1 - z)) * cos(30°)
+        screen_y = (H - 1 - y) + (x + z) * sin(30°)
+
+    so that increasing x moves right, increasing y moves *up* on screen,
+    increasing z moves left-and-down (into the page).
+
+    Painter's-algorithm Z-buffer: voxels are sorted by depth (front
+    voxels last), and for each output pixel only the *frontmost*
+    above-threshold voxel is kept. Voxel colour is `cmap(value) * alpha`
+    where alpha = value (so dim voxels render dim, not solid).
+
+    Cost on a 32³ source: ~32k voxels → one numpy lexsort + one unique →
+    ~3-5 ms on the harness CPU thread. For larger grids the field is
+    block-mean downsampled to ≤32³ first so cost stays bounded.
+    """
+    field = field3d.astype(np.float32)
+
+    # Per-frame normalise to [0, 1] so the colormap span is full-range.
+    v_lo = float(field.min())
+    v_hi = float(field.max())
+    if v_hi - v_lo < 1e-6:
+        # Flat field → return a uniform dim slate so the panel doesn't
+        # flicker when a worker briefly settles into rest.
+        rgb_u8 = np.zeros((out_size, out_size, 3), dtype=np.uint8)
+        rgb_u8[..., :] = (24, 8, 36)
+        import base64
+        return {
+            'w': int(out_size), 'h': int(out_size),
+            'cmap': 'inferno', 'mode': 'iso',
+            'b64': base64.b64encode(rgb_u8.tobytes()).decode('ascii'),
+        }
+    field = (field - v_lo) / (v_hi - v_lo)
+
+    # Bound the source resolution so the painter's loop stays tiny
+    # regardless of grid size. 2× block-mean halving until ≤ 32³.
+    max_dim = 32
+    H, W, D = field.shape   # NOTE: numpy field is (H, W, D) per upstream
+    # The harness consistently passes (H, W, D) through grid[..., channel],
+    # but keep this generic — treat the 3 axes symmetrically.
+    while max(field.shape) > max_dim:
+        s0, s1, s2 = field.shape
+        n0, n1, n2 = s0 // 2, s1 // 2, s2 // 2
+        if n0 < 1 or n1 < 1 or n2 < 1:
+            break
+        field = (field[:2 * n0, :2 * n1, :2 * n2]
+                 .reshape(n0, 2, n1, 2, n2, 2).mean(axis=(1, 3, 5)))
+    H, W, D = field.shape
+
+    # Voxel coordinates and screen projection.
+    cos30 = 0.86602540378
+    sin30 = 0.5
+    ys, xs, zs = np.meshgrid(
+        np.arange(H, dtype=np.float32),
+        np.arange(W, dtype=np.float32),
+        np.arange(D, dtype=np.float32),
+        indexing='ij',
+    )
+    sx = (xs + (D - 1 - zs)) * cos30
+    sy = (H - 1 - ys) + (xs + zs) * sin30
+
+    # Fit the diamond into [0, out_size)² with a small margin.
+    margin = 1
+    sx_min, sx_max = float(sx.min()), float(sx.max())
+    sy_min, sy_max = float(sy.min()), float(sy.max())
+    span = max(sx_max - sx_min, sy_max - sy_min, 1e-6)
+    scale = (out_size - 2 * margin - 1) / span
+    sx_pix = ((sx - sx_min) * scale + margin).astype(np.int32)
+    # sy convention: image (0,0) is top-left, so flip y.
+    sy_pix = (out_size - 1 - margin - (sy - sy_min) * scale).astype(np.int32)
+
+    # Per-voxel colour via cmap, modulated by value-as-alpha.
+    n_stops = _PREVIEW_CMAP.shape[0]
+    idx = np.clip(field * (n_stops - 1), 0, n_stops - 1 - 1e-6)
+    i0 = idx.astype(np.int32)
+    frac = (idx - i0)[..., None]
+    voxel_rgb = (1.0 - frac) * _PREVIEW_CMAP[i0] + frac * _PREVIEW_CMAP[i0 + 1]
+    # Boost contrast so faint background haze doesn't bury the structure.
+    alpha = np.clip(field, 0.0, 1.0) ** 1.3
+    voxel_rgb = voxel_rgb * alpha[..., None]
+
+    # Z-buffered painter: closer voxels (high (x+z)-y) override farther.
+    depth = (xs + zs) - ys
+    pix_idx = sy_pix * out_size + sx_pix
+
+    pix_flat = pix_idx.ravel()
+    depth_flat = depth.ravel()
+    rgb_flat = voxel_rgb.reshape(-1, 3)
+    alpha_flat = alpha.ravel()
+
+    keep = ((alpha_flat > alpha_threshold)
+            & (pix_flat >= 0)
+            & (pix_flat < out_size * out_size))
+    if not keep.any():
+        # Nothing above threshold — emit empty canvas (background colour).
+        out_rgb = np.zeros((out_size, out_size, 3), dtype=np.float32)
+    else:
+        pix_k = pix_flat[keep]
+        depth_k = depth_flat[keep]
+        rgb_k = rgb_flat[keep]
+
+        # Stable sort by (pix, depth ascending) so duplicates of the same
+        # pixel end up sorted back→front. np.unique with return_index on
+        # the reversed array picks the *last* (= frontmost) occurrence.
+        order = np.lexsort((depth_k, pix_k))
+        pix_s = pix_k[order]
+        rgb_s = rgb_k[order]
+
+        _, last_in_rev = np.unique(pix_s[::-1], return_index=True)
+        last_idx = len(pix_s) - 1 - last_in_rev
+
+        canvas = np.zeros((out_size * out_size, 3), dtype=np.float32)
+        canvas[pix_s[last_idx]] = rgb_s[last_idx]
+        out_rgb = canvas.reshape(out_size, out_size, 3)
+
+    rgb_u8 = np.clip(out_rgb * 255.0, 0, 255).astype(np.uint8)
+
+    import base64
+    return {
+        'w':    int(out_size),
+        'h':    int(out_size),
+        'cmap': 'inferno',
+        'mode': 'iso',
+        'b64':  base64.b64encode(rgb_u8.tobytes()).decode('ascii'),
+    }
+
+
+def _colormap_apply(field2d):
+    """Apply the 8-stop inferno cmap to a 2D float32 field → uint8 RGB."""
+    v_lo = float(field2d.min())
+    v_hi = float(field2d.max())
+    if v_hi - v_lo < 1e-6:
+        norm = np.zeros_like(field2d)
+    else:
+        norm = (field2d - v_lo) / (v_hi - v_lo)
+
+    n_stops = _PREVIEW_CMAP.shape[0]
+    idx = np.clip(norm * (n_stops - 1), 0.0, n_stops - 1 - 1e-6)
+    i0 = idx.astype(np.int32)
+    frac = (idx - i0).astype(np.float32)[..., None]
+    rgb = (1.0 - frac) * _PREVIEW_CMAP[i0] + frac * _PREVIEW_CMAP[i0 + 1]
+    return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
 
 
 # ── GPU-side metrics (opt-out via CA_HARNESS_GPU_METRICS=0) ──────────

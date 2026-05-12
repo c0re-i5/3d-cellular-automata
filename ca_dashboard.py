@@ -695,11 +695,15 @@ class FooterBar(Static):
 class LivePreviewsPanel(Static):
     """Mosaic of tiny live thumbnails — one per active worker.
 
-    Each worker writes a 32x32 RGB preview (base64) into its status JSON
-    after every trial. We render it here as 24-bit-color Unicode
-    half-blocks (▀ = top RGB on bottom RGB), so 32x32 px = 32 cols × 16
-    rows of text per thumbnail. Mosaic is laid out responsively to
-    available width: thumbs_per_row computed from terminal cols.
+    Each worker writes an RGB preview (base64) into its status JSON
+    after every trial — typically a 40×40 axonometric voxel render
+    (`mode='iso'`) or a 32×32 max-projection (`mode='maxproj'`). We
+    render them as 24-bit-color Unicode half-blocks (▀ = top RGB on
+    bottom RGB), so an HxW preview becomes W cols × ceil(H/2) rows of
+    text per thumbnail. Thumbnail size is read per-preview from the
+    status JSON, so iso and maxproj workers can coexist in the same
+    mosaic without layout glitches. The mosaic lays out responsively
+    based on terminal columns.
     """
 
     workers: reactive[list[dict[str, Any]]] = reactive([])
@@ -708,46 +712,60 @@ class LivePreviewsPanel(Static):
     # preview yet (or the JSON is malformed). Renders as a flat dim block
     # so the layout doesn't reflow when workers come online.
     _PLACEHOLDER_RGB = (32, 12, 48)
+    # Default thumbnail dimensions when no worker has reported a preview
+    # yet (used purely for layout math — the placeholder block is solid).
+    _DEFAULT_PREVIEW_W = 40
+    _DEFAULT_PREVIEW_H = 40
 
     def render(self) -> str:
         import base64
         if not self.workers:
             return '[bold]Live Previews[/]  [dim]no workers reporting[/]'
-        # Layout: each thumbnail is 32 chars wide + 1 char gap.
-        # Caption is 1 line above the half-block art.
-        thumb_w = 32
-        thumb_h_chars = 16   # 32 px / 2 per row
+
+        # Decode previews up front so we can iterate row-major.
+        # We also need each preview's pixel size to lay out the mosaic,
+        # so the per-row arithmetic adapts to whatever the workers send
+        # (iso → 40, maxproj → 32, future modes → whatever).
+        decoded: list[dict[str, Any]] = []
+        now = time.time()
+        # Cap at 8 thumbnails (2 visual rows of 4 typical) to keep the
+        # panel on-screen when the search fans out wider than that.
+        for w in self.workers[:8]:
+            preview = w.get('preview')
+            rgb = None
+            pw, ph = self._DEFAULT_PREVIEW_W, self._DEFAULT_PREVIEW_H
+            if preview and isinstance(preview, dict):
+                try:
+                    raw = base64.b64decode(preview.get('b64', ''))
+                    h = int(preview.get('h', self._DEFAULT_PREVIEW_H))
+                    bw = int(preview.get('w', self._DEFAULT_PREVIEW_W))
+                    if len(raw) == h * bw * 3:
+                        rgb = (raw, h, bw)
+                        pw, ph = bw, h
+                except Exception:
+                    rgb = None
+            age = now - float(w.get('updated_at', 0))
+            decoded.append({
+                'rule':   w.get('rule', '?'),
+                'best':   float(w.get('best_score', 0.0)),
+                'rgb':    rgb,
+                'pw':     pw,
+                'ph':     ph,
+                'stale':  age > 10.0,
+            })
+
+        # Layout: each thumbnail is `pw` chars wide + `gap` char gap.
+        # All thumbs in a given row share the same width (use the max
+        # so mixed iso/maxproj mosaics still line up cleanly).
         gap = 2
+        thumb_w = max(d['pw'] for d in decoded)
+        thumb_h_chars = (max(d['ph'] for d in decoded) + 1) // 2
         try:
             cols = max(40, self.app.size.width)
         except Exception:
             cols = 160
         per_row = max(1, (cols - 4) // (thumb_w + gap))
-        per_row = min(per_row, len(self.workers), 8)
-
-        # Decode previews up front so we can iterate row-major.
-        decoded: list[dict[str, Any]] = []
-        now = time.time()
-        for w in self.workers[:per_row * 2]:   # cap at 2 visual rows
-            preview = w.get('preview')
-            rgb = None
-            if preview and isinstance(preview, dict):
-                try:
-                    raw = base64.b64decode(preview.get('b64', ''))
-                    h = int(preview.get('h', 32))
-                    bw = int(preview.get('w', 32))
-                    if len(raw) == h * bw * 3:
-                        # bytes view; we'll index directly.
-                        rgb = (raw, h, bw)
-                except Exception:
-                    rgb = None
-            age = now - float(w.get('updated_at', 0))
-            decoded.append({
-                'rule':     w.get('rule', '?'),
-                'best':     float(w.get('best_score', 0.0)),
-                'rgb':      rgb,
-                'stale':    age > 10.0,
-            })
+        per_row = min(per_row, len(decoded), 8)
 
         out_lines: list[str] = ['[bold]Live Previews[/]']
         for row_start in range(0, len(decoded), per_row):
@@ -763,7 +781,7 @@ class LivePreviewsPanel(Static):
                 caps.append(f'[{tag}]{rule:<{thumb_w - 7}}[/] [bold]{w["best"]:.3f}[/]')
             out_lines.append((' ' * gap).join(caps))
 
-            # 16 rows of half-block art.
+            # Half-block art: each text row encodes two pixel rows.
             for cy in range(thumb_h_chars):
                 y_top = cy * 2
                 y_bot = y_top + 1
@@ -780,12 +798,19 @@ class LivePreviewsPanel(Static):
                     else:
                         raw, h, bw = rgb
                         chunks = []
-                        for x in range(min(thumb_w, bw)):
-                            o_top = (y_top * bw + x) * 3
-                            o_bot = (y_bot * bw + x) * 3
-                            tr, tg, tb = raw[o_top], raw[o_top + 1], raw[o_top + 2]
-                            br, bg, bb = (raw[o_bot], raw[o_bot + 1],
-                                          raw[o_bot + 2]) if y_bot < h else (0, 0, 0)
+                        for x in range(thumb_w):
+                            if x < bw and y_top < h:
+                                o_top = (y_top * bw + x) * 3
+                                tr, tg, tb = (raw[o_top], raw[o_top + 1],
+                                              raw[o_top + 2])
+                            else:
+                                tr = tg = tb = 0
+                            if x < bw and y_bot < h:
+                                o_bot = (y_bot * bw + x) * 3
+                                br, bg, bb = (raw[o_bot], raw[o_bot + 1],
+                                              raw[o_bot + 2])
+                            else:
+                                br = bg = bb = 0
                             chunks.append(
                                 f'[rgb({tr},{tg},{tb}) on rgb({br},{bg},{bb})]▀[/]'
                             )
@@ -811,7 +836,7 @@ class CADashboard(App):
     WorkersPanel { width: 2fr; }
     RuleStatsPanel { width: 1fr; }
     DiscoveriesPanel { height: 1fr; min-height: 10; }
-    LivePreviewsPanel { height: auto; min-height: 19; }
+    LivePreviewsPanel { height: auto; min-height: 23; }
     """
 
     BINDINGS = [

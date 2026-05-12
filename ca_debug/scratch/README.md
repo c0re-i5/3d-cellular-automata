@@ -20,7 +20,6 @@ new rule was validated against analytic expectations.
 | `probe_*.py` / `diag_*.py` / `compare_*.py` | Per-rule investigation scripts (mostly crystal growth dendritic-tip kinetics) |
 | `sweep_crystals.py` | Parameter sweep harness for the five crystal-growth presets |
 | `flag_strip.py` / `visualize_flagged.py` | Quick visual triage of audit-flagged rules |
-| `ca_dashboard.py` | Rolling health dashboard (alive ratio / activity / NaN watch) over a discovery batch |
 | `batch_debug_audit.py` / `batch_merge.py` | Batch orchestration for headless audit runs |
 | `apply_preset_tuning.py` / `preset_tuning_audit.py` | Apply / audit a preset-overrides JSON layer (predates the inline-presets-are-authoritative refactor) |
 | `bench_regression.py` | Step-time regression test against a baseline JSON |
