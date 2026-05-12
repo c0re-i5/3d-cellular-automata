@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, ~40 distinct compute shaders, and 59 built-in presets — from classic Game of Life to quantum mechanics, peridynamic fracture, and Saffman–Taylor viscous fingering.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with a five-probe physical-correctness suite (`ca_debug.*`) that audits every preset for shader hygiene, spatial equivariance, parameter coupling, conservation laws, and edge-case behaviour, plus an end-to-end recording → YouTube → Reddit publishing pipeline.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -10,7 +10,7 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 ## Features
 
 ### Simulation
-- **~40 GPU compute shaders** powering 59 built-in presets
+- **70+ GPU compute shaders** powering 100+ built-in presets (including 12 hand-curated flagship recordings)
 - **Multi-pass physics** — presets can chain several shaders per logical step (e.g. 8× pressure-Jacobi + 1× transport for viscous fingers, 4× Poisson + 1× dynamics for galaxy formation), with per-pass parameter remapping and a second ping-pong texture pair (`u_src2`/`u_dst2`) for auxiliary fields like pressure, fear, magnetic flux, or strain
 - **Grid sizes 32³ to 512³** with dynamic resizing (auto-switches rgba32f → rgba16f at large sizes)
 - **Resolution-independent physics** — h² Laplacian scaling and h⁻¹ gradient scaling keeps behavior consistent across grid sizes
@@ -41,12 +41,41 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 - **Idle-frame blit cache** — when camera, simulation state, and render knobs are all unchanged, the previous frame is re-displayed via a GPU framebuffer blit (~0.3 ms) instead of re-marching rays (5–30 ms at 512³)
 
 ### Recording
-- **MP4 video capture** at 2560×1440 60fps via ffmpeg (H.264)
-- **Text overlays** burned into video — title, description, parameters, seed, grid size, discovery score
-- **JSON metadata sidecar** — full parameter snapshot alongside each recording
-- **Background writer thread** — 30-frame queue to avoid blocking the main loop
-- **Blinking REC indicator** in the UI during capture
+- **MP4 video capture** via ffmpeg (H.264 NVENC by default, libx264 fallback)
+- **Resolution selector** — 4K, 1440p, 1080p, 720p, or vertical 1080×1920 (Shorts/Reels)
+- **FPS selector** — 24 (cinematic), 30 (web), 60 (smooth motion, default)
+- **Per-step capture cadence** (default) — locks one video frame to N sim steps so output duration is reproducible across rules regardless of how fast the simulator runs in real time. Eliminates the "this CA recorded as 3 s and that one as 90 s" problem caused by render-frame-paced capture
+- **Steps-per-frame slider** (per-step mode) — fractional or integer, dial in time-lapse (`>1`) or slow-motion (`<1`) without changing duration math
+- **Real-time cadence** — legacy mode preserved for users who want wall-clock-paced captures
+- **Auto-stop at target duration** — pick 10 s / 30 s / 60 s / 2 min / 5 min and the recording terminates the moment the captured frame count reaches the target. Combined with per-step cadence this gives pixel-precise duration control
+- **Publish-grade quality** — NVENC `cq 19` near-visually-lossless with spatial+temporal AQ, 3 B-frames, 32-frame lookahead, and a 120 Mb/s VBR ceiling so high-entropy frames don't bloat filesize unbounded; libx264 fallback uses `crf 20 / preset slow / tune film`
+- **Async pixel-pack ping-pong** — two PBOs ping-ponged across frames so the GPU→CPU DMA overlaps with the next frame's render work, removing the per-frame pipeline stall
+- **Pre-rendered overlay PNG** — title / description / parameter / seed / grid-size text is rasterised once at start and applied via a single `overlay` filter, replacing 4–5 per-frame `drawtext` invocations
+- **Live stats overlay** — score, alive ratio, step count refresh ~10 Hz via ffmpeg `drawtext reload=1` on a temp textfile (disable with `CA_RECORDING_LIVE_STATS=0`)
+- **JSON metadata sidecar** — full parameter snapshot, capture cadence, FPS, resolution, and discovery info alongside each `.mp4`
+- **Background writer thread** — 120-frame queue absorbs encoder hiccups; saturated-queue events are logged so dropped frames don't go unnoticed
+- **UI progress bar** when an auto-stop target is set; status line shows real-time + video duration during capture
 - **Opt-in only** — recording requires `CA_RECORDING_ENABLED=1` in the environment; F5 is a no-op without it
+
+### Publishing Pipeline
+- **`youtube_pipeline/`** — OAuth 2.0 + chunked resumable upload of
+  `recordings/*.mp4` to YouTube. Reads each clip's sidecar JSON to
+  build the title, description, tags, and category; auto-detects
+  vertical aspect ratio for Shorts; supports per-recording
+  `_overrides.json` for one-off metadata tweaks. Run with
+  `python -m youtube_pipeline` (see `youtube_pipeline/README.md` for
+  Google Cloud Console + OAuth flow).
+- **`reddit_pipeline/`** — PRAW link submission of uploaded videos to a
+  subreddit, with a markdown reproduction comment containing the rule
+  name, parameters, seed, and grid size. Reads
+  `recordings/upload_log.jsonl` to find what's been uploaded to
+  YouTube and dedupes against `reddit_log.jsonl`. Run with
+  `python -m reddit_pipeline` or chain via `python -m youtube_pipeline
+  --reddit` after upload. Defaults to the daily-cap-aware Shorts
+  workflow.
+- **Credentials are gitignored** — `**/credentials/`, `*.client_secret*`,
+  and `token.json` never enter the repo. The pipeline code is public,
+  the secrets stay local.
 
 ### Discovery System
 - **Save discoveries** — store interesting parameter sets with interestingness score and metrics
@@ -75,11 +104,13 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 | **Classic** | Game of Life, SmoothLife | Discrete and continuous life-like automata |
 | **Reaction-Diffusion** | Gray-Scott, BZ, Barkley, Morphogen, BZ Turbulence | Chemical pattern formation — spots, spirals, scroll waves |
 | **Continuous** | Lenia, Multi-channel Lenia | Kernel-based continuous CAs with lifelike organisms |
-| **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×6) | Wave equations, full-vector electromagnetics, quantum mechanics |
-| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic) | Phase separation, anisotropic solidification, brittle fracture, channelised erosion |
-| **Biology** | Predator-Prey, Flocking (Reynolds + predator), Physarum (adaptive flux), Mycelium (anastomosing), Lichen | Population dynamics, swarm behaviour, biological transport networks |
-| **Astrophysics** | Galaxy Formation | Self-gravity (Jacobi-Poisson) + semi-Lagrangian gas dynamics |
-| **Chemistry** | Element CA, Viscous Fingers (Saffman–Taylor), Fire (combustion fluid) | 118-element particle chemistry, two-phase porous flow, reactive flow with vorticity confinement |
+| **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×6), Schrödinger–Poisson, 3+1D Dirac (4-spinor leapfrog) | Wave equations, full-vector electromagnetics, single-particle and self-interacting QM, relativistic spin-½ evolution |
+| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic), Active Nematic (Q-tensor) | Phase separation, anisotropic solidification, brittle fracture, channelised erosion, defect-driven liquid-crystal flow |
+| **Biology** | Predator-Prey, Flocking (Reynolds + predator), Physarum (adaptive flux), Mycelium (anastomosing), Lichen, Wandering Voxels (entity_arena demo) | Population dynamics, swarm behaviour, biological transport networks, validation harness for the entity-arena GPU substrate |
+| **Astrophysics** | Galaxy Formation, Compressible Euler (Sod / Kelvin–Helmholtz / blast) | Self-gravity (Jacobi-Poisson) + semi-Lagrangian gas dynamics, finite-volume conservative compressible flow |
+| **Chemistry** | Element CA, Viscous Fingers (Saffman–Taylor), Fire (combustion fluid), Smoke + Wind | 118-element particle chemistry, two-phase porous flow, reactive flow with vorticity confinement, advected scalar with prescribed wind field |
+| **Networks** | Small-World CA (Watts–Strogatz on a 3D lattice) | Discrete CA on a graph that interpolates regular-lattice ↔ random-graph topology |
+| **Geometric** | Mandelbulb, Mandelbox, Menger Sponge | Distance-estimator viewport SDFs (no voxel state — demonstrates the viewport renderer path) |
 
 ## Getting Started
 
@@ -152,16 +183,50 @@ The test harness runs GPU parameter sweeps without a window, scoring each trial 
 python test_harness.py                       # single headless run
 ```
 
+### Correctness Probes
+
+All five probes run headless and exit non-zero on any `crit` finding, suitable for CI:
+
+```bash
+python -m ca_debug.shader_lint               # static GLSL review (~2 s)
+python -m ca_debug.symmetry                  # spatial equivariance (~5 s, GPU)
+python -m ca_debug.coupling                  # parameter sensitivity (~12 s, GPU)
+python -m ca_debug.conservation              # mass/charge/prob drift (~10 s, GPU)
+python -m ca_debug.limits                    # determinism + edge cases (~8 s, GPU)
+```
+
+Each probe accepts `--rules <comma-separated>` to scope to a single preset, and `--size`/`--steps` to widen or narrow the test window.
+
 ## Architecture
 
 ```
-simulator.py         — Main simulator: GLSL shaders, rendering, UI (~26 700 lines)
-element_data.py      — Periodic table data for the Element Chemistry rule
-test_harness.py      — Headless parameter sweep and discovery engine (~4 200 lines)
-snapshot_3d.py       — Headless renderer + multi-channel auditor (PNG strips, channel-utilisation reports)
+simulator.py            — Main simulator: GLSL shaders, rendering, UI (~31 000 lines)
+element_data.py         — Periodic table data for the Element Chemistry rule
+entity_arena.py         — GPU substrate for typed voxel-resident agents
+                          (predator/prey, wandering teams) with spatial-hash
+                          neighbour queries and SSBO-backed entity storage
+nca_trainer.py          — Offline trainer for the 3D neural CA preset; exports
+                          MLP weights to .npz for runtime loading
+trained_nca/            — Pre-trained NCA weight blobs (sphere, torus targets)
+test_harness.py         — Headless parameter sweep and discovery engine (~4 200 lines)
+snapshot_3d.py          — Headless renderer + multi-channel auditor (PNG strips, channel-utilisation reports)
+ca_debug/               — Unified debug + data-capture + correctness-probe package
+                          (see Quality Assurance section below). Includes
+                          `ca_debug/scratch/` — informal investigation scripts
+                          accumulated while hunting specific bugs (density
+                          audit, particle SSBO probe, per-rule validators).
+youtube_pipeline/       — OAuth + chunked resumable upload of `recordings/`
+                          MP4s to YouTube. Reads sidecar JSON for titles,
+                          descriptions, and Shorts detection. See
+                          `youtube_pipeline/README.md` for OAuth setup.
+reddit_pipeline/        — PRAW link-submission of uploaded videos to a
+                          subreddit, with markdown reproduction comment
+                          and dedupe log. Reads `recordings/upload_log.jsonl`.
 ```
 
-> `discoveries.json` and the batch search scripts are personal workflow tooling and are gitignored; they are not part of the repository.
+> Credentials live under `*/credentials/` (gitignored). Discovery files,
+> recordings, and personal batch-search shell scripts are also gitignored
+> and not part of the repository.
 
 All compute shaders are embedded in `simulator.py` as GLSL source strings, compiled at runtime via moderngl. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
 
@@ -179,6 +244,53 @@ Each rule is a GLSL compute shader dispatched over an 8×8×8 workgroup grid. A 
 A preset can declare a list of passes; each pass picks a shader, a write target (`p1` or `p2` — or both for fused updates), and an optional per-pass parameter remap so the same global slider can mean different things to different passes. This lets a single logical step run, for example, eight Jacobi sweeps over a pressure field and then one transport step that reads the converged pressure.
 
 Shaders that use large neighbourhood radii (SmoothLife, Lenia) have an optimised shared-memory tiling path with automatic fallback for drivers that don't support it. Most reaction-diffusion shaders use a 19-point Patra–Karttunen stencil whose leading error ∝ ∇²(∇²f) is rotationally symmetric — the cheaper 6-point stencil's anisotropic Σ ∂⁴/∂xi⁴ error visibly distorts spirals and droplets toward grid axes.
+
+## Quality Assurance
+
+The `ca_debug/` package provides a five-probe correctness suite that audits every preset against a different physical-correctness criterion. All probes are headless and run end-to-end against the real simulator pipeline (the `HeadlessRunner` is the same one `test_harness.py` uses), so the verdict reflects the production code path.
+
+```bash
+python -m ca_debug.shader_lint    # static-analysis pass over GLSL source
+python -m ca_debug.symmetry       # spatial-equivariance check (rotate / reflect / translate)
+python -m ca_debug.coupling       # parameter-sensitivity matrix
+python -m ca_debug.conservation   # mass / charge / probability drift
+python -m ca_debug.limits         # determinism + empty-IC + damping-zero edge cases
+```
+
+| Probe | What it catches |
+|-------|-----------------|
+| **shader_lint** | Static GLSL source review: undeclared uniforms, missing bounds checks, unscaled Laplacians, hard-coded grid-size literals, single-axis hash idioms, etc. Pure regex/AST inspection — no GPU required. |
+| **symmetry** | Re-runs each preset on a mirrored / 90°-rotated / translated initial condition and compares against the un-transformed run. Catches accidental axis preferences (only-Y gravity in a horizontally isotropic rule, lab-frame stencil bias, etc.). Auto-detects 25+ shaders that *intentionally* break equivariance via lab-frame quenched noise (crystal twin nucleation, defect FBM, erosion rain cells, galaxy chirality) and skips them. |
+| **coupling** | Per-parameter sensitivity matrix: perturbs each slider ±10 % and measures the per-channel response. Flags `DEAD` (no effect), `EXP` (≥10× explosion), `ASYM` (one-sided response), and `SAT` (param is responsive at extreme values but the design ±10 % range is inside a shader-internal clamp). Distinguishes mode/init-time/normal params so categorical knobs don't false-positive. |
+| **conservation** | Tracks per-channel L¹ drift over a fixed number of steps for rules with explicit conservation laws (probability density for Schrödinger, mass for Cahn–Hilliard / Gray-Scott, integer particle count for sandpile). Per-voxel absolute-drift floor prevents near-zero-baseline rules from blowing up the relative-error metric. |
+| **limits** | Three edge cases per rule: (1) determinism — same seed twice must produce identical output; (2) empty IC must stay empty (catches "thermal" sources that bootstrap the sim from vacuum); (3) zeroing the damping coefficient must NOT cause an `inf`/`NaN` blow-up within the design step horizon. |
+
+Probes share a common headless harness in `ca_debug/recorder.py` and emit terminal-readable summaries plus optional JSON for CI:
+
+```
+Summary: crit=0 high=0 med=2 ok=84 n/a=0 err=0
+```
+
+### Investigation scratchpad
+
+`ca_debug/scratch/` collects the informal scripts written while hunting
+specific bugs — they are not part of CI and may break when their target
+rule's preset changes, but they document the methodology used to validate
+the 100+ presets. Highlights:
+
+- **`density_audit.py`** — mirrors the GPU view shader's density math on
+  the CPU and flags rules whose voxels saturate or vanish under their
+  declared `vis_mode`. Found five solid-cube / uniform-haze rendering
+  bugs in a single audit pass.
+- **`particle_debug.py`** — reads the particle SSBO and deposit texture
+  each frame. Caught an uninitialised-deposit-buffer bug that made every
+  particle-coupled CA preset read $1.88 \times 10^{31}$ + NaN garbage on
+  its first step.
+- **`validate_*.py`** — per-rule analytic / lattice-solution checks
+  (Ising, Langton's ant, Margolus block CA, fluid projection,
+  predator-prey lattice, sparse dispatch).
+- **`audit_*.py` / `probe_*.py` / `sweep_*.py`** — per-rule
+  investigations, mostly crystal-growth dendritic-tip kinetics.
 
 ### Multi-channel field layout
 

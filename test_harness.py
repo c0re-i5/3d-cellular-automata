@@ -496,7 +496,10 @@ void main() {
             vec4 prev = imageLoad(u_prev, pos);
             bool changed = abs(v - prev[u_channel]) > u_change_thr;
             if (u_is_element != 0 && !changed) {
-                changed = abs(cur.y - prev.y) > 1.0;
+                // Temperature shimmer from heat diffusion is sub-degree
+                // every step at high baseline temperatures; only count
+                // genuinely large swings (melting/reaction fronts).
+                changed = abs(cur.y - prev.y) > 25.0;
             }
             if (changed) atomicAdd(s_activity, 1u);
         }
@@ -630,6 +633,7 @@ class HeadlessRunner:
 
         # Rule-type-aware measurement config
         shader = self.preset['shader']
+        is_agent_rule = self.preset.get('agent_count', 0) > 0
         if self.is_element_ca:
             self.measure_channel = 0
             self.measure_mode = 'element'  # non-vacuum = alive
@@ -687,7 +691,12 @@ class HeadlessRunner:
         elif shader == 'kuramoto_3d':
             self.measure_channel = 0  # phase [0,1]
             self.measure_mode = 'phase_coherence'  # alive = domain boundary cells
-            self.alive_threshold = 0.35  # boundary cells: high local phase incoherence
+            # 0.35 was too strict — only the very cores of phase
+            # singularities registered, and a near-synchronized field
+            # (the actual healthy outcome of Kuramoto coupling) read as
+            # 'dead'. 0.15 captures the broader domain-boundary skin
+            # while still excluding the synchronized bulk.
+            self.alive_threshold = 0.15
             self.change_threshold = 0.02  # continuous field
         elif shader == 'flocking_3d':
             self.measure_channel = 0  # density rho
@@ -944,6 +953,77 @@ class HeadlessRunner:
             self.measure_mode = 'deviation'
             self.alive_threshold = 0.1
             self.change_threshold = 0.005
+        elif shader in ('dirac_3d_phi', 'dirac_3d_chi'):
+            # 4-component spinor; values are signed and small (~0.1
+            # peak for a Gaussian wavepacket). The discrete default
+            # (alive_threshold=0.5) marks every cell dead. Use 'wave'
+            # mode (abs-of-value) on the upper-real component, which
+            # carries most of the probability mass for the default
+            # init_variants.
+            self.measure_channel = 0
+            self.measure_mode = 'wave'
+            self.alive_threshold = 0.005
+            self.change_threshold = 0.001
+        elif shader == 'lenia_multi_3d':
+            # Multi-channel Lenia: continuous density fields per
+            # channel, range ~[0, 1]. Same measurement profile as
+            # single-channel lenia_3d.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.005
+        elif shader == 'smoke_wind_3d':
+            # Compressible smoke transport: density field ρ ≥ 0 with
+            # a buoyant source. Catch the rising plume as deviation
+            # from the quiescent baseline.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.005
+        elif shader == 'noop':
+            # Agent-only rule whose state lives in the SSBO, not the
+            # voxel grid (e.g. wandering_voxels_3d). The grid stays
+            # mostly empty by design — the action is in the agents.
+            # Use a permissive threshold so the few cells the agents
+            # touch register as alive instead of being mis-flagged
+            # 'dead'. This is a coarse approximation; the ideal fix
+            # is to surface agent-population metrics here.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.001
+            self.change_threshold = 0.0005
+        elif shader == 'causal_ca':
+            # Measure the cumulative 'arrival' channel (ch1), which
+            # latches the frame-of-first-illumination for every cell
+            # the light cone has reached. This grows monotonically with
+            # time, so a near-zero late-step alive ratio means the
+            # wavefront stalled — exactly the failure mode we want to
+            # catch. The wavefront channel (ch0) is too transient to
+            # measure stably.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.0005
+            self.change_threshold = 0.0001
+        elif shader in ('pp_lattice_move', 'pp_lattice_repro'):
+            # 4-state lattice (0=empty, 0.25=food, 0.5=prey, 0.75=pred).
+            # The discrete>0.5 default only catches prey+pred; we want
+            # to count any non-empty cell so the food-saturated
+            # carrying capacity also reads alive.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.05
+        elif is_agent_rule:
+            # Agent-driven rule with a non-trivial voxel shader (e.g.
+            # smugglers_3d). The grid carries sparse trails / stashes
+            # / contamination written by agents in the SSBO, so the
+            # alive ratio is naturally low even when the simulation is
+            # working. Use a permissive non-zero threshold to count
+            # the agent-touched voxels.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.01
+            self.change_threshold = 0.005
         else:
             # Discrete CAs (game_of_life_3d)
             self.measure_channel = 0
@@ -1096,6 +1176,13 @@ class HeadlessRunner:
         # Init volume
         rng = np.random.RandomState(seed)
         init_name = init_override if init_override else self.preset['init']
+        # Stash so _make_field2_init() can mirror the (possibly overridden)
+        # pair-1 IC when it constructs pair 2 — without this the two pairs
+        # disagree whenever the variant cycler swaps pair-1's init mid-run
+        # (e.g., switching the compressible-Euler scenario from blast →
+        # shocktube would otherwise leave a blast E field paired with a
+        # shocktube ρ).
+        self._active_init_name = init_name
         # Special init schemes that don't live in INIT_FUNCS — `lsystem:...`
         # rasterises a turtle-graphics L-system into the volume; `mesh:...`
         # voxelises a built-in or .obj/.glb mesh. Both are used by the
@@ -1283,6 +1370,33 @@ class HeadlessRunner:
             arr[..., 1] = 0.7 + r[..., 1] * 0.6
             arr[..., 2] = (r[..., 2] - 0.5) * 0.6
             arr[..., 3] = r[..., 3]
+        elif init_name == 'euler_pair2_auto':
+            # Compressible Euler pair-2 init: build E from the same
+            # primitives the rule's pair-1 init used so the two
+            # textures are conservation-consistent at t=0.
+            from simulator import (_euler_primitives,
+                                   _euler_pair2_from_primitives)
+            current = getattr(self, '_active_init_name',
+                              self.preset.get('init', 'euler_blast'))
+            kind = current[len('euler_'):] if current.startswith('euler_') else 'blast'
+            if kind not in ('blast', 'shocktube', 'kelvin_helmholtz'):
+                kind = 'blast'
+            rho, vel, p = _euler_primitives(kind, size)
+            arr = _euler_pair2_from_primitives(rho, vel, p)
+        elif init_name == 'dirac_pair2_auto':
+            # Dirac χ (lower bispinor) packed in lockstep with φ
+            # using the same primitive builder, so the full 4-spinor
+            # is consistent at t=0.
+            from simulator import _dirac_primitives
+            current = getattr(self, '_active_init_name',
+                              self.preset.get('init', 'dirac_wavepacket'))
+            kind = current[len('dirac_'):] if current.startswith('dirac_') else 'wavepacket'
+            mapping = {'wavepacket':         'wavepacket_rest',
+                       'moving_wavepacket':  'wavepacket_moving',
+                       'collision':          'wavepacket_collision'}
+            primname = mapping.get(kind, 'wavepacket_rest')
+            _, chi = _dirac_primitives(primname, size)
+            arr = chi
         return arr
 
     def step(self):
@@ -1737,8 +1851,12 @@ def compute_metrics(grid, prev_grid, runner):
         prev_ch = prev_grid[:, :, :, runner.measure_channel]
         changed = np.abs(ch - prev_ch) > runner.change_threshold
         if mode == 'element':
-            # Also count temperature changes as activity
-            temp_changed = np.abs(grid[:, :, :, 1] - prev_grid[:, :, :, 1]) > 1.0
+            # Also count temperature changes as activity, but only
+            # genuinely large swings — at high baseline temperatures
+            # heat diffusion produces sub-degree shimmer in every cell
+            # every step. A 25 K threshold ignores that diffusion noise
+            # while still catching melting/reaction fronts.
+            temp_changed = np.abs(grid[:, :, :, 1] - prev_grid[:, :, :, 1]) > 25.0
             changed = changed | temp_changed
         activity = changed.sum() / total
 
@@ -1841,6 +1959,33 @@ def score_interestingness(metric_history):
     # If only late activity is dead but mid-run had significant activity, partial credit
     if late_activity < 0.0001:
         return max(0.15, 0.35 * min(peak_activity * 3, 1.0))
+
+    # Static-cluster penalty: a non-trivial alive population whose count
+    # has stopped changing AND whose per-step activity has decayed below
+    # the discrete activity sweet-spot (~0.01) is a still-life lump.
+    # This catches the "rectangular prism" failure mode where a
+    # localized init (game_of_life_centered, life_fbm_*) settles into a
+    # stable cluster that occupies a chunk of the volume — the alive
+    # bell-curve, surface bell-curve and activity bell-curve all award
+    # high partial credit, but the run is visually frozen.
+    #
+    # Detection criteria (all must hold):
+    #   * non-trivial population: repr_alive > 0.01
+    #   * activity has decayed: late_activity < mean_activity / 4
+    #     (rules out steady-state PDEs which have late ≈ mean)
+    #   * activity is well below the discrete sweet spot: late < 0.001
+    #   * alive count has stopped changing: alive_std < 0.01
+    #     (rules out wavefront / reaction-diffusion dynamics with low
+    #     per-step pixel activity but global redistribution)
+    if (repr_alive > 0.01
+            and not continuous_field
+            and mean_activity > 0
+            and late_activity < mean_activity * 0.25
+            and late_activity < 0.001
+            and alive_std < 0.01):
+        # Partial credit scaled by peak activity (gives credit for
+        # transient evolution that produced an interesting endpoint).
+        return max(0.18, 0.40 * min(peak_activity * 3, 1.0))
 
     score = 0.0
 
@@ -2147,6 +2292,28 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
     if init_density is not None:
         result['init_density'] = init_density
     result.update(structure)
+
+    # Spatial-uniformity damper: a CA whose final state is essentially
+    # homogeneous across the volume isn't producing structure, no matter
+    # how high the alive/activity/surface bell-curves rate it.  This
+    # catches the second systemic scoring failure mode found in the
+    # 2026-05 audit:
+    #   - nucleation:        100% of discoveries had sv < 0.011
+    #   - xy_spin_3d:        78% had sv < 0.05  (all spins aligned)
+    #   - brusselator_3d:    p90 sv = 0.008  (uniform limit-cycle)
+    #   - schnakenberg_3d:   33% had sv < 0.10
+    #   - fitzhugh_nagumo:   p50 sv = 0.091   (uniform excitable medium)
+    # vs healthy rules where top discoveries land sv ≥ 0.20:
+    #   kuramoto p50=0.375, lenia p50=0.852, bz p50=1.0, wave p50=1.0,
+    #   gray_scott p50=1.0, phase_separation p50=0.804.
+    #
+    # Linear ramp from 0.10× at sv=0 to 1.00× at sv=0.15, no change above.
+    # Floor of 0.10 (not 0) preserves ranking within the punished band.
+    sv = result.get('spatial_variation', 1.0)
+    if sv < 0.15:
+        sv_factor = max(0.10, sv / 0.15)
+        result['score'] *= sv_factor
+        result['spatial_uniformity_factor'] = sv_factor
 
     # Live-stream thumbnail (CPU reduce on a grid we already had to read
     # back; never raises, returns None on failure).
