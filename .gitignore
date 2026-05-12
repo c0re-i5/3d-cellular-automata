@@ -15,11 +15,9 @@ imgui.ini
 # Recordings (large media files)
 recordings/
 
-# YouTube upload pipeline (private branch only)
+# YouTube + Reddit upload pipelines— code is public, but credentials never are
 youtube_pipeline/credentials/
 youtube_pipeline/__pycache__/
-
-# Reddit submission pipeline (private branch only)
 reddit_pipeline/credentials/
 reddit_pipeline/__pycache__/
 
@@ -34,24 +32,15 @@ debug_runs/
 # Live status snapshots written by test_harness.py search workers
 runs/
 
-# One-off audit and debugging scripts (personal workflow tooling)
-scripts/
-audit_*.py
-*_audit.py
+# One-off audit / debugging scripts moved to ca_debug/scratch/ and are now
+# tracked. The patterns below only ignore stray copies left at repo root.
 ghost_cube_*/
 flagship_strips/
 flagship_shots/
 perf_runs/
-flag_strip.py
-_*.py
-ca_dashboard.py
 ca_health_*.json
 preset_tuning_report.md
-preset_tuning_audit.py
-apply_preset_tuning.py
 preset_overrides.json
-bench_regression.py
-entity_arena.py
 baseline_pre_anisotropic.json
 discoveries_prescreen*.json*
 test_cross_resolution.py
@@ -70,8 +59,9 @@ screenshots/aniso/
 screenshots/file.png
 tmp_flagship/
 
-# One-off validators (kept locally)
-validate_*.py
+# One-off validators moved to ca_debug/scratch/ and now tracked.
+# This pattern only ignores stray copies left at repo root.
+/validate_*.py
 
 # OAuth credentials — NEVER commit (covers the youtube-pipeline branch too)
 **/credentials/

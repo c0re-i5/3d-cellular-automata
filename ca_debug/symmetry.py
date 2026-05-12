@@ -318,8 +318,12 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
     # appear to break rotation/reflection symmetry purely because
     # pair2 was left untouched.
     if getattr(r2, 'tex_a2', None) is not None:
+        # Harness may auto-bump size when the preset has a default_size /
+        # search_size larger than what we requested; use the runner's
+        # actual size, not the originally requested one.
+        rsize = getattr(r2, 'size', size)
         ic2 = np.frombuffer(r2.tex_a2.read(), dtype=r2._tex_np_dtype).reshape(
-            size, size, size, 4).astype(np.float32)
+            rsize, rsize, rsize, 4).astype(np.float32)
         # Use vector_channels=(0,1,2) for pair2 since the convention is
         # almost universally (vx, vy, vz, scalar) in this codebase.
         ic2_t = probe.forward(ic2, (0, 1, 2))
@@ -337,8 +341,10 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
 
     # Crop a 4-voxel margin to avoid boundary artifacts when BCs aren't
     # truly periodic.  This is safe for translation under periodic BCs
-    # (no information lost) and necessary otherwise.
-    m = 4 if size > 16 else 2
+    # (no information lost) and necessary otherwise.  Use the runner's
+    # actual size (may be auto-bumped from the requested size).
+    actual_size = g_ctrl.shape[0]
+    m = 4 if actual_size > 16 else 2
     a = g_ctrl[m:-m, m:-m, m:-m, :]
     b = g_undo[m:-m, m:-m, m:-m, :]
 

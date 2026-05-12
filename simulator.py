@@ -213,7 +213,41 @@ layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
 layout(rgba32f, binding=0) uniform image3D u_src;
 layout(rgba32f, binding=1) uniform image3D u_dst;
 
+// `u_size` is declared early because the optional deposit() helper
+// below needs it for SSBO indexing.  All other CA uniforms follow
+// the deposit block.
 uniform int u_size;
+
+// ── Optional particle→field deposit channel ────────────────────────
+// When the active preset enables deposit (any non-zero deposit_strength
+// or trail_strength), the simulator compiles every CA pass with
+// DEPOSIT_ENABLED=1 and binds an r32f image at unit 12 holding the
+// per-voxel sum of particle splats from this step.  CA shaders that
+// want to react to particles call `deposit(pos)` and add the result
+// (scaled by `u_deposit_strength`) into a chosen channel.  Shaders
+// that ignore deposit pay zero cost — `deposit()` returns 0 and the
+// optimiser deletes the load+multiply.
+#ifndef DEPOSIT_ENABLED
+#define DEPOSIT_ENABLED 0
+#endif
+uniform float u_deposit_strength;     // always declared; 0 when no deposit
+uniform int   u_deposit_channel;      // informational; shader picks where
+#if DEPOSIT_ENABLED
+// SSBO instead of image: image units are limited to 8 on this driver,
+// so we use SSBO binding 15 (the image namespace was full).  Atomic
+// float adds on SSBOs are provided by GL_NV_shader_atomic_float in the
+// particle shader; the CA shader only reads.
+layout(std430, binding = 15) readonly buffer DepositBuf { float data[]; } u_deposit_buf;
+float deposit(ivec3 p) {
+    // Use u_dims (W,H,D) for correct linear indexing on non-cubic grids.
+    // u_dims is injected by _compile_compute alongside u_size.
+    int idx = (p.z * u_dims.y + p.y) * u_dims.x + p.x;
+    return u_deposit_buf.data[idx];
+}
+#else
+float deposit(ivec3 p) { return 0.0; }
+#endif
+
 uniform float u_dt;
 uniform float u_param0;
 uniform float u_param1;
@@ -659,6 +693,16 @@ void main() {
     // vanish cleanly. SmoothLife creatures live in the 0.3-0.8 range; a
     // 0.005 floor never affects living structure but kills sub-visible fog.
     if (result < 0.005) result = 0.0;
+
+    // ── Optional particle→field coupling ───────────────────────────
+    // When the preset enables deposit, particles raining onto the
+    // SmoothLife field add to ch0 directly.  This breaks the "tracer"
+    // illusion: the particles aren't watching the CA, they're feeding
+    // it.  A swarm camped over a quiet region will spawn life there;
+    // a swarm dispersing dilutes it.  Deposit is added BEFORE the
+    // [0,1] clamp so an overloaded voxel saturates instead of running
+    // away.
+    result = clamp(result + u_deposit_strength * deposit(pos), 0.0, 1.0);
 
     // ch1 = outer-annulus mean n (kernel response), ch2 = growth signal (already [0,1]),
     // ch3 = |delta| (reaction magnitude). Use 'rgb_channels' / 'rgba_blend' vis_mode.
@@ -2327,6 +2371,268 @@ void main() {
     float activity = (abs(ga) + abs(gb) + abs(gc)) / 3.0;
 
     imageStore(u_dst, pos, vec4(result, activity));
+}
+""",
+
+    "flow_lenia_potential": """
+// Flow Lenia (Plantec et al., 2022) — Pass 1 of 2: compute growth field.
+//
+// Standard Lenia:    A_new = clip(A + dt · G(K * A))
+//   The growth term G(...) arbitrarily creates and destroys mass
+//   wherever the local potential lands in the growth band.  Blobs
+//   "evaporate" into background activity and patterns dissolve.
+//
+// Flow Lenia:        A_new(p) = A(p − v · dt),  with v = α · ∇G(K * A)
+//   The growth function defines a *potential landscape* and mass
+//   is *transported* along its gradient (semi-Lagrangian backtrace).
+//   Total ∫A is exactly conserved (modulo trilinear's mild numerical
+//   diffusion).  Result: blobs become solid creatures that collide,
+//   merge, split, and deform without ever evaporating.
+//
+// This pass writes pair 2:
+//   r: G  (growth, [-1, 1])      — finite-differenced by pass 2 for ∇G
+//   g: U  (kernel potential)     — carried through for visualisation
+//   b, a: 0 (reserved)
+//
+// Reads: pair 1 channel R (mass field A).
+// Same kernel geometry as `lenia_3d` (3-D ring at radius `Ring position`
+// fraction of `Kernel radius`, gaussian thickness 0.15·R).
+
+#define MAX_R 7
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float mu       = u_param0;
+    float sigma    = max(u_param1, 0.001);
+    float radius   = u_param2;
+    float ring_pos = clamp(u_param3, 0.1, 0.9);
+    if (ring_pos < 0.05) ring_pos = 0.5;
+
+    int R = clamp(int(round(radius * h_inv)), 3, MAX_R);
+    float fR = float(R);
+
+    float weighted_sum = 0.0;
+    float weight_total = 0.0;
+
+    for (int dz = -R; dz <= R; dz++)
+    for (int dy = -R; dy <= R; dy++)
+    for (int dx = -R; dx <= R; dx++) {
+        float dist2 = float(dx*dx + dy*dy + dz*dz);
+        if (dist2 < 0.25) continue;
+        float dist = sqrt(dist2);
+        if (dist > fR + 0.5) continue;
+        float r_norm = dist / fR;
+        float kring  = (r_norm - ring_pos) / 0.15;
+        float kernel = exp(-0.5 * kring * kring);
+        float v = fetch(pos + ivec3(dx, dy, dz)).r;
+        weighted_sum += v * kernel;
+        weight_total += kernel;
+    }
+
+    float U = weight_total > 0.0 ? weighted_sum / weight_total : 0.0;
+    float gz = (U - mu) / sigma;
+    float G  = 2.0 * exp(-0.5 * gz * gz) - 1.0;
+
+    imageStore(u_dst2, pos, vec4(G, U, 0.0, 0.0));
+}
+""",
+
+    "flow_lenia_advect": """
+// Flow Lenia — Pass 2 of 2: semi-Lagrangian transport of mass along ∇G.
+//
+// Reads pair 2 channel R (growth field G from pass 1) at ±1 in each
+// axis to form ∇G via central differences, then backtraces the mass
+// field A by v = α · ∇G to find where each cell's *new* mass came
+// from in the *current* mass field.  Trilinear interpolation makes
+// the operator effectively conservative.
+//
+// Velocity is clamped to ½ cell per step (CFL condition for stable
+// trilinear advection — beyond this the backtrace overshoots and
+// mass "tunnels" through structure, destroying coherence).
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+vec4 fetch2(ivec3 p) {
+    if (u_boundary == 1) {
+        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
+            return vec4(0.0);
+        return imageLoad(u_src2, p);
+    }
+    if (u_boundary == 2) {
+        p = clamp(p, ivec3(0), ivec3(u_size - 1));
+        return imageLoad(u_src2, p);
+    }
+    p = (p + u_size) % u_size;
+    return imageLoad(u_src2, p);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float alpha = u_param0;  // Flow strength
+
+    // ∇G via central differences on pass 1's growth field.
+    float Gxp = fetch2(pos + ivec3( 1, 0, 0)).r;
+    float Gxm = fetch2(pos + ivec3(-1, 0, 0)).r;
+    float Gyp = fetch2(pos + ivec3( 0, 1, 0)).r;
+    float Gym = fetch2(pos + ivec3( 0,-1, 0)).r;
+    float Gzp = fetch2(pos + ivec3( 0, 0, 1)).r;
+    float Gzm = fetch2(pos + ivec3( 0, 0,-1)).r;
+
+    vec3 grad = 0.5 * vec3(Gxp - Gxm, Gyp - Gym, Gzp - Gzm);
+
+    // Mass flows TOWARD higher growth: v = α · ∇G.  Sign matters —
+    // negating this collapses blobs to nothing as mass flees the
+    // growth band.
+    vec3 vel = alpha * grad;
+
+    // CFL clamp: |v · dt| ≤ 0.5 cell.  Beyond this the semi-Lagrangian
+    // backtrace can skip over fine structure (mass "tunneling") and
+    // the conservation guarantee weakens visibly.
+    float vmax_per_step = 0.5;
+    float disp = length(vel) * u_dt;
+    if (disp > vmax_per_step) vel *= (vmax_per_step / disp);
+
+    // Backtrace: where did this cell's mass come from last frame?
+    vec3 src_pos = vec3(pos) - vel * u_dt;
+    float A_new = fetch_interp(src_pos).r;
+
+    A_new = clamp(A_new, 0.0, 1.0);
+    if (A_new < 0.005) A_new = 0.0;  // matches lenia_3d's death floor
+
+    // Carry potential & growth from p2 for vis (channels 1, 2);
+    // channel 3 is |Δ| against the unadvected source for activity vis.
+    float U     = fetch2(pos).g;
+    float G     = fetch2(pos).r;
+    float A_old = fetch(pos).r;
+
+    imageStore(u_dst, pos, vec4(A_new, U, 0.5 + 0.5 * G, abs(A_new - A_old)));
+}
+""",
+
+    "nca_3d": """
+// 3D Neural Cellular Automaton (Mordvintsev et al., "Growing Neural
+// Cellular Automata", Distill 2020 — extended here to 3 dimensions).
+//
+// Each cell holds a 4-vector of "hidden state".  A tiny per-cell
+// neural network (16 → 32 → 4, ReLU + linear) reads a 16-feature
+// perception vector built from:
+//   • channel-wise identity            (4 features)
+//   • channel-wise ∂x via central diff (4 features)
+//   • channel-wise ∂y via central diff (4 features)
+//   • channel-wise ∂z via central diff (4 features)
+// and outputs a delta that's added to the cell's state with a
+// stochastic per-cell fire mask (asynchronous update — fire_rate
+// fraction of cells update each step).
+//
+// Weights live in an SSBO at binding 14, regenerated host-side
+// from `self.seed` whenever the user randomises.  Same seed → same
+// "creature".  Most random seeds produce dissipative or runaway
+// dynamics; the interesting ones produce static patterns, travelling
+// waves, breathing pulses, or branching growth from the seed cell.
+// Hunting for a good seed *is* the experience.
+
+#define NCA_HID 32
+#define NCA_IN  16
+#define NCA_OUT 4
+
+layout(std430, binding=14) readonly buffer NcaWeights {
+    // Layout (679 floats for HID=32):
+    //   W1 [NCA_IN  × NCA_HID] row-major  (i*HID + h)   → 16*32 = 512
+    //   b1 [NCA_HID]                                    → 32
+    //   W2 [NCA_HID × NCA_OUT] row-major  (h*OUT + o)   → 32*4  = 128
+    //   b2 [NCA_OUT]                                    → 4
+    //   nca_alive_thr (1 float)                         → 1
+    //   nca_state_clip (1 float)                        → 1
+    //   nca_seed_value (1 float)                        → 1
+    float w[];
+} NcaW;
+
+const int W1_OFF = 0;
+const int B1_OFF = NCA_IN  * NCA_HID;
+const int W2_OFF = B1_OFF + NCA_HID;
+const int B2_OFF = W2_OFF + NCA_HID * NCA_OUT;
+
+// Hash → uniform [0, 1).  Per-(cell, frame) so the fire mask varies
+// over space and time.  Doesn't depend on the global seed because
+// the network weights already differ per-seed; mixing seed in here
+// would just decorrelate fire timing without adding visual variety.
+float cell_hash(ivec3 p, int frame) {
+    uint h = uint(p.x) * 73856093u
+           ^ uint(p.y) * 19349663u
+           ^ uint(p.z) * 83492791u
+           ^ uint(frame) * 2654435761u;
+    h ^= (h >> 16); h *= 0x85ebca6bu;
+    h ^= (h >> 13); h *= 0xc2b2ae35u;
+    h ^= (h >> 16);
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float fire_rate = clamp(u_param0, 0.0, 1.0);
+    float dt        = max(u_param1, 0.0);          // update step size
+    float clip      = max(u_param2, 0.5);          // state magnitude clip
+
+    // ── Perception ──
+    vec4 self_v = fetch(pos);
+    vec4 xp = fetch(pos + ivec3( 1, 0, 0));
+    vec4 xm = fetch(pos + ivec3(-1, 0, 0));
+    vec4 yp = fetch(pos + ivec3( 0, 1, 0));
+    vec4 ym = fetch(pos + ivec3( 0,-1, 0));
+    vec4 zp = fetch(pos + ivec3( 0, 0, 1));
+    vec4 zm = fetch(pos + ivec3( 0, 0,-1));
+    vec4 dx = 0.5 * (xp - xm);
+    vec4 dy = 0.5 * (yp - ym);
+    vec4 dz = 0.5 * (zp - zm);
+
+    float in_vec[NCA_IN];
+    in_vec[ 0] = self_v.r; in_vec[ 1] = self_v.g; in_vec[ 2] = self_v.b; in_vec[ 3] = self_v.a;
+    in_vec[ 4] = dx.r;     in_vec[ 5] = dx.g;     in_vec[ 6] = dx.b;     in_vec[ 7] = dx.a;
+    in_vec[ 8] = dy.r;     in_vec[ 9] = dy.g;     in_vec[10] = dy.b;     in_vec[11] = dy.a;
+    in_vec[12] = dz.r;     in_vec[13] = dz.g;     in_vec[14] = dz.b;     in_vec[15] = dz.a;
+
+    // ── Layer 1: 16 → 32, ReLU ──
+    float hid[NCA_HID];
+    for (int h = 0; h < NCA_HID; ++h) {
+        float s = NcaW.w[B1_OFF + h];
+        for (int i = 0; i < NCA_IN; ++i) {
+            s += NcaW.w[W1_OFF + i * NCA_HID + h] * in_vec[i];
+        }
+        hid[h] = max(s, 0.0);  // ReLU
+    }
+
+    // ── Layer 2: 32 → 4, linear (delta) ──
+    vec4 delta = vec4(0.0);
+    for (int o = 0; o < NCA_OUT; ++o) {
+        float s = NcaW.w[B2_OFF + o];
+        for (int h = 0; h < NCA_HID; ++h) {
+            s += NcaW.w[W2_OFF + h * NCA_OUT + o] * hid[h];
+        }
+        delta[o] = s;
+    }
+
+    // ── Stochastic update (asynchrony) ──
+    float coin = cell_hash(pos, u_frame);
+    float fire = step(coin, fire_rate);   // 1.0 if updating this step, else 0
+
+    vec4 new_v = self_v + dt * fire * delta;
+
+    // Soft clamp keeps state from running away when the random network
+    // happens to have a positive eigenvalue feedback loop.  Without
+    // this, ~80% of random seeds blow up to ±inf within 50 steps.
+    new_v = clamp(new_v, vec4(-clip), vec4(clip));
+
+    imageStore(u_dst, pos, new_v);
 }
 """,
 
@@ -6015,6 +6321,16 @@ void main() {
     float div_v   = 0.5 * ((xp.g - xm.g) + (yp.b - ym.b) + (zp.a - zm.a));
     float new_rho = adv_rho - rho * div_v * u_dt;
     new_rho = clamp(new_rho, 0.001, 10.0);
+
+    // ── Optional particle→field coupling ───────────────────────────
+    // When deposit is active, dust particles add their mass directly
+    // into the gravitating density field.  The next pass's Poisson
+    // solve will see this mass and pull other dust toward it, closing
+    // the loop:  particles ride ∇Φ → particles deposit ρ → Φ updates →
+    // particles ride the new ∇Φ.  This is what turns "dust drifting on
+    // a frozen galaxy" into "dust collapsing under its own gravity".
+    new_rho = clamp(new_rho + u_deposit_strength * deposit(pos),
+                    0.001, 10.0);
 
     // Velocity speed cap (keeps CFL bounded under runaway collapse).
     float spd = length(new_vel);
@@ -11445,6 +11761,7 @@ void main() {
 #                    around vorticity tubes (great for aurora/ink).
 PARTICLE_UPDATE_COMPUTE = """
 #version 430
+#extension GL_NV_shader_atomic_float : enable
 layout(local_size_x = 64) in;
 
 layout(std430, binding = 9) buffer Particles { vec4 data[]; } P;
@@ -11456,6 +11773,26 @@ layout(std430, binding = 9) buffer Particles { vec4 data[]; } P;
 #endif
 #ifndef NN_SHARED
 #define NN_SHARED 0
+#endif
+
+#ifndef DEPOSIT_ENABLED
+#define DEPOSIT_ENABLED 0
+#endif
+
+#if DEPOSIT_ENABLED
+// Each particle does an atomic float add into the (newly cleared)
+// deposit SSBO at its post-update voxel.  Requires
+// GL_NV_shader_atomic_float — fp32 atomics on SSBOs are NVIDIA-only,
+// but every target device for this simulator (GeForce/Quadro from
+// Maxwell onward) supports them.  We use an SSBO instead of an image
+// because the driver only exposes 8 image units, all of which are
+// already taken by field src/dst/extras bindings.
+layout(std430, binding = 15) coherent buffer DepositBuf { float data[]; } u_deposit_buf;
+uniform float u_deposit_amount;       // mass added per particle per step
+uniform int   u_deposit_radius;       // 0 = single voxel, 1 = 3³ cube splat
+uniform ivec3 u_dep_dims;             // (W,H,D) — needed for correct linear
+                                      // indexing on non-cubic grids; u_size
+                                      // is the back-compat scalar max(W,H,D).
 #endif
 
 #if NN_HID > 0
@@ -11479,6 +11816,22 @@ uniform uint  u_frame;        // for respawn RNG
 uniform vec3  u_spawn_min;
 uniform vec3  u_spawn_max;
 uniform float u_spawn_speed;  // initial random speed magnitude on respawn
+
+// ── Particle Lenia (force mode 6) parameters ──────────────────────
+// All dimensions are in cell units.  Matches Mordvintsev et al. 2022
+// ("Particle Lenia and the Energy-Based Behaviour of Pattern
+// Formation"): each particle feels a kernel-summed potential U from
+// its neighbours and moves down the energy E(x) = R(x) - G(U(x)),
+// where R is short-range repulsion and G is the bell-shaped growth
+// function from standard Lenia.  Self-organising clusters, gliders,
+// and metastable structures emerge from pure pairwise dynamics — no
+// background field required.
+uniform float u_pl_mu_k;     // kernel centre radius
+uniform float u_pl_sigma_k;  // kernel ring thickness
+uniform float u_pl_mu_g;     // growth-function centre (target U)
+uniform float u_pl_sigma_g;  // growth-function width
+uniform float u_pl_c_rep;    // repulsion strength
+uniform float u_pl_r_rep;    // repulsion cutoff radius
 
 float fs = float(u_size);
 
@@ -11603,6 +11956,71 @@ void main() {
         force = u_force_scale * act;
     }
 #endif
+    else if (u_force_mode == 6) {
+        // ── Particle Lenia (Mordvintsev et al., 2022) ──
+        // Two N² passes over neighbours: pass 1 sums U at this point,
+        // pass 2 sums ∇U and ∇R for the force.  Toroidal min-image
+        // distances keep the dynamics consistent with the wrapped
+        // particle positions.  Cutoffs prune work outside the kernel
+        // and repulsion supports.
+        float mu_k    = u_pl_mu_k;
+        float sigma_k = max(u_pl_sigma_k, 0.001);
+        float mu_g    = u_pl_mu_g;
+        float sigma_g = max(u_pl_sigma_g, 0.001);
+        float c_rep   = u_pl_c_rep;
+        float r_rep   = max(u_pl_r_rep, 0.001);
+        float k_cut   = mu_k + 4.0 * sigma_k;
+        float k_cut2  = k_cut * k_cut;
+        float r_rep2  = r_rep * r_rep;
+
+        // Pass 1: kernel-summed potential at this particle.
+        float U = 0.0;
+        for (uint j = 0u; j < uint(u_count); ++j) {
+            if (j == i) continue;
+            vec3 pj = P.data[2u * j + 0u].xyz;
+            vec3 d = pos - pj;
+            // Toroidal min-image displacement (matches mod(pos,fs) wrap).
+            d -= fs * round(d / fs);
+            float r2 = dot(d, d);
+            if (r2 > k_cut2) continue;
+            float r = sqrt(r2);
+            float z = (r - mu_k) / sigma_k;
+            U += exp(-0.5 * z * z);
+        }
+
+        // G(U) and dG/dU:  G(U) = exp(-½ z²),  z = (U-μ_g)/σ_g
+        //                 G'(U) = -G·z/σ_g
+        float zg     = (U - mu_g) / sigma_g;
+        float G_at   = exp(-0.5 * zg * zg);
+        float Gprime = -G_at * zg / sigma_g;
+
+        // Pass 2: ∇U (kernel) and ∇R (repulsion) at this particle.
+        // ∂K(r)/∂x_i = -K·z/(σ_k·r) · d        with d = x_i - x_j
+        // ∂R(r)/∂x_i = -2·c_rep·(1 - r/r_rep)/(r_rep·r) · d   for r<r_rep
+        vec3 grad_U = vec3(0.0);
+        vec3 grad_R = vec3(0.0);
+        for (uint j = 0u; j < uint(u_count); ++j) {
+            if (j == i) continue;
+            vec3 pj = P.data[2u * j + 0u].xyz;
+            vec3 d = pos - pj;
+            d -= fs * round(d / fs);
+            float r2 = dot(d, d);
+            if (r2 > k_cut2 && r2 > r_rep2) continue;
+            float r = sqrt(max(r2, 1e-8));
+            if (r2 <= k_cut2) {
+                float z = (r - mu_k) / sigma_k;
+                float K = exp(-0.5 * z * z);
+                grad_U += -K * z / (sigma_k * r) * d;
+            }
+            if (r < r_rep) {
+                float t = 1.0 - r / r_rep;
+                grad_R += -2.0 * c_rep * t / (r_rep * r) * d;
+            }
+        }
+
+        // F = -∇E = -(∇R - G'·∇U) = G'·∇U - ∇R
+        force = u_force_scale * (Gprime * grad_U - grad_R);
+    }
 
     // Semi-implicit Euler with linear drag.
     vel = vel * (1.0 - u_drag) + force * u_dt;
@@ -11614,6 +12032,41 @@ void main() {
 
     P.data[2u * i + 0u] = vec4(pos, life);
     P.data[2u * i + 1u] = vec4(vel, b.w);
+
+#if DEPOSIT_ENABLED
+    // Splat into the deposit field at the particle's new voxel.  We
+    // round-to-nearest rather than floor so a particle at the centre
+    // of a voxel deposits into that voxel (not the one to its lower
+    // corner).  The deposit texture is cleared every step before this
+    // pass, so we accumulate "this step's worth" only — no temporal
+    // smearing here (the CA shader can integrate over time if it wants
+    // a persistent trail).  Atomic add tolerates the rare race where
+    // two particles land in the same voxel; without atomics we'd lose
+    // ~N²/V deposits per step at high particle density.
+    if (life > 0.0 && u_deposit_amount != 0.0) {
+        ivec3 dp = ivec3(floor(pos + 0.5));
+        dp = clamp(dp, ivec3(0), u_dep_dims - ivec3(1));
+        if (u_deposit_radius == 0) {
+            int idx = (dp.z * u_dep_dims.y + dp.y) * u_dep_dims.x + dp.x;
+            atomicAdd(u_deposit_buf.data[idx], u_deposit_amount);
+        } else {
+            // 3³ Gaussian-ish splat with weights 1, 1/2, 1/4 by Chebyshev
+            // distance.  Total energy ≈ 1 + 6·½ + 12·¼ + 8·¼ = 9 — caller
+            // should scale u_deposit_amount accordingly if they want unit
+            // total mass per particle.
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec3 q = clamp(dp + ivec3(dx, dy, dz),
+                                ivec3(0), u_dep_dims - ivec3(1));
+                int cheby = max(max(abs(dx), abs(dy)), abs(dz));
+                float w = (cheby == 0) ? 1.0 : (cheby == 1 ? 0.5 : 0.25);
+                int idx = (q.z * u_dep_dims.y + q.y) * u_dep_dims.x + q.x;
+                atomicAdd(u_deposit_buf.data[idx], u_deposit_amount * w);
+            }
+        }
+    }
+#endif
 }
 """
 
@@ -13697,7 +14150,12 @@ def _wandering_voxels_preset():
         "vis_abs": 2,            # signed bipolar: maps [-1,+1] -> [0,1]
         "colormap": 1,           # cool: blue (team 1) -> magenta (team 0)
         "render_mode": "volumetric",
-        "voxel_threshold": 0.05,
+        # ch0 is signed in [-1,+1] but ~99% of voxels sit near 0 (only
+        # ~1% are painted by entities); with vis_abs=2 mapping [-1,+1]→
+        # [0,1] the unpainted bulk renders at density≈0.5 (solid grey
+        # haze that hides the team blobs). Threshold 0.6 cuts the bulk
+        # and shows only painted voxels (|ch0|>0.2).
+        "voxel_threshold": 0.6,
         "boundary": "toroidal",
         "description": (
             "Validation demo for the entity_arena substrate. "
@@ -13885,7 +14343,13 @@ def _predator_prey_preset():
         "vis_abs": 2,         # signed bipolar for ch0
         "colormap": 6,        # Diverging blue->white->red
         "render_mode": "volumetric",
-        "voxel_threshold": 0.03,
+        # ch0 is signed [-1,+1]; with vis_abs=2 mapping [-1,+1]→[0,1]
+        # every voxel — including the bulk food field at ch0≈+0.17 →
+        # density=0.58 — renders solid, drowning the prey/predator
+        # entities in a uniform pink haze. Threshold 0.6 hides the
+        # background food field and lights only |ch0|>0.2 voxels
+        # (entities + dense food clusters).
+        "voxel_threshold": 0.6,
         "boundary": "toroidal",
         "description": (
             "Lotka-Volterra ecosystem in 3D. Prey (red) graze a "
@@ -14036,12 +14500,26 @@ RULE_PRESETS = {
         "vis_default": 1,
         "vis_abs": False,
         "vis_mode": "rgb_channels",
+        # Turing spot peaks of V drift to ~2.3 (well above default cap 1.0)
+        # while the substrate U dips to ~0.4. Without an explicit range the
+        # pattern saturates the colour map and renders as a uniform cube.
+        "vis_range": (0.0, 2.5),
         "boundary": "toroidal",
     },
     "fitzhugh_nagumo_3d": {
-        "label": "FitzHugh-Nagumo (nerve pulses)",
+        "label": "FitzHugh-Nagumo (scroll waves)",
         "shader": "fitzhugh_nagumo_3d",
-        "params": {"a": 0.7, "b": 0.8, "ε": 0.08, "D": 1.0},
+        # Auto-oscillatory regime (equilibrium V*≈-0.2 sits on the
+        # unstable middle branch of the cubic V-nullcline → Hopf
+        # bifurcation crossed → every voxel is a limit-cycle
+        # oscillator).  The classical *excitable* regime (a=0.7, b=0.8)
+        # quenches to homogeneous rest within ~500 steps on a 64³ box
+        # because the wavefront cannot survive its own collisions in
+        # such a small domain — a uniform cube is the only attractor.
+        # Auto-oscillation guarantees sustained activity for any seed
+        # with phase variation; combined with the phase-singularity
+        # init this gives a stable scroll wave that persists forever.
+        "params": {"a": 0.1, "b": 0.5, "ε": 0.10, "D": 1.0},
         "param_ranges": {"a": (0.0, 1.5), "b": (0.1, 2.0),
                          "ε": (0.005, 0.5), "D": (0.1, 4.0)},
         "dt": 0.2,
@@ -14052,7 +14530,20 @@ RULE_PRESETS = {
         "vis_default": 0,
         "vis_abs": False,
         "vis_mode": "hsv_phase",  # excitable oscillator: phase = atan2(W, V)
-        "boundary": "toroidal",
+        # V ∈ [-2, +2], W ∈ [-1, +1.5]; framing for rgb_channels fallback.
+        "vis_range": (-2.0, 2.0),
+        # Inverted aux range (lo>hi): bulk |A|=sqrt(V²+W²)≈1.4 renders
+        # transparent, defect cores (|A|<0.6) render bright → visualises
+        # the actual scroll filament cores rather than a uniformly
+        # opaque oscillating cube. Mirrors the BZ oscillator pattern.
+        "vis_aux_range": (1.6, 0.6),
+        # Mirror (Neumann zero-flux) BC: scroll filaments survive on a
+        # closed domain because the wavefront cannot wrap around the box
+        # and annihilate against its own refractory wake — the failure
+        # mode under toroidal BCs that left the cube uniform within ~500
+        # steps.  Mirror is also the physically-correct choice for an
+        # isolated patch of excitable tissue.
+        "boundary": "mirror",
     },
     "brusselator_3d": {
         "label": "Brusselator (autocatalytic)",
@@ -14065,9 +14556,19 @@ RULE_PRESETS = {
         "init": "brusselator",
         "description": "Brusselator — Prigogine's autocatalytic oscillator with Hopf and Turing regimes.",
         "vis_channels": ["U", "V"],
-        "vis_default": 1,
+        # Render the U channel (autocatalyst peaks) as sparse spots.
+        # In the Turing spot regime U sits near the well-mixed mean of
+        # ~1 with isolated peaks at U≈3–5 colocated with V-troughs;
+        # mapping (2.5, 5.0) clips the bulk to transparent and lights
+        # only the peaks, producing the classic 3D Turing spot pattern.
+        # Earlier (vis_default=1, vis_mode='rgb_channels', range (1,3.5))
+        # rendered every voxel opaque (V mean=2.5, std=0.5 → density
+        # ≈0.6 everywhere, length(rgb)/√3 ≈0.4) which volumetrically
+        # alpha-composites to a featureless cube even though each
+        # mid-plane slice clearly shows spots.
+        "vis_default": 0,
         "vis_abs": False,
-        "vis_mode": "rgb_channels",
+        "vis_range": (2.5, 5.0),
         "boundary": "toroidal",
     },
     "cyclic_ca_3d": {
@@ -14435,6 +14936,170 @@ RULE_PRESETS = {
         "vis_abs": False,
         "boundary": "toroidal",
     },
+    "flow_lenia": {
+        "label": "Flow Lenia",
+        # Two-pass mass-conserving Lenia (Plantec et al., 2022, "Flow
+        # Lenia: Mass Conservation for the Study of Virtual Creatures").
+        # Pass 1 builds the growth field G(K*A) into pair 2; pass 2
+        # advects the mass field A along ∇G via semi-Lagrangian backtrace.
+        # Result: blobs become *solid* creatures that collide, merge,
+        # split, and deform without ever evaporating into background
+        # activity (the failure mode of standard Lenia at most parameter
+        # settings).
+        "shader": "flow_lenia_advect",  # nominal "main" shader; passes overrides
+        "passes": [
+            {"shader": "flow_lenia_potential", "writes": ["p2"], "kind": "voxel",
+             "param_names": ["Growth center", "Growth width", "Kernel radius", "Ring position"]},
+            {"shader": "flow_lenia_advect", "writes": ["p1"], "kind": "voxel",
+             "param_names": ["Flow strength", "Growth width", "Kernel radius", "Ring position"]},
+        ],
+        # extra_fields=1 enables pair 2 (tex_a2/tex_b2) for storing the
+        # intermediate growth/potential fields between passes.
+        "extra_fields": 1,
+        "params": {"Growth center": 0.15, "Growth width": 0.030,
+                   "Kernel radius": 4.0, "Ring position": 0.5,
+                   "Flow strength": 0.6},
+        "param_ranges": {"Growth center": (0.02, 0.40), "Growth width": (0.005, 0.10),
+                         "Kernel radius": (2.0, 6.0), "Ring position": (0.2, 0.8),
+                         "Flow strength": (0.0, 3.0)},
+        # Semi-Lagrangian advection is unconditionally stable, so we can
+        # take much larger steps than standard Lenia's 0.05.  The internal
+        # CFL clamp (½ cell per step) caps actual displacement.
+        "dt": 0.10,
+        "dt_range": (0.02, 0.30),
+        "init": "lenia_fbm",
+        "init_variants": ["lenia_fbm", "lenia"],
+        "description": "Mass-conserving Lenia (Plantec 2022) — solid creatures that flow, collide, merge, and split without evaporating.",
+        "vis_channels": ["Mass", "Potential U", "Growth G", "|Δ|"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "boundary": "toroidal",
+    },
+    "particle_lenia": {
+        "label": "Particle Lenia",
+        # Particle Lenia (Mordvintsev et al., 2022) lives entirely in the
+        # particle SSBO — no voxel field required.  We piggy-back on
+        # `wave_3d` as a stable-at-zero base shader so the standard
+        # voxel pipeline runs cheaply and renders nothing.  All the
+        # interesting dynamics happen in PARTICLE_UPDATE_COMPUTE's
+        # force_mode==6 branch (N² pairwise kernel sum + repulsion).
+        "shader": "wave_3d",
+        # Sliders read by _step_particles into the dedicated u_pl_*
+        # uniforms.  Names are kept short so the GUI stays compact.
+        # Defaults tuned for size=64 + 1500 particles + centred-blob
+        # init.  Growth μ ~5 sits just above the random-fill kernel
+        # sum so the system has a gentle drive toward denser packing
+        # without launching particles ballistically; low drag (0.01)
+        # leaves enough kinetic energy that orbits and rearrangement
+        # persist instead of freezing into a static crystal.
+        "params": {"Kernel μ": 4.0, "Kernel σ": 1.0,
+                   "Growth μ": 5.0, "Growth σ": 1.5,
+                   "Repulsion": 1.0, "Repulse R": 1.5},
+        "param_ranges": {"Kernel μ":   (1.5, 8.0),  "Kernel σ":   (0.3, 3.0),
+                         "Growth μ":   (1.0, 30.0), "Growth σ":   (0.2, 5.0),
+                         "Repulsion":  (0.0, 5.0),  "Repulse R":  (0.3, 4.0)},
+        "dt": 0.01,  # voxel pass dt (irrelevant — wave at zero stays zero)
+        "dt_range": (0.001, 0.1),
+        "init": "blank",  # invisible voxel field
+        # Particle layer config — this is what actually runs.
+        "particle_count": 1500,
+        "particle_init": "centered_blob",
+        "particle_force": "lenia_pp",
+        "particle_force_scale": 1.0,
+        "particle_dt": 0.10,
+        "particle_drag": 0.01,
+        "particle_life_decay": 0.0,  # immortal — clusters need to persist
+        "particle_respawn": False,
+        "particle_color_mode": "speed",
+        "particle_size": 0.45,
+        "description": "Particle Lenia (Mordvintsev 2022) — pairwise kernel forces produce self-organising clusters, gliders, metastable structures.",
+        "vis_channels": ["(particles)", "—", "—", "—"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "boundary": "toroidal",
+    },
+    "nca_3d": {
+        "label": "3D Neural CA",
+        # 3D port of Mordvintsev et al., "Growing Neural CA" (Distill 2020).
+        # Each cell is a 4-vector + a tiny per-cell MLP (16→32→4) reading
+        # identity + 3-axis Sobel features, applied with a stochastic
+        # per-cell fire mask.  Weights are random from `seed`; most seeds
+        # die or saturate, but a meaningful fraction grow into stable
+        # patterns, breathing pulses, or branching structures.  Hit
+        # Randomize repeatedly — *finding* an interesting weight set is
+        # the experience.  See `Neural CA (a)` for the trained variant.
+        "shader": "nca_3d",
+        "params": {"Fire rate": 0.5, "Step size": 1.0,
+                   "State clip": 4.0},
+        "param_ranges": {"Fire rate":  (0.05, 1.0),
+                         "Step size":  (0.05, 2.0),
+                         "State clip": (0.5, 8.0)},
+        "dt": 1.0,           # u_dt is unused — Step size param drives integration
+        "dt_range": (1.0, 1.0),
+        "init": "nca_seed",
+        "init_variants": ["nca_seed", "nca_random_specks"],
+        "description": "Random-weight 3D Neural CA — every Randomize gives a new creature; some grow, some pulse, most die.",
+        "vis_channels": ["Channel 0", "Channel 1", "Channel 2", "Channel 3"],
+        "vis_default": 0,
+        "vis_abs": True,     # state can go negative; |·| renders both signs
+        "vis_mode": "rgb_channels",
+        "boundary": "clamped",  # avoid pattern wrapping; growth from seed is the show
+        "precision": "fp32",    # MLP outputs are sensitive to fp16 rounding
+        # State is signed; rendering uses |·|.  0.05 hides the sub-threshold
+        # quiescent halo (most cells idle near 0) while keeping all real
+        # structure visible — clamp ceiling is 4.0 so 0.05 ≈ 1.25% of range.
+        "voxel_threshold": 0.05,
+    },
+    # ── Trained NCA variants ───────────────────────────────────────────
+    # These share the `nca_3d` shader but load weights from .npz blobs
+    # produced by nca_trainer.py.  Each grew toward a specific 3D shape
+    # at 32³ during training; behaviour at other sizes is approximate
+    # but usually still resembles the target (NCA learns local rules).
+    # Re-train at the desired size for crisp results:
+    #   python nca_trainer.py --target sphere --size 64 --steps 5000 \
+    #       --out trained_nca/sphere_64.npz
+    "nca_3d_sphere": {
+        "label": "3D Neural CA — Sphere (trained)",
+        "shader": "nca_3d",
+        "weights_path": "trained_nca/sphere_32.npz",
+        "params": {"Fire rate": 0.5, "Step size": 1.0, "State clip": 4.0},
+        "param_ranges": {"Fire rate":  (0.05, 1.0),
+                         "Step size":  (0.05, 2.0),
+                         "State clip": (0.5, 8.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "nca_seed",
+        "init_variants": ["nca_seed", "nca_random_specks"],
+        "description": "Trained 3D Neural CA — single seed voxel grows into a sphere over ~60 steps. Try damaging it to see regeneration.",
+        "vis_channels": ["Channel 0 (alpha)", "Channel 1", "Channel 2", "Channel 3"],
+        "vis_default": 0,
+        "vis_abs": True,
+        "vis_mode": "rgb_channels",
+        "boundary": "clamped",
+        "precision": "fp32",
+        "voxel_threshold": 0.20,  # trained ch0 saturates near 1.0; cull halo at 0.2
+    },
+    "nca_3d_torus": {
+        "label": "3D Neural CA — Torus (trained)",
+        "shader": "nca_3d",
+        "weights_path": "trained_nca/torus_32.npz",
+        "params": {"Fire rate": 0.5, "Step size": 1.0, "State clip": 4.0},
+        "param_ranges": {"Fire rate":  (0.05, 1.0),
+                         "Step size":  (0.05, 2.0),
+                         "State clip": (0.5, 8.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "nca_seed",
+        "init_variants": ["nca_seed", "nca_random_specks"],
+        "description": "Trained 3D Neural CA — grows a torus from the seed cell. Higher target loss than sphere; expect a slightly lumpy ring.",
+        "vis_channels": ["Channel 0 (alpha)", "Channel 1", "Channel 2", "Channel 3"],
+        "vis_default": 0,
+        "vis_abs": True,
+        "vis_mode": "rgb_channels",
+        "boundary": "clamped",
+        "precision": "fp32",
+        "voxel_threshold": 0.20,
+    },
     "predator_prey_3d": {
         "label": "3D Predator-Prey",
         "shader": "predator_prey_3d",
@@ -14560,6 +15225,13 @@ RULE_PRESETS = {
         "vis_channels": ["Activator", "Inhibitor", "Tissue density"],
         "vis_default": 0,
         "vis_abs": False,
+        # Activator field has steady-state bulk mean≈1.04 and Turing-spot
+        # peaks rising to ~1.6 (verified by simulation at t=3000-5000).
+        # Range (1.0, 1.6) keeps the bulk transparent and lights only the
+        # spot peaks so the regular spotted pattern is visible — earlier
+        # range (0.3, 1.7) made the bulk render at density≈0.5 (uniform
+        # haze with the spots only marginally brighter).
+        "vis_range": (1.0, 1.6),
         "boundary": "toroidal",
     },
 
@@ -14585,6 +15257,12 @@ RULE_PRESETS = {
         "vis_channels": ["Density", "Vel X", "Vel Y", "Vel Z"],
         "vis_default": 0,
         "vis_abs": False,
+        # Density is a smeared occupancy field with bulk values in
+        # [0.03, 0.10] (mean ≈ 0.05). Default (0,1) range collapsed
+        # the whole field to a uniform 5% opacity haze with no visible
+        # structure. (0, 0.12) gives the flocking density bands proper
+        # contrast while keeping zero-density gaps transparent.
+        "vis_range": (0.0, 0.12),
         "boundary": "toroidal",
     },
     "element_ca": {
@@ -15907,13 +16585,17 @@ RULE_PRESETS = {
                         "evolution happening live as a spatial process "
                         "inside the lattice, not as offline search."),
         "vis_channels": ["u (excite)", "v (recover)", "Memory 1", "Memory 2"],
-        "vis_default": 0,
-        "vis_abs": True,
+        # u channel polarises to ±3 in nearly every voxel (std≈3) →
+        # genuinely binary, no spatial structure to render. Memory 1
+        # (ch2) is continuous in [-1, +1] with culture-scale spatial
+        # variation → use bipolar mode to colour positive/negative
+        # memory states differently.
+        "vis_default": 2,
+        "vis_abs": False,
+        "vis_mode": "bipolar",
+        "vis_aux_range": (0.0, 1.0),
         "render_mode": "volumetric",
-        # |u| spans [0, ~1.7]; bulk noise sits below ~0.5. Restrict to
-        # the active fronts so culture boundaries are visible.
-        "vis_range": (0.7, 1.7),
-        "voxel_threshold": 0.9,
+        "voxel_threshold": 0.5,
         "boundary": "toroidal",
     },
 
@@ -16396,31 +17078,67 @@ def _flagship(base, **overrides):
     p.update(overrides)
     return p
 
-# 1. Neural swarm — heterogeneous-brain particles steer on a smoothlife
-#    substrate; each agent has its own randomly-initialised 6→8→3 MLP.
+# 1. Neural swarm — particles read the local SmoothLife gradient AND
+#    deposit life back into the field.  The two-way coupling means the
+#    swarm seeds and feeds its own substrate: dense clusters thicken
+#    the SmoothLife pattern, which in turn pulls more particles in.
+#    Without deposit feedback this preset was a tracer demo with no
+#    influence on the CA — which is exactly what we *don't* want.
 RULE_PRESETS['flagship_neural_swarm'] = _flagship(
     'smoothlife_3d',
     label="Flagship: Neural Swarm",
-    description=("4000 particles, each with its own random tanh MLP, "
-                 "steering on the local smoothlife gradient."),
+    description=("4000 particles climb the SmoothLife gradient and "
+                 "deposit life back into the field — the swarm both "
+                 "sculpts and is sculpted by the substrate."),
     particle_count=4000, particle_init='random_volume',
-    particle_force='nn_brain', particle_force_scale=3.0,
+    # `velocity_rgb` reads (ch0,ch1,ch2)-0.5 as a 3D velocity field at
+    # the particle position.  SmoothLife stores creature density in ch0
+    # and outer-annulus mean / growth signals in ch1+ch2 — the latter
+    # are *non-saturating* even where ch0 is at clamp=1.0, so the
+    # particles always feel a non-zero force and never freeze.  We
+    # tried `gradient_r` first (climb the density), but on SmoothLife
+    # the saturated creature interiors have an exact zero gradient
+    # (clamp kills ∂/∂x), drag pulls velocity to ~1e-21 within ~500
+    # steps and the swarm becomes a static dot cloud.  NN brain
+    # remains disabled — random MLPs produce noise, not behaviour.
+    particle_force='velocity_rgb', particle_force_scale=0.8,
     particle_dt=0.4, particle_drag=0.06, particle_life_decay=0.0005,
     particle_color_mode='speed', particle_size=0.35,
-    nn_brain_hidden=8, nn_brain_shared=False, nn_brain_seed=11,
+    # Two-way coupling: each particle drips into channel 0 every step.
+    # strength is the CA-side multiplier; amount is the per-particle
+    # deposit; radius=1 splats over a 3³ neighbourhood for stability.
+    # Tuned down from (strn=0.6, amt=0.012): the original numbers
+    # saturated SmoothLife voxels to clamp=1.0 within ~50 steps.  In the
+    # saturated region the gradient_r force is exactly zero (clamp kills
+    # the partial derivative), drag pulls velocities to ~1e-14, and
+    # the swarm freezes.  Halving strength + halving amount keeps the
+    # feedback effect visible (field mean shifts 0.306 → 0.315 vs
+    # no-deposit baseline) while keeping the swarm mobile (|v| stays
+    # in the 0.02–1.3 range instead of collapsing to zero).
+    particle_deposit_strength=0.3,
+    particle_deposit_amount=0.006,
+    particle_deposit_radius=1,
+    particle_deposit_channel=0,
 )
 
-# 2. Synchronised flock — single shared brain coordinates the whole swarm.
+# 2. Synchronised flock — same idea but with curl-of-gradient steering
+#    so particles orbit density ridges instead of climbing them, and a
+#    weaker deposit so the flock traces patterns rather than pooling.
 RULE_PRESETS['flagship_unison_flock'] = _flagship(
     'smoothlife_3d',
     label="Flagship: Unison Flock",
-    description=("Shared-brain swarm: all 3000 particles obey the same "
-                 "8-neuron MLP, producing globally coherent motion."),
+    description=("3000 particles ride the curl of the SmoothLife "
+                 "gradient (so they orbit ridges instead of pooling on "
+                 "peaks) and trail-deposit life behind them, leaving "
+                 "vortex-tracks the CA can amplify into structures."),
     particle_count=3000, particle_init='random_volume',
-    particle_force='nn_brain', particle_force_scale=2.0,
+    particle_force='curl_rgb', particle_force_scale=2.5,
     particle_dt=0.5, particle_drag=0.04, particle_life_decay=0.0,
     particle_color_mode='velocity', particle_size=0.4,
-    nn_brain_hidden=8, nn_brain_shared=True, nn_brain_seed=101,
+    particle_deposit_strength=0.35,
+    particle_deposit_amount=0.006,
+    particle_deposit_radius=0,   # single-voxel for sharper trails
+    particle_deposit_channel=0,
 )
 
 # 3. Branching tree — L-system tree seeds BZ spiral waves so chemical
@@ -16512,17 +17230,40 @@ RULE_PRESETS['flagship_glyph_bz'] = _flagship(
     glyph_alpha=0.7,
 )
 
-# 11. Galaxy with particles — galaxy substrate + 4000 particles drifting
-#     on the gravitational gradient field.
+# 11. Galaxy dust — substrate + 4000 dust grains that fall down the
+#     gravitational potential AND deposit mass back into the rho
+#     channel.  Density attracts dust -> dust accumulates -> density
+#     grows -> more dust falls in: a real feedback loop, not a tracer
+#     overlay.
 RULE_PRESETS['flagship_galaxy_dust'] = _flagship(
     'galaxy',
     label="Flagship: Galaxy Dust",
-    description=("A galaxy-formation substrate dressed with 4000 dust "
-                 "particles that follow the gravitational gradient."),
+    description=("4000 dust particles fall down the gravitational "
+                 "potential (gradient_neg_r) and deposit mass back into "
+                 "the density field - gravitational accretion you can "
+                 "watch grow."),
     particle_count=4000, particle_init='random_volume',
-    particle_force='gradient', particle_force_scale=6.0,
+    # gradient_neg_r: dust falls *down* the gradient (toward dense
+    # regions), the way matter actually behaves under gravity.  The
+    # earlier 'gradient' was a typo not in PARTICLE_FORCE_MODES (now an
+    # alias to gradient_r) - this is the physically correct mode.
+    particle_force='gradient_neg_r', particle_force_scale=6.0,
     particle_dt=0.3, particle_drag=0.04, particle_life_decay=0.0,
     particle_color_mode='speed', particle_size=0.35,
+    # Mass deposit: small per-particle amount, smeared over 3^3 voxels
+    # for numerical stability.  The galaxy shader adds
+    # u_deposit_strength * deposit(pos) to rho each step.
+    particle_deposit_strength=0.4,
+    particle_deposit_amount=0.004,
+    particle_deposit_radius=1,
+    particle_deposit_channel=0,
+    # Density grows under deposit feedback from the base galaxy ~[0,3]
+    # to ~[0.5, 10] — the inherited (0,1) default mapped the entire
+    # post-collapse field above the ceiling, rendering as one saturated
+    # cube. (0.5, 8) keeps the cosmic-web filament/node contrast visible
+    # for the first ~1500 steps, after which the deposit feedback
+    # genuinely fills the box (rule-level runaway, not a vis bug).
+    vis_range=(0.5, 8.0),
 )
 
 # 12. Dual Lenia — composition of two Lenia variants running in parallel.
@@ -16827,6 +17568,38 @@ def init_blank(size, rng):
     return np.zeros((size, size, size, 4), dtype=np.float32)
 
 
+def init_nca_seed(size, rng):
+    """Single-voxel seed at the cube centre, all four channels = 1.0.
+
+    Used by the 3D Neural CA — gives the network a non-zero locus to
+    grow / propagate / dissipate from.  A flat-zero init is a fixed
+    point of any sane MLP (NN(0)=b, but b=0 by our init), so the
+    interesting dynamics only kick in once there's *something* in the
+    field for the perception filters to differentiate.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    c = size // 2
+    data[c, c, c, :] = 1.0
+    return data
+
+
+def init_nca_random_specks(size, rng):
+    """A handful of random non-zero voxels scattered through the cube.
+
+    Tends to produce more visually busy NCA dynamics than the single-
+    seed init: each speck is its own potential growth source, so a
+    network that's mildly diffusive lights up the whole cube quickly
+    instead of spending hundreds of frames before the seed reaches a
+    voxel boundary.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    n = max(8, size * size // 200)  # density ~1/(200 voxels per slice)
+    coords = rng.integers(0, size, size=(n, 3))
+    for x, y, z in coords:
+        data[x, y, z, :] = rng.random(4).astype(np.float32)
+    return data
+
+
 def init_food_seed(size, rng):
     """Seed ch3 (alpha) with low-density food noise + a few hot patches.
 
@@ -17045,21 +17818,57 @@ def init_schnakenberg(size, rng):
     return data
 
 def init_fitzhugh_nagumo(size, rng):
-    """FN: quiescent V=−1, W=−2/3 (resting state), with one or two
-    suprathreshold blobs to trigger propagating pulses."""
+    """FN: seed a scroll filament so 3-D activity persists.
+
+    Naive blob seeds emit target waves that propagate outward, collide,
+    annihilate, and leave the medium at the homogeneous rest state —
+    visually a uniform cube within ~1000 steps because the default
+    (a=0.7, b=0.8, ε=0.08) regime is *quiescent excitable*, not
+    auto-oscillatory.  Block-quadrant ICs fail too: the bulk excited
+    region repolarises synchronously before a curved wavefront has time
+    to develop, so the spiral never forms.
+
+    The robust fix (same trick used by `init_bz_spiral_seed`) is to set
+    a *continuous phase field* φ(x,y,z) that winds 2π around an axis,
+    then map φ to the FHN limit cycle.  This produces a true
+    topological defect along the axis: the φ → ±0 discontinuity is the
+    scroll filament, and there's no way for the surrounding tissue to
+    relax to homogeneous rest without first un-winding the phase, which
+    diffusion alone cannot do.  Mirror BCs in the preset prevent the
+    far-field wavefront from wrapping into its own wake.
+
+    The FHN limit-cycle parameterisation:
+        V(φ) = V0 + Vamp · cos(φ)         centred between rest (-1) and
+                                          excited (+2): V0 = 0.5,  Vamp = 1.5
+        W(φ) = W0 + Wamp · sin(φ)         centred between rest (-2/3)
+                                          and refractory (+1):
+                                          W0 = 1/6,  Wamp = 5/6
+    so as φ runs 0 → 2π the (V, W) trajectory traces the standard FHN
+    relaxation oscillation once.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = -1.0
-    data[:, :, :, 1] = -2.0 / 3.0
+    mid = size / 2.0
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
-    n_blobs = rng.randint(1, 3)
-    for _ in range(n_blobs):
-        cx = rng.uniform(0.2, 0.8) * size
-        cy = rng.uniform(0.2, 0.8) * size
-        cz = rng.uniform(0.2, 0.8) * size
-        r  = max(2.0, size / 14.0)
-        d2 = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
-        blob = np.exp(-0.5 * d2 / (r * r)).astype(np.float32)
-        data[:, :, :, 0] += 2.5 * blob   # push V well above threshold
+    # Random axis for the scroll filament (one of x, y, z).
+    axis = rng.randint(0, 3)
+    if axis == 0:
+        dx, dy = (x - mid).astype(np.float64), (y - mid).astype(np.float64)
+    elif axis == 1:
+        dx, dy = (x - mid).astype(np.float64), (z - mid).astype(np.float64)
+    else:
+        dx, dy = (y - mid).astype(np.float64), (z - mid).astype(np.float64)
+    # Phase winds 2π around the chosen axis.
+    phase = np.arctan2(dy, dx)
+    # FHN limit-cycle parameterisation (see docstring).
+    V0, Vamp = 0.5,        1.5
+    W0, Wamp = 1.0 / 6.0,  5.0 / 6.0
+    V = V0 + Vamp * np.cos(phase)
+    W = W0 + Wamp * np.sin(phase)
+    # Tiny noise to break perfect symmetry along the filament and avoid
+    # grid-aligned pinning.
+    V += rng.uniform(-0.01, 0.01, V.shape)
+    data[:, :, :, 0] = V.astype(np.float32)
+    data[:, :, :, 1] = W.astype(np.float32)
     return data
 
 def init_brusselator(size, rng):
@@ -20694,6 +21503,8 @@ INIT_FUNCS = {
     'random_smooth': init_random_smooth,
     'blank': init_blank,
     'food_seed': init_food_seed,
+    'nca_seed': init_nca_seed,
+    'nca_random_specks': init_nca_random_specks,
     'predator_prey_lattice': init_predator_prey_lattice,
     'life_fbm_sparse': init_life_fbm_sparse,
     'life_fbm_moderate': init_life_fbm_moderate,
@@ -21058,7 +21869,24 @@ PARTICLE_INIT_FUNCS = {
     'sphere_shell': particle_init_sphere_shell,
     'top_plane': particle_init_top_plane,
     'bottom_jet': particle_init_bottom_jet,
+    'centered_blob': lambda size, count, rng: _particle_init_centered_blob(size, count, rng),
 }
+
+
+def _particle_init_centered_blob(size, count, rng):
+    """All particles packed into a small Gaussian blob near the cube
+    centre.  Useful for kernel-based pairwise dynamics (e.g. Particle
+    Lenia) where a uniform fill leaves neighbours too far apart to
+    bootstrap any structure — the blob hands the system a guaranteed
+    high-density seed from which clusters can crystallise outward."""
+    out = np.zeros((count, 8), dtype=np.float32)
+    centre = np.full(3, size * 0.5, dtype=np.float32)
+    sigma = size * 0.12  # tight enough that ~all neighbours are inside μ_k
+    out[:, 0:3] = centre + rng.standard_normal((count, 3)).astype(np.float32) * sigma
+    out[:, 3] = 1.0
+    out[:, 4:7] = (rng.random((count, 3), dtype=np.float32) - 0.5) * 0.05
+    out[:, 7] = 1.0
+    return out
 
 
 PARTICLE_FORCE_MODES = {
@@ -21068,11 +21896,20 @@ PARTICLE_FORCE_MODES = {
     'gradient_neg_r': 3,
     'curl_rgb': 4,
     'nn_brain': 5,
+    'lenia_pp': 6,  # particle-particle Lenia (Mordvintsev 2022)
+    # ── Aliases for legibility / common misspellings ──
+    'gradient':       2,   # alias of gradient_r (climb the density)
+    'gradient_up':    2,
+    'gradient_down':  3,   # alias of gradient_neg_r (fall into the basin)
+    'curl':           4,
+    'velocity':       1,
+    'lenia':          6,
 }
 
 PARTICLE_COLOR_MODES = {
     'fixed': 0,
     'speed': 1,
+    'velocity': 1,   # alias — callers expect colour-by-velocity-magnitude
     'lifetime': 2,
     'position': 3,
 }
@@ -23274,6 +24111,13 @@ class Simulator:
                     pass
         self.compute_progs = []
         smem = '1' if self._use_shared_mem else '0'
+        # Particle deposit feedback: when the active preset wants
+        # particles to write into the field, every CA pass is built with
+        # DEPOSIT_ENABLED=1 so `deposit(pos)` and `u_deposit_strength`
+        # become meaningful.  Otherwise they're stubbed to zero — see
+        # COMPUTE_HEADER.  Per-shader opt-in not needed; shaders that
+        # don't reference deposit() pay nothing.
+        dep_enabled = '1' if self._has_deposit() else '0'
 
         for pass_idx, spec in enumerate(self._pass_specs):
             key = spec['shader']
@@ -23313,7 +24157,7 @@ class Simulator:
                     source = COMPUTE_HEADER + shaders[key]
                     source = source.replace(
                         '#version 430',
-                        f'#version 430\n#define USE_SHARED_MEM {smem}\n#define PASS_INDEX {pass_idx}')
+                        f'#version 430\n#define USE_SHARED_MEM {smem}\n#define PASS_INDEX {pass_idx}\n#define DEPOSIT_ENABLED {dep_enabled}')
                     if self._tex_glsl_fmt != 'rgba32f':
                         source = source.replace('rgba32f', self._tex_glsl_fmt)
                     source = source.replace(
@@ -23340,7 +24184,7 @@ class Simulator:
                 source = COMPUTE_HEADER + CA_RULES[key]
             source = source.replace(
                 '#version 430',
-                f'#version 430\n#define USE_SHARED_MEM {smem}\n#define PASS_INDEX {pass_idx}')
+                f'#version 430\n#define USE_SHARED_MEM {smem}\n#define PASS_INDEX {pass_idx}\n#define DEPOSIT_ENABLED {dep_enabled}')
             if self._tex_glsl_fmt != 'rgba32f':
                 source = source.replace('rgba32f', self._tex_glsl_fmt)
             source = source.replace(
@@ -23659,6 +24503,9 @@ class Simulator:
                 self._particle_render_prog, [])
         # NN brains (optional). Allocate once particle_count is known.
         self._alloc_brains()
+        # Deposit feedback texture (only allocated if the preset opts in
+        # via particle_deposit_strength).
+        self._alloc_deposit_tex()
 
     def _release_particles(self):
         if getattr(self, 'particle_ssbo', None) is not None:
@@ -23675,6 +24522,7 @@ class Simulator:
             self.particle_render_vao = None
         self.particle_count = 0
         self._release_brains()
+        self._release_deposit_tex()
 
     # ── NN Brains for particle agents ────────────────────────────────
     # When `nn_brain_hidden > 0` is set in the preset, each particle
@@ -23720,6 +24568,168 @@ class Simulator:
             except Exception: pass
             self.brain_ssbo = None
 
+    # ── 3D Neural CA: per-rule SSBO with random-init MLP weights ──
+    # Architecture (matches `nca_3d` shader):
+    #   W1[16×32] + b1[32] + W2[32×4] + b2[4]  =  676 floats (~2.7 KB)
+    # Regenerated from `self.seed` whenever the user randomises so the
+    # creature is reproducible per (seed) and varied per (Randomize click).
+    NCA_HID = 32
+    NCA_IN  = 16
+    NCA_OUT = 4
+    NCA_WEIGHT_COUNT = (NCA_IN * NCA_HID + NCA_HID
+                        + NCA_HID * NCA_OUT + NCA_OUT)
+
+    def _is_nca_rule(self):
+        return self.preset.get('shader') == 'nca_3d'
+
+    def _load_nca_weights_npz(self, path):
+        """Load (W1, b1, W2, b2) from an .npz file (produced by
+        nca_trainer.py) and return the flat float32 buffer in the byte
+        layout the shader expects.  Relative paths are resolved against
+        the directory containing simulator.py so presets work regardless
+        of the user's cwd.  Returns None on any failure (missing keys,
+        wrong shapes, IO error) so the caller can fall back to random
+        init."""
+        try:
+            p = path
+            if not os.path.isabs(p):
+                p = os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
+            d = np.load(p)
+            W1 = np.asarray(d['W1'], dtype=np.float32)
+            b1 = np.asarray(d['b1'], dtype=np.float32)
+            W2 = np.asarray(d['W2'], dtype=np.float32)
+            b2 = np.asarray(d['b2'], dtype=np.float32)
+        except Exception as e:
+            print(f"[nca] could not load weights from {path}: {e}")
+            return None
+        IN, HID, OUT = self.NCA_IN, self.NCA_HID, self.NCA_OUT
+        if W1.shape != (IN, HID) or b1.shape != (HID,) \
+                or W2.shape != (HID, OUT) or b2.shape != (OUT,):
+            print(f"[nca] shape mismatch loading {path}: "
+                  f"W1={W1.shape} b1={b1.shape} W2={W2.shape} b2={b2.shape}")
+            return None
+        return np.concatenate([W1.flatten(), b1, W2.flatten(), b2])
+
+    def _alloc_nca_weights(self):
+        """Populate the SSBO at binding 14 with NCA weights.
+
+        Resolution order:
+          1. CLI override `self._nca_weights_override` (takes precedence
+             over preset — set by `--nca-weights` flag).
+          2. Preset field `weights_path` — for the curated trained
+             presets (sphere, torus, …).
+          3. Random Xavier/He init from `self.seed` — the explorable
+             "hunt for an interesting creature" mode.
+
+        Idempotent — releases any prior buffer first.  No shader
+        recompile required, so swapping weights at runtime is cheap."""
+        if not self._is_nca_rule():
+            self._release_nca_weights()
+            return
+
+        flat = None
+        path = (getattr(self, '_nca_weights_override', None)
+                or self.preset.get('weights_path'))
+        if path:
+            flat = self._load_nca_weights_npz(path)
+
+        if flat is None:
+            # Random init — see comments below for the scale rationale.
+            rng = np.random.default_rng(int(self.seed))
+            IN, HID, OUT = self.NCA_IN, self.NCA_HID, self.NCA_OUT
+            # Xavier init for ReLU first layer; small init on output so the
+            # network starts close to "do nothing" — most randomly-init NCAs
+            # explode otherwise, and a near-zero output preserves the seed
+            # pattern long enough to see whether the network nudges it into
+            # something organised before clipping kicks in.
+            s1 = float(np.sqrt(2.0 / IN))                  # He init for ReLU
+            W1 = rng.standard_normal((IN, HID)).astype(np.float32) * s1
+            b1 = np.zeros(HID, dtype=np.float32)
+            # 0.1× scale on the linear output layer keeps per-step deltas
+            # small (≪ clip) so dynamics evolve over many frames instead of
+            # saturating in one step.
+            s2 = 0.1 * float(np.sqrt(2.0 / HID))
+            W2 = rng.standard_normal((HID, OUT)).astype(np.float32) * s2
+            b2 = np.zeros(OUT, dtype=np.float32)
+            flat = np.concatenate([W1.flatten(), b1, W2.flatten(), b2])
+
+        assert flat.size == self.NCA_WEIGHT_COUNT, (flat.size, self.NCA_WEIGHT_COUNT)
+        self._release_nca_weights()
+        self.nca_ssbo = self.ctx.buffer(data=flat.astype(np.float32).tobytes())
+# ── Particle → Field deposit feedback ────────────────────────────
+    # When a preset sets `particle_deposit_strength` > 0, every step
+    # the simulator:
+    #   1. clears `self.deposit_tex` (r32f, same dims as the field),
+    #   2. runs the particle update — which atomically adds into the
+    #      texture at each particle's voxel,
+    #   3. issues a memory barrier,
+    #   4. runs the CA pass — which can read deposit() in its shader
+    #      and add it to whichever channel makes physical sense.
+    # This is what turns particles from passive tracers into active
+    # forcers.  Requires GL_NV_shader_atomic_float (NVIDIA-only); on
+    # other vendors we fall back to tracer mode silently.
+    def _has_deposit(self):
+        return (self._has_particles()
+                and float(self.preset.get('particle_deposit_strength', 0.0)) != 0.0)
+
+    def _alloc_deposit_tex(self):
+        """Allocate (or reallocate) the deposit SSBO matching the
+        current field dims.  No-op if deposit isn't enabled or the
+        buffer is already the right size.
+
+        We use an SSBO (binding 15) instead of an r32f image because
+        the driver only exposes 8 image units, all consumed by the
+        field src/dst/extras bindings.  Float atomicAdd on SSBOs is
+        provided by GL_NV_shader_atomic_float (NVIDIA-only)."""
+        if not self._has_deposit():
+            self._release_deposit_tex()
+            return
+        want_dims = (self.W, self.H, self.D)
+        existing = getattr(self, 'deposit_tex', None)
+        if existing is not None and getattr(self, '_deposit_dims', None) == want_dims:
+            return
+        self._release_deposit_tex()
+        nbytes = want_dims[0] * want_dims[1] * want_dims[2] * 4  # float32
+        # `deposit_tex` keeps its name for backward-compat in callers,
+        # but it now holds a moderngl.Buffer rather than a Texture3D.
+        self.deposit_tex = self.ctx.buffer(reserve=nbytes)
+        self._deposit_dims = want_dims
+        self._deposit_zero = np.zeros(want_dims[0] * want_dims[1] * want_dims[2],
+                                      dtype=np.float32).tobytes()
+        # CRITICAL: ctx.buffer(reserve=...) leaves contents uninitialised.
+        # CA shaders read this SSBO on the *first* step BEFORE
+        # _step_particles has had a chance to clear+write it (particles
+        # run *after* CA passes in _step_sim).  Without this zero the
+        # first frame ingests garbage — observed values up to 1.88e+31
+        # and NaNs, which clamp-saturate fields like SmoothLife to a
+        # uniform fixed point and kill all subsequent gradient-driven
+        # particle motion.
+        self.deposit_tex.write(self._deposit_zero)
+
+    def _release_deposit_tex(self):
+        if getattr(self, 'deposit_tex', None) is not None:
+            try: self.deposit_tex.release()
+            except Exception: pass
+            self.deposit_tex = None
+        self._deposit_dims = None
+        self._deposit_zero = None
+
+    def _clear_deposit(self):
+        """Zero the deposit buffer before the particle pass writes to
+        it.  At 64³ that's 1 MB — fits comfortably in PCIe bandwidth.
+        At larger sizes a compute-shader clear would beat this; revisit
+        if it ever shows up in a profile."""
+        if getattr(self, 'deposit_tex', None) is None:
+            return
+        self.deposit_tex.write(self._deposit_zero)
+
+    
+    def _release_nca_weights(self):
+        if getattr(self, 'nca_ssbo', None) is not None:
+            try: self.nca_ssbo.release()
+            except Exception: pass
+            self.nca_ssbo = None
+
     def _compile_particle_progs(self):
         """Compile + cache the particle update (compute) and render
         (vertex/fragment) programs and look up uniforms once.
@@ -23730,14 +24740,17 @@ class Simulator:
         """
         nn_hid    = int(self.preset.get('nn_brain_hidden', 0))
         nn_shared = 1 if self.preset.get('nn_brain_shared', False) else 0
+        dep       = 1 if self._has_deposit() else 0
         src = PARTICLE_UPDATE_COMPUTE.replace(
             '#version 430',
-            f'#version 430\n#define NN_HID {nn_hid}\n#define NN_SHARED {nn_shared}',
+            f'#version 430\n#define NN_HID {nn_hid}\n#define NN_SHARED {nn_shared}'
+            f'\n#define DEPOSIT_ENABLED {dep}',
             1,
         )
         self._particle_update_prog = self.ctx.compute_shader(src)
         self._nn_hid_compiled    = nn_hid
         self._nn_shared_compiled = nn_shared
+        self._dep_compiled       = dep
         u = self._particle_update_prog
         self._pu_size       = u['u_size']
         self._pu_count      = u['u_count']
@@ -23751,6 +24764,19 @@ class Simulator:
         self._pu_spawn_min  = u['u_spawn_min']
         self._pu_spawn_max  = u['u_spawn_max']
         self._pu_spawn_speed = u['u_spawn_speed']
+        # Particle Lenia uniforms (force mode 6).  Always present —
+        # GLSL declares them at file scope so they survive even when
+        # mode 6 is unreachable from the current call sites.
+        self._pu_pl_mu_k    = u.get('u_pl_mu_k',    None)
+        self._pu_pl_sigma_k = u.get('u_pl_sigma_k', None)
+        self._pu_pl_mu_g    = u.get('u_pl_mu_g',    None)
+        # Deposit uniforms (force unused / optimised away when DEPOSIT_ENABLED=0).
+        self._pu_dep_amount = u.get('u_deposit_amount', None)
+        self._pu_dep_radius = u.get('u_deposit_radius', None)
+        self._pu_dep_dims   = u.get('u_dep_dims',       None)
+        self._pu_pl_sigma_g = u.get('u_pl_sigma_g', None)
+        self._pu_pl_c_rep   = u.get('u_pl_c_rep',   None)
+        self._pu_pl_r_rep   = u.get('u_pl_r_rep',   None)
         u['u_field_tex'].value = 7  # texture unit 7 (won't clash w/ unit 0)
 
         self._particle_render_prog = self.ctx.program(
@@ -23776,15 +24802,21 @@ class Simulator:
         passes have written the latest field state."""
         if not self._has_particles():
             return
+        # Lazily allocate / resize the deposit texture when the preset
+        # opts in.  Idempotent — bails fast if dims already match.
+        if self._has_deposit():
+            self._alloc_deposit_tex()
         if not hasattr(self, '_particle_update_prog'):
             self._compile_particle_progs()
-        # If the preset's NN config changed (rule swap, manual edit), the
-        # cached compute shader has stale NN_HID/NN_SHARED #defines. Detect
-        # and recompile.
+        # If the preset's NN config or deposit toggle changed (rule
+        # swap, manual edit), the cached compute shader has stale
+        # NN_HID/NN_SHARED/DEPOSIT_ENABLED #defines. Detect and recompile.
         wanted_hid    = int(self.preset.get('nn_brain_hidden', 0))
         wanted_shared = 1 if self.preset.get('nn_brain_shared', False) else 0
+        wanted_dep    = 1 if self._has_deposit() else 0
         if (getattr(self, '_nn_hid_compiled', 0)    != wanted_hid
-                or getattr(self, '_nn_shared_compiled', 0) != wanted_shared):
+                or getattr(self, '_nn_shared_compiled', 0) != wanted_shared
+                or getattr(self, '_dep_compiled', 0) != wanted_dep):
             try: self._particle_update_prog.release()
             except Exception: pass
             del self._particle_update_prog
@@ -23799,9 +24831,26 @@ class Simulator:
         # Bind brain SSBO at binding 13 if present.
         if self._has_brains() and getattr(self, 'brain_ssbo', None) is not None:
             self.brain_ssbo.bind_to_storage_buffer(13)
+        # Bind deposit SSBO at binding 15 if present.  Cleared first so
+        # each step's deposit reflects only this frame's particle
+        # positions; CA reads it on the *next* step (one-frame lag,
+        # acceptable for visual feedback).
+        if wanted_dep and getattr(self, 'deposit_tex', None) is not None:
+            self._clear_deposit()
+            self.deposit_tex.bind_to_storage_buffer(15)
 
         force_name = self.preset.get('particle_force', 'none')
-        force_mode = PARTICLE_FORCE_MODES.get(force_name, 0)
+        force_mode = PARTICLE_FORCE_MODES.get(force_name, None)
+        if force_mode is None:
+            # Loud one-time warning so the next typo isn't silent.
+            warned = getattr(self, '_warned_force_modes', set())
+            if force_name not in warned:
+                print(f"[particles] unknown particle_force={force_name!r} "
+                      f"(preset {self.preset.get('label')!r}); falling back to "
+                      f"'none'.  Valid: {sorted(PARTICLE_FORCE_MODES.keys())}")
+                warned.add(force_name)
+                self._warned_force_modes = warned
+            force_mode = 0
         self._pu_size.value        = self.size
         self._pu_count.value       = self.particle_count
         self._pu_force_mode.value  = force_mode
@@ -23818,10 +24867,40 @@ class Simulator:
         self._pu_spawn_max.value = tuple(spawn_max)
         self._pu_spawn_speed.value = float(self.preset.get('particle_spawn_speed', 0.1))
 
+        # Deposit uniforms (only meaningful when DEPOSIT_ENABLED=1, but
+        # the .get() handles the optimised-out case gracefully).
+        if self._pu_dep_amount is not None:
+            self._pu_dep_amount.value = float(self.preset.get(
+                'particle_deposit_strength', 0.0))
+        if self._pu_dep_radius is not None:
+            self._pu_dep_radius.value = int(self.preset.get(
+                'particle_deposit_radius', 0))
+        if self._pu_dep_dims is not None:
+            self._pu_dep_dims.value = (int(self.W), int(self.H), int(self.D))
+
+        # Particle Lenia: pull live params (slider-editable) into the
+        # dedicated uniforms.  Falls back to preset defaults so other
+        # force modes don't pay the cost of decorating their params.
+        if force_mode == 6:
+            p = self.params
+            if self._pu_pl_mu_k    is not None:
+                self._pu_pl_mu_k.value    = float(p.get('Kernel μ',     3.0))
+            if self._pu_pl_sigma_k is not None:
+                self._pu_pl_sigma_k.value = float(p.get('Kernel σ',     1.0))
+            if self._pu_pl_mu_g    is not None:
+                self._pu_pl_mu_g.value    = float(p.get('Growth μ',     2.0))
+            if self._pu_pl_sigma_g is not None:
+                self._pu_pl_sigma_g.value = float(p.get('Growth σ',     0.3))
+            if self._pu_pl_c_rep   is not None:
+                self._pu_pl_c_rep.value   = float(p.get('Repulsion',    1.0))
+            if self._pu_pl_r_rep   is not None:
+                self._pu_pl_r_rep.value   = float(p.get('Repulse R',    1.5))
+
         groups = (self.particle_count + 63) // 64
         self._particle_update_prog.run(groups, 1, 1)
         GL.glMemoryBarrier(GL.GL_SHADER_STORAGE_BARRIER_BIT
-                           | GL.GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT)
+                           | GL.GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT
+                           | GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
     def _render_particles(self):
         """Draw the particle SSBO as additive billboards on top of the
@@ -24676,7 +25755,7 @@ class Simulator:
             if self.mouse_right_pressed:
                 rot = self._get_camera_rot()
                 right = rot[:, 0]
-                up = rot[:, 1]
+                up    = rot[:, 1]
                 if self._is_viewport_kind():
                     # Viewport fractals: panning translates the viewport
                     # origin in fractal space (cam_target is unused).
@@ -24764,8 +25843,12 @@ class Simulator:
                 'aux_b': prog['u_aux_b'] if 'u_aux_b' in prog else None,
                 'params': [prog[f'u_param{i}'] if f'u_param{i}' in prog else None
                            for i in range(4)],
-                # Cache prog handle for entity-arena uniform pushes that
-                # iterate by name rather than fixed slots.
+                # Particle-deposit feedback uniforms (always declared by
+                # COMPUTE_HEADER even when DEPOSIT_ENABLED=0; in that
+                # case `deposit()` is a stub returning 0).
+                'dep_strength': prog['u_deposit_strength'] if 'u_deposit_strength' in prog else None,
+                'dep_channel':  prog['u_deposit_channel']  if 'u_deposit_channel'  in prog else None,
+                # Cache prog handle for entity-arena uniform pushes.
                 'prog': prog,
             }
             self._cu_per_pass.append(cu)
@@ -24887,6 +25970,11 @@ class Simulator:
             if has_arena:
                 self.arena.bind_all()
                 self.arena.set_uniforms(self._cu_per_pass[pass_idx]['prog'])
+            # 3D Neural CA weights live at binding 14.  Bound only when
+            # the active rule is `nca_3d`; otherwise nothing references it.
+            if (kind == 'voxel' and spec['shader'] == 'nca_3d'
+                    and getattr(self, 'nca_ssbo', None) is not None):
+                self.nca_ssbo.bind_to_storage_buffer(14)
 
             cu = self._cu_per_pass[pass_idx]
             if cu['size'] is not None:
@@ -24935,6 +26023,20 @@ class Simulator:
                         cu_p.value = 0.0
                 else:
                     cu_p.value = float(param_values[i]) if i < len(param_values) else 0.0
+
+            # Particle → field deposit: push the per-step strength and
+            # target channel, then bind the deposit SSBO at binding 15.
+            # `_has_deposit()` gates the bind so non-deposit presets pay
+            # zero overhead. The shader's `deposit()` reads the buffer
+            # only when DEPOSIT_ENABLED=1 was baked at compile time.
+            if cu['dep_strength'] is not None:
+                cu['dep_strength'].value = float(self.preset.get(
+                    'particle_deposit_strength', 0.0))
+            if cu['dep_channel'] is not None:
+                cu['dep_channel'].value = int(self.preset.get(
+                    'particle_deposit_channel', 0))
+            if self._has_deposit() and getattr(self, 'deposit_tex', None) is not None:
+                self.deposit_tex.bind_to_storage_buffer(15)
 
             if kind == 'agent':
                 # 1D dispatch over agent count; workgroup is (64,1,1).
@@ -25204,6 +26306,12 @@ class Simulator:
         self._release_entity_arena()
         if self._has_entity_arena():
             self._alloc_entity_arena()
+        # 3D Neural CA: regenerate weights from current seed so that
+        # Randomize (which mutates self.seed) yields a new "creature".
+        if self._is_nca_rule():
+            self._alloc_nca_weights()
+        else:
+            self._release_nca_weights()
         self._prev_grid = None
         _fence_delete(getattr(self, '_metrics_fence', None))
         self._metrics_fence = None
@@ -25457,7 +26565,8 @@ class Simulator:
             self.voxel_threshold = 0.01
         elif shader == 'wave_3d':
             self.voxel_threshold = 0.005
-        elif shader in ('smoothlife_3d', 'lenia_3d', 'lenia_multi_3d'):
+        elif shader in ('smoothlife_3d', 'lenia_3d', 'lenia_multi_3d',
+                         'flow_lenia_advect', 'flow_lenia_potential'):
             # Life CAs settle into stable values around 0.3-0.6 for live
             # cells; values below ~0.1 are decaying / sub-threshold and
             # rendering them gives the appearance of "the cube filling
@@ -26457,7 +27566,7 @@ void main() {
             channel, mode, threshold, change_thr = 1, 1, 0.01, 0.001
         elif shader == 'wave_3d':
             channel, mode, threshold, change_thr = 0, 2, 0.005, 0.001
-        elif shader in ('smoothlife_3d', 'lenia_3d'):
+        elif shader in ('smoothlife_3d', 'lenia_3d', 'flow_lenia_advect'):
             channel, mode, threshold, change_thr = 0, 1, 0.01, 0.001
         else:
             channel, mode, threshold, change_thr = 0, 0, 0.5, 0.01
@@ -30089,6 +31198,11 @@ def main():
                         help='Load discovery from JSON file (index with --discovery-index)')
     parser.add_argument('--discovery-index', type=int, default=0,
                         help='Which discovery to load (0-based index)')
+    parser.add_argument('--nca-weights', type=str, default=None,
+                        help='Path to a .npz file produced by nca_trainer.py '
+                             '(keys W1, b1, W2, b2). When set with --rule '
+                             'nca_3d, overrides random init with trained '
+                             'weights so the NCA grows toward its target.')
     # --- audit mode ---
     parser.add_argument('--audit', action='store_true',
                         help='Run a headless debug audit across --audit-sizes '
@@ -30258,6 +31372,14 @@ def main():
     if args.seed is not None:
         sim.seed = int(args.seed)
         sim._reset()
+
+    if args.nca_weights is not None:
+        sim._nca_weights_override = args.nca_weights
+        if sim._is_nca_rule():
+            sim._alloc_nca_weights()
+            sim._reset()
+        else:
+            print(f"[nca] --nca-weights ignored (rule is {args.rule}, not nca_3d)")
 
     sim.run()
 
