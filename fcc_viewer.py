@@ -41,6 +41,9 @@ from fcc_render import (
     VIS_MODE_DENSITY,
     VIS_MODE_RGB_CHANNELS,
 )
+from fcc_rule_gray_scott import (
+    GrayScottFCC, REGIMES as GS_REGIMES, seed_random_clusters,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +130,7 @@ def _hsv_to_rgb(h: float, s: float, v: float) -> Tuple[float, float, float]:
 
 def _build_world(
     ctx, mode: str, grid: int, nn_spacing: int,
+    *, gs_regime: str = 'mitosis', gs_steps: int = 1500, gs_seed: int = 0,
 ) -> Tuple[FCCField, FCCFieldShape, VoxelSettings, float]:
     if mode == 'sphere':
         shape = FCCFieldShape(grid, grid, grid)
@@ -161,6 +165,32 @@ def _build_world(
         shape = FCCFieldShape(grid, grid, grid)
         field = FCCField(ctx, shape)
         settings = VoxelSettings()
+        half = np.array([shape.Na, shape.Nb, shape.Nc], dtype=np.float64) * 0.5
+        return field, shape, settings, float(np.linalg.norm(FCC.index_to_world(half)))
+
+    if mode == 'gray_scott':
+        shape = FCCFieldShape(grid, grid, grid)
+        field = FCCField(ctx, shape, linear_filter=False)
+        seed_random_clusters(field, n_seeds=max(8, grid // 4),
+                             seed_radius=3, rng_seed=gs_seed)
+        if gs_regime not in GS_REGIMES:
+            raise ValueError(f"unknown gs regime: {gs_regime!r} "
+                             f"(known: {list(GS_REGIMES)})")
+        rule = GrayScottFCC(ctx)
+        params = GS_REGIMES[gs_regime]
+        for _ in range(gs_steps):
+            rule.step(field, params)
+        ctx.finish()
+        rule.release()
+        settings = VoxelSettings(
+            threshold=0.30,            # peaks of V (background sits ~0.15-0.2)
+            vis_mode=VIS_MODE_DENSITY,
+            channel=1,                 # V
+            colormap=0,                # fire
+            voxel_shrink=1.0,
+            ao_strength=0.4,
+            brightness=1.8,
+        )
         half = np.array([shape.Na, shape.Nb, shape.Nc], dtype=np.float64) * 0.5
         return field, shape, settings, float(np.linalg.norm(FCC.index_to_world(half)))
 
@@ -292,12 +322,18 @@ def headless_render(
     height: int = 720,
     expect_components: int = 13,
     roundness_max: float = 0.10,
+    gs_regime: str = 'mitosis',
+    gs_steps: int = 1500,
+    gs_seed: int = 0,
 ) -> int:
     import moderngl
     print(f"[viewer] headless ({mode}): booting standalone context...")
     ctx = moderngl.create_standalone_context(require=430)
 
-    field, shape, settings, frame_radius = _build_world(ctx, mode, grid, nn_spacing)
+    field, shape, settings, frame_radius = _build_world(
+        ctx, mode, grid, nn_spacing,
+        gs_regime=gs_regime, gs_steps=gs_steps, gs_seed=gs_seed,
+    )
     print(f"[viewer]   field = {shape.Na}x{shape.Nb}x{shape.Nc} "
           f"({shape.cell_count} cells)")
 
@@ -365,6 +401,28 @@ def headless_render(
               f"(distinct colours must equal {expect_components})")
         return 0 if ok else 1
 
+    if mode == 'gray_scott':
+        # Read V field directly to compute alive-fraction (more reliable
+        # than counting screen pixels, which depend on camera framing).
+        cells = np.frombuffer(field.current.read(), dtype=np.float32) \
+                  .reshape(shape.numpy_shape())
+        V = cells[..., 1]
+        alive_frac = float((V > settings.threshold).mean())
+        v_mean = float(V.mean()); v_max = float(V.max())
+        n_comp = _connected_components(mask)
+        print(f"[viewer]   V: mean={v_mean:.3f}  max={v_max:.3f}  "
+              f"alive_frac={alive_frac:.3f}  (regime={gs_regime})")
+        print(f"[viewer]   pattern components (2D projection) = {n_comp}")
+        # Pearson regimes typically settle at 2-40% V coverage. Outside
+        # this band the rule has either collapsed (V -> 0) or saturated
+        # (V everywhere); both are pathological.
+        ok_frac = 0.02 < alive_frac < 0.45
+        ok_comp = n_comp >= 6        # at least 6 distinct spots in projection
+        ok = ok_frac and ok_comp
+        print(f"[viewer] gray_scott: {'PASS' if ok else 'FAIL'} "
+              f"(need 0.02 < V-coverage < 0.45 AND >=6 components)")
+        return 0 if ok else 1
+
     return 0
 
 
@@ -376,6 +434,7 @@ def headless_render(
 def interactive(
     *, mode: str = 'sphere', grid: int = 64, nn_spacing: int = 3,
     width: int = 1024, height: int = 768,
+    gs_regime: str = 'mitosis', gs_steps: int = 1500, gs_seed: int = 0,
 ) -> None:
     import glfw, moderngl
 
@@ -398,7 +457,10 @@ def interactive(
     print(f"[viewer] {ctx.info.get('GL_RENDERER', '?')}  "
           f"{ctx.info.get('GL_VERSION', '?')}")
 
-    field, shape, settings, frame_radius = _build_world(ctx, mode, grid, nn_spacing)
+    field, shape, settings, frame_radius = _build_world(
+        ctx, mode, grid, nn_spacing,
+        gs_regime=gs_regime, gs_steps=gs_steps, gs_seed=gs_seed,
+    )
     renderer = VoxelRenderer(ctx)
     centre = renderer.field_world_center(shape)
     cam = OrbitCamera(target=centre, distance=frame_radius * 2.6,
@@ -463,7 +525,8 @@ def interactive(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=('sphere', 'neighbours', 'empty'),
+    ap.add_argument('--mode',
+                    choices=('sphere', 'neighbours', 'empty', 'gray_scott'),
                     default='sphere')
     ap.add_argument('--headless', action='store_true')
     ap.add_argument('--out', default='/tmp/fcc_view.png')
@@ -474,6 +537,10 @@ def main() -> None:
     ap.add_argument('--height', type=int, default=720)
     ap.add_argument('--expect-components', type=int, default=13)
     ap.add_argument('--roundness-max', type=float, default=0.10)
+    ap.add_argument('--gs-regime',
+                    choices=tuple(GS_REGIMES.keys()), default='spots')
+    ap.add_argument('--gs-steps', type=int, default=5000)
+    ap.add_argument('--gs-seed', type=int, default=0)
     args = ap.parse_args()
 
     if args.headless:
@@ -482,11 +549,15 @@ def main() -> None:
             nn_spacing=args.nn_spacing, width=args.width, height=args.height,
             expect_components=args.expect_components,
             roundness_max=args.roundness_max,
+            gs_regime=args.gs_regime, gs_steps=args.gs_steps,
+            gs_seed=args.gs_seed,
         )
         sys.exit(rc)
     else:
         interactive(mode=args.mode, grid=args.grid, nn_spacing=args.nn_spacing,
-                    width=args.width, height=args.height)
+                    width=args.width, height=args.height,
+                    gs_regime=args.gs_regime, gs_steps=args.gs_steps,
+                    gs_seed=args.gs_seed)
 
 
 if __name__ == '__main__':
