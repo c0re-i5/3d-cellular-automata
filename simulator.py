@@ -22954,6 +22954,18 @@ class Simulator:
                                         self.box_dims[1] * 0.5,
                                         self.box_dims[2] * 0.5])
 
+        # Auto-rotate (slow orbit around cam_target). Rate is in
+        # *viewer-time* degrees/second, so a 24 fps and a 60 fps
+        # recording produce the same on-screen angular velocity:
+        #   - not recording, or recording in 'realtime' mode → tick by
+        #     wall-clock dt at the top of the main loop.
+        #   - recording in 'per_step' mode → tick by `rate / _rec_fps`
+        #     per *captured* video frame (advanced just after the
+        #     capture block), so output rotation is locked to output FPS.
+        self._auto_rotate = False
+        self._auto_rotate_rate_deg = 9.0   # 40 s / revolution
+        self._auto_rotate_last_wall = time.perf_counter()
+
         # Rendering
         self.density_scale = 15.0
         self.brightness = 1.5
@@ -29173,6 +29185,38 @@ void main() {
                 imgui.end_combo()
 
         # ── Video recording ───────────────────────────────────────────
+        # Auto-rotate camera (rate-locked to output time when recording,
+        # wall-clock when not). Lives above the recording controls so
+        # it's visible both as a "framing aid" for live viewing and as
+        # a recording option.
+        changed, val = imgui.checkbox(
+            "Auto-rotate camera", self._auto_rotate)
+        if changed:
+            self._auto_rotate = val
+            self._auto_rotate_last_wall = time.perf_counter()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Slowly orbit the camera around the look-at point at a\n"
+                "constant *viewer-time* rate. When recording in per-step\n"
+                "mode the rate is locked to output FPS, so a 24 fps and a\n"
+                "60 fps recording produce identical on-screen rotation\n"
+                "speed in playback.")
+        imgui.same_line()
+        imgui.set_next_item_width(160)
+        rchanged, new_rate = imgui.slider_float(
+            "deg/s##autorot", float(self._auto_rotate_rate_deg),
+            -90.0, 90.0, '%.1f')
+        if rchanged:
+            self._auto_rotate_rate_deg = float(new_rate)
+        if imgui.is_item_hovered():
+            sec_per_rev = (360.0 / abs(self._auto_rotate_rate_deg)
+                           if abs(self._auto_rotate_rate_deg) > 1e-3 else 0.0)
+            tip = ("Rotation rate in degrees per second of viewer time.\n"
+                   "Positive = right-hand rule around world-up.")
+            if sec_per_rev > 0.0:
+                tip += f"\nCurrent: 1 revolution every {sec_per_rev:.1f} s."
+            imgui.set_tooltip(tip)
+
         if self._recording:
             imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.8, 0.1, 0.1, 1.0))
             imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(1.0, 0.2, 0.2, 1.0))
@@ -30529,6 +30573,22 @@ void main() {
                 t_after_poll = time.perf_counter()
                 sec['poll'] = t_after_poll - t0
 
+                # Auto-rotate camera (frame-rate independent). Wall-clock
+                # advance for the live preview + realtime-mode recording;
+                # per_step-mode recording uses output-FPS advance applied
+                # after the capture block below.
+                dt_wall = t0 - self._auto_rotate_last_wall
+                self._auto_rotate_last_wall = t0
+                if (self._auto_rotate
+                        and not (self._recording
+                                 and self._rec_capture_mode == 'per_step')):
+                    self.cam_theta += (math.radians(self._auto_rotate_rate_deg)
+                                       * dt_wall)
+                    if self.cam_theta > math.pi:
+                        self.cam_theta -= 2.0 * math.pi
+                    elif self.cam_theta < -math.pi:
+                        self.cam_theta += 2.0 * math.pi
+
                 # Update framebuffer size
                 fb_w, fb_h = glfw.get_framebuffer_size(self.window)
                 if fb_w > 0 and fb_h > 0:
@@ -30620,6 +30680,7 @@ void main() {
                         # loop trying to flush hundreds of frames at once.
                         spf = max(self._rec_steps_per_frame, 1e-3)
                         guard = 32
+                        frames_before = self._rec_frame_count
                         while (self._recording
                                and self._rec_step_accum >= spf
                                and guard > 0):
@@ -30627,6 +30688,23 @@ void main() {
                             self._rec_step_accum -= spf
                             guard -= 1
                             self._rec_check_autostop()
+                        # Auto-rotate: advance cam_theta in output-video
+                        # time, locked to _rec_fps so the rotation rate
+                        # on playback is exactly _auto_rotate_rate_deg
+                        # deg/sec regardless of how the sim/render loop
+                        # is paced. The angle update lags the captured
+                        # frames by one main-loop iteration (it lands in
+                        # the next iter's render), which is a sub-degree
+                        # offset at any sensible rotation rate.
+                        captured = self._rec_frame_count - frames_before
+                        if captured > 0 and self._auto_rotate:
+                            self.cam_theta += (
+                                math.radians(self._auto_rotate_rate_deg)
+                                * (captured / max(self._rec_fps, 1)))
+                            if self.cam_theta > math.pi:
+                                self.cam_theta -= 2.0 * math.pi
+                            elif self.cam_theta < -math.pi:
+                                self.cam_theta += 2.0 * math.pi
 
                 # Render UI
                 t_ui_start = time.perf_counter()
