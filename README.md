@@ -210,11 +210,56 @@ nca_trainer.py          — Offline trainer for the 3D neural CA preset; exports
 trained_nca/            — Pre-trained NCA weight blobs (sphere, torus targets)
 test_harness.py         — Headless parameter sweep and discovery engine (~4 200 lines)
 snapshot_3d.py          — Headless renderer + multi-channel auditor (PNG strips, channel-utilisation reports)
+schema.py               — Discovery-record schema v1 (canonical field list,
+                          strict accessor, version gates). Producers and
+                          consumers go through `get_field` so a missing v1
+                          field on a v1+ entry raises immediately.
+audit.py                — Corpus auditor for discoveries.json: schema
+                          coverage, cross-reference of `derived_from`
+                          links, optional GPU replay sample (`--replay K`)
+                          that re-scores entries from their recorded
+                          size/steps/seed/params and reports drift, and a
+                          code-surface pass (bare-`except` triage, ruff
+                          BLE001 enforcement). See "Reproducibility &
+                          Audit" below.
+refine.py / batch_refine.py
+                        — Deep-refinement pipeline: takes a parent
+                          discovery and runs a longer, larger trial with
+                          extra dynamics analysis (period, growth, cluster,
+                          translation), writing report.json into a
+                          per-discovery refinement directory. The batch
+                          driver fans this out across the corpus.
+scripts/                — One-off maintenance scripts:
+                          `annotate_bare_except.py` (mass-annotates
+                          `except Exception:` with `# noqa: BLE001`
+                          + reason) and `backfill_legacy_discoveries.py`
+                          (adds size/steps + provenance marker to pre-v1
+                          discovery entries).
+ca_dashboard.py         — Read-only TUI dashboard over discoveries +
+                          recordings (live previews, top-rule summary,
+                          recent activity).
 ca_debug/               — Unified debug + data-capture + correctness-probe package
                           (see Quality Assurance section below). Includes
                           `ca_debug/scratch/` — informal investigation scripts
                           accumulated while hunting specific bugs (density
                           audit, particle SSBO probe, per-rule validators).
+lattice.py, fcc_field.py, fcc_render.py, fcc_rule_gray_scott.py,
+fcc_viewer.py, lattice_gpu_check.py
+                        — **Work in progress / on the back burner.**
+                          Experimental face-centred-cubic (FCC) lattice
+                          substrate: dense native storage in primitive
+                          cell coordinates, 12-NN Laplacian, voxel
+                          renderer with rhombohedral primitive cells. The
+                          goal is denser sphere packing than the cubic
+                          lattice (12 nearest neighbours instead of 6,
+                          $\pi/\sqrt{18}\approx 74\%$ packing fraction
+                          vs. cubic's $\pi/6\approx 52\%$) for more
+                          isotropic discrete diffusion. One rule
+                          (Gray-Scott) and a headless viewer exist as a
+                          proof of concept; not wired into the main
+                          simulator UI and not the path used by the 100+
+                          cubic-lattice presets. The pre-FCC commit is
+                          tagged `pre-fcc-transition` for rollback.
 youtube_pipeline/       — OAuth + chunked resumable upload of `recordings/`
                           MP4s to YouTube. Reads sidecar JSON for titles,
                           descriptions, and Shorts detection. See
@@ -299,9 +344,7 @@ Every rule's primary state lives in an RGBA `image3D` (4 channels per voxel), so
 The dispatcher writes back the *same* texture format, so:
 - **Voxel mode** still reads only `.r` (state) — auxiliary channels are ignored, no behaviour change
 - **Volumetric mode** lets the per-preset `vis_mode` choose how to reduce ch0–ch3 into a colour
-- **Discovery scoring / GPU metrics** still operate on `.r`; auxiliaries are visualisation-only
-
-A condensed reference for what the auxiliary channels mean per rule (see source for full list):
+- **Discovery scoring / GPU metrics** still operate on `.r`; auxiliaries are visualisation-onlyA condensed reference for what the auxiliary channels mean per rule (see source for full list):
 
 | Rule | ch0 | ch1 | ch2 | ch3 | default `vis_mode` |
 |------|-----|-----|-----|-----|--------------------|
@@ -330,6 +373,55 @@ A condensed reference for what the auxiliary channels mean per rule (see source 
 | Schrödinger family (×8) | ψ real | ψ imag | potential V | \|Ψ\|² | (default density on \|Ψ\|²) |
 
 The `wireworld_3d` row carries one important invariant: `ch0` *must* remain `state/3` because the kernel re-reads it via `ww_state()` to recover the discrete state on the next step. Promoting `ch1–ch3` is free; ch0 is load-bearing.
+
+## Reproducibility & Audit
+
+The discovery corpus and the producer/consumer code are kept honest by a small
+schema + auditor stack rather than convention. `discoveries.json` accumulates
+entries from every search run and is the main long-lived artefact in the
+project; it has to survive code edits, refactors, and the inevitable drift
+between "the rule that scored 0.87" and "the rule as it exists today".
+
+**Discovery schema v1** (`schema.py`). Every entry written by current
+producers carries:
+
+```
+schema_version, rule, params, score, seed,   # identity
+size, steps, rule_code_hash                   # reproducibility
+```
+
+`rule_code_hash` is a digest of the rule's GLSL source at the moment the
+entry was written. `schema.get_field(entry, name)` is strict on v1+ entries
+and raises if a required field is missing, so silent producer bugs surface
+the next time the entry is touched.
+
+**Legacy backfill.** Pre-v1 entries (the bulk of the historical corpus)
+were backfilled in place with the audit's documented historical replay
+defaults (`size=48`, `steps=200`) plus a `_legacy_backfill` provenance
+dict, so consumers can read `size`/`steps` uniformly across the corpus.
+`schema_version` stays absent on these entries — they have no
+`rule_code_hash`, so bit-exact replay is **not** guaranteed; the audit
+flags them explicitly.
+
+**Audit passes** (`python audit.py [--replay K]`):
+
+| Pass | Checks |
+|------|--------|
+| **1 — schema** | Field coverage per entry, per-rule field shape clusters, value-range sanity (score ∈ [0, 1], no NaN/Inf), v1-required-field presence on v1+ entries. |
+| **2 — cross-reference** | `derived_from` links resolve to existing entries; refinement blocks point at on-disk `report.json`. |
+| **3 — replay (opt-in, GPU)** | Re-runs a random sample of entries at their recorded `size/steps/seed/params/dt`, compares fresh score against recorded. Bit-exact match expected for v1+ entries whose `rule_code_hash` still matches current source (drift is reported); legacy entries are replayed under the backfilled defaults and treated as approximate. |
+| **4 — code surface** | Bare-`except` triage across the whole repo: every `except Exception:` must either narrow to a typed exception or carry a `# noqa: BLE001  <reason>` marker. Counts and per-file breakdown go into `audit_report.md`. |
+
+**Lint enforcement.** `ruff.toml` selects `BLE001` so an unannotated
+`except Exception:` is a hard error in CI:
+
+```bash
+ruff check .       # fails on any bare exception without a noqa: BLE001 marker
+```
+
+This puts a one-line audit trail on every defensive catch in the codebase
+(225 sites at last count) — "why does this function swallow exceptions?"
+is answered next to the `except`, not in commit history.
 
 ## Mathematical Reference
 
