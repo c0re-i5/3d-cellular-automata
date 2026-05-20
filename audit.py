@@ -55,6 +55,7 @@ DYNAMICS_FIELDS = {
 LATER_OPTIONAL = {
     'init_variant', 'init_density', 'derived_from',
     'marked', 'marked_at', 'refinement',
+    '_legacy_backfill',  # Tier 4c provenance marker on pre-v1 entries
 }
 # Schema v1 fields (2026-05 audit, Tier 1+2). Always present on new writes
 # from schema_version >= 1; absent on historical entries.
@@ -495,9 +496,11 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         out['error'] = f'cannot import test_harness: {e}'
         return out
 
-    # Default replay parameters for *legacy* entries that don't record
-    # size/steps. v1+ entries carry these fields and we use them verbatim,
-    # which is the whole point of the v1 schema: reproducible replay.
+    # Fallback replay parameters for entries that record neither size
+    # nor steps. After Tier 4c, the legacy corpus has been backfilled
+    # with these defaults (provenance: `_legacy_backfill`), and v1+
+    # entries carry recorded values, so this fallback only fires for
+    # malformed or partial entries.
     LEGACY_SIZE = 48
     LEGACY_STEPS = 200
 
@@ -518,12 +521,15 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         for j, idx in enumerate(sample_idx):
             e = entries[idx]
             rule = e.get('rule')
-            # v1+ entries record size/steps — use them so the replay
-            # reproduces the original conditions. Legacy entries fall
-            # back to the small fixed pair (replay is approximate).
+            # Use recorded size/steps when present (v1 schema records
+            # them; pre-v1 entries were backfilled in Tier 4c with
+            # historical defaults, see `_legacy_backfill` provenance).
+            # Bit-exactness is only guaranteed for v1+ (rule_code_hash
+            # binds replay to the producing code); legacy entries are
+            # replayed under presumed conditions.
             is_v1 = bool(e.get('schema_version', 0))
-            size_ = int(e['size']) if is_v1 and 'size' in e else LEGACY_SIZE
-            steps_ = int(e['steps']) if is_v1 and 'steps' in e else LEGACY_STEPS
+            size_ = int(e['size']) if 'size' in e else LEGACY_SIZE
+            steps_ = int(e['steps']) if 'steps' in e else LEGACY_STEPS
             if is_v1:
                 v1_replays += 1
             else:
@@ -570,9 +576,9 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
     out['legacy_replays'] = legacy_replays
     out['note'] = (
         f'Replayed {v1_replays} v1+ entries at their recorded size/steps '
-        f'and {legacy_replays} legacy entries at fallback '
-        f'size={LEGACY_SIZE}, steps={LEGACY_STEPS} (legacy corpus does '
-        f'not record these, so replay is approximate).'
+        f'and {legacy_replays} legacy entries at recorded (Tier 4c-backfilled) '
+        f'size/steps (default {LEGACY_SIZE}x{LEGACY_STEPS}). Bit-exact '
+        f'replay only expected for v1+ entries; legacy replay is approximate.'
     )
     out['wildly_different_examples'] = wild[:15]
     out['crashes_examples'] = crashes[:15]

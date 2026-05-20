@@ -172,7 +172,7 @@ def classify(body: str) -> str | None:
         try:
             if matcher(body):
                 return reason
-        except Exception:
+        except Exception:  # noqa: BLE001  matcher may raise on odd shapes, skip
             continue
     return None
 
