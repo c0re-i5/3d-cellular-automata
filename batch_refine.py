@@ -31,6 +31,8 @@ import fcntl
 
 import numpy as np
 
+from schema import get_field
+
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 DISC_PATH = os.path.join(THIS_DIR, 'discoveries.json')
 LOCK_PATH = DISC_PATH + '.lock'
@@ -39,10 +41,10 @@ LOCK_PATH = DISC_PATH + '.lock'
 def _short_hash(entry):
     """Mirrors refine.short_hash and simulator._refine_short_hash."""
     import hashlib
-    rule = entry.get('rule', '')
+    rule = get_field(entry, 'rule', '')
     params = sorted((str(k), float(v))
-                    for k, v in (entry.get('params') or {}).items())
-    seed = int(entry.get('seed', 0))
+                    for k, v in (get_field(entry, 'params', {}) or {}).items())
+    seed = int(get_field(entry, 'seed', 0))
     key = json.dumps([rule, params, seed], sort_keys=True)
     return hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]
 
@@ -169,7 +171,7 @@ def main():
     parent_idx, parent = _resolve_parent(all_disc, args)
     parent_hash = _short_hash(parent)
     rule = parent['rule']
-    centre = dict(parent.get('params') or {})
+    centre = dict(get_field(parent, 'params', {}) or {})
     if not centre:
         sys.exit(f"parent #{parent_idx} ({rule}) has no params — nothing to mutate")
 
@@ -305,6 +307,8 @@ def main():
         if trial_density is not None:
             result['init_density'] = trial_density
         score = float(result.get(args.metric, result.get('score', 0.0)))
+        # NOTE: `result` here is a run_trial output dict, NOT a discovery
+        # entry, so it's intentionally read with raw .get().
         kept = score >= args.min_quality
         if kept:
             d = _make_discovery(result)

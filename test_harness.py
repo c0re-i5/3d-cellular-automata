@@ -54,6 +54,11 @@ warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
 # fields and should be treated as schema_version=None (== pre-1).
 DISCOVERY_SCHEMA_VERSION = 1
 
+# Schema-aware discovery field access. Strict on v1+ entries (raises if a
+# REQUIRED_V1 field is missing); lenient on legacy entries (falls through
+# to the default).
+from schema import get_field
+
 # ── Headless GPU context ──────────────────────────────────────────────
 
 def create_headless_context():
@@ -3933,9 +3938,9 @@ def cmd_promote(ctx, args):
     with open(in_path) as f:
         all_disc = json.load(f)
 
-    candidates = [d for d in all_disc if d.get('rule') == args.rule]
+    candidates = [d for d in all_disc if get_field(d, 'rule') == args.rule]
     # Sort by prescreen score; take top-K
-    candidates.sort(key=lambda d: d.get('score', 0.0), reverse=True)
+    candidates.sort(key=lambda d: get_field(d, 'score', 0.0), reverse=True)
     candidates = candidates[:args.top]
     if not candidates:
         print(f"No prescreen entries for {args.rule} in {in_path}")
@@ -3949,11 +3954,11 @@ def cmd_promote(ctx, args):
     survivors = []
     min_q = getattr(args, 'min_quality', 0.20)
     for i, d in enumerate(candidates):
-        params      = dict(d.get('params', {}))
-        dt          = d.get('dt')
+        params      = dict(get_field(d, 'params', {}) or {})
+        dt          = d.get('dt')  # not in REQUIRED_V1 (preset-driven default)
         init_dens   = d.get('init_density')
         init_var    = d.get('init_variant')
-        seed        = int(d.get('seed', i))
+        seed        = int(get_field(d, 'seed', i))
         try:
             with _trial_recorder(args, args.rule, size=args.size, seed=seed,
                                  params=params, dt=dt, tags=['promote']) as rec:
@@ -3972,7 +3977,7 @@ def cmd_promote(ctx, args):
         bv = _get_metric(r, metric)
         keep = _is_quality(r, min_score=min_q) and bv >= min_q
         flag = 'KEEP' if keep else 'drop'
-        print(f"  [{i+1:3d}/{len(candidates)}] pre={d.get('score',0):.3f} "
+        print(f"  [{i+1:3d}/{len(candidates)}] pre={get_field(d, 'score', 0):.3f} "
               f"-> post={r['score']:.3f} {metric}={bv:.3f} {flag}  "
               f"{_fmt_params(r['params'])}")
         if keep:

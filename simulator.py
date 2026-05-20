@@ -29,6 +29,9 @@ from imgui_bundle import imgui
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 from element_data import ELEMENT_GPU_DATA, SYMBOLS, NAMES, NUM_ELEMENTS, FLOATS_PER_ELEMENT, WALL_ID
 import entity_arena
+
+# Schema-aware discovery field access (REQUIRED_V1 strict on v1+ entries).
+from schema import get_field
 # Unified debug bundle writer. Optional dependency: if pyarrow/pandas are
 # missing the recorder import will fail — we tolerate that and fall back
 # to legacy debug_runs/ + perf_runs/ writers (which are still in place).
@@ -27345,10 +27348,10 @@ void main() {
         """Mirror of refine.short_hash without importing refine.py
         (which would pull in moderngl twice)."""
         import hashlib
-        rule = entry.get('rule', '')
+        rule = get_field(entry, 'rule', '')
         params = sorted((str(k), float(v))
-                        for k, v in (entry.get('params') or {}).items())
-        seed = int(entry.get('seed', 0))
+                        for k, v in (get_field(entry, 'params', {}) or {}).items())
+        seed = int(get_field(entry, 'seed', 0))
         key = json.dumps([rule, params, seed], sort_keys=True)
         return hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]
 
@@ -27820,11 +27823,11 @@ void main() {
         if not self.discoveries:
             return
         same_rule = [(i, d) for i, d in enumerate(self.discoveries)
-                     if d.get('rule') == self.rule_name]
+                     if get_field(d, 'rule') == self.rule_name]
         if not same_rule:
             print(f"[discovery] no discoveries on file for '{self.rule_name}'")
             return
-        same_rule.sort(key=lambda pair: pair[1].get('score', 0.0), reverse=True)
+        same_rule.sort(key=lambda pair: get_field(pair[1], 'score', 0.0), reverse=True)
         topk = same_rule[:max(1, random_topk)]
         if random_topk <= 1:
             chosen_idx, chosen_disc = topk[0]
@@ -27834,7 +27837,7 @@ void main() {
             chosen_idx, chosen_disc = _r.choice(topk)
             tag = f'random in top-{len(topk)}'
         print(f"[discovery] loading {tag} for '{self.rule_name}' "
-              f"(score={chosen_disc.get('score', 0):.3f}, idx={chosen_idx})")
+              f"(score={get_field(chosen_disc, 'score', 0):.3f}, idx={chosen_idx})")
         self._load_discovery(chosen_idx)
 
     def _load_discovery(self, index):
@@ -27863,7 +27866,7 @@ void main() {
                 unknown.append(k)
         if unknown:
             sys.stderr.write(
-                f"[discovery] WARNING: rule '{disc.get('rule', '?')}' no longer "
+                f"[discovery] WARNING: rule '{get_field(disc, 'rule', '?')}' no longer "
                 f"defines params: {', '.join(unknown)} — these were dropped.\n")
         if 'dt' in disc:
             self.dt = disc['dt']
@@ -27883,7 +27886,7 @@ void main() {
             else:
                 sys.stderr.write(
                     f"[discovery] WARNING: init variant '{saved_init}' is no "
-                    f"longer registered for rule '{disc.get('rule', '?')}'; "
+                    f"longer registered for rule '{get_field(disc, 'rule', '?')}'; "
                     f"falling back to preset default.\n")
         self.discovery_index = index
         self._reset()
@@ -29973,7 +29976,7 @@ void main() {
                 from collections import OrderedDict
                 by_rule = OrderedDict()
                 for i, d in enumerate(self.discoveries):
-                    by_rule.setdefault(d.get('rule', 'unknown'), []).append(i)
+                    by_rule.setdefault(get_field(d, 'rule', 'unknown'), []).append(i)
                 self._disc_by_rule = by_rule
                 self._disc_cache_len = len(self.discoveries)
             by_rule = self._disc_by_rule
@@ -30011,16 +30014,16 @@ void main() {
                         if self._disc_marked_only:
                             ri = [i for i in ri if self.discoveries[i].get('marked')]
                         if self._disc_sort_mode == 0:
-                            indices.extend(sorted(ri, key=lambda i: self.discoveries[i].get('score', 0), reverse=True))
+                            indices.extend(sorted(ri, key=lambda i: get_field(self.discoveries[i], 'score', 0), reverse=True))
                         else:
                             indices.extend(sorted(ri, reverse=True))
                     return indices
                 else:
-                    ri = [i for i, d in enumerate(self.discoveries) if d.get('rule') == self.rule_name]
+                    ri = [i for i, d in enumerate(self.discoveries) if get_field(d, 'rule') == self.rule_name]
                     if self._disc_marked_only:
                         ri = [i for i in ri if self.discoveries[i].get('marked')]
                     if self._disc_sort_mode == 0:
-                        return sorted(ri, key=lambda i: self.discoveries[i].get('score', 0), reverse=True)
+                        return sorted(ri, key=lambda i: get_field(self.discoveries[i], 'score', 0), reverse=True)
                     else:
                         return sorted(ri, reverse=True)
 
@@ -30051,7 +30054,7 @@ void main() {
                     badge += ' ✓'
                 if d.get('marked'):
                     badge += ' ★'
-                imgui.text(f"#{self.discovery_index} {d['rule']} S={d.get('score',0):.2f}{badge}")
+                imgui.text(f"#{self.discovery_index} {d['rule']} S={get_field(d, 'score', 0):.2f}{badge}")
             else:
                 imgui.text("(unsaved)")
 
@@ -30073,14 +30076,14 @@ void main() {
                             continue
                     # Sort by selected mode
                     if self._disc_sort_mode == 0:
-                        indices_sorted = sorted(indices, key=lambda i: self.discoveries[i].get('score', 0), reverse=True)
+                        indices_sorted = sorted(indices, key=lambda i: get_field(self.discoveries[i], 'score', 0), reverse=True)
                     else:
                         indices_sorted = sorted(indices, reverse=True)  # newest first (highest index)
                     header_open = imgui.tree_node(f"{rule_name} ({len(indices)})##rh_{rule_name}")
                     if header_open:
                         for idx in indices_sorted:
                             d = self.discoveries[idx]
-                            sc = d.get('score', 0)
+                            sc = get_field(d, 'score', 0)
                             gc = d.get('gol_coherence', 0)
                             pc = d.get('projection_complexity', 0)
                             mi = d.get('slice_mi', 0)
@@ -30092,13 +30095,13 @@ void main() {
                             # distinguishable in the list.
                             iv = d.get('init_variant')
                             preset_default = (
-                                RULE_PRESETS.get(d.get('rule', ''), {}).get('init')
+                                RULE_PRESETS.get(get_field(d, 'rule', ''), {}).get('init')
                             )
                             tag = ''
                             if iv and iv != preset_default:
                                 # Strip rule-name prefix for compactness
                                 short = iv
-                                rn = d.get('rule', '')
+                                rn = get_field(d, 'rule', '')
                                 if rn and short.startswith(rn + '_'):
                                     short = short[len(rn) + 1:]
                                 tag = f' [{short}]'
@@ -30716,7 +30719,7 @@ void main() {
         has_static_score = (self.discovery_index >= 0 and
                             self.discovery_index < len(self.discoveries))
         if has_static_score:
-            score = self.discoveries[self.discovery_index].get('score', 0)
+            score = get_field(self.discoveries[self.discovery_index], 'score', 0)
             score_str = f'Score\\: {score:.2f}'
             drawtext_parts.append(
                 f"drawtext=fontfile='{fontb}':text='{score_str}':"
@@ -31195,7 +31198,7 @@ void main() {
         }
         if self.discovery_index >= 0 and self.discovery_index < len(self.discoveries):
             disc = self.discoveries[self.discovery_index]
-            meta['discovery_score'] = disc.get('score', 0)
+            meta['discovery_score'] = get_field(disc, 'score', 0)
             meta['discovery_index'] = self.discovery_index
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
@@ -32153,7 +32156,7 @@ def main():
             sim.seed = disc['seed']
             sim._reset()
         print(f"Loaded discovery #{args.discovery_index}: {disc['rule']} "
-              f"score={disc.get('score', '?')} params={disc['params']}")
+              f"score={get_field(disc, 'score', '?')} params={disc['params']}")
     else:
         sim = Simulator(size=args.size, rule=args.rule,
                         force_precision=_resolve_precision(args), dims=dims)

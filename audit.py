@@ -372,14 +372,31 @@ def pass4_codesurface() -> dict:
         k: v[:8] for k, v in hits.items()
     }
     # Context lifecycle asymmetry per file.
+    #
+    # A context is owned by whichever code calls moderngl.create_*; the
+    # destroying file can legitimately be different (e.g. snapshot_3d.py
+    # consumes a Simulator instance and releases its borrowed `sim.ctx`).
+    # So per-file (create != destroy) is NOT in itself a leak signal.
+    # We classify each file:
+    #   - producer-only (create>0, destroy<create): potential leak
+    #   - consumer-only (create==0, destroy>0): borrowed ctx, fine
+    #   - mixed (create>0, destroy>=create): fine
+    # We also report the project-wide totals so a true net leak surfaces.
     per_file = defaultdict(lambda: {'create': 0, 'destroy': 0})
     for f, _, _ in hits['mgl_create_context']:
         per_file[f]['create'] += 1
     for f, _, _ in hits['mgl_destroy']:
         per_file[f]['destroy'] += 1
-    out['context_lifecycle_per_file'] = {
+    total_create = sum(v['create'] for v in per_file.values())
+    total_destroy = sum(v['destroy'] for v in per_file.values())
+    suspicious = {
         f: v for f, v in per_file.items()
-        if v['create'] != v['destroy']
+        if v['create'] > 0 and v['destroy'] < v['create']
+    }
+    out['context_lifecycle_per_file'] = suspicious
+    out['context_lifecycle_totals'] = {
+        'create': total_create, 'destroy': total_destroy,
+        'net_outstanding': total_create - total_destroy,
     }
     # Schema-migration progress per file. The helper's own file is the
     # source of truth and is excluded — its `.get('schema_version', 0)`
@@ -727,8 +744,22 @@ def _render_code(lines, p):
         for f, c in per_file.items():
             lines.append(f'  - {f}: {c}')
     lines.append('')
+    totals = p.get('context_lifecycle_totals') or {}
+    if totals:
+        net = totals.get('net_outstanding', 0)
+        marker = '⚠ ' if net > 0 else ''
+        lines.append(f'### {marker}GPU context lifecycle totals')
+        lines.append('')
+        lines.append(f'- creates: **{totals["create"]}**  releases: **{totals["destroy"]}**  '
+                     f'net outstanding: **{net}** '
+                     f'({"likely leak" if net > 0 else "balanced or consumer-heavy"})')
+        lines.append('')
     if p['context_lifecycle_per_file']:
-        lines.append('### ⚠ GPU context create/destroy asymmetry')
+        lines.append('### ⚠ Producer files with unreleased contexts')
+        lines.append('')
+        lines.append('_Files that call `moderngl.create_*` more times than they '
+                     'release. Consumer-only files (release a borrowed `sim.ctx`) '
+                     'are excluded._')
         lines.append('')
         for f, v in p['context_lifecycle_per_file'].items():
             lines.append(f'- {f}: create={v["create"]} destroy={v["destroy"]}')

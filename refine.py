@@ -54,6 +54,8 @@ from typing import Any
 
 import numpy as np
 
+from schema import get_field
+
 # Headless GL context comes from Simulator(headless=True). Importing
 # simulator.py is heavy (~3s) so we defer to inside main().
 
@@ -71,9 +73,9 @@ def _iso_now() -> str:
 
 def short_hash(entry: dict) -> str:
     """Stable 10-char id derived from (rule, sorted params, seed)."""
-    rule = entry.get('rule', '')
-    params = sorted((str(k), float(v)) for k, v in (entry.get('params') or {}).items())
-    seed = int(entry.get('seed', 0))
+    rule = get_field(entry, 'rule', '')
+    params = sorted((str(k), float(v)) for k, v in (get_field(entry, 'params', {}) or {}).items())
+    seed = int(get_field(entry, 'seed', 0))
     key = json.dumps([rule, params, seed], sort_keys=True)
     return hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]
 
@@ -81,7 +83,7 @@ def short_hash(entry: dict) -> str:
 def refinement_dir(entry: dict) -> tuple[str, str]:
     """Return (hash, full_path) for an entry's refinement directory."""
     h = short_hash(entry)
-    safe_rule = ''.join(c if c.isalnum() or c in '-_' else '_' for c in entry.get('rule', 'unknown'))
+    safe_rule = ''.join(c if c.isalnum() or c in '-_' else '_' for c in get_field(entry, 'rule', 'unknown'))
     return h, os.path.join(REF_DIR, f"{safe_rule}_{h}")
 
 
@@ -232,9 +234,9 @@ def pass_a_deep_replay(entry: dict, *, size: int, steps: int,
     status.update(pass_='A', pct=0.0, msg='building sim')
 
     sim = _make_sim(rule=entry['rule'], size=size,
-                    params=entry.get('params') or {},
+                    params=get_field(entry, 'params', {}) or {},
                     dt=entry.get('dt'),
-                    seed=int(entry.get('seed', 0)),
+                    seed=int(get_field(entry, 'seed', 0)),
                     init_variant=entry.get('init_variant'))
     sim._debug_enabled = True
     sim._debug_sample_interval = max(1, int(sample_interval))
@@ -268,7 +270,7 @@ def pass_a_deep_replay(entry: dict, *, size: int, steps: int,
     # so the GUI debug-overlay's plot widgets can ingest it directly.
     deep = {
         'rule': entry['rule'],
-        'params': entry.get('params') or {},
+        'params': get_field(entry, 'params', {}) or {},
         'dt': sim.dt,
         'seed': sim.seed,
         'init_variant': entry.get('init_variant') or sim._current_init,
@@ -381,7 +383,7 @@ def pass_c_seed_sensitivity(entry: dict, *, size: int, steps: int,
     """Replay the same params with N different seeds; collect end-state
     metrics; report mean ± std. Skips the original seed; uses 0..N."""
     status.update(pass_='C', pct=0.0, msg=f'seed sweep 0/{n_seeds}')
-    original_seed = int(entry.get('seed', 0))
+    original_seed = int(get_field(entry, 'seed', 0))
     seeds: list[int] = []
     s = 0
     while len(seeds) < n_seeds:
@@ -391,7 +393,7 @@ def pass_c_seed_sensitivity(entry: dict, *, size: int, steps: int,
     rows = []
     for i, seed in enumerate(seeds):
         sim = _make_sim(entry['rule'], size=size,
-                        params=entry.get('params') or {},
+                        params=get_field(entry, 'params', {}) or {},
                         dt=entry.get('dt'), seed=seed,
                         init_variant=entry.get('init_variant'))
         sim._debug_enabled = True
@@ -444,7 +446,7 @@ def pass_d_param_sensitivity(entry: dict, *, size: int, steps: int,
     fractional half-width: each param sweeps [p*(1-span), p*(1+span)].
     Params with value 0 sweep ±span absolute. Returns rows + a per-param
     elasticity (Δmetric / Δparam normalised)."""
-    params = dict(entry.get('params') or {})
+    params = dict(get_field(entry, 'params', {}) or {})
     if not params:
         return {'rows': [], 'note': 'no params'}
     keys = sorted(params.keys())
@@ -461,7 +463,7 @@ def pass_d_param_sensitivity(entry: dict, *, size: int, steps: int,
         p = {k: float(samples[i, j]) for j, k in enumerate(keys)}
         sim = _make_sim(entry['rule'], size=size, params=p,
                         dt=entry.get('dt'),
-                        seed=int(entry.get('seed', 0)),
+                        seed=int(get_field(entry, 'seed', 0)),
                         init_variant=entry.get('init_variant'))
         sim._debug_enabled = True
         sim._debug_sample_interval = max(1, int(sample_interval))
@@ -498,17 +500,17 @@ def pass_e_neighbours(entry: dict, all_disc: list[dict],
     distance in normalised parameter space. Each param dim is
     z-scored across the cohort. Returns ranking by distance."""
     status.update(pass_='E', pct=0.0, msg='ranking')
-    rule = entry.get('rule')
-    keys = sorted((entry.get('params') or {}).keys())
+    rule = get_field(entry, 'rule')
+    keys = sorted((get_field(entry, 'params', {}) or {}).keys())
     if not keys:
         return {'neighbours': [], 'note': 'no params'}
     cohort_idx = [i for i, d in enumerate(all_disc)
-                  if d.get('rule') == rule and i != parent_index]
+                  if get_field(d, 'rule') == rule and i != parent_index]
     if not cohort_idx:
         return {'neighbours': [], 'note': 'no cohort'}
 
     def vec(d: dict) -> np.ndarray:
-        p = d.get('params') or {}
+        p = get_field(d, 'params', {}) or {}
         return np.array([float(p.get(k, 0.0)) for k in keys], dtype=np.float64)
 
     me = vec(entry)
@@ -533,9 +535,9 @@ def pass_e_neighbours(entry: dict, all_disc: list[dict],
             'rank': rank,
             'index': idx,
             'distance': float(dist[j]),
-            'score': float(d.get('score', 0.0)),
-            'params': d.get('params'),
-            'seed':   d.get('seed'),
+            'score': float(get_field(d, 'score', 0.0)),
+            'params': get_field(d, 'params'),
+            'seed':   get_field(d, 'seed'),
             'marked': bool(d.get('marked')),
             'refined': bool(d.get('refinement')),
         })
@@ -555,7 +557,7 @@ def refine_one(parent_index: int, all_disc: list[dict], args) -> dict:
     t_start = time.time()
 
     try:
-        print(f"[refine] #{parent_index} {entry.get('rule')} → {h}", flush=True)
+        print(f"[refine] #{parent_index} {get_field(entry, 'rule')} → {h}", flush=True)
         # Pass A — deep replay
         sim, snapshots = pass_a_deep_replay(
             entry, size=args.size, steps=args.steps,
@@ -615,9 +617,9 @@ def refine_one(parent_index: int, all_disc: list[dict], args) -> dict:
         report = {
             'hash': h,
             'parent_index': parent_index,
-            'rule': entry.get('rule'),
-            'params': entry.get('params'),
-            'seed': entry.get('seed'),
+            'rule': get_field(entry, 'rule'),
+            'params': get_field(entry, 'params'),
+            'seed': get_field(entry, 'seed'),
             'init_variant': entry.get('init_variant'),
             'dt': entry.get('dt'),
             'config': {
