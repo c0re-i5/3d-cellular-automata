@@ -456,13 +456,13 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         out['error'] = f'cannot import test_harness: {e}'
         return out
 
-    # Default replay parameters (since size/steps not recorded — that's
-    # the whole point of this audit). Use small fast values; the goal
-    # is "does it run + is the score *somewhere near*", not bit-exact.
-    SIZE = 48
-    STEPS = 200
+    # Default replay parameters for *legacy* entries that don't record
+    # size/steps. v1+ entries carry these fields and we use them verbatim,
+    # which is the whole point of the v1 schema: reproducible replay.
+    LEGACY_SIZE = 48
+    LEGACY_STEPS = 200
 
-    ctx = create_headless_context()
+    window, ctx = create_headless_context()
     results = {
         'match': 0,           # within tolerance
         'within_5pct': 0,
@@ -470,6 +470,8 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         'crashed': 0,
         'unloadable': 0,
     }
+    legacy_replays = 0
+    v1_replays = 0
     deltas = []
     crashes: list[tuple[int, str, str]] = []
     wild: list[tuple[int, str, float, float]] = []
@@ -477,9 +479,19 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         for j, idx in enumerate(sample_idx):
             e = entries[idx]
             rule = e.get('rule')
+            # v1+ entries record size/steps — use them so the replay
+            # reproduces the original conditions. Legacy entries fall
+            # back to the small fixed pair (replay is approximate).
+            is_v1 = bool(e.get('schema_version', 0))
+            size_ = int(e['size']) if is_v1 and 'size' in e else LEGACY_SIZE
+            steps_ = int(e['steps']) if is_v1 and 'steps' in e else LEGACY_STEPS
+            if is_v1:
+                v1_replays += 1
+            else:
+                legacy_replays += 1
             try:
                 fresh = run_trial(
-                    ctx, rule, size=SIZE, steps=STEPS,
+                    ctx, rule, size=size_, steps=steps_,
                     seed=e.get('seed', 0),
                     params=e.get('params', {}),
                     dt=e.get('dt'),
@@ -511,12 +523,18 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
                       f'crash={results["crashed"]}',
                       file=sys.stderr)
     finally:
-        destroy_context(ctx)
+        destroy_context(window)
 
     out['sampled'] = len(sample_idx)
     out['results'] = results
-    out['note'] = (f'Replay used size={SIZE}, steps={STEPS} (defaults '
-                   'since corpus does not record these).')
+    out['v1_replays'] = v1_replays
+    out['legacy_replays'] = legacy_replays
+    out['note'] = (
+        f'Replayed {v1_replays} v1+ entries at their recorded size/steps '
+        f'and {legacy_replays} legacy entries at fallback '
+        f'size={LEGACY_SIZE}, steps={LEGACY_STEPS} (legacy corpus does '
+        f'not record these, so replay is approximate).'
+    )
     out['wildly_different_examples'] = wild[:15]
     out['crashes_examples'] = crashes[:15]
     if deltas:
@@ -845,6 +863,10 @@ def main() -> int:
                          '(default 0.01).')
     ap.add_argument('--out', default=str(REPORT_PATH),
                     help=f'Report path (default {REPORT_PATH}).')
+    ap.add_argument('--input', default=str(DISCOVERIES),
+                    help=f'Discoveries JSON to audit '
+                         f'(default {DISCOVERIES.name}). Useful for '
+                         f'validating fresh sweep output before merge.')
     args = ap.parse_args()
 
     if args.passes.lower() == 'all':
@@ -854,12 +876,13 @@ def main() -> int:
     if args.replay > 0:
         wanted.add(3)
 
-    if not DISCOVERIES.exists():
-        print(f'[audit] FATAL: {DISCOVERIES} not found', file=sys.stderr)
+    discoveries_path = Path(args.input)
+    if not discoveries_path.exists():
+        print(f'[audit] FATAL: {discoveries_path} not found', file=sys.stderr)
         return 1
     t0 = time.time()
-    print(f'[audit] loading {DISCOVERIES} ...', file=sys.stderr)
-    with open(DISCOVERIES) as f:
+    print(f'[audit] loading {discoveries_path} ...', file=sys.stderr)
+    with open(discoveries_path) as f:
         entries = json.load(f)
     print(f'[audit] loaded {len(entries):,} entries '
           f'in {time.time()-t0:.1f}s', file=sys.stderr)
