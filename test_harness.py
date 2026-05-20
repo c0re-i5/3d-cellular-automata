@@ -35,12 +35,12 @@ import entity_arena
 # alongside the legacy discoveries.json output. Pure best-effort.
 try:
     from ca_debug import RunRecorder as _RunRecorder
-except Exception:  # noqa: BLE001  optional recorder, never block startup
+except ImportError:
     _RunRecorder = None
 
 try:
     from OpenGL import GL  # type: ignore
-except Exception:  # noqa: BLE001  optional dependency
+except ImportError:
     GL = None  # type: ignore
 
 # Suppress numpy overflow/invalid warnings from degenerate CA states (all-NaN grids, etc.)

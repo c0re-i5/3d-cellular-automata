@@ -348,7 +348,7 @@ def _existing_assertion_keys(events_path: Path) -> set[tuple[str, int | None]]:
         for line in f:
             try:
                 ev = json.loads(line)
-            except Exception:  # noqa: BLE001  malformed JSON, treat as missing
+            except json.JSONDecodeError:
                 continue
             if ev.get('kind') == 'assertion_failed':
                 keys.add((ev.get('property', ''), ev.get('step')))

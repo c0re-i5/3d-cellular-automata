@@ -26500,7 +26500,7 @@ class Simulator:
                 continue
             try:
                 m = json.loads(mpath.read_text())
-            except Exception:  # noqa: BLE001  malformed JSON, treat as missing
+            except (OSError, json.JSONDecodeError):
                 continue
             tags = set(m.get("tags") or [])
             if m.get("pinned") or tags & {"pinned", "discovery", "keep"}:
@@ -27431,7 +27431,7 @@ void main() {
             try:
                 with open(self._refine_status_path) as f:
                     self._refine_status = json.load(f)
-            except Exception:  # noqa: BLE001  malformed JSON, treat as missing
+            except (OSError, json.JSONDecodeError):
                 pass  # mid-write; try next tick
         # Has the process exited?
         rc = self._refine_proc.poll()
@@ -27561,7 +27561,7 @@ void main() {
                 inside = tail_line[1:tail_line.index(']')].strip()
                 cur, tot = inside.split('/')
                 prog = float(cur) / max(float(tot), 1.0)
-            except Exception:  # noqa: BLE001  log parse, best-effort
+            except (ValueError, IndexError):
                 pass
         if self._explore_status is not None:
             self._explore_status['msg'] = tail_line[:120]
@@ -27601,7 +27601,7 @@ void main() {
         try:
             with open(path) as f:
                 report = json.load(f)
-        except Exception:  # noqa: BLE001  malformed JSON, treat as missing
+        except (OSError, json.JSONDecodeError):
             return None
         self._refine_report_cache[h] = report
         return report
@@ -32108,7 +32108,7 @@ def main():
                 if line:
                     try:
                         events.append(json.loads(line))
-                    except Exception:  # noqa: BLE001  malformed JSON, treat as missing
+                    except json.JSONDecodeError:
                         pass
         # Sort by step (events are already in time order, but be defensive).
         events.sort(key=lambda e: int(e.get("step", 0)))

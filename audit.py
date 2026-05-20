@@ -191,7 +191,7 @@ def pass1_schema(entries: list[dict]) -> dict:
     # discovery may no longer reproduce.
     try:
         from simulator import rule_code_hash as _rch
-    except Exception:  # noqa: BLE001  optional dependency
+    except ImportError:
         _rch = None
     drift_by_rule: Counter = Counter()
     drift_examples = []
@@ -492,7 +492,7 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         from test_harness import (
             create_headless_context, destroy_context, run_trial,
         )
-    except Exception as e:  # noqa: BLE001  optional dependency
+    except ImportError as e:
         out['error'] = f'cannot import test_harness: {e}'
         return out
 

@@ -184,7 +184,7 @@ def main():
             try:
                 with open(rp) as f:
                     report = json.load(f)
-            except Exception as e:  # noqa: BLE001  malformed JSON, treat as missing
+            except (OSError, json.JSONDecodeError) as e:
                 print(f"[batch_refine] warn: cannot read {rp}: {e}",
                       file=sys.stderr)
 

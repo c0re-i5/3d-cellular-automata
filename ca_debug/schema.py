@@ -68,7 +68,7 @@ def capture_code_metadata(repo_path: str | None = None) -> dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         out["git_sha"] = sha
-    except Exception:  # noqa: BLE001  git probe; missing .git or git binary is OK
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return out
     try:
         diff = subprocess.check_output(
@@ -76,7 +76,7 @@ def capture_code_metadata(repo_path: str | None = None) -> dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         out["git_dirty"] = bool(diff)
-    except Exception:  # noqa: BLE001  git probe; missing .git or git binary is OK
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     try:
         branch = subprocess.check_output(
@@ -84,7 +84,7 @@ def capture_code_metadata(repo_path: str | None = None) -> dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         out["branch"] = branch
-    except Exception:  # noqa: BLE001  git probe; missing .git or git binary is OK
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     return out
 

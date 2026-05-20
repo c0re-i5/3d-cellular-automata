@@ -314,7 +314,7 @@ def _load_discoveries(path: str) -> list[dict]:
             return json.load(f)
     except FileNotFoundError:
         return []
-    except Exception as e:  # noqa: BLE001  malformed JSON, treat as missing
+    except (OSError, json.JSONDecodeError) as e:
         print(f"[smell] could not read {path}: {e}", file=sys.stderr)
         return []
 
@@ -484,7 +484,7 @@ def detect_anomaly_events(runs_root: str) -> list[Finding]:
             for line in f:
                 try:
                     ev = json.loads(line)
-                except Exception:  # noqa: BLE001  malformed JSON, treat as missing
+                except json.JSONDecodeError:
                     continue
                 kind = ev.get('kind', '')
                 if kind in ('anomaly', 'assertion_failed'):
