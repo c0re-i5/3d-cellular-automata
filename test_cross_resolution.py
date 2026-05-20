@@ -201,6 +201,13 @@ def main():
     only = set(s.strip() for s in args.only.split(",") if s.strip())
 
     ctx = moderngl.create_standalone_context(require=430)
+    try:
+        _run_all(ctx, args, sizes, only)
+    finally:
+        ctx.release()
+
+
+def _run_all(ctx, args, sizes, only):
     print(f"GL renderer : {ctx.info.get('GL_RENDERER','?')}")
     print(f"GL vendor   : {ctx.info.get('GL_VENDOR','?')}")
     print(f"GL version  : {ctx.info.get('GL_VERSION','?')}")

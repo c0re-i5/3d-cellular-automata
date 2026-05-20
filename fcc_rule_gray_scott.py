@@ -199,39 +199,44 @@ def seed_random_clusters(field: FCCField, *,
 def _self_check() -> None:
     print("[fcc_rule_gray_scott] booting standalone context...")
     ctx = moderngl.create_standalone_context(require=430)
+    try:
+        shape = FCCFieldShape(32, 32, 32, channels=4)
+        field = FCCField(ctx, shape, dtype=np.dtype('float32'), linear_filter=False)
+        seed_random_clusters(field, n_seeds=8, seed_radius=3, rng_seed=1)
 
-    shape = FCCFieldShape(32, 32, 32, channels=4)
-    field = FCCField(ctx, shape, dtype=np.dtype('float32'), linear_filter=False)
-    seed_random_clusters(field, n_seeds=8, seed_radius=3, rng_seed=1)
+        rule = GrayScottFCC(ctx)
+        before = np.frombuffer(field.current.read(), dtype=np.float32) \
+                   .reshape(shape.numpy_shape())
+        print(f"  initial: U_mean={before[..., 0].mean():.4f}  "
+              f"V_mean={before[..., 1].mean():.4f}  "
+              f"V_max={before[..., 1].max():.4f}")
 
-    rule = GrayScottFCC(ctx)
-    before = np.frombuffer(field.current.read(), dtype=np.float32) \
-               .reshape(shape.numpy_shape())
-    print(f"  initial: U_mean={before[..., 0].mean():.4f}  "
-          f"V_mean={before[..., 1].mean():.4f}  "
-          f"V_max={before[..., 1].max():.4f}")
+        params = REGIMES["mitosis"]
+        for _ in range(200):
+            rule.step(field, params)
 
-    params = REGIMES["mitosis"]
-    for _ in range(200):
-        rule.step(field, params)
+        after = np.frombuffer(field.current.read(), dtype=np.float32) \
+                  .reshape(shape.numpy_shape())
+        print(f"  after 200 steps: U_mean={after[..., 0].mean():.4f}  "
+              f"V_mean={after[..., 1].mean():.4f}  "
+              f"V_max={after[..., 1].max():.4f}")
 
-    after = np.frombuffer(field.current.read(), dtype=np.float32) \
-              .reshape(shape.numpy_shape())
-    print(f"  after 200 steps: U_mean={after[..., 0].mean():.4f}  "
-          f"V_mean={after[..., 1].mean():.4f}  "
-          f"V_max={after[..., 1].max():.4f}")
+        # Sanity: V must have spread but not exploded.
+        v_mean = float(after[..., 1].mean())
+        v_max  = float(after[..., 1].max())
+        assert 0.005 < v_mean < 0.6, f"V mean out of range: {v_mean}"
+        assert 0.2   < v_max  <= 1.0, f"V max out of range: {v_max}"
+        # And U must have been consumed somewhere but not driven to zero
+        # everywhere.
+        u_mean = float(after[..., 0].mean())
+        assert 0.2 < u_mean < 0.99, f"U mean out of range: {u_mean}"
 
-    # Sanity: V must have spread but not exploded.
-    v_mean = float(after[..., 1].mean())
-    v_max  = float(after[..., 1].max())
-    assert 0.005 < v_mean < 0.6, f"V mean out of range: {v_mean}"
-    assert 0.2   < v_max  <= 1.0, f"V max out of range: {v_max}"
-    # And U must have been consumed somewhere but not driven to zero
-    # everywhere.
-    u_mean = float(after[..., 0].mean())
-    assert 0.2 < u_mean < 0.99, f"U mean out of range: {u_mean}"
-
-    print("[fcc_rule_gray_scott] PASS")
+        print("[fcc_rule_gray_scott] PASS")
+    finally:
+        # Explicit teardown avoids the Mesa NVK deadlock that occasionally
+        # bites when a standalone context is reaped at interpreter exit
+        # with unreleased compute programs / image bindings.
+        ctx.release()
 
 
 if __name__ == "__main__":

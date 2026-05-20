@@ -46,6 +46,14 @@ except Exception:  # pragma: no cover -- already optional in step()
 # Suppress numpy overflow/invalid warnings from degenerate CA states (all-NaN grids, etc.)
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
 
+# ── Discovery schema version ──────────────────────────────────────────
+# Bumped whenever the canonical discovery record format changes in a way
+# readers must know about. Tier 1 of the 2026-05 audit added
+# size/steps/schema_version to every new write so future replay
+# verification has the necessary context. Historical entries lack these
+# fields and should be treated as schema_version=None (== pre-1).
+DISCOVERY_SCHEMA_VERSION = 1
+
 # ── Headless GPU context ──────────────────────────────────────────────
 
 def create_headless_context():
@@ -3059,12 +3067,28 @@ def _normalize_fingerprints(vectors):
 
 def _make_discovery(r):
     """Build a discovery dict from a trial result, including any dynamics data."""
+    # rule_code_hash lazy-imported to avoid simulator<->test_harness cycle
+    # at module load (simulator imports test_harness via run_trial in a
+    # few places). None is acceptable downstream (== unknown rule).
+    try:
+        from simulator import rule_code_hash as _rch
+        _code_hash = _rch(r['rule'])
+    except Exception:
+        _code_hash = None
     d = {
+        'schema_version': DISCOVERY_SCHEMA_VERSION,
         'rule': r['rule'],
+        'rule_code_hash': _code_hash,
         'params': r['params'],
         'dt': r['dt'],
         'score': r['score'],
         'seed': r['seed'],
+        # size/steps were added in schema v1 (2026-05 audit) so replay
+        # verification has the grid + horizon the score was measured at.
+        # run_trial always stamps these into the result; fall back to
+        # None only defensively.
+        'size': r.get('size'),
+        'steps': r.get('steps'),
         'final_alive': r['final_alive'],
         'median_alive': r.get('median_alive', r['final_alive']),
         'final_activity': r['final_activity'],

@@ -67,108 +67,111 @@ void main() {{
 def main() -> int:
     print("[validate] booting moderngl standalone context (require=430)...")
     ctx = moderngl.create_standalone_context(require=430)
-    print(f"[validate]   GL vendor   = {ctx.info.get('GL_VENDOR', '?')}")
-    print(f"[validate]   GL renderer = {ctx.info.get('GL_RENDERER', '?')}")
-    print(f"[validate]   GL version  = {ctx.info.get('GL_VERSION', '?')}")
-
-    # ----- Compile shader ---------------------------------------------------
-    src = COMPUTE_SHADER_TEMPLATE.format(lattice_header=FCC.glsl_header())
-    print(f"[validate] compiling compute shader ({len(src)} chars)...")
     try:
-        prog = ctx.compute_shader(src)
-    except moderngl.Error as e:
-        print("[validate] SHADER COMPILE FAILED")
-        print(str(e))
-        print("--- shader source ---")
-        for i, line in enumerate(src.splitlines(), 1):
-            print(f"{i:4d}  {line}")
-        return 1
-    print("[validate]   ok")
+        print(f"[validate]   GL vendor   = {ctx.info.get('GL_VENDOR', '?')}")
+        print(f"[validate]   GL renderer = {ctx.info.get('GL_RENDERER', '?')}")
+        print(f"[validate]   GL version  = {ctx.info.get('GL_VERSION', '?')}")
 
-    # ----- Allocate textures -----------------------------------------------
-    # Delta input: 1.0 at the centre, 0 elsewhere. Channel order is (W, H, D)
-    # in moderngl's texture3d, and numpy is laid out (D, H, W) for the upload
-    # buffer. Stick to a symmetric grid so the distinction is invisible here.
-    field = np.zeros((GRID, GRID, GRID), dtype=np.float32)
-    field[CENTRE] = 1.0
+        # ----- Compile shader ---------------------------------------------------
+        src = COMPUTE_SHADER_TEMPLATE.format(lattice_header=FCC.glsl_header())
+        print(f"[validate] compiling compute shader ({len(src)} chars)...")
+        try:
+            prog = ctx.compute_shader(src)
+        except moderngl.Error as e:
+            print("[validate] SHADER COMPILE FAILED")
+            print(str(e))
+            print("--- shader source ---")
+            for i, line in enumerate(src.splitlines(), 1):
+                print(f"{i:4d}  {line}")
+            return 1
+        print("[validate]   ok")
 
-    tex_in = ctx.texture3d((GRID, GRID, GRID), 1, field.tobytes(), dtype='f4')
-    tex_in.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        # ----- Allocate textures -----------------------------------------------
+        # Delta input: 1.0 at the centre, 0 elsewhere. Channel order is (W, H, D)
+        # in moderngl's texture3d, and numpy is laid out (D, H, W) for the upload
+        # buffer. Stick to a symmetric grid so the distinction is invisible here.
+        field = np.zeros((GRID, GRID, GRID), dtype=np.float32)
+        field[CENTRE] = 1.0
 
-    tex_out = ctx.texture3d((GRID, GRID, GRID), 1, b'\x00' * (GRID ** 3 * 4),
-                            dtype='f4')
-    tex_out.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        tex_in = ctx.texture3d((GRID, GRID, GRID), 1, field.tobytes(), dtype='f4')
+        tex_in.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
-    # ----- Dispatch --------------------------------------------------------
-    tex_in.bind_to_image(0, read=True,  write=False)
-    tex_out.bind_to_image(1, read=False, write=True)
-    groups = GRID // 4
-    prog.run(groups, groups, groups)
-    ctx.finish()
-    print(f"[validate] dispatched ({groups}, {groups}, {groups}) workgroups")
+        tex_out = ctx.texture3d((GRID, GRID, GRID), 1, b'\x00' * (GRID ** 3 * 4),
+                                dtype='f4')
+        tex_out.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
-    # ----- Read back -------------------------------------------------------
-    raw = tex_out.read()
-    out = np.frombuffer(raw, dtype=np.float32).reshape((GRID, GRID, GRID))
+        # ----- Dispatch --------------------------------------------------------
+        tex_in.bind_to_image(0, read=True,  write=False)
+        tex_out.bind_to_image(1, read=False, write=True)
+        groups = GRID // 4
+        prog.run(groups, groups, groups)
+        ctx.finish()
+        print(f"[validate] dispatched ({groups}, {groups}, {groups}) workgroups")
 
-    # ----- Expected --------------------------------------------------------
-    # For a delta input at CENTRE, the output should be 1.0 at exactly the
-    # 12 neighbour positions of CENTRE (with wrap), and 0 everywhere else.
-    expected = np.zeros_like(out)
-    cx, cy, cz = CENTRE
-    expected_positions = set()
-    for off in FCC.neighbours:
-        nx = (cx + int(off[0])) % GRID
-        ny = (cy + int(off[1])) % GRID
-        nz = (cz + int(off[2])) % GRID
-        expected[nx, ny, nz] = 1.0
-        expected_positions.add((nx, ny, nz))
+        # ----- Read back -------------------------------------------------------
+        raw = tex_out.read()
+        out = np.frombuffer(raw, dtype=np.float32).reshape((GRID, GRID, GRID))
 
-    # ----- Check -----------------------------------------------------------
-    failures = []
+        # ----- Expected --------------------------------------------------------
+        # For a delta input at CENTRE, the output should be 1.0 at exactly the
+        # 12 neighbour positions of CENTRE (with wrap), and 0 everywhere else.
+        expected = np.zeros_like(out)
+        cx, cy, cz = CENTRE
+        expected_positions = set()
+        for off in FCC.neighbours:
+            nx = (cx + int(off[0])) % GRID
+            ny = (cy + int(off[1])) % GRID
+            nz = (cz + int(off[2])) % GRID
+            expected[nx, ny, nz] = 1.0
+            expected_positions.add((nx, ny, nz))
 
-    nz = int(np.count_nonzero(out))
-    if nz != 12:
-        failures.append(f"expected exactly 12 non-zero cells, got {nz}")
+        # ----- Check -----------------------------------------------------------
+        failures = []
 
-    s = float(out.sum())
-    if not np.isclose(s, 12.0):
-        failures.append(f"expected sum == 12.0, got {s}")
+        nz = int(np.count_nonzero(out))
+        if nz != 12:
+            failures.append(f"expected exactly 12 non-zero cells, got {nz}")
 
-    if not np.allclose(out, expected):
-        diff = np.where(out != expected)
-        n_diff = len(diff[0])
-        sample = list(zip(*diff))[:6]
-        failures.append(
-            f"output != expected at {n_diff} positions; first few:\n"
-            + "\n".join(
-                f"    pos={p}  out={out[p]!r}  expected={expected[p]!r}"
-                for p in sample
+        s = float(out.sum())
+        if not np.isclose(s, 12.0):
+            failures.append(f"expected sum == 12.0, got {s}")
+
+        if not np.allclose(out, expected):
+            diff = np.where(out != expected)
+            n_diff = len(diff[0])
+            sample = list(zip(*diff))[:6]
+            failures.append(
+                f"output != expected at {n_diff} positions; first few:\n"
+                + "\n".join(
+                    f"    pos={p}  out={out[p]!r}  expected={expected[p]!r}"
+                    for p in sample
+                )
             )
-        )
 
-    actual_positions = {
-        tuple(int(x) for x in pos) for pos in zip(*np.where(out > 0))
-    }
-    missing = expected_positions - actual_positions
-    extra = actual_positions - expected_positions
-    if missing:
-        failures.append(f"missing positions: {sorted(missing)}")
-    if extra:
-        failures.append(f"unexpected positions: {sorted(extra)}")
+        actual_positions = {
+            tuple(int(x) for x in pos) for pos in zip(*np.where(out > 0))
+        }
+        missing = expected_positions - actual_positions
+        extra = actual_positions - expected_positions
+        if missing:
+            failures.append(f"missing positions: {sorted(missing)}")
+        if extra:
+            failures.append(f"unexpected positions: {sorted(extra)}")
 
-    # ----- Report ----------------------------------------------------------
-    if failures:
-        print("\n[validate] FAILED")
-        for f in failures:
-            print("  -", f)
-        return 1
+        # ----- Report ----------------------------------------------------------
+        if failures:
+            print("\n[validate] FAILED")
+            for f in failures:
+                print("  -", f)
+            return 1
 
-    print(f"[validate]   12 neighbours found at correct positions")
-    print(f"[validate]   sum = {s:.1f}  (expected 12.0)")
-    print(f"[validate]   max = {out.max():.6f}  min = {out.min():.6f}")
-    print("[validate] PASS")
-    return 0
+        print(f"[validate]   12 neighbours found at correct positions")
+        print(f"[validate]   sum = {s:.1f}  (expected 12.0)")
+        print(f"[validate]   max = {out.max():.6f}  min = {out.min():.6f}")
+        print("[validate] PASS")
+        return 0
+    finally:
+        ctx.release()
 
 
 if __name__ == "__main__":

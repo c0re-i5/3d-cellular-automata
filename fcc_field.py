@@ -175,29 +175,31 @@ class FCCField:
 def _self_check() -> None:
     print("[fcc_field] booting standalone context...")
     ctx = moderngl.create_standalone_context(require=430)
+    try:
+        shape = FCCFieldShape(Na=8, Nb=8, Nc=8, channels=4)
+        field = FCCField(ctx, shape)
 
-    shape = FCCFieldShape(Na=8, Nb=8, Nc=8, channels=4)
-    field = FCCField(ctx, shape)
+        # Round-trip: upload random data, download, expect bit-identity.
+        rng = np.random.default_rng(0)
+        data = rng.standard_normal(shape.numpy_shape()).astype(np.float32)
+        field.upload(data)
+        got = field.download()
+        assert got.shape == data.shape
+        assert np.array_equal(got, data), "round-trip mismatch"
 
-    # Round-trip: upload random data, download, expect bit-identity.
-    rng = np.random.default_rng(0)
-    data = rng.standard_normal(shape.numpy_shape()).astype(np.float32)
-    field.upload(data)
-    got = field.download()
-    assert got.shape == data.shape
-    assert np.array_equal(got, data), "round-trip mismatch"
+        # Ping-pong sanity: swap returns to original after two swaps.
+        a_before = field.current
+        field.swap()
+        assert field.current is not a_before
+        field.swap()
+        assert field.current is a_before
 
-    # Ping-pong sanity: swap returns to original after two swaps.
-    a_before = field.current
-    field.swap()
-    assert field.current is not a_before
-    field.swap()
-    assert field.current is a_before
-
-    field.release()
-    print("[fcc_field] self-check: OK")
-    print(f"  shape = {shape}")
-    print(f"  cell_count = {shape.cell_count}")
+        field.release()
+        print("[fcc_field] self-check: OK")
+        print(f"  shape = {shape}")
+        print(f"  cell_count = {shape.cell_count}")
+    finally:
+        ctx.release()
 
 
 if __name__ == "__main__":

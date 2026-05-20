@@ -329,7 +329,34 @@ def headless_render(
     import moderngl
     print(f"[viewer] headless ({mode}): booting standalone context...")
     ctx = moderngl.create_standalone_context(require=430)
+    try:
+        return _headless_render_impl(
+            ctx, out_path,
+            mode=mode, grid=grid, nn_spacing=nn_spacing,
+            width=width, height=height,
+            expect_components=expect_components,
+            roundness_max=roundness_max,
+            gs_regime=gs_regime, gs_steps=gs_steps, gs_seed=gs_seed,
+        )
+    finally:
+        ctx.release()
 
+
+def _headless_render_impl(
+    ctx,
+    out_path: str,
+    *,
+    mode: str,
+    grid: int,
+    nn_spacing: int,
+    width: int,
+    height: int,
+    expect_components: int,
+    roundness_max: float,
+    gs_regime: str,
+    gs_steps: int,
+    gs_seed: int,
+) -> int:
     field, shape, settings, frame_radius = _build_world(
         ctx, mode, grid, nn_spacing,
         gs_regime=gs_regime, gs_steps=gs_steps, gs_seed=gs_seed,

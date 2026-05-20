@@ -22891,6 +22891,67 @@ def _resolve_composed_preset(name):
     return out
 
 
+# ── Rule code fingerprint ──────────────────────────────────────────────
+# Stamped onto every new discovery (Tier 2 of 2026-05 audit). Lets us
+# detect when a rule's GLSL has been edited after a discovery was scored,
+# which would otherwise silently invalidate reproducibility. Hashes the
+# rule-specific shader bodies — NOT COMPUTE_HEADER, NOT the runtime macro
+# substitutions (#define USE_SHARED_MEM, u_size constants, sparse-dispatch
+# rewrites), because those depend on grid size / GPU caps and would make
+# the same rule hash differently on different machines.
+_RULE_CODE_HASH_CACHE: dict = {}
+
+
+def rule_code_hash(rule_name: str):
+    """Stable 10-char sha256 prefix of the GLSL sources for `rule_name`.
+
+    Returns None if the rule is unknown or has no resolvable shader source
+    (caller should treat None the same as "pre-schema-v1": skip the check).
+    Cached per process — shader source is module-level constant, so the
+    hash never changes during a run.
+    """
+    import hashlib as _hashlib
+    cached = _RULE_CODE_HASH_CACHE.get(rule_name)
+    if cached is not None:
+        return cached
+    try:
+        preset = _resolve_composed_preset(rule_name)
+    except Exception:
+        return None
+
+    # Collect every shader name this preset references. Multi-pass and
+    # composed presets list them in `passes`; simple presets use `shader`.
+    raw_passes = preset.get('passes', [preset.get('shader', '')])
+    shader_names = []
+    for entry in raw_passes:
+        if isinstance(entry, str):
+            shader_names.append(entry)
+        elif isinstance(entry, dict):
+            name = entry.get('shader', '')
+            if name:
+                shader_names.append(name)
+
+    # Resolve each name to its source. Voxel passes live in CA_RULES;
+    # entity passes live on the preset itself under `entity_shaders`.
+    # Names that collide are vanishingly unlikely in practice — we
+    # prefer entity_shaders since that's what `_compile_compute` does
+    # when a pass declares kind=entity_*.
+    entity_shaders = preset.get('entity_shaders', {}) or {}
+    src_map = {}
+    for name in shader_names:
+        if name in entity_shaders:
+            src_map[name] = entity_shaders[name]
+        elif name in CA_RULES:
+            src_map[name] = CA_RULES[name]
+    if not src_map:
+        return None
+
+    payload = json.dumps(src_map, sort_keys=True, separators=(',', ':'))
+    h = _hashlib.sha256(payload.encode('utf-8')).hexdigest()[:10]
+    _RULE_CODE_HASH_CACHE[rule_name] = h
+    return h
+
+
 # ── Simulator class ──────────────────────────────────────────────────
 
 class Simulator:
@@ -23048,6 +23109,27 @@ class Simulator:
         self.discovery_file = 'discoveries.json'
         self.discovery_index = -1  # -1 = not browsing
         self._load_discoveries()
+        # Refinement subprocess + status polling. The refinement runner
+        # (refine.py) is launched out-of-process so the GUI stays
+        # responsive while passes A–E run on the same GPU.
+        self._refine_proc = None          # subprocess.Popen | None
+        self._refine_status = None        # last polled dict | None
+        self._refine_status_path = None   # str | None — file we're polling
+        self._refine_status_last_poll = 0.0
+        self._refine_report_cache = {}    # hash → parsed report.json
+        self._refine_report_open = False  # collapsing header default
+        # Neighbourhood-exploration subprocess (batch_refine.py). Mutates
+        # the currently-loaded refined entry's params and appends survivors
+        # to discoveries.json. Same orphan-safety mechanic as refine.py.
+        self._explore_proc = None          # subprocess.Popen | None
+        self._explore_log_path = None      # str | None
+        self._explore_status = None        # dict {'state','msg','progress'}
+        self._explore_status_last_poll = 0.0
+        self._explore_disc_count_at_start = 0  # to count appended entries
+        self._explore_trials = 200         # input field default
+        self._explore_span = 0.10          # input field default
+        self._explore_vary_init = False    # broaden over init_variants
+        self._explore_vary_density = False # jitter init_density
         self._score = 0.0
         self._score_metrics = {}  # latest metrics dict
         self._score_frame = 0     # frames since last score update
@@ -27206,21 +27288,527 @@ void main() {
 
     def _save_current_to_discoveries(self):
         """Save current params as a new discovery."""
+        # Match the test_harness writer's schema (Tier 1 of 2026-05 audit:
+        # size/steps/schema_version are required for replay verification).
+        try:
+            from test_harness import DISCOVERY_SCHEMA_VERSION as _SCHEMA_V
+        except Exception:
+            _SCHEMA_V = 1
         entry = {
+            'schema_version': _SCHEMA_V,
             'rule': self.rule_name,
+            'rule_code_hash': rule_code_hash(self.rule_name),
             'params': dict(self.params),
             'dt': self.dt,
             'score': self._score,
             'seed': self.seed,
+            'size': int(getattr(self, 'size', 0)),
+            'steps': int(getattr(self, 'step_count', 0)),
             'final_alive': self._score_metrics.get('alive_ratio', 0),
             'final_activity': self._score_metrics.get('activity', 0),
             'final_surface': self._score_metrics.get('surface_ratio', 0),
         }
         self.discoveries.append(entry)
+        self._persist_discoveries()
+        self.discovery_index = len(self.discoveries) - 1
+        self._disc_by_rule = None  # invalidate browser cache
+
+    def _persist_discoveries(self):
+        """Write self.discoveries to disk (pretty JSON)."""
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.discovery_file)
         with open(path, 'w') as f:
             json.dump(self.discoveries, f, indent=2)
-        self.discovery_index = len(self.discoveries) - 1
+
+    def _toggle_mark_current_discovery(self):
+        """Flip the ``marked`` flag on the currently-loaded discovery and
+        persist. Marked entries are candidates for the refinement pipeline
+        (see ``test_harness.py refine``). No-op if no entry is loaded."""
+        if not (0 <= self.discovery_index < len(self.discoveries)):
+            return
+        d = self.discoveries[self.discovery_index]
+        now_marked = not bool(d.get('marked', False))
+        d['marked'] = now_marked
+        if now_marked:
+            d['marked_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        else:
+            d.pop('marked_at', None)
+        self._persist_discoveries()
+
+    # ── Refinement subprocess control ────────────────────────────────
+    # The refinement engine lives in refine.py and is launched as a
+    # subprocess so the GUI stays interactive during passes A–E. We poll
+    # its status sidecar (refinements/.status/<hash>.json) every ~250 ms
+    # and re-read discoveries.json once the run completes so the parent
+    # entry's `refinement` block becomes visible in the browser.
+
+    def _refine_short_hash(self, entry):
+        """Mirror of refine.short_hash without importing refine.py
+        (which would pull in moderngl twice)."""
+        import hashlib
+        rule = entry.get('rule', '')
+        params = sorted((str(k), float(v))
+                        for k, v in (entry.get('params') or {}).items())
+        seed = int(entry.get('seed', 0))
+        key = json.dumps([rule, params, seed], sort_keys=True)
+        return hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]
+
+    def _launch_refinement(self):
+        """Spawn refine.py for the currently-loaded discovery."""
+        if not (0 <= self.discovery_index < len(self.discoveries)):
+            return
+        if self._refine_proc is not None and self._refine_proc.poll() is None:
+            return  # already running
+        entry = self.discoveries[self.discovery_index]
+        h = self._refine_short_hash(entry)
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, 'refine.py')
+        if not os.path.exists(script):
+            print(f"[refine] refine.py not found at {script}", file=sys.stderr)
+            return
+        cmd = [sys.executable, '-u', script, '--idx', str(self.discovery_index)]
+        # Make sure the status dir exists *before* spawning so we can
+        # open the stderr log there, and so the child's StatusWriter
+        # never races a missing dir.
+        status_dir = os.path.join(here, 'refinements', '.status')
+        try:
+            os.makedirs(status_dir, exist_ok=True)
+        except Exception as e:
+            print(f"[refine] cannot create {status_dir}: {e}", file=sys.stderr)
+            return
+        log_path = os.path.join(status_dir, f'{h}.log')
+        try:
+            log_fh = open(log_path, 'wb')
+        except Exception as e:
+            print(f"[refine] cannot open log {log_path}: {e}", file=sys.stderr)
+            return
+        # Linux: ask the kernel to SIGTERM this child when the simulator
+        # (its parent) dies for any reason. Belt-and-braces against the
+        # orphan-process bug where Popen subprocesses outlive the GUI.
+        def _preexec():
+            try:
+                import ctypes, signal as _sig
+                PR_SET_PDEATHSIG = 1
+                libc = ctypes.CDLL('libc.so.6', use_errno=True)
+                libc.prctl(PR_SET_PDEATHSIG, _sig.SIGTERM, 0, 0, 0)
+            except Exception:
+                pass  # non-Linux or libc missing — fall back to atexit kill
+        try:
+            self._refine_proc = subprocess.Popen(
+                cmd, cwd=here,
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                preexec_fn=_preexec if sys.platform.startswith('linux') else None,
+                start_new_session=True,
+            )
+        except Exception as e:
+            print(f"[refine] failed to launch: {e}", file=sys.stderr)
+            self._refine_proc = None
+            log_fh.close()
+            return
+        # Popen dup'd the fd; close our handle so the file is flushed
+        # when the child exits.
+        log_fh.close()
+        self._refine_log_path = log_path
+        self._refine_status_path = os.path.join(status_dir, f'{h}.json')
+        self._refine_status = {'state': 'starting', 'pass': 'init',
+                               'pass_pct': 0.0, 'msg': 'spawning'}
+        self._refine_status_last_poll = 0.0
+        print(f"[refine] launched pid={self._refine_proc.pid} hash={h}")
+
+    def _poll_refinement(self):
+        """Throttled (~250 ms) check of the refine subprocess + status
+        sidecar. Called once per frame from the GUI; cheap when idle."""
+        if self._refine_proc is None:
+            return
+        now = time.time()
+        if now - self._refine_status_last_poll < 0.25:
+            return
+        self._refine_status_last_poll = now
+        # Read status sidecar if present
+        if self._refine_status_path and os.path.exists(self._refine_status_path):
+            try:
+                with open(self._refine_status_path) as f:
+                    self._refine_status = json.load(f)
+            except Exception:
+                pass  # mid-write; try next tick
+        # Has the process exited?
+        rc = self._refine_proc.poll()
+        if rc is not None:
+            # Reap and reload discoveries so the parent entry's
+            # refinement block appears in the browser.
+            self._refine_proc = None
+            if rc == 0:
+                self._load_discoveries()
+                self._disc_by_rule = None  # invalidate cache
+                self._refine_report_cache.clear()
+                if self._refine_status is None:
+                    self._refine_status = {'state': 'done', 'msg': 'complete'}
+                else:
+                    self._refine_status['state'] = 'done'
+            else:
+                tail = ''
+                lp = getattr(self, '_refine_log_path', None)
+                if lp and os.path.exists(lp):
+                    try:
+                        with open(lp, 'rb') as f:
+                            data = f.read()[-400:]
+                        tail = data.decode('utf-8', 'replace').strip().splitlines()[-1] if data else ''
+                    except Exception:
+                        pass
+                    print(f"[refine] exit {rc}; full log: {lp}",
+                          file=sys.stderr)
+                if self._refine_status is None:
+                    self._refine_status = {'state': 'failed',
+                                           'msg': f'exit {rc} {tail[:80]}'.strip()}
+                else:
+                    self._refine_status['state'] = 'failed'
+                    self._refine_status['msg'] = (
+                        f"exit {rc} {tail[:80]}".strip()
+                        if tail else self._refine_status.get('msg', f'exit {rc}'))
+
+    # ── Neighbourhood exploration (batch_refine.py) ────────────────
+    def _launch_explore(self, parent_hash, trials, span,
+                        vary_init=False, vary_density=False):
+        """Spawn batch_refine.py for the currently-loaded refined entry."""
+        if self._explore_proc is not None and self._explore_proc.poll() is None:
+            return  # already running
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, 'batch_refine.py')
+        if not os.path.exists(script):
+            print(f"[explore] batch_refine.py not found at {script}",
+                  file=sys.stderr)
+            return
+        log_dir = os.path.join(here, 'refinements', '.status')
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_fh = open(os.path.join(log_dir, f'explore_{parent_hash}.log'),
+                          'wb')
+        except Exception as e:
+            print(f"[explore] cannot open log: {e}", file=sys.stderr)
+            return
+        self._explore_log_path = os.path.join(
+            log_dir, f'explore_{parent_hash}.log')
+        cmd = [sys.executable, '-u', script,
+               '--hash', parent_hash,
+               '--trials', str(int(trials)),
+               '--span', f'{float(span):.4f}']
+        if vary_init:
+            cmd.append('--vary-init')
+        if vary_density:
+            cmd.append('--vary-density')
+
+        def _preexec():
+            try:
+                import ctypes, signal as _sig
+                ctypes.CDLL('libc.so.6', use_errno=True).prctl(
+                    1, _sig.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+            except Exception:
+                pass
+        try:
+            self._explore_disc_count_at_start = len(self.discoveries)
+            self._explore_proc = subprocess.Popen(
+                cmd, cwd=here, stdout=log_fh, stderr=subprocess.STDOUT,
+                preexec_fn=_preexec if sys.platform.startswith('linux') else None,
+                start_new_session=True)
+        except Exception as e:
+            print(f"[explore] failed to launch: {e}", file=sys.stderr)
+            self._explore_proc = None
+            log_fh.close()
+            return
+        log_fh.close()
+        self._explore_status = {'state': 'starting',
+                                'msg': f'{trials} trials, span={span}',
+                                'progress': 0.0}
+        self._explore_status_last_poll = 0.0
+        flags = []
+        if vary_init: flags.append('vary-init')
+        if vary_density: flags.append('vary-density')
+        flags_str = (' ' + ' '.join(flags)) if flags else ''
+        print(f"[explore] launched pid={self._explore_proc.pid} "
+              f"hash={parent_hash} trials={trials} span={span}{flags_str}")
+
+    def _poll_explore(self):
+        """Throttled (~500 ms) tail of batch_refine.py log + reaper."""
+        if self._explore_proc is None:
+            return
+        now = time.time()
+        if now - self._explore_status_last_poll < 0.5:
+            return
+        self._explore_status_last_poll = now
+        # Tail last progress line for live status
+        tail_line = ''
+        if self._explore_log_path and os.path.exists(self._explore_log_path):
+            try:
+                with open(self._explore_log_path, 'rb') as f:
+                    data = f.read()[-2048:]
+                lines = data.decode('utf-8', 'replace').strip().splitlines()
+                # Find last "[ N/T]" progress line
+                for ln in reversed(lines):
+                    s = ln.strip()
+                    if s.startswith('[') and '/' in s.split(']')[0]:
+                        tail_line = s
+                        break
+                if not tail_line and lines:
+                    tail_line = lines[-1].strip()
+            except Exception:
+                pass
+        # Parse progress fraction from "[  N/T] ..."
+        prog = float(self._explore_status.get('progress', 0.0)) if self._explore_status else 0.0
+        if tail_line.startswith('['):
+            try:
+                inside = tail_line[1:tail_line.index(']')].strip()
+                cur, tot = inside.split('/')
+                prog = float(cur) / max(float(tot), 1.0)
+            except Exception:
+                pass
+        if self._explore_status is not None:
+            self._explore_status['msg'] = tail_line[:120]
+            self._explore_status['progress'] = prog
+
+        rc = self._explore_proc.poll()
+        if rc is not None:
+            self._explore_proc = None
+            if rc == 0:
+                self._load_discoveries()
+                self._disc_by_rule = None
+                appended = len(self.discoveries) - self._explore_disc_count_at_start
+                self._explore_status = {
+                    'state': 'done',
+                    'msg': f'appended {max(appended, 0)} new entries',
+                    'progress': 1.0}
+            else:
+                self._explore_status = {
+                    'state': 'failed',
+                    'msg': f'exit {rc} (see {self._explore_log_path})',
+                    'progress': prog}
+
+    def _load_refinement_report(self, entry):
+        """Return parsed report.json for the given discovery entry, or
+        None if the entry has no refinement or the file is missing.
+        Cached by hash for cheap repeated UI draws."""
+        block = entry.get('refinement') if entry else None
+        if not block:
+            return None
+        h = block.get('id')
+        if h in self._refine_report_cache:
+            return self._refine_report_cache[h]
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = block.get('dir') and os.path.join(here, block['dir'], 'report.json')
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                report = json.load(f)
+        except Exception:
+            return None
+        self._refine_report_cache[h] = report
+        return report
+
+    def _draw_refinement_controls(self):
+        """Refine-now button + live status + report panel for the
+        currently-loaded discovery. Called from the discovery browser."""
+        if not (0 <= self.discovery_index < len(self.discoveries)):
+            return
+        entry = self.discoveries[self.discovery_index]
+        running = (self._refine_proc is not None
+                   and self._refine_proc.poll() is None)
+
+        if running:
+            st = self._refine_status or {}
+            phase = st.get('pass', '?')
+            pct = float(st.get('pass_pct', 0.0) or 0.0)
+            msg = st.get('msg', '')
+            imgui.text_colored(imgui.ImVec4(0.6, 0.8, 1.0, 1.0),
+                               f"refining: pass {phase}  {int(pct * 100):3d}%")
+            imgui.same_line()
+            imgui.progress_bar(pct, imgui.ImVec2(140, 0))
+            if msg:
+                imgui.same_line()
+                imgui.text_disabled(msg)
+        else:
+            if imgui.button("Refine now##refine_launch"):
+                self._launch_refinement()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Run the deep-analysis pipeline on this discovery:\n"
+                    "  A: replay at 96³ × 1500 steps with debug stats\n"
+                    "  B: dynamics fingerprint (period, clusters, …)\n"
+                    "  C: seed sensitivity (8 reruns)\n"
+                    "  D: parameter sensitivity (20-row LHS)\n"
+                    "  E: nearest neighbours in this rule's cohort\n"
+                    "Results back-fill the entry's ✓ Refined block.")
+            # Show terminal state once after a run
+            st = self._refine_status or {}
+            if st.get('state') in ('done', 'failed'):
+                imgui.same_line()
+                col = (imgui.ImVec4(0.4, 1.0, 0.4, 1.0) if st['state'] == 'done'
+                       else imgui.ImVec4(1.0, 0.5, 0.5, 1.0))
+                imgui.text_colored(col,
+                                   f"last: {st['state']}  {st.get('msg', '')}")
+
+        # Report panel — only when this entry has been refined.
+        report = self._load_refinement_report(entry)
+        if report is None:
+            return
+        if not imgui.collapsing_header(f"Refinement report — {report.get('verdict', '?')}##refine_rpt"):
+            return
+
+        es = report.get('end_state') or {}
+        ss = report.get('seed_summary') or {}
+        fp = report.get('fingerprint') or {}
+        el = report.get('param_elasticity') or {}
+        nb = report.get('neighbours_top') or []
+        cfg = report.get('config') or {}
+
+        imgui.text(f"verdict: {report.get('verdict', '?')}    "
+                   f"wall: {report.get('wall_seconds', 0):.1f}s    "
+                   f"size={cfg.get('size','?')} steps={cfg.get('steps','?')}")
+        imgui.separator()
+        imgui.text(f"end_state:  active_frac={es.get('active_frac',0):.4f}  "
+                   f"rg={es.get('rg',0):.3f}  "
+                   f"finite_c0={es.get('finite_c0',0)}  "
+                   f"nan={es.get('nan_c0',0)}  inf={es.get('inf_c0',0)}")
+        if ss:
+            af = ss.get('active_frac', {}) or {}
+            rg = ss.get('rg', {}) or {}
+            imgui.text(f"seed stability (n={cfg.get('seeds','?')}): "
+                       f"af={af.get('mean',0):.4f}±{af.get('std',0):.4f}  "
+                       f"rg={rg.get('mean',0):.3f}±{rg.get('std',0):.3f}  "
+                       f"af_cv={ss.get('active_frac_cv',0):.4f}")
+
+        # Fingerprint headline numbers (compact one-liners)
+        if fp:
+            per = fp.get('period') if isinstance(fp.get('period'), dict) else None
+            trn = fp.get('translation') if isinstance(fp.get('translation'), dict) else None
+            grw = fp.get('growth') if isinstance(fp.get('growth'), dict) else None
+            cl  = fp.get('clusters') or {}
+            sy  = fp.get('symmetry') or {}
+            ds  = fp.get('debug_summary') or {}
+            if per:
+                imgui.text(f"period:      {per}")
+            if trn:
+                imgui.text(f"translation: {trn}")
+            if grw:
+                imgui.text(f"growth:      {grw}")
+            if cl:
+                imgui.text(f"clusters:    n={cl.get('n_clusters','?')}  "
+                           f"largest={cl.get('largest_frac', 0):.3f}")
+            if sy:
+                imgui.text(f"symmetry:    {sy}")
+            if ds:
+                imgui.text(f"af series:   "
+                           f"mean={ds.get('active_frac_mean',0):.4f}  "
+                           f"std={ds.get('active_frac_std',0):.4f}  "
+                           f"min={ds.get('active_frac_min',0):.4f}  "
+                           f"max={ds.get('active_frac_max',0):.4f}  "
+                           f"n={ds.get('n_samples',0)}")
+
+        # Elasticity bars — Pearson r in [-1, +1] per param vs active_frac.
+        if el:
+            imgui.separator()
+            imgui.text("param elasticity (Pearson r → active_frac):")
+            max_abs = max((abs(float(v)) for v in el.values()), default=1.0) or 1.0
+            for k in sorted(el.keys()):
+                v = float(el[k])
+                # Bar: scaled to ±max_abs so the strongest correlation
+                # fills the width; sign tinted red (−) / green (+).
+                bar = '█' * max(1, int(abs(v) / max_abs * 18))
+                sign = '+' if v >= 0 else '-'
+                col = (imgui.ImVec4(0.4, 1.0, 0.4, 1.0) if v >= 0
+                       else imgui.ImVec4(1.0, 0.5, 0.4, 1.0))
+                imgui.text(f"  {k:>18s}  {sign}{abs(v):.2f}  ")
+                imgui.same_line()
+                imgui.text_colored(col, bar)
+
+        # Neighbours — clickable: jump to that discovery
+        if nb:
+            imgui.separator()
+            imgui.text(f"nearest neighbours in '{report.get('rule','')}' cohort:")
+            for n in nb:
+                idx = int(n.get('index', -1))
+                dist = float(n.get('distance', 0))
+                sc = float(n.get('score', 0))
+                bdg = ''
+                if n.get('refined'): bdg += ' ✓'
+                if n.get('marked'):  bdg += ' ★'
+                label = (f"  #{idx:>5d}  d={dist:.3f}  S={sc:.2f}{bdg}"
+                         f"##nbr_{idx}")
+                if imgui.selectable(label, False)[0]:
+                    self._load_discovery(idx)
+
+        # Footer: link to sidecar dir
+        block = entry.get('refinement') or {}
+        imgui.separator()
+        imgui.text_disabled(f"sidecar: {block.get('dir','?')}")
+
+        # ── Neighbourhood explorer (batch_refine.py) ──────────────
+        imgui.separator()
+        self._poll_explore()
+        explore_running = (self._explore_proc is not None
+                           and self._explore_proc.poll() is None)
+        parent_hash = block.get('id') or self._refine_short_hash(entry)
+        if explore_running:
+            st = self._explore_status or {}
+            prog = float(st.get('progress', 0.0) or 0.0)
+            imgui.text_colored(imgui.ImVec4(1.0, 0.85, 0.5, 1.0),
+                               f"exploring: {int(prog * 100):3d}%")
+            imgui.same_line()
+            imgui.progress_bar(prog, imgui.ImVec2(140, 0))
+            msg = st.get('msg', '')
+            if msg:
+                imgui.text_disabled(msg)
+        else:
+            imgui.text("Explore neighbourhood:")
+            imgui.same_line()
+            imgui.set_next_item_width(80)
+            changed, val = imgui.input_int("trials##expl", int(self._explore_trials), 0, 0)
+            if changed:
+                self._explore_trials = max(10, min(5000, int(val)))
+            imgui.same_line()
+            imgui.set_next_item_width(80)
+            changed, val = imgui.input_float("span##expl", float(self._explore_span), 0.0, 0.0, "%.2f")
+            if changed:
+                self._explore_span = max(0.01, min(1.0, float(val)))
+            imgui.same_line()
+            if imgui.button("Explore now##expl_launch"):
+                self._launch_explore(parent_hash, self._explore_trials,
+                                     self._explore_span,
+                                     vary_init=self._explore_vary_init,
+                                     vary_density=self._explore_vary_density)
+            if imgui.is_item_hovered():
+                init_note = ("  init_variant: cycled per trial\n"
+                             if self._explore_vary_init
+                             else "  init_variant: locked to parent\n")
+                dens_note = ("  init_density: jittered per trial\n"
+                             if self._explore_vary_density
+                             else "  init_density: locked to parent\n")
+                imgui.set_tooltip(
+                    "Run batch_refine.py on this refined entry:\n"
+                    f"  mutate params ±{self._explore_span:.2f} (× elasticity)\n"
+                    f"  {self._explore_trials} trials at size 48 × 200 steps\n"
+                    + init_note + dens_note +
+                    "  survivors above quality 0.25 appended to discoveries.json\n"
+                    "  each new entry gets derived_from.parent_hash =\n"
+                    f"  {parent_hash}")
+            # Broader-exploration toggles (default off = pure neighbourhood)
+            changed, self._explore_vary_init = imgui.checkbox(
+                "vary init##expl_vi", self._explore_vary_init)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Pick a random init_variant per trial from the preset's\n"
+                    "init_variants list. Off = lock to parent's init.")
+            imgui.same_line()
+            changed, self._explore_vary_density = imgui.checkbox(
+                "vary density##expl_vd", self._explore_vary_density)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Jitter init_density per trial within the preset's range.\n"
+                    "Off = lock to parent's density.")
+            st = self._explore_status or {}
+            if st.get('state') in ('done', 'failed'):
+                imgui.same_line()
+                col = (imgui.ImVec4(0.4, 1.0, 0.4, 1.0) if st['state'] == 'done'
+                       else imgui.ImVec4(1.0, 0.5, 0.5, 1.0))
+                imgui.text_colored(col, f"last: {st['state']}  {st.get('msg','')[:80]}")
 
     def _load_best_for_current_rule(self, random_topk: int = 1):
         """Load the best discovery for the currently-loaded rule.
@@ -29361,6 +29949,20 @@ void main() {
             imgui.set_tooltip("Load a random pick from the top 10\n"
                               "discoveries for the current rule.")
         imgui.same_line()
+        # ★ Mark for refinement — toggles the `marked` flag on the
+        # currently-loaded discovery. The refinement runner picks these up
+        # via `test_harness.py refine --all-marked`.
+        cur_marked = (0 <= self.discovery_index < len(self.discoveries) and
+                      bool(self.discoveries[self.discovery_index].get('marked')))
+        mark_label = ("Unmark##disc_mark" if cur_marked else "Mark ★##disc_mark")
+        if imgui.button(mark_label):
+            self._toggle_mark_current_discovery()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Flag this discovery for deeper analysis.\n"
+                "Marked entries are processed by the refinement\n"
+                "pipeline (test_harness.py refine --all-marked).")
+        imgui.same_line()
         imgui.text(f"({len(self.discoveries)} total)")
 
         # Discovery browser — all rules
@@ -29381,7 +29983,13 @@ void main() {
                 self._disc_show_all = True
             if not hasattr(self, '_disc_sort_mode'):
                 self._disc_sort_mode = 1  # 0=score, 1=newest
+            if not hasattr(self, '_disc_marked_only'):
+                self._disc_marked_only = False
             _, self._disc_show_all = imgui.checkbox("All rules##disc_all", self._disc_show_all)
+            imgui.same_line()
+            _, self._disc_marked_only = imgui.checkbox("Marked only##disc_marked", self._disc_marked_only)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Show only entries flagged with ★ Mark.")
             imgui.same_line()
             sort_labels = ["By score", "Newest first"]
             if imgui.begin_combo("##disc_sort", sort_labels[self._disc_sort_mode]):
@@ -29400,6 +30008,8 @@ void main() {
                     indices = []
                     for rn in by_rule:
                         ri = by_rule[rn]
+                        if self._disc_marked_only:
+                            ri = [i for i in ri if self.discoveries[i].get('marked')]
                         if self._disc_sort_mode == 0:
                             indices.extend(sorted(ri, key=lambda i: self.discoveries[i].get('score', 0), reverse=True))
                         else:
@@ -29407,6 +30017,8 @@ void main() {
                     return indices
                 else:
                     ri = [i for i, d in enumerate(self.discoveries) if d.get('rule') == self.rule_name]
+                    if self._disc_marked_only:
+                        ri = [i for i in ri if self.discoveries[i].get('marked')]
                     if self._disc_sort_mode == 0:
                         return sorted(ri, key=lambda i: self.discoveries[i].get('score', 0), reverse=True)
                     else:
@@ -29434,9 +30046,20 @@ void main() {
             imgui.same_line()
             if 0 <= self.discovery_index < len(self.discoveries):
                 d = self.discoveries[self.discovery_index]
-                imgui.text(f"#{self.discovery_index} {d['rule']} S={d.get('score',0):.2f}")
+                badge = ''
+                if d.get('refinement'):
+                    badge += ' ✓'
+                if d.get('marked'):
+                    badge += ' ★'
+                imgui.text(f"#{self.discovery_index} {d['rule']} S={d.get('score',0):.2f}{badge}")
             else:
                 imgui.text("(unsaved)")
+
+            # ── Refinement controls ──────────────────────────────
+            # Poll the running refine subprocess (cheap; throttled to
+            # 4 Hz internally) and draw the status row / launch buttons.
+            self._poll_refinement()
+            self._draw_refinement_controls()
 
             # Scrollable discovery list with rule headers
             if imgui.begin_child("##disc_list", imgui.ImVec2(0, 200), imgui.ChildFlags_.borders):
@@ -29444,6 +30067,10 @@ void main() {
                     [r for r in by_rule if r == self.rule_name]
                 for rule_name in show_rules:
                     indices = by_rule[rule_name]
+                    if self._disc_marked_only:
+                        indices = [i for i in indices if self.discoveries[i].get('marked')]
+                        if not indices:
+                            continue
                     # Sort by selected mode
                     if self._disc_sort_mode == 0:
                         indices_sorted = sorted(indices, key=lambda i: self.discoveries[i].get('score', 0), reverse=True)
@@ -29475,8 +30102,14 @@ void main() {
                                 if rn and short.startswith(rn + '_'):
                                     short = short[len(rn) + 1:]
                                 tag = f' [{short}]'
+                            # Refinement / mark badges
+                            badge = ''
+                            if d.get('refinement'):
+                                badge += ' ✓'
+                            if d.get('marked'):
+                                badge += ' ★'
                             label = (f"#{idx:3d} S={sc:.2f} G={gc:.2f} "
-                                     f"P={pc:.2f} M={mi:.2f}{tag}##d{idx}")
+                                     f"P={pc:.2f} M={mi:.2f}{tag}{badge}##d{idx}")
                             if imgui.selectable(label, is_sel)[0]:
                                 self._load_discovery(idx)
                             if iv and imgui.is_item_hovered():
@@ -30192,9 +30825,26 @@ void main() {
             cmd += ['-vf', ','.join(parts)]
 
         cmd += enc_args + ['-movflags', '+faststart', self._rec_filename]
+        # Orphan-safety: same pattern as refine.py / batch_refine.py launches.
+        # If the simulator is SIGKILL'd or segfaults, ffmpeg would otherwise
+        # keep running, holding the output file open and consuming CPU
+        # forever. PR_SET_PDEATHSIG asks the kernel to send SIGTERM to the
+        # child the instant its parent (us) dies for *any* reason.
+        # start_new_session detaches it from our controlling TTY so a Ctrl-C
+        # in the parent shell doesn't get duplicated to ffmpeg.
+        def _ffmpeg_preexec():
+            try:
+                import ctypes, signal as _sig
+                ctypes.CDLL('libc.so.6', use_errno=True).prctl(
+                    1, _sig.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+            except Exception:
+                pass
         self._rec_process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, bufsize=w * h * 3 * 2)
+            stderr=subprocess.PIPE, bufsize=w * h * 3 * 2,
+            preexec_fn=(_ffmpeg_preexec
+                        if sys.platform.startswith('linux') else None),
+            start_new_session=True)
 
         # Verify ffmpeg started successfully
         time.sleep(0.05)
@@ -30771,6 +31421,47 @@ void main() {
             VBO/VAO). It must be torn down WHILE the GL context is still
             current, but BEFORE the moderngl context itself is released.
         """
+        # 0. Terminate any background refinement subprocess. Independent of
+        #    GL state, so do this first — and unconditionally — so even a
+        #    later GL teardown crash leaves no orphan refine.py running.
+        proc = getattr(self, '_refine_proc', None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                print(f"[shutdown] terminated refine.py pid={proc.pid}",
+                      flush=True)
+            except Exception as e:
+                print(f"[shutdown] refine.py kill failed: {e!r}", flush=True)
+            self._refine_proc = None
+
+        # Same for the neighbourhood-explorer subprocess (batch_refine.py).
+        eproc = getattr(self, '_explore_proc', None)
+        if eproc is not None and eproc.poll() is None:
+            try:
+                eproc.terminate()
+                try:
+                    eproc.wait(timeout=2.0)
+                except Exception:
+                    eproc.kill()
+                    try:
+                        eproc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                print(f"[shutdown] terminated batch_refine.py pid={eproc.pid}",
+                      flush=True)
+            except Exception as e:
+                print(f"[shutdown] batch_refine.py kill failed: {e!r}",
+                      flush=True)
+            self._explore_proc = None
+
         # 1. Stop the recording subprocess and writer thread before touching GL.
         #    _stop_recording is bounded by ffmpeg's wait timeout; if that hangs
         #    we'd rather kill ffmpeg than block forever during shutdown.
@@ -30779,6 +31470,26 @@ void main() {
                 self._stop_recording()
             except Exception:
                 pass
+        # Belt-and-braces: even if _recording was never set true (Popen
+        # returned but launch failed mid-way) or _stop_recording raised
+        # before reaping, make sure ffmpeg doesn't outlive us.
+        rproc = getattr(self, '_rec_process', None)
+        if rproc is not None and rproc.poll() is None:
+            try:
+                rproc.terminate()
+                try:
+                    rproc.wait(timeout=2.0)
+                except Exception:
+                    rproc.kill()
+                    try:
+                        rproc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                print(f"[shutdown] terminated ffmpeg pid={rproc.pid}",
+                      flush=True)
+            except Exception as e:
+                print(f"[shutdown] ffmpeg kill failed: {e!r}", flush=True)
+            self._rec_process = None
 
         # 1b. Flush + close the unified run bundle BEFORE we lose the GL
         #     context (RunRecorder may want a final ctx.info read for the

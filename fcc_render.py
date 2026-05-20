@@ -544,12 +544,15 @@ class VoxelRenderer:
 def _self_check() -> None:
     print("[fcc_render] booting standalone context...")
     ctx = moderngl.create_standalone_context(require=430)
-    r = VoxelRenderer(ctx)
-    print("[fcc_render] cull + draw programs compiled OK")
-    print(f"[fcc_render] BITS_POS={BITS_POS} (max grid {MAX_DIM}), "
-          f"BITS_SHADE={BITS_SHADE} ({SHADE_LEVELS} levels)")
-    r.release()
-    print("[fcc_render] self-check: OK")
+    try:
+        r = VoxelRenderer(ctx)
+        print("[fcc_render] cull + draw programs compiled OK")
+        print(f"[fcc_render] BITS_POS={BITS_POS} (max grid {MAX_DIM}), "
+              f"BITS_SHADE={BITS_SHADE} ({SHADE_LEVELS} levels)")
+        r.release()
+        print("[fcc_render] self-check: OK")
+    finally:
+        ctx.release()
 
 
 if __name__ == "__main__":

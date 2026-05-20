@@ -33,6 +33,11 @@ from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Static
 
+# Discovery-entry field access: strict on v1+ entries (loud KeyError on
+# missing required field), lenient on legacy entries and on dashboard-
+# internal dicts like worker status / live-stream payloads.
+from schema import get_field
+
 REPO_ROOT = Path(__file__).resolve().parent
 STATUS_DIR = REPO_ROOT / 'runs' / '.status'
 DISCOVERIES_PATH = REPO_ROOT / 'discoveries.json'
@@ -473,8 +478,8 @@ class SearchOverviewPanel(Static):
             for i, e in enumerate(self.leaderboard[:3]):
                 medal = ('[bright_yellow]🥇[/]', '[white]🥈[/]', '[yellow]🥉[/]')[i]
                 tops.append(
-                    f"{medal} [bold]{e.get('score', 0):.3f}[/] "
-                    f"[cyan]{e.get('rule', '?')}[/]"
+                    f"{medal} [bold]{get_field(e, 'score', 0):.3f}[/] "
+                    f"[cyan]{get_field(e, 'rule', '?')}[/]"
                 )
             leaderboard_line = '  ' + '   '.join(tops)
         else:
@@ -617,8 +622,8 @@ class DiscoveriesPanel(Static):
             return '\n'.join(lines)
         # Newest first.
         for d in reversed(entries):
-            score = d.get('score', 0.0)
-            rule = d.get('rule', '?')
+            score = get_field(d, 'score', 0.0)
+            rule = get_field(d, 'rule', '?')
             star = '★' if score >= 0.7 else '·'
             star_color = (
                 'bright_yellow' if score >= 0.85 else
@@ -628,7 +633,7 @@ class DiscoveriesPanel(Static):
                 f'  [{star_color}]{star}[/]  '
                 f'[bold]{score:5.3f}[/]  '
                 f'[cyan]{rule:<24}[/]  '
-                f'[dim]seed={d.get("seed", "?")}[/]'
+                f'[dim]seed={get_field(d, "seed", "?")}[/]'
             )
         return '\n'.join(lines)
 
@@ -991,8 +996,10 @@ class CADashboard(App):
         # Per-rule aggregates from the cumulative live feed.
         per_rule: dict[str, dict[str, Any]] = {}
         for e in self.live_disc:
-            rule = e.get('rule', '?')
-            score = float(e.get('score', 0.0))
+            rule = get_field(e, 'rule', '?')
+            score = float(get_field(e, 'score', 0.0))
+            # 't' is a dashboard-internal timestamp on live-stream entries,
+            # not a v1 discovery field — keep plain .get().
             t_ = float(e.get('t', 0.0))
             slot = per_rule.setdefault(
                 rule, {'rule': rule, 'count': 0, 'best': 0.0, 'last_t': 0.0}
@@ -1011,9 +1018,9 @@ class CADashboard(App):
         seen_rules: set[str] = set()
         leaderboard: list[dict[str, Any]] = []
         for e in sorted(
-            self.live_disc, key=lambda x: float(x.get('score', 0)), reverse=True,
+            self.live_disc, key=lambda x: float(get_field(x, 'score', 0)), reverse=True,
         ):
-            r = e.get('rule', '?')
+            r = get_field(e, 'rule', '?')
             if r in seen_rules:
                 continue
             seen_rules.add(r)
