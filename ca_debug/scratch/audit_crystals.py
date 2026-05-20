@@ -338,7 +338,7 @@ def main():
     finally:
         try:
             ctx.release()
-        except Exception:
+        except Exception:  # noqa: BLE001  GL resource release, never fatal
             pass
 
 

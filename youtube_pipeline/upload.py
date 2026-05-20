@@ -77,7 +77,7 @@ def _classify_http_error(e: HttpError) -> tuple[str | None, str]:
         errors = err.get('errors') or []
         if errors:
             reason = errors[0].get('reason')
-    except Exception:
+    except Exception:  # noqa: BLE001  malformed JSON, treat as missing
         pass
     return reason, message
 

@@ -256,7 +256,7 @@ class RunSet:
             # immutable run identity (rule, size, seed) can't be shadowed.
             try:
                 d = r.derived or {}
-            except Exception:
+            except Exception:  # noqa: BLE001  optional derived attribute access
                 d = {}
             for k, v in d.items():
                 # Only merge JSON-scalar / list values; nested dicts would

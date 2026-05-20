@@ -101,7 +101,7 @@ for r in rules:
         s = audit_rule(r)
         if s is None: continue
         results[r] = s
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  per-item analysis may crash, record error and continue
         print(f"  {r}: ERROR {e}")
 
 print("\n=== FLAGGED ===")

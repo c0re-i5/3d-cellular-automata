@@ -198,7 +198,7 @@ def audit_rule(rule: str, size: int, warmup: int, save_dir: str | None,
     try:
         sim = Simulator(size=size, rule=rule, headless=True)
         sim.renderer_mode = renderer
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  sim construction may fail on bad params
         print(f'   BUILD ERROR: {type(e).__name__}: {e}')
         return None
     try:
@@ -231,13 +231,13 @@ def audit_rule(rule: str, size: int, warmup: int, save_dir: str | None,
                 path = os.path.join(save_dir, f'{tag}_{renderer}_{rule}.png')
                 Image.fromarray(img[:, :, :3]).save(path)
                 print(f'   -> saved {path}')
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  best-effort mkdir
                 print(f'   image save failed: {e}')
         return metrics
     finally:
         try:
             sim.close()
-        except Exception:
+        except Exception:  # noqa: BLE001  teardown, never fatal
             pass
 
 

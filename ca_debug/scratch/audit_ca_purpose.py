@@ -249,7 +249,7 @@ def main():
                   f'k*={res["peak_k"]:>2} slope={res["spec_slope"]:+.2f} '
                   f'comΔ={res["com_drift"]:.1f} bbox={res["bbox_fill"]:.2f} '
                   f'sat={res["sat_frac"]:.2f} ({elapsed:.1f}s)')
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-item analysis may crash, record error and continue
             print(f'  {r:<26} ERROR: {str(e)[:120]}')
             results.append(dict(rule=r, verdict='ERROR', error=str(e)[:200]))
 

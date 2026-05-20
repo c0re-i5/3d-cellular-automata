@@ -120,7 +120,7 @@ def _evolve(ctx, rule: str, *, size: int, steps: int, seed: int):
     samples.append(_measure(g_final))
     if hasattr(r, 'release'):
         try: r.release()
-        except Exception: pass
+        except Exception: pass  # noqa: BLE001  GL resource release, never fatal
     return samples, g0, g_final
 
 
@@ -216,7 +216,7 @@ def _select_rules(args) -> list[str]:
     for r in sorted(RULE_PRESETS.keys()):
         try:
             preset = _resolve_composed_preset(r)
-        except Exception:
+        except Exception:  # noqa: BLE001  preset lookup failure -> caller falls back
             continue
         if preset.get('kind') == 'viewport':
             continue
@@ -263,7 +263,7 @@ def main(argv=None):
             voxels = int(np.prod(g0.shape[:-1]))
             grade = _classify_run(samples, EXPECTED.get(rule, []), voxels)
             row = {'rule': rule, 'grade': grade}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             row = {'rule': rule,
                    'grade': {'severity': 'err',
                              'flags': [f'CRASH:{type(e).__name__}:{e}'],

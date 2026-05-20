@@ -1,0 +1,33 @@
+# Minimal ruff config — enforces the audit-hardening invariants this
+# project has earned. We do NOT enable the full ruff default ruleset
+# because the codebase has many local style choices that aren't worth
+# churning. This file locks in just the rules where we already have
+# 100% compliance.
+
+# Scan top-level modules plus our two first-party packages.
+extend-exclude = [
+    ".venv",
+    "venv",
+    "recordings",
+    "screenshots",
+    "refinements",
+    "runs",
+    "discoveries_backup.json",
+]
+
+line-length = 100  # advisory; we don't lint E501
+
+[lint]
+# Allowlist. Add new codes only after a clean scan and matching
+# annotation/cleanup pass in audit.py.
+select = [
+    "BLE001",  # blind-except (every `except Exception:` must annotate or narrow)
+]
+
+# Per-rule config.
+[lint.flake8-bugbear]
+# (placeholder for future B-series rules)
+
+[lint.per-file-ignores]
+# The annotator script lives in /tmp and is not part of the repo; if
+# it ever moves here, allow bare-except inside RULES-evaluation guards.

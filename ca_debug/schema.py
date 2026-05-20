@@ -68,7 +68,7 @@ def capture_code_metadata(repo_path: str | None = None) -> dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         out["git_sha"] = sha
-    except Exception:
+    except Exception:  # noqa: BLE001  git probe; missing .git or git binary is OK
         return out
     try:
         diff = subprocess.check_output(
@@ -76,7 +76,7 @@ def capture_code_metadata(repo_path: str | None = None) -> dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         out["git_dirty"] = bool(diff)
-    except Exception:
+    except Exception:  # noqa: BLE001  git probe; missing .git or git binary is OK
         pass
     try:
         branch = subprocess.check_output(
@@ -84,7 +84,7 @@ def capture_code_metadata(repo_path: str | None = None) -> dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         out["branch"] = branch
-    except Exception:
+    except Exception:  # noqa: BLE001  git probe; missing .git or git binary is OK
         pass
     return out
 
@@ -110,7 +110,7 @@ def capture_env_metadata(gl_ctx: Any | None = None) -> dict[str, Any]:
             out["gpu_vendor"]   = info.get("GL_VENDOR")
             out["gpu_renderer"] = info.get("GL_RENDERER")
             out["gl_version"]   = info.get("GL_VERSION")
-        except Exception:
+        except Exception:  # noqa: BLE001  GL info probe, may be unsupported
             pass
     return out
 

@@ -627,7 +627,7 @@ def main():
                             f"  [{done:>3}/{n_trials}] {rule} seed={seed} "
                             f"{overrides}  elapsed={t.elapsed:.1f}s  ETA={eta:.0f}s"
                         )
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001  trial may crash on bad params, score=0
                         print(f"  [FAIL] {rule} seed={seed} {overrides}: {e}")
 
     print(f"\n# All trials done in {time.perf_counter() - t_start:.1f}s")

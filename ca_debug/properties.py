@@ -348,7 +348,7 @@ def _existing_assertion_keys(events_path: Path) -> set[tuple[str, int | None]]:
         for line in f:
             try:
                 ev = json.loads(line)
-            except Exception:
+            except Exception:  # noqa: BLE001  malformed JSON, treat as missing
                 continue
             if ev.get('kind') == 'assertion_failed':
                 keys.add((ev.get('property', ''), ev.get('step')))
@@ -377,7 +377,7 @@ def check_run(run, *, dry_run: bool = False) -> list[Failure]:
     for prop in PER_BUNDLE_PROPERTIES:
         try:
             out.extend(prop(run))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  property check crash, log and continue
             out.append(Failure(
                 property=prop.__name__,
                 detail=f"property crashed: {type(e).__name__}: {e}",
@@ -411,7 +411,7 @@ def check_all(runs_root: str = S.DEFAULT_RUNS_ROOT, *,
                     if matches:
                         _append_failures(
                             matches[0].path / S.EVENTS_NAME, fails)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  property check crash, log and continue
             print(f"[properties] {cross.__name__} crashed: {e}",
                   file=sys.stderr)
 

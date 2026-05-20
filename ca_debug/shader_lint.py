@@ -85,7 +85,7 @@ def _load_shader_dict() -> dict[str, str]:
         try:
             mod = __import__(sibling)
             _scan_module(mod)
-        except Exception:
+        except Exception:  # noqa: BLE001  optional dependency
             pass
     # Pull per-preset `entity_shaders` and `pass_shaders` dicts as well.
     for preset in simulator.RULE_PRESETS.values():
@@ -444,7 +444,7 @@ def lint_rule(rule: str, shaders: dict[str, str]) -> list[dict]:
     findings: list[dict] = []
     try:
         preset = _resolve(rule)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  preset resolution may fail
         return [{'severity': 'err', 'code': 'PRESET_RESOLVE_FAILED',
                  'msg': f"[{rule}] {e}"}]
 
@@ -533,7 +533,7 @@ def main(argv=None):
     for r in rules:
         try:
             preset = _resolve(r)
-        except Exception:
+        except Exception:  # noqa: BLE001  preset resolution may fail
             continue
         for p in (preset.get('passes') or [{'shader': preset.get('shader')}]):
             sh = p.get('shader')

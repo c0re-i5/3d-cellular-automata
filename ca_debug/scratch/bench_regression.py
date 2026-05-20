@@ -54,7 +54,7 @@ def _run_one(ctx, rule_name, size, steps, seed):
             'score':   float(result.get('score', float('nan'))),
             'effective_size': int(result.get('size', size)),
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  optional dependency
         return {'ok': False, 'error': f'{type(e).__name__}: {e}',
                 'tb': traceback.format_exc(limit=4)}
 

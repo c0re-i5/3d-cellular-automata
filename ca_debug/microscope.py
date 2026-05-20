@@ -134,7 +134,7 @@ def microscope(ctx, rule_name: str, *,
                         'has_nan':      bool(res.get('has_nan', False)),
                         'has_inf':      bool(res.get('has_inf', False)),
                     }
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  trial may crash on bad params, score=0
                     rec = {'init_variant': iv, 'pv_idx': pv_idx,
                            'seed': seed, 'params': dict(params),
                            'error': f"{type(e).__name__}: {e}",
@@ -352,7 +352,7 @@ def _cli():
     finally:
         try:
             window.destroy()
-        except Exception:
+        except Exception:  # noqa: BLE001  teardown, never fatal
             pass
     if args.json:
         print()

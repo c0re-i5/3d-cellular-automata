@@ -210,7 +210,7 @@ def _run_one(ctx, rule: str, args) -> tuple[dict, dict, str]:
                                 size=size, steps=args.steps,
                                 seed_base=args.seed_base)
         report['size_used'] = size
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  microscope analysis may crash per rule
         tb = traceback.format_exc(limit=4)
         report = {'rule': rule, 'n_trials': 0,
                   'errors': [{'error': f"{type(e).__name__}: {e}"}],
@@ -319,7 +319,7 @@ def _cli():
     finally:
         try:
             window.destroy()
-        except Exception:
+        except Exception:  # noqa: BLE001  teardown, never fatal
             pass
 
     print(f"\nDone in {time.time() - t_start:.1f}s.")

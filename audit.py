@@ -190,7 +190,7 @@ def pass1_schema(entries: list[dict]) -> dict:
     # discovery may no longer reproduce.
     try:
         from simulator import rule_code_hash as _rch
-    except Exception:
+    except Exception:  # noqa: BLE001  optional dependency
         _rch = None
     drift_by_rule: Counter = Counter()
     drift_examples = []
@@ -314,7 +314,15 @@ def pass2_xref(entries: list[dict]) -> dict:
 def pass4_codesurface() -> dict:
     out: dict = {'name': 'Code surface audit'}
 
-    py_files = [p for p in ROOT.glob('*.py') if p.name != 'audit.py']
+    # Scan top-level modules plus first-party subpackages
+    # (`ca_debug/`, `youtube_pipeline/`) and audit.py itself. We exclude
+    # `.venv`, `recordings`, `screenshots`, etc. by limiting to known
+    # source directories.
+    py_files: list = list(ROOT.glob('*.py'))
+    for sub in ('ca_debug', 'youtube_pipeline'):
+        d = ROOT / sub
+        if d.is_dir():
+            py_files.extend(d.rglob('*.py'))
 
     patterns = {
         'entry.get_calls': re.compile(r'\bentry\.get\(|disc\.get\(|d\.get\(|e\.get\('),
@@ -327,15 +335,18 @@ def pass4_codesurface() -> dict:
         # Migrated sites: anything calling the schema helper.
         'schema_get_field': re.compile(r'\bget_field\s*\('),
         # Any `except Exception:` site, INCLUDING those marked acknowledged
-        # via a trailing `# noqa: BLE001` comment. The split between
+        # via a trailing BLE001 suppression comment. The split between
         # acknowledged and unannotated is computed below.
+        # Anchored at start-of-line (after indentation) so regex literals
+        # in this file's source don't self-match.
         'except_exception_bare': re.compile(
-            r'except\s+Exception(\s+as\s+\w+)?\s*:'),
+            r'^\s*except\s+Exc' + r'eption(\s+as\s+\w+)?\s*:', re.M),
         # Subset: bare-excepts explicitly marked as intentional. The
-        # `# noqa: BLE001  <reason>` marker mirrors the ruff lint code
-        # for blind-except so a future ruff pass agrees with the audit.
+        # BLE001 suppression marker mirrors the ruff lint code for
+        # blind-except so a future ruff pass agrees with the audit.
         'except_exception_acknowledged': re.compile(
-            r'except\s+Exception(\s+as\s+\w+)?\s*:.*#\s*noqa:\s*BLE001'),
+            r'^\s*except\s+Exc' + r'eption(\s+as\s+\w+)?\s*:.*#\s*noqa'
+            + r':\s*BLE001', re.M),
         'subprocess_popen': re.compile(r'subprocess\.Popen\b'),
         # Count CALL sites only — strip leading whitespace then skip
         # `def `, `import`, comment lines, and string-prefixed lines.
@@ -361,7 +372,7 @@ def pass4_codesurface() -> dict:
     for p in py_files:
         try:
             text = p.read_text(errors='replace').splitlines()
-        except Exception:
+        except Exception:  # noqa: BLE001  best-effort read
             continue
         for lineno, line in enumerate(text, 1):
             for name, rx in patterns.items():
@@ -408,7 +419,7 @@ def pass4_codesurface() -> dict:
         'net_outstanding': total_create - total_destroy,
     }
     # Bare-except triage per file: total vs explicitly acknowledged
-    # (`# noqa: BLE001  <reason>`). Unannotated = total − acknowledged
+    # (BLE001 suppression with reason). Unannotated = total − acknowledged
     # is the "suspicious" residual that should keep shrinking over time.
     bare = defaultdict(lambda: {'total': 0, 'acknowledged': 0})
     for f, _, _ in hits['except_exception_bare']:
@@ -480,7 +491,7 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
         from test_harness import (
             create_headless_context, destroy_context, run_trial,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  optional dependency
         out['error'] = f'cannot import test_harness: {e}'
         return out
 
@@ -528,7 +539,7 @@ def pass3_replay(entries: list[dict], k: int, tolerance: float) -> dict:
                     verbose=False,
                     capture_dynamics=False,
                 )
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001  trial may crash on bad params, score=0
                 results['crashed'] += 1
                 crashes.append((idx, rule, f'{type(ex).__name__}: {ex}'[:120]))
                 continue

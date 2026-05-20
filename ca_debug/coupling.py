@@ -95,7 +95,7 @@ def _evolve(ctx, rule: str, *, size: int, steps: int, seed: int,
     g = r.read_grid().astype(np.float32)
     if hasattr(r, 'release'):
         try: r.release()
-        except Exception: pass
+        except Exception: pass  # noqa: BLE001  GL resource release, never fatal
     return g0, g
 
 
@@ -238,7 +238,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
         with contextlib.redirect_stdout(io.StringIO()):
             g_init, g_base = _evolve(ctx, rule, size=args.size, steps=args.steps,
                                      seed=args.seed, params_override=None)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
         return {'rule': rule, 'coupling': {},
                 'grade': {'severity': 'err',
                           'flags': [f'BASELINE_CRASH:{type(e).__name__}'],
@@ -283,7 +283,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
                 with contextlib.redirect_stdout(io.StringIO()):
                     _, g = _evolve(ctx, rule, size=args.size, steps=args.steps,
                                    seed=args.seed, params_override=override)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
                 info[tag] = np.full(g_base.shape[-1], float('nan'),
                                     dtype=np.float32)
                 info[f'nan_{ "pos" if tag=="+" else "neg" }'] = True
@@ -338,7 +338,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
                     _, g = _evolve(ctx, rule, size=args.size,
                                    steps=args.steps, seed=args.seed,
                                    params_override={pname: vp})
-            except Exception:
+            except Exception:  # noqa: BLE001  per-rule trial may crash, record error and continue
                 continue
             if not np.isfinite(g).all():
                 continue
@@ -378,7 +378,7 @@ def _select_rules(args) -> list[str]:
     for r in sorted(RULE_PRESETS.keys()):
         try:
             preset = _resolve_composed_preset(r)
-        except Exception:
+        except Exception:  # noqa: BLE001  preset lookup failure -> caller falls back
             continue
         if preset.get('kind') == 'viewport':
             continue
@@ -423,7 +423,7 @@ def main(argv=None):
         sys.stdout.flush()
         try:
             row = _run_one(ctx, rule, args)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             row = {'rule': rule, 'coupling': {},
                    'grade': {'severity': 'err', 'flags': [f'CRASH:{e}'],
                              'n_dead': 0, 'n_explosive': 0, 'n_asym': 0}}

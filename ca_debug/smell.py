@@ -58,7 +58,7 @@ def _q(query: str, runs_root: str):
     """
     try:
         return analyzer.sql(query, runs_root=runs_root)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  sql query may fail, log and continue
         print(f"[smell] query failed: {type(e).__name__}: {e}", file=sys.stderr)
         return _empty_df()
 
@@ -314,7 +314,7 @@ def _load_discoveries(path: str) -> list[dict]:
             return json.load(f)
     except FileNotFoundError:
         return []
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  malformed JSON, treat as missing
         print(f"[smell] could not read {path}: {e}", file=sys.stderr)
         return []
 
@@ -484,7 +484,7 @@ def detect_anomaly_events(runs_root: str) -> list[Finding]:
             for line in f:
                 try:
                     ev = json.loads(line)
-                except Exception:
+                except Exception:  # noqa: BLE001  malformed JSON, treat as missing
                     continue
                 kind = ev.get('kind', '')
                 if kind in ('anomaly', 'assertion_failed'):
@@ -541,7 +541,7 @@ def run_all(runs_root: str = S.DEFAULT_RUNS_ROOT,
         try:
             arg = discoveries_path if name in DISCOVERY_DETECTORS else runs_root
             findings.extend(det(arg))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  detector may crash, log and continue
             print(f"[smell] {name} failed: {e}", file=sys.stderr)
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f.severity, 9), f.kind, f.subject))
     return findings

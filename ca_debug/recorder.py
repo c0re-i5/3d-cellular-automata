@@ -289,7 +289,7 @@ class RunRecorder:
             try:
                 self._events_fp.flush()
                 self._events_fp.close()
-            except Exception:
+            except Exception:  # noqa: BLE001  teardown, never fatal
                 pass
             self.manifest["ended_at"] = _utcnow_iso()
             self._write_manifest()

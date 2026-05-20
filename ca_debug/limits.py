@@ -132,7 +132,7 @@ def _evolve(ctx, rule: str, *, size: int, steps: int, seed: int,
     g = r.read_grid().astype(np.float32)
     if hasattr(r, 'release'):
         try: r.release()
-        except Exception: pass
+        except Exception: pass  # noqa: BLE001  GL resource release, never fatal
     return g
 
 
@@ -178,7 +178,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
             if not np.isfinite(err) or err > DETERMINISM_TOL:
                 sev = _worst(sev, 'crit' if err > 0.10 else 'high')
                 flags.append(f'NONDET={err:.2e}')
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             sub['determinism'] = {'error': f'{type(e).__name__}: {e}'}
             sev = _worst(sev, 'err')
             flags.append(f'DET_CRASH:{type(e).__name__}')
@@ -196,7 +196,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
             if density > EMPTY_IC_TOL and rule not in _SPONTANEOUS_OK:
                 sev = _worst(sev, 'high' if density > 0.1 else 'med')
                 flags.append(f'EMPTY_IC_NONZERO={density:.3f}')
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             sub['empty_ic'] = {'error': f'{type(e).__name__}: {e}'}
             flags.append(f'EMPTY_CRASH:{type(e).__name__}')
 
@@ -239,7 +239,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
                     flags.append(
                         f'DAMP_SIGN?({",".join(damping_params)}):'
                         f'{ratio:.2f}x')
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
                 sub['damping'] = {'error': f'{type(e).__name__}: {e}'}
                 flags.append(f'DAMP_CRASH:{type(e).__name__}')
         else:
@@ -261,7 +261,7 @@ def _select_rules(args) -> list[str]:
     for r in sorted(RULE_PRESETS.keys()):
         try:
             preset = _resolve_composed_preset(r)
-        except Exception:
+        except Exception:  # noqa: BLE001  preset lookup failure -> caller falls back
             continue
         if preset.get('kind') == 'viewport':
             continue
@@ -302,7 +302,7 @@ def main(argv=None):
         sys.stdout.flush()
         try:
             row = _run_one(ctx, rule, args)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             row = {'rule': rule, 'sub': {},
                    'grade': {'severity': 'err',
                              'flags': [f'CRASH:{type(e).__name__}']}}

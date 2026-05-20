@@ -73,5 +73,5 @@ for r in ['particle_lenia', 'flagship_neural_swarm',
           'flagship_unison_flock', 'flagship_galaxy_dust']:
     try:
         probe(r)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  per-item analysis may crash, record error and continue
         import traceback; traceback.print_exc()

@@ -141,7 +141,7 @@ def _detect_lab_noise_shaders() -> set[str]:
     """
     try:
         from simulator import CA_RULES
-    except Exception:
+    except Exception:  # noqa: BLE001  optional dependency
         return set()
     import re
     pat = re.compile(
@@ -164,7 +164,7 @@ def _detect_lab_noise_shaders() -> set[str]:
         from simulator import ELEMENT_CA_RULE
         if pat.search(ELEMENT_CA_RULE):
             out.add('element_ca')
-    except Exception:
+    except Exception:  # noqa: BLE001  optional dependency
         pass
     # Manual additions: shaders that use lab-frame literal coordinates
     # for design-time asymmetry (rain cells, plume sources, chiral spin
@@ -302,7 +302,7 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
     g_ctrl = r1.read_grid()
     if hasattr(r1, 'release'):
         try: r1.release()
-        except Exception: pass
+        except Exception: pass  # noqa: BLE001  GL resource release, never fatal
 
     # Transformed: build a fresh runner with the SAME seed (so any stored
     # state matches), then overwrite tex_a with the transformed IC.
@@ -335,7 +335,7 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
     g_xform = r2.read_grid()
     if hasattr(r2, 'release'):
         try: r2.release()
-        except Exception: pass
+        except Exception: pass  # noqa: BLE001  GL resource release, never fatal
 
     g_undo = probe.inverse(g_xform, vec_channels)
 
@@ -405,7 +405,7 @@ def _select_rules(args) -> list[str]:
     for r in sorted(RULE_PRESETS.keys()):
         try:
             preset = _resolve_composed_preset(r)
-        except Exception:
+        except Exception:  # noqa: BLE001  preset lookup failure -> caller falls back
             continue
         if preset.get('kind') == 'viewport':
             continue
@@ -467,7 +467,7 @@ def _run_one(ctx, rule: str, args) -> dict[str, Any]:
                               seed=args.seed, probe=probe,
                               vec_channels=vec_channels)
             results[probe.name] = r
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             results[probe.name] = {'error': f'{type(e).__name__}: {e}',
                                    'tb': traceback.format_exc()}
     grade = _grade(results)
@@ -500,7 +500,7 @@ def main(argv=None):
         sys.stdout.flush()
         try:
             row = _run_one(ctx, rule, args)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             row = {'rule': rule, 'probes': {},
                    'grade': {'severity': 'err', 'flags': [f'CRASH:{e}'],
                              'max_err': 0.0}}

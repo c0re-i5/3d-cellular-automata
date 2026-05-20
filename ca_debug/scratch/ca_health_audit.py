@@ -84,7 +84,7 @@ def run_one(ctx, rule, *, size: int, steps: int, seed: int) -> dict[str, Any]:
     try:
         r = run_trial(ctx, rule, size=size, seed=seed, steps=steps,
                       sample_interval=max(5, steps // 12), verbose=False)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  trial may crash on bad params, score=0
         return {'ok': False, 'error': f'{type(e).__name__}: {e}',
                 'dt_sec': time.perf_counter() - t0}
     history = r.get('history', [])

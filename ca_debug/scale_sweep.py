@@ -69,7 +69,7 @@ def _run_one(ctx, rule: str, *, size: int, steps: int, seed: int,
         gN = r.read_grid().astype(np.float32).copy()
         if hasattr(r, 'release'):
             try: r.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
         return traj, g0, gN
     finally:
         RULE_PRESETS[rule]['sparse_dispatch'] = saved
@@ -255,7 +255,7 @@ def _scan_all_rules(ctx, sizes: list[int], steps: int, seed: int,
                   file=sys.stderr)
             interrupted = True
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
             rows.append({'rule': name, 'status': f'ERR: {type(e).__name__}',
                          'max_div': float('nan'), 'divs': {},
                          'verdict': 'error'})
@@ -400,7 +400,7 @@ def main(argv=None):
                 traj, g0, gN = _run_one(
                     ctx, args.rule, size=size, steps=args.steps,
                     seed=args.seed, sparse=mode)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  per-rule trial may crash, record error and continue
                 print(f"{size:>5}  {label:<8}  ERROR: {e!r}")
                 continue
             sig = _solid_block_signature(gN)
