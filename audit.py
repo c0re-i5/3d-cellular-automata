@@ -326,7 +326,16 @@ def pass4_codesurface() -> dict:
         ),
         # Migrated sites: anything calling the schema helper.
         'schema_get_field': re.compile(r'\bget_field\s*\('),
-        'except_exception_bare': re.compile(r'except\s+Exception(\s+as\s+\w+)?\s*:\s*$'),
+        # Any `except Exception:` site, INCLUDING those marked acknowledged
+        # via a trailing `# noqa: BLE001` comment. The split between
+        # acknowledged and unannotated is computed below.
+        'except_exception_bare': re.compile(
+            r'except\s+Exception(\s+as\s+\w+)?\s*:'),
+        # Subset: bare-excepts explicitly marked as intentional. The
+        # `# noqa: BLE001  <reason>` marker mirrors the ruff lint code
+        # for blind-except so a future ruff pass agrees with the audit.
+        'except_exception_acknowledged': re.compile(
+            r'except\s+Exception(\s+as\s+\w+)?\s*:.*#\s*noqa:\s*BLE001'),
         'subprocess_popen': re.compile(r'subprocess\.Popen\b'),
         # Count CALL sites only — strip leading whitespace then skip
         # `def `, `import`, comment lines, and string-prefixed lines.
@@ -397,6 +406,25 @@ def pass4_codesurface() -> dict:
     out['context_lifecycle_totals'] = {
         'create': total_create, 'destroy': total_destroy,
         'net_outstanding': total_create - total_destroy,
+    }
+    # Bare-except triage per file: total vs explicitly acknowledged
+    # (`# noqa: BLE001  <reason>`). Unannotated = total − acknowledged
+    # is the "suspicious" residual that should keep shrinking over time.
+    bare = defaultdict(lambda: {'total': 0, 'acknowledged': 0})
+    for f, _, _ in hits['except_exception_bare']:
+        bare[f]['total'] += 1
+    for f, _, _ in hits['except_exception_acknowledged']:
+        bare[f]['acknowledged'] += 1
+    out['bare_except_per_file'] = {
+        f: {**v, 'unannotated': v['total'] - v['acknowledged']}
+        for f, v in sorted(bare.items())
+        if v['total']
+    }
+    out['bare_except_totals'] = {
+        'total': sum(v['total'] for v in bare.values()),
+        'acknowledged': sum(v['acknowledged'] for v in bare.values()),
+        'unannotated': sum(v['total'] - v['acknowledged']
+                           for v in bare.values()),
     }
     # Schema-migration progress per file. The helper's own file is the
     # source of truth and is excluded — its `.get('schema_version', 0)`
@@ -781,6 +809,27 @@ def _render_code(lines, p):
         lines.append('')
         for f, v in p['context_lifecycle_per_file'].items():
             lines.append(f'- {f}: create={v["create"]} destroy={v["destroy"]}')
+        lines.append('')
+    if p.get('bare_except_per_file'):
+        tot = p['bare_except_totals']
+        marker = '⚠ ' if tot['unannotated'] else '✓ '
+        lines.append(f'### {marker}Bare-except triage')
+        lines.append('')
+        lines.append('_Every `except Exception:` is either narrowed to a '
+                     'specific exception type, or annotated with '
+                     '`# noqa: BLE001  <reason>` to mark it as intentional '
+                     'defensive cleanup. Unannotated sites are the '
+                     'residual hygiene debt._')
+        lines.append('')
+        lines.append(f'- total bare-except sites: **{tot["total"]}**')
+        lines.append(f'- acknowledged (`# noqa: BLE001`): **{tot["acknowledged"]}**')
+        lines.append(f'- **unannotated: {tot["unannotated"]}**')
+        lines.append('')
+        lines.append('| file | total | acknowledged | unannotated |')
+        lines.append('|---|---:|---:|---:|')
+        for f, v in p['bare_except_per_file'].items():
+            lines.append(f'| {f} | {v["total"]} | {v["acknowledged"]} | '
+                         f'{v["unannotated"]} |')
         lines.append('')
     if p.get('schema_migration_per_file'):
         lines.append('### Schema-aware field access migration')

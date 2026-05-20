@@ -73,7 +73,7 @@ def _probe_tex_alloc_limit(ctx):
                 # Reserve 1 GB for non-sim GL objects, then divide remainder by 4
                 budget = max(1_000_000_000, (total_bytes - 1_000_000_000) // 4)
                 return min(budget, 8_000_000_000)          # sanity cap at 8 GB
-    except Exception:
+    except Exception:  # noqa: BLE001  GPU memory query unsupported (non-NVIDIA)
         pass
     return 1_000_000_000
 
@@ -21119,7 +21119,7 @@ def voxelize_mesh(mesh_or_path, size: int, scale: float = 0.85,
         if not shell:
             try:
                 vox = vox.fill()  # requires watertight mesh
-            except Exception:
+            except Exception:  # noqa: BLE001  mesh op fallback
                 # Non-watertight: fall back to per-cell point-in-mesh.
                 xs, ys, zs = np.meshgrid(
                     np.arange(size) + 0.5,
@@ -21140,7 +21140,7 @@ def voxelize_mesh(mesh_or_path, size: int, scale: float = 0.85,
         )
         idx = idx[ok]
         grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  mesh op fallback
         # Last-ditch fallback: surface-sample then point-in-mesh test.
         print(f"[voxelize_mesh] direct path failed ({e}); using contains() fallback")
         xs, ys, zs = np.meshgrid(
@@ -22576,7 +22576,7 @@ def _fence_after_dispatch():
     handle, or None if the GL driver doesn't support fences."""
     try:
         return GL.glFenceSync(GL.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
-    except Exception:
+    except Exception:  # noqa: BLE001  fence sync not supported by driver
         return None
 
 
@@ -22590,7 +22590,7 @@ def _fence_ready(fence):
     try:
         result = GL.glClientWaitSync(fence, 0, 0)  # flags=0, timeout=0 ns
         return result in (GL.GL_ALREADY_SIGNALED, GL.GL_CONDITION_SATISFIED)
-    except Exception:
+    except Exception:  # noqa: BLE001  fence sync not supported, treat as ready
         return True
 
 
@@ -22599,7 +22599,7 @@ def _fence_delete(fence):
         return
     try:
         GL.glDeleteSync(fence)
-    except Exception:
+    except Exception:  # noqa: BLE001  fence cleanup, never fatal
         pass
 
 
@@ -22919,7 +22919,7 @@ def rule_code_hash(rule_name: str):
         return cached
     try:
         preset = _resolve_composed_preset(rule_name)
-    except Exception:
+    except Exception:  # noqa: BLE001  preset lookup failure -> caller falls back
         return None
 
     # Collect every shader name this preset references. Multi-pass and
@@ -23515,7 +23515,7 @@ class Simulator:
         if not self.headless and _RunRecorder is not None:
             try:
                 self._open_run(reason="startup")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  optional recorder, never block startup
                 # Recorder is optional — never let it block startup.
                 print(f"[ca_debug] disabled: {e!r}", flush=True)
                 self._run_recorder = None
@@ -23540,7 +23540,7 @@ class Simulator:
         ssbo_max = 128 * 1024 * 1024  # 128 MB typical minimum
         try:
             ssbo_max = self.ctx.info.get("GL_MAX_SHADER_STORAGE_BLOCK_SIZE", ssbo_max)
-        except Exception:
+        except Exception:  # noqa: BLE001  GL info probe, may be unsupported
             pass
         max_budget = ssbo_max // bytes_per_voxel  # 128MB / 4 = 32M voxels
 
@@ -23668,7 +23668,7 @@ class Simulator:
             self._cull_sp_u_max_voxels = self.voxel_cull_sparse_prog['u_max_voxels']
             self._cull_sp_u_channel = self.voxel_cull_sparse_prog['u_channel']
             self._cull_sp_u_use_abs = self.voxel_cull_sparse_prog['u_use_abs']
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  shader compile fallback
             print(f"[cull] sparse cull compile failed (falling back to dense): {e}")
             self.voxel_cull_sparse_prog = None
 
@@ -23881,7 +23881,7 @@ class Simulator:
         if bool(self._sparse_supported()) != bool(compiled):
             try:
                 self._compile_compute()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  transient compile error, GUI keeps running
                 # Don't crash the GUI on a transient compile error;
                 # the next param edit will retry.
                 print(f"[sparse_flip] recompile failed: {e!r}")
@@ -24059,7 +24059,7 @@ class Simulator:
         if self._range_fence is not None and _fence_ready(self._range_fence):
             try:
                 raw = self._range_ssbo.read()
-            except Exception:
+            except Exception:  # noqa: BLE001  ssbo read race during teardown
                 raw = None
             _fence_delete(self._range_fence)
             self._range_fence = None
@@ -24204,7 +24204,7 @@ class Simulator:
             for p in self.compute_progs:
                 try:
                     p.release()
-                except Exception:
+                except Exception:  # noqa: BLE001  GL resource release, never fatal
                     pass
         self.compute_progs = []
         smem = '1' if self._use_shared_mem else '0'
@@ -24535,7 +24535,7 @@ class Simulator:
                 for t in lst:
                     try:
                         t.release()
-                    except Exception:
+                    except Exception:  # noqa: BLE001  GL resource release, never fatal
                         pass
             setattr(self, tex_list_name, [])
         self.ping_extras = []
@@ -24563,7 +24563,7 @@ class Simulator:
         if getattr(self, 'agent_ssbo', None) is not None:
             try:
                 self.agent_ssbo.release()
-            except Exception:
+            except Exception:  # noqa: BLE001  GL resource release, never fatal
                 pass
             self.agent_ssbo = None
         self.agent_count = 0
@@ -24608,13 +24608,13 @@ class Simulator:
         if getattr(self, 'particle_ssbo', None) is not None:
             try:
                 self.particle_ssbo.release()
-            except Exception:
+            except Exception:  # noqa: BLE001  GL resource release, never fatal
                 pass
             self.particle_ssbo = None
         if getattr(self, 'particle_render_vao', None) is not None:
             try:
                 self.particle_render_vao.release()
-            except Exception:
+            except Exception:  # noqa: BLE001  GL resource release, never fatal
                 pass
             self.particle_render_vao = None
         self.particle_count = 0
@@ -24656,13 +24656,13 @@ class Simulator:
         # Release any prior brain SSBO (size may have changed).
         if getattr(self, 'brain_ssbo', None) is not None:
             try: self.brain_ssbo.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
         self.brain_ssbo = self.ctx.buffer(data=weights.tobytes())
 
     def _release_brains(self):
         if getattr(self, 'brain_ssbo', None) is not None:
             try: self.brain_ssbo.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.brain_ssbo = None
 
     # ── 3D Neural CA: per-rule SSBO with random-init MLP weights ──
@@ -24696,7 +24696,7 @@ class Simulator:
             b1 = np.asarray(d['b1'], dtype=np.float32)
             W2 = np.asarray(d['W2'], dtype=np.float32)
             b2 = np.asarray(d['b2'], dtype=np.float32)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  optional file load
             print(f"[nca] could not load weights from {path}: {e}")
             return None
         IN, HID, OUT = self.NCA_IN, self.NCA_HID, self.NCA_OUT
@@ -24806,7 +24806,7 @@ class Simulator:
     def _release_deposit_tex(self):
         if getattr(self, 'deposit_tex', None) is not None:
             try: self.deposit_tex.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.deposit_tex = None
         self._deposit_dims = None
         self._deposit_zero = None
@@ -24824,7 +24824,7 @@ class Simulator:
     def _release_nca_weights(self):
         if getattr(self, 'nca_ssbo', None) is not None:
             try: self.nca_ssbo.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.nca_ssbo = None
 
     def _compile_particle_progs(self):
@@ -24915,7 +24915,7 @@ class Simulator:
                 or getattr(self, '_nn_shared_compiled', 0) != wanted_shared
                 or getattr(self, '_dep_compiled', 0) != wanted_dep):
             try: self._particle_update_prog.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             del self._particle_update_prog
             self._compile_particle_progs()
             # Brain SSBO may need re-allocating if hidden size changed.
@@ -25247,13 +25247,13 @@ class Simulator:
             obj = getattr(self, attr, None)
             if obj is not None:
                 try: obj.release()
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  GL resource release, never fatal
                 setattr(self, attr, None)
         # Force recompile on next use (handles size changes that affect cap)
         for attr in ('_mc_compute_prog', '_mc_render_prog'):
             if hasattr(self, attr):
                 try: getattr(self, attr).release()
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  GL resource release, never fatal
                 delattr(self, attr)
 
     # ── Entity Arena ──────────────────────────────────────────────────
@@ -25284,7 +25284,7 @@ class Simulator:
         if getattr(self, 'arena', None) is not None:
             try:
                 self.arena.release()
-            except Exception:
+            except Exception:  # noqa: BLE001  GL resource release, never fatal
                 pass
             self.arena = None
 
@@ -26308,7 +26308,7 @@ class Simulator:
                         # for cleanliness.
                         self.cam_phi = 0.0
                         self.cam_theta = 0.0
-                except Exception:
+                except Exception:  # noqa: BLE001  bisection may fail, keep current vista
                     # Bisection failure shouldn't kill the sim; just
                     # rewind in place.
                     self.viewport_zoom = self.viewport_zoom_base
@@ -26500,7 +26500,7 @@ class Simulator:
                 continue
             try:
                 m = json.loads(mpath.read_text())
-            except Exception:
+            except Exception:  # noqa: BLE001  malformed JSON, treat as missing
                 continue
             tags = set(m.get("tags") or [])
             if m.get("pinned") or tags & {"pinned", "discovery", "keep"}:
@@ -26521,7 +26521,7 @@ class Simulator:
             return
         try:
             rec.update_manifest(ended_reason=reason)
-        except Exception:
+        except Exception:  # noqa: BLE001  recorder cleanup, never fatal
             pass
         try:
             rec.close()
@@ -27295,7 +27295,7 @@ void main() {
         # size/steps/schema_version are required for replay verification).
         try:
             from test_harness import DISCOVERY_SCHEMA_VERSION as _SCHEMA_V
-        except Exception:
+        except Exception:  # noqa: BLE001  optional dependency
             _SCHEMA_V = 1
         entry = {
             'schema_version': _SCHEMA_V,
@@ -27375,13 +27375,13 @@ void main() {
         status_dir = os.path.join(here, 'refinements', '.status')
         try:
             os.makedirs(status_dir, exist_ok=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  best-effort mkdir
             print(f"[refine] cannot create {status_dir}: {e}", file=sys.stderr)
             return
         log_path = os.path.join(status_dir, f'{h}.log')
         try:
             log_fh = open(log_path, 'wb')
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  best-effort write
             print(f"[refine] cannot open log {log_path}: {e}", file=sys.stderr)
             return
         # Linux: ask the kernel to SIGTERM this child when the simulator
@@ -27393,7 +27393,7 @@ void main() {
                 PR_SET_PDEATHSIG = 1
                 libc = ctypes.CDLL('libc.so.6', use_errno=True)
                 libc.prctl(PR_SET_PDEATHSIG, _sig.SIGTERM, 0, 0, 0)
-            except Exception:
+            except Exception:  # noqa: BLE001  optional dependency
                 pass  # non-Linux or libc missing — fall back to atexit kill
         try:
             self._refine_proc = subprocess.Popen(
@@ -27402,7 +27402,7 @@ void main() {
                 preexec_fn=_preexec if sys.platform.startswith('linux') else None,
                 start_new_session=True,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  subprocess cleanup, never fatal
             print(f"[refine] failed to launch: {e}", file=sys.stderr)
             self._refine_proc = None
             log_fh.close()
@@ -27431,7 +27431,7 @@ void main() {
             try:
                 with open(self._refine_status_path) as f:
                     self._refine_status = json.load(f)
-            except Exception:
+            except Exception:  # noqa: BLE001  malformed JSON, treat as missing
                 pass  # mid-write; try next tick
         # Has the process exited?
         rc = self._refine_proc.poll()
@@ -27455,7 +27455,7 @@ void main() {
                         with open(lp, 'rb') as f:
                             data = f.read()[-400:]
                         tail = data.decode('utf-8', 'replace').strip().splitlines()[-1] if data else ''
-                    except Exception:
+                    except Exception:  # noqa: BLE001  best-effort read
                         pass
                     print(f"[refine] exit {rc}; full log: {lp}",
                           file=sys.stderr)
@@ -27485,7 +27485,7 @@ void main() {
             os.makedirs(log_dir, exist_ok=True)
             log_fh = open(os.path.join(log_dir, f'explore_{parent_hash}.log'),
                           'wb')
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  best-effort mkdir
             print(f"[explore] cannot open log: {e}", file=sys.stderr)
             return
         self._explore_log_path = os.path.join(
@@ -27504,7 +27504,7 @@ void main() {
                 import ctypes, signal as _sig
                 ctypes.CDLL('libc.so.6', use_errno=True).prctl(
                     1, _sig.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
-            except Exception:
+            except Exception:  # noqa: BLE001  optional dependency
                 pass
         try:
             self._explore_disc_count_at_start = len(self.discoveries)
@@ -27512,7 +27512,7 @@ void main() {
                 cmd, cwd=here, stdout=log_fh, stderr=subprocess.STDOUT,
                 preexec_fn=_preexec if sys.platform.startswith('linux') else None,
                 start_new_session=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  subprocess cleanup, never fatal
             print(f"[explore] failed to launch: {e}", file=sys.stderr)
             self._explore_proc = None
             log_fh.close()
@@ -27552,7 +27552,7 @@ void main() {
                         break
                 if not tail_line and lines:
                     tail_line = lines[-1].strip()
-            except Exception:
+            except Exception:  # noqa: BLE001  best-effort read
                 pass
         # Parse progress fraction from "[  N/T] ..."
         prog = float(self._explore_status.get('progress', 0.0)) if self._explore_status else 0.0
@@ -27561,7 +27561,7 @@ void main() {
                 inside = tail_line[1:tail_line.index(']')].strip()
                 cur, tot = inside.split('/')
                 prog = float(cur) / max(float(tot), 1.0)
-            except Exception:
+            except Exception:  # noqa: BLE001  log parse, best-effort
                 pass
         if self._explore_status is not None:
             self._explore_status['msg'] = tail_line[:120]
@@ -27601,7 +27601,7 @@ void main() {
         try:
             with open(path) as f:
                 report = json.load(f)
-        except Exception:
+        except Exception:  # noqa: BLE001  malformed JSON, treat as missing
             return None
         self._refine_report_cache[h] = report
         return report
@@ -27984,7 +27984,7 @@ void main() {
             return
         try:
             raw = self._debug_ssbo.read()
-        except Exception:
+        except Exception:  # noqa: BLE001  ssbo read race during teardown
             raw = None
         _fence_delete(self._debug_fence)
         self._debug_fence = None
@@ -29028,10 +29028,10 @@ void main() {
         # Free previous
         if self._scene_cache_fbo is not None:
             try: self._scene_cache_fbo.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
         if self._scene_cache_tex is not None:
             try: self._scene_cache_tex.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
         self._scene_cache_tex = self.ctx.texture(need, 4, dtype='f1')
         self._scene_cache_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self._scene_cache_fbo = self.ctx.framebuffer(
@@ -29369,8 +29369,8 @@ void main() {
                         "note", step=self.step_count,
                         event_kind="debug_snapshot_saved", path=path,
                         n_samples=len(self._debug_history))
-                except Exception: pass
-        except Exception as e:
+                except Exception: pass  # noqa: BLE001  optional recorder, never fatal
+        except Exception as e:  # noqa: BLE001  optional recorder, never fatal
             print(f"[debug] save failed: {e!r}", flush=True)
 
     def _take_voxel_snapshot(self):
@@ -29396,7 +29396,7 @@ void main() {
             self._last_snapshot_path = str(path.relative_to(
                 self._run_recorder.run_dir))
             return path
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  GPU texture read race during teardown
             print(f"[snapshot] failed: {e!r}", flush=True)
             return None
 
@@ -29443,7 +29443,7 @@ void main() {
                         self.renderer_mode = mode
                 # Other kinds (note, snapshot, recording_*, anomaly,
                 # discovery_save) are observational and not reproduced.
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  optional attribute probe
                 print(f"[replay] event {kind} @ step {ev_step} failed: {e!r}",
                       flush=True)
         # End-of-stream: leave replay flag on so we don't reset _replay_idx,
@@ -29579,9 +29579,9 @@ void main() {
                         "note", step=self.step_count,
                         event_kind="perf_log_saved", path=path,
                         n_frames=len(history))
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  optional recorder, never fatal
             return path
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  optional recorder, never fatal
             print(f"[perf] save failed: {e!r}", flush=True)
             return None
 
@@ -29608,7 +29608,7 @@ void main() {
                             self._run_recorder.log_event(
                                 "rule_change", step=self.step_count,
                                 from_=self.rule_name, to=name)
-                        except Exception: pass
+                        except Exception: pass  # noqa: BLE001  optional recorder, never fatal
                     self._change_rule(name)
                 if is_selected:
                     imgui.set_item_default_focus()
@@ -29664,7 +29664,7 @@ void main() {
                             self._run_recorder.log_event(
                                 "param_change", step=self.step_count,
                                 key=name, from_=int(val), to=int(new_val))
-                        except Exception: pass
+                        except Exception: pass  # noqa: BLE001  optional recorder, never fatal
                     self.params[name] = new_val
                     # Sparse dispatch eligibility can flip when a Life-rule
                     # Birth-min slider crosses 0↔1 (vacuum-spawn guard).
@@ -29678,7 +29678,7 @@ void main() {
                             self._run_recorder.log_event(
                                 "param_change", step=self.step_count,
                                 key=name, from_=float(val), to=float(new_val))
-                        except Exception: pass
+                        except Exception: pass  # noqa: BLE001  optional recorder, never fatal
                     self.params[name] = new_val
                     self._maybe_recompile_for_sparse_flip()
 
@@ -29699,7 +29699,7 @@ void main() {
                     self._run_recorder.log_event(
                         "param_change", step=self.step_count,
                         key="dt", from_=float(self.dt), to=float(new_dt))
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  optional recorder, never fatal
             self.dt = new_dt
 
         changed, new_speed = imgui.slider_int("Steps/batch", self.sim_speed, 1, 20)
@@ -29734,21 +29734,21 @@ void main() {
             if self._run_recorder is not None:
                 try:
                     self._run_recorder.log_event("restart", step=self.step_count, source="button")
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  optional recorder, never fatal
             self._reset()
         imgui.same_line()
         if imgui.button("Randomize"):
             if self._run_recorder is not None:
                 try:
                     self._run_recorder.log_event("randomize", step=self.step_count, source="button")
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  optional recorder, never fatal
             self._randomize_params()
         imgui.same_line()
         if imgui.button("Mutate"):
             if self._run_recorder is not None:
                 try:
                     self._run_recorder.log_event("randomize", step=self.step_count, source="mutate")
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  optional recorder, never fatal
             self._mutate_params()
 
         changed, new_seed = imgui.input_int("Seed", self.seed)
@@ -30207,7 +30207,7 @@ void main() {
                         self.viewport_zoom = self.viewport_zoom_base
                         self.cam_phi = 0.0
                         self.cam_theta = 0.0
-                except Exception:
+                except Exception:  # noqa: BLE001  bisection may fail, keep current vista
                     pass
             imgui.same_line()
             if imgui.button("Rewind zoom"):
@@ -30748,7 +30748,7 @@ void main() {
                     f"reload=1:fontcolor=white:fontsize={live_fs}:"
                     f"x=w-tw-{margin}:y={live_y}:line_spacing={line_sp}:"
                     f"borderw={border_w}:bordercolor=black@0.8")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  tempfile creation, best-effort
                 sys.stderr.write(f"[recording] live-stats setup failed ({e})\n")
                 self._rec_live_textfile = None
                 live_drawtext = None
@@ -30758,7 +30758,7 @@ void main() {
         try:
             self._rec_overlay_path = self._render_overlay_png(
                 w, h, drawtext_parts)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  recording overlay, best-effort
             sys.stderr.write(f"[recording] overlay pre-render failed ({e}); "
                              f"falling back to per-frame drawtext\n")
             self._rec_overlay_path = None
@@ -30840,7 +30840,7 @@ void main() {
                 import ctypes, signal as _sig
                 ctypes.CDLL('libc.so.6', use_errno=True).prctl(
                     1, _sig.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
-            except Exception:
+            except Exception:  # noqa: BLE001  optional dependency
                 pass
         self._rec_process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -30895,7 +30895,7 @@ void main() {
                     capture_mode=self._rec_capture_mode,
                     steps_per_frame=float(self._rec_steps_per_frame),
                     auto_stop_sec=float(self._rec_auto_stop_sec))
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  optional recorder, never fatal
 
     def _rec_check_autostop(self):
         """Stop the recording if the configured target duration is reached.
@@ -30932,14 +30932,14 @@ void main() {
                 if self._rec_write_queue is not None:
                     self._rec_write_queue.put(data, timeout=0.5)
                     self._rec_frame_count += 1
-            except Exception:
+            except Exception:  # noqa: BLE001  queue race during teardown
                 pass
             self._rec_pbo_pending = False
 
         if self._rec_write_queue is not None:
             try:
                 self._rec_write_queue.put(None, timeout=1.0)  # sentinel
-            except Exception:
+            except Exception:  # noqa: BLE001  queue race during teardown
                 pass
         if self._rec_write_thread is not None:
             self._rec_write_thread.join(timeout=3.0)
@@ -30953,20 +30953,20 @@ void main() {
         for i, pbo in enumerate(self._rec_pbo):
             if pbo is not None:
                 try: pbo.release()
-                except Exception: pass
+                except Exception: pass  # noqa: BLE001  GL resource release, never fatal
                 self._rec_pbo[i] = None
 
         # Clean up the overlay PNG (best effort).
         if self._rec_overlay_path:
             try: os.unlink(self._rec_overlay_path)
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  best-effort cleanup
             self._rec_overlay_path = None
         # Clean up the live-stats textfile (best effort).
         if self._rec_live_textfile:
             try: os.unlink(self._rec_live_textfile)
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  best-effort cleanup
             try: os.unlink(self._rec_live_textfile + '.tmp')
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  best-effort cleanup
             self._rec_live_textfile = None
 
         # Close ffmpeg stdin after writer thread has finished (avoids BrokenPipeError).
@@ -30977,7 +30977,7 @@ void main() {
             self._rec_process = None
             try:
                 proc.stdin.close()
-            except Exception:
+            except Exception:  # noqa: BLE001  pipe cleanup, never fatal
                 pass
             try:
                 proc.wait(timeout=3.0)
@@ -30989,12 +30989,12 @@ void main() {
                     proc.kill()
                     try:
                         proc.wait(timeout=1.0)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                         pass
-            except Exception:
+            except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                 try:
                     proc.kill()
-                except Exception:
+                except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                     pass
 
         duration = time.time() - self._rec_start_time
@@ -31007,13 +31007,13 @@ void main() {
                     path=self._rec_filename,
                     n_frames=int(self._rec_frame_count),
                     duration_s=float(duration))
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  optional recorder, never fatal
 
         # Sidecar write must never crash the simulator on stop — the video
         # is already saved, missing metadata is recoverable.
         try:
             self._write_recording_metadata()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  recording overlay, best-effort
             self._rec_msg = f"WARN: sidecar write failed: {e}"
             self._rec_msg_time = time.time()
 
@@ -31134,7 +31134,7 @@ void main() {
                     m0 = means[0]
                     if m0 == m0:  # not NaN
                         lines.append(f"Mean {m0:.3f}")
-        except Exception:
+        except Exception:  # noqa: BLE001  optional attribute probe
             return
         text = '\n'.join(lines)
         tmp = path + '.tmp'
@@ -31142,7 +31142,7 @@ void main() {
             with open(tmp, 'w', encoding='utf-8') as f:
                 f.write(text)
             os.replace(tmp, path)
-        except Exception:
+        except Exception:  # noqa: BLE001  best-effort write
             pass
 
     def _render_overlay_png(self, w, h, drawtext_parts):
@@ -31168,7 +31168,7 @@ void main() {
         proc = subprocess.run(cmd, capture_output=True, timeout=10)
         if proc.returncode != 0 or not os.path.exists(path) or os.path.getsize(path) == 0:
             try: os.unlink(path)
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  best-effort cleanup
             err = proc.stderr.decode(errors='replace').strip()[:200]
             raise RuntimeError(f"overlay PNG generation failed: {err}")
         return path
@@ -31403,11 +31403,11 @@ void main() {
             # context can crash the kernel module on next start.
             try:
                 self._cleanup()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  cleanup hook, never fatal
                 print(f"[shutdown] cleanup raised: {e!r}", flush=True)
                 try:
                     glfw.terminate()
-                except Exception:
+                except Exception:  # noqa: BLE001  GLFW teardown, never fatal
                     pass
 
     def _cleanup(self):
@@ -31433,15 +31433,15 @@ void main() {
                 proc.terminate()
                 try:
                     proc.wait(timeout=2.0)
-                except Exception:
+                except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                     proc.kill()
                     try:
                         proc.wait(timeout=1.0)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                         pass
                 print(f"[shutdown] terminated refine.py pid={proc.pid}",
                       flush=True)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  subprocess cleanup, never fatal
                 print(f"[shutdown] refine.py kill failed: {e!r}", flush=True)
             self._refine_proc = None
 
@@ -31452,15 +31452,15 @@ void main() {
                 eproc.terminate()
                 try:
                     eproc.wait(timeout=2.0)
-                except Exception:
+                except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                     eproc.kill()
                     try:
                         eproc.wait(timeout=1.0)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                         pass
                 print(f"[shutdown] terminated batch_refine.py pid={eproc.pid}",
                       flush=True)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  subprocess cleanup, never fatal
                 print(f"[shutdown] batch_refine.py kill failed: {e!r}",
                       flush=True)
             self._explore_proc = None
@@ -31471,7 +31471,7 @@ void main() {
         if self._recording:
             try:
                 self._stop_recording()
-            except Exception:
+            except Exception:  # noqa: BLE001  cleanup hook, never fatal
                 pass
         # Belt-and-braces: even if _recording was never set true (Popen
         # returned but launch failed mid-way) or _stop_recording raised
@@ -31482,15 +31482,15 @@ void main() {
                 rproc.terminate()
                 try:
                     rproc.wait(timeout=2.0)
-                except Exception:
+                except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                     rproc.kill()
                     try:
                         rproc.wait(timeout=1.0)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  subprocess cleanup, never fatal
                         pass
                 print(f"[shutdown] terminated ffmpeg pid={rproc.pid}",
                       flush=True)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  subprocess cleanup, never fatal
                 print(f"[shutdown] ffmpeg kill failed: {e!r}", flush=True)
             self._rec_process = None
 
@@ -31507,18 +31507,18 @@ void main() {
         #    driver when we release that program below.
         try:
             GL.glFinish()
-        except Exception:
+        except Exception:  # noqa: BLE001  GL sync call, best-effort
             pass
 
         # 3. Tear down imgui FIRST — it owns GL textures/programs and needs
         #    a live, current context to release them cleanly.
         try:
             self.imgui_renderer.shutdown()
-        except Exception:
+        except Exception:  # noqa: BLE001  imgui teardown, never fatal
             pass
         try:
             imgui.destroy_context()
-        except Exception:
+        except Exception:  # noqa: BLE001  imgui teardown, never fatal
             pass
 
         # 4. Release every GL resource in strict dependency order.
@@ -31581,7 +31581,7 @@ void main() {
                 continue
             try:
                 obj.release()
-            except Exception:
+            except Exception:  # noqa: BLE001  GL resource release, never fatal
                 pass
             # Clear the attribute so a later __del__ during Python GC
             # cannot double-release into a dead context.
@@ -31591,7 +31591,7 @@ void main() {
         #    work (e.g. NVK schedules texture frees on a worker queue).
         try:
             GL.glFinish()
-        except Exception:
+        except Exception:  # noqa: BLE001  GL sync call, best-effort
             pass
 
         # 6. Release the moderngl Context itself. This catches anything we
@@ -31599,7 +31599,7 @@ void main() {
         #    references during interpreter shutdown.
         try:
             self.ctx.release()
-        except Exception:
+        except Exception:  # noqa: BLE001  GL resource release, never fatal
             pass
         # Drop our reference so Python GC won't touch the Context again.
         self.ctx = None
@@ -31608,7 +31608,7 @@ void main() {
         #    gone — any surviving GL handle that hits __del__ is a bug.
         try:
             glfw.terminate()
-        except Exception:
+        except Exception:  # noqa: BLE001  GLFW teardown, never fatal
             pass
 
 
@@ -31684,11 +31684,11 @@ def _audit_one(rule, size, steps, seed, sample_interval, warmup, quiet=False):
     # Tear down so the next size gets a fresh context.
     try:
         sim.ctx.release()
-    except Exception:
+    except Exception:  # noqa: BLE001  GL resource release, never fatal
         pass
     try:
         glfw.destroy_window(sim.window)
-    except Exception:
+    except Exception:  # noqa: BLE001  GLFW teardown, never fatal
         pass
     return final
 
@@ -31818,7 +31818,7 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
                 if rmode is not None:
                     sim.renderer_mode = rmode
                 sim._reset()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  rule change failure, keep current rule
                 print(f"[bench]   skipped: change_rule failed: {e!r}", flush=True)
                 continue
 
@@ -31929,7 +31929,7 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
         with open(out_path, 'w') as f:
             json.dump(payload, f)
         print(f"\n[bench] saved combined report -> {out_path}", flush=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  best-effort write
         print(f"[bench] save failed: {e!r}", flush=True)
 
     # Print top-level summary table to stdout
@@ -31950,7 +31950,7 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
     # Tear down
     try:
         sim._cleanup()
-    except Exception:
+    except Exception:  # noqa: BLE001  cleanup hook, never fatal
         pass
 
 
@@ -32072,7 +32072,7 @@ def main():
         )
         try:
             glfw.terminate()
-        except Exception:
+        except Exception:  # noqa: BLE001  GLFW teardown, never fatal
             pass
         return
 
@@ -32088,7 +32088,7 @@ def main():
                   scale_steps=args.audit_scale_steps)
         try:
             glfw.terminate()
-        except Exception:
+        except Exception:  # noqa: BLE001  GLFW teardown, never fatal
             pass
         return
 
@@ -32108,7 +32108,7 @@ def main():
                 if line:
                     try:
                         events.append(json.loads(line))
-                    except Exception:
+                    except Exception:  # noqa: BLE001  malformed JSON, treat as missing
                         pass
         # Sort by step (events are already in time order, but be defensive).
         events.sort(key=lambda e: int(e.get("step", 0)))

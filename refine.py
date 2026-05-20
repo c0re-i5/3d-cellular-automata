@@ -159,7 +159,7 @@ class StatusWriter:
             with open(tmp, 'w') as f:
                 json.dump(body, f, indent=2)
             os.replace(tmp, self.path)
-        except Exception:
+        except Exception:  # noqa: BLE001  best-effort write
             pass  # status writes are best-effort
 
 
@@ -214,11 +214,11 @@ def _release_sim(sim) -> None:
     """Best-effort GL teardown so the next refinement gets a fresh ctx."""
     try:
         sim.shutdown()  # may not exist
-    except Exception:
+    except Exception:  # noqa: BLE001  cleanup hook, never fatal
         pass
     try:
         sim.ctx.release()
-    except Exception:
+    except Exception:  # noqa: BLE001  GL resource release, never fatal
         pass
 
 
@@ -323,11 +323,11 @@ def pass_b_fingerprint(snapshots: list[tuple[int, np.ndarray]],
     # Multi-snapshot detectors
     try:
         out['period']      = A.detect_period(grids)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  optional dynamics analysis
         out['period']      = {'error': str(e)}
     try:
         out['translation'] = A.detect_translation(grids)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  optional dynamics analysis
         out['translation'] = {'error': str(e)}
 
     # Growth needs metric_history. Build it from debug stats: alive_ratio
@@ -336,7 +336,7 @@ def pass_b_fingerprint(snapshots: list[tuple[int, np.ndarray]],
     if mh:
         try:
             out['growth'] = A.detect_growth(mh)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  optional dynamics analysis
             out['growth'] = {'error': str(e)}
 
     # Summary stats from debug timeseries
@@ -659,7 +659,7 @@ def refine_one(parent_index: int, all_disc: list[dict], args) -> dict:
               f"({report['wall_seconds']}s)", flush=True)
         return block
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  best-effort write
         tb = traceback.format_exc()
         status.fail(msg=str(e))
         print(f"[refine]   ✗ {h} FAILED: {e}\n{tb}", file=sys.stderr, flush=True)
@@ -745,7 +745,7 @@ def main():
         except KeyboardInterrupt:
             print("[refine] interrupted", file=sys.stderr)
             sys.exit(130)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  per-item failure, skip and continue
             failures += 1
             print(f"[refine] unexpected error on idx={parent_index}: {e}",
                   file=sys.stderr)

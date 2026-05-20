@@ -766,7 +766,7 @@ class EntityArena:
             if buf is not None:
                 try:
                     buf.release()
-                except Exception:
+                except Exception:  # noqa: BLE001  GL resource release, never fatal
                     pass
                 setattr(self, attr, None)
 

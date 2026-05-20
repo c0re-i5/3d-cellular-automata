@@ -184,7 +184,7 @@ def main():
             try:
                 with open(rp) as f:
                     report = json.load(f)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  malformed JSON, treat as missing
                 print(f"[batch_refine] warn: cannot read {rp}: {e}",
                       file=sys.stderr)
 
@@ -297,7 +297,7 @@ def main():
                 verbose=False,
                 capture_dynamics=args.dynamics,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  trial may crash on bad params, score=0
             print(f"  [{t+1:4d}/{args.trials}] FAIL: {e}", file=sys.stderr)
             continue
         # run_trial doesn't echo init_variant back; stamp it ourselves so

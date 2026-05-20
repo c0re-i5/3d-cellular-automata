@@ -61,7 +61,7 @@ def run_once(ctx, preset_name, preset, size, steps=20, seed=7):
     )
     try:
         prog = ctx.compute_shader(src)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  shader compile fallback
         return {"error": f"compile: {e}"}
 
     rng = np.random.default_rng(seed)
@@ -69,7 +69,7 @@ def run_once(ctx, preset_name, preset, size, steps=20, seed=7):
     try:
         tex_a = ctx.texture3d((size, size, size), 4, data.tobytes(), dtype="f4")
         tex_b = ctx.texture3d((size, size, size), 4, dtype="f4")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  GPU texture alloc may OOM
         prog.release()
         return {"error": f"alloc: {e}"}
     for t in (tex_a, tex_b):
@@ -79,7 +79,7 @@ def run_once(ctx, preset_name, preset, size, steps=20, seed=7):
         if k in prog:
             try:
                 prog[k].value = v
-            except Exception:
+            except Exception:  # noqa: BLE001  uniform type mismatch, skip
                 pass
 
     dt = float(preset.get("dt", 0.3))
@@ -105,7 +105,7 @@ def run_once(ctx, preset_name, preset, size, steps=20, seed=7):
         ctx.finish()
         elapsed = time.perf_counter() - t0
         arr = np.frombuffer(src_t.read(), dtype=np.float32).reshape(size, size, size, 4)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  shader run may fail, return error
         tex_a.release(); tex_b.release(); prog.release()
         return {"error": f"run: {e}"}
 
@@ -233,7 +233,7 @@ def _run_all(ctx, args, sizes, only):
             t_one = time.perf_counter()
             try:
                 r = run_once(ctx, preset_name, preset, sz, steps=args.steps)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  trial may crash on bad params, score=0
                 r = {"error": f"harness exc: {e}"}
             per_size[sz] = r
             # Erase the "[sz…]" placeholder by overprinting

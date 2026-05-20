@@ -747,7 +747,7 @@ class LivePreviewsPanel(Static):
                     if len(raw) == h * bw * 3:
                         rgb = (raw, h, bw)
                         pw, ph = bw, h
-                except Exception:
+                except Exception:  # noqa: BLE001  malformed preview, skip
                     rgb = None
             age = now - float(w.get('updated_at', 0))
             decoded.append({
@@ -767,7 +767,7 @@ class LivePreviewsPanel(Static):
         thumb_h_chars = (max(d['ph'] for d in decoded) + 1) // 2
         try:
             cols = max(40, self.app.size.width)
-        except Exception:
+        except Exception:  # noqa: BLE001  terminal size probe, use default
             cols = 160
         per_row = max(1, (cols - 4) // (thumb_w + gap))
         per_row = min(per_row, len(decoded), 8)

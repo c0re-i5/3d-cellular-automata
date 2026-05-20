@@ -35,12 +35,12 @@ import entity_arena
 # alongside the legacy discoveries.json output. Pure best-effort.
 try:
     from ca_debug import RunRecorder as _RunRecorder
-except Exception:
+except Exception:  # noqa: BLE001  optional recorder, never block startup
     _RunRecorder = None
 
 try:
     from OpenGL import GL  # type: ignore
-except Exception:  # pragma: no cover -- already optional in step()
+except Exception:  # noqa: BLE001  optional dependency
     GL = None  # type: ignore
 
 # Suppress numpy overflow/invalid warnings from degenerate CA states (all-NaN grids, etc.)
@@ -181,7 +181,7 @@ def _status_host():
         import socket
         try:
             _STATUS_HOST = socket.gethostname()
-        except Exception:
+        except Exception:  # noqa: BLE001  hostname probe, best-effort
             _STATUS_HOST = '?'
     return _STATUS_HOST
 
@@ -291,7 +291,7 @@ def _make_preview(grid, channel=0, mode='continuous'):
         if _PREVIEW_MODE_ENV == 'iso':
             return _make_isometric_preview(ch)
         return _make_maxproj_preview(ch)
-    except Exception:
+    except Exception:  # noqa: BLE001  preview render best-effort, return None
         return None
 
 
@@ -1670,7 +1670,7 @@ class HeadlessRunner:
                 prog.run(groups, groups, groups)
             try:
                 GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
-            except Exception:
+            except Exception:  # noqa: BLE001  GL sync call, best-effort
                 self.ctx.memory_barrier()
 
             # Ping-pong only the pairs voxel passes wrote to. Agent passes
@@ -1777,7 +1777,7 @@ class HeadlessRunner:
             try:
                 GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT |
                                    GL.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
-            except Exception:
+            except Exception:  # noqa: BLE001  GL sync call, best-effort
                 self.ctx.memory_barrier()
         else:
             self.ctx.memory_barrier()
@@ -1880,7 +1880,7 @@ class HeadlessRunner:
                     size, size, size,
                 )
                 copied = True
-            except Exception:
+            except Exception:  # noqa: BLE001  GL sync call, best-effort
                 copied = False
         if not copied:
             # Fallback: read & write via host. Slow but safe.
@@ -1915,30 +1915,30 @@ class HeadlessRunner:
         pt = getattr(self, '_prev_tex', None)
         if pt is not None:
             try: pt.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self._prev_tex = None
         ssbo = getattr(self, '_metrics_ssbo', None)
         if ssbo is not None:
             try: ssbo.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self._metrics_ssbo = None
         _return_textures(self.ctx, self.size, self._tex_dtype,
                          self.tex_a, self.tex_b)
         if self.tex_a2 is not None:
             try: self.tex_a2.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.tex_a2 = None
         if self.tex_b2 is not None:
             try: self.tex_b2.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.tex_b2 = None
         if self.agent_ssbo is not None:
             try: self.agent_ssbo.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.agent_ssbo = None
         if getattr(self, 'arena', None) is not None:
             try: self.arena.release()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.arena = None
 
 
@@ -2507,7 +2507,7 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
             else:
                 result['target_distance'] = float('inf')
                 result['target_match'] = 0.0
-        except Exception:
+        except Exception:  # noqa: BLE001  signature compute may fail on edge grids
             result['target_distance'] = float('inf')
             result['target_match'] = 0.0
 
@@ -2533,7 +2533,7 @@ def run_trial(ctx, rule_name, size=32, seed=42, steps=100, sample_interval=15,
         try:
             result['_run_id'] = recorder.manifest.get('run_id')
             result['_run_dir'] = str(recorder.run_dir)
-        except Exception: pass
+        except Exception: pass  # noqa: BLE001  optional recorder, never fatal
         try:
             derived = {k: v for k, v in result.items()
                        if k not in ('history', 'preview', 'params')}
@@ -2612,7 +2612,7 @@ def _trial_recorder(args, rule, *, size, seed, params, dt, tags=()):
     finally:
         if rec is not None:
             try: rec.close()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  optional recorder, never fatal
 
 
 # ── Commands ──────────────────────────────────────────────────────────
@@ -2729,7 +2729,7 @@ def cmd_test(ctx, args):
     finally:
         if rec is not None:
             try: rec.close()
-            except Exception: pass
+            except Exception: pass  # noqa: BLE001  optional recorder, never fatal
     print()
     print(f"Score: {result['score']:.3f}")
     print(f"Params: {result['params']}")
@@ -3078,7 +3078,7 @@ def _make_discovery(r):
     try:
         from simulator import rule_code_hash as _rch
         _code_hash = _rch(r['rule'])
-    except Exception:
+    except Exception:  # noqa: BLE001  optional dependency
         _code_hash = None
     d = {
         'schema_version': DISCOVERY_SCHEMA_VERSION,
@@ -3490,7 +3490,7 @@ def cmd_search(ctx, args):
             print(f"  (target signature: {target_path}, shape={target_sig.shape})")
             if metric != 'target_match':
                 print(f"  (note: --metric=target_match is recommended when --target is set)")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  optional file load
             print(f"  (failed to load target {target_path}: {e})")
             target_sig = None
     print()
@@ -3967,7 +3967,7 @@ def cmd_promote(ctx, args):
                               init_density=init_dens, init_override=init_var,
                               capture_dynamics=dynamics, verbose=False,
                               recorder=rec)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  optional recorder, never block startup
             print(f"  [{i+1}/{len(candidates)}] FAIL: {e}")
             continue
         if init_var:

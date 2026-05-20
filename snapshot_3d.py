@@ -473,7 +473,7 @@ def _audit_one(rule: str, size: int, steps: int, seed: int):
     """Returns (used_count, std_per_ch, xch_corr, verdict, error_or_none)."""
     try:
         sim = _build_sim(rule, size, seed)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  optional snapshot build
         return None, None, None, None, f'build: {e}'
     try:
         for _ in range(steps):
@@ -481,12 +481,12 @@ def _audit_one(rule: str, size: int, steps: int, seed: int):
         sim.step_count = steps
         try:
             vox = _read_voxels(sim)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  optional snapshot build
             return None, None, None, None, f'read: {e}'
     finally:
         try:
             sim.ctx.release()
-        except Exception:
+        except Exception:  # noqa: BLE001  GL resource release, never fatal
             pass
     a32 = vox.astype(np.float32)
     stds = [float(a32[..., c].std()) for c in range(4)]
