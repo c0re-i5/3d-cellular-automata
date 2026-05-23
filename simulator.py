@@ -16092,6 +16092,10 @@ RULE_PRESETS = {
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "volumetric",
+        # Pair-2 layout is (E, p, |u|, helicity) -- all scalars/magnitudes,
+        # none of which flip sign under a parity transform of pair-1.
+        # Tell the symmetry probe not to negate any pair-2 channel.
+        "pair2_vector_channels": None,
         # Baseline ρ=1 floods the box at vis_range (0,4): every voxel
         # has alpha≈0.25 → 64-deep accumulation = opaque cube. Lifting
         # vis_lo above the baseline lets the shock-front overdensities
