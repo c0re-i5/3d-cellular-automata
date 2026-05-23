@@ -3275,9 +3275,19 @@ void main() {
     // Tissue grows where activator is high, decays slowly elsewhere
     float d_rho = growth * (a - 0.3) * rho + 0.002 * lap_rho;
 
-    float new_a = clamp(a + d_a * u_dt, 0.0, 5.0);
-    float new_h = clamp(h + d_h * u_dt, 0.0, 10.0);
-    float new_rho = clamp(rho + d_rho * u_dt, 0.0, 1.0);
+    // CFL-safe dt clamp.  Explicit Euler 3D diffusion is stable when
+    // D * dt * h_sq <= 1/6.  At grids larger than REF_SIZE = 128
+    // h_sq > 1 and the preset's 'dt' (tuned at 128) violates CFL --
+    // observed in the scale-sweep as 'morphogen_spots' going
+    // saturated/NaN at sizes 256 and 384.  Same pattern as the
+    // gray_scott / schnakenberg / fitzhugh shaders below.
+    float D_max    = max(max(Da, Dh), 0.002);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float new_a = clamp(a + d_a * dt_eff, 0.0, 5.0);
+    float new_h = clamp(h + d_h * dt_eff, 0.0, 10.0);
+    float new_rho = clamp(rho + d_rho * dt_eff, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_a, new_h, new_rho, 0.0));
 }
@@ -9503,8 +9513,20 @@ void main() {
         }
     }
 
-    float v_new = v_val + force * u_dt;
-    float u_new = u_val + v_new * u_dt;
+    // CFL-safe dt clamp.  Explicit leapfrog for the 3D wave equation
+    // is stable when  c^2 * dt^2 * h_sq <= 1/3 (Courant condition with
+    // 6-point Laplacian).  At grids larger than REF_SIZE = 128 h_sq>1
+    // and the preset's 'dt' (tuned at 128) violates CFL -- observed in
+    // the scale-sweep as 'sine_gordon_3d' going NaN at size 384.
+    // Use a small safety margin (0.9) and drop the bound on c2=0 by
+    // falling back to the user-requested dt.
+    float dt_wave  = (c2 > 1e-8)
+                   ? sqrt(0.9 / 3.0 / max(c2 * h_sq, 1e-8))
+                   : u_dt;
+    float dt_eff   = min(u_dt, dt_wave);
+
+    float v_new = v_val + force * dt_eff;
+    float u_new = u_val + v_new * dt_eff;
 
     imageStore(u_dst, pos, vec4(u_new, v_new, 0.0, 0.0));
 }
