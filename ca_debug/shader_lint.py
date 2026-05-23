@@ -236,17 +236,46 @@ def _check_asymmetric_stencil(shader_name: str, src: str) -> list[dict]:
     """In any block that mentions lap/grad/omega, count axial offsets per axis.
     A healthy 3D stencil uses (+1,-1) on each of x/y/z.  Mismatches like
     (+2,0) on one axis are usually typos that produce anisotropic dynamics.
+
+    Heuristic constraints (each one fixes a class of false positive):
+      * LHS must be a vector type (vec2/vec3/vec4 or an undeclared identifier).
+        A scalar like ``float omega = clamp(u_param3, 0.0, 1.95)`` (SOR
+        relaxation parameter) is not a stencil, even though the surrounding
+        Poisson/Schrödinger Laplacians use ivec3 offsets.
+      * Scan a window BEFORE and AFTER the keyword.  Many curl blocks cache
+        neighbour fetches in local vec3s declared just before the
+        ``omega = curl(...)`` line, so the inline ivec3 offsets for that
+        axis only appear in the lines above the assignment.
+      * Treat a per-axis offset set as fine if any neighbouring axis has it
+        as a subset.  An axis that records only ``{+1}`` while another
+        records ``{-1,+1}`` is benign when the ``-1`` ivec3 is shared via
+        a local-var cache that the linter can't statically follow.
+        Real bugs (only ``+1`` *and* the matching axis was supposed to be
+        symmetric) show up as a strictly different set across BOTH sides.
     """
     findings = []
+    seen: set[tuple[str, int]] = set()  # dedup (shader, line)
     src_clean = _strip_comments(src)
     # Find blocks of code introduced by `lap`, `grad`, `omega`, `curl` keywords.
-    for kw_match in re.finditer(r'\b(lap|grad|omega|curl|vortic)\w*\s*=\s*', src_clean):
+    # Capture an optional type prefix so we can reject scalars.
+    kw_re = re.compile(
+        r'(?:(?P<type>\b(?:float|int|uint|bool|double|vec2|vec3|vec4|mat\d|ivec\d)\b)\s+)?'
+        r'\b(?P<kw>lap|grad|omega|curl|vortic)\w*\s*=\s*'
+    )
+    for kw_match in kw_re.finditer(src_clean):
+        # Reject scalar LHS — those identifiers are unrelated to stencils
+        # (e.g. SOR over-relaxation parameter `float omega = clamp(...)`).
+        decl_type = kw_match.group('type')
+        if decl_type and not decl_type.startswith(('vec', 'mat', 'ivec')):
+            continue
         block_start = kw_match.start()
-        # block is the next ~600 chars (covers a typical stencil sum) or
-        # until the next `;` that isn't inside parens.
-        chunk = src_clean[block_start:block_start + 600]
-        offsets_per_axis = defaultdict(set)  # axis -> set of int offsets
-        # Match ivec3( a , b , c ) literals for the x/y/z offsets.
+        # Window: 300 chars before + 600 chars after.  The "before" window
+        # catches the common pattern of caching neighbour fetches into
+        # local vec3s just above an `omega = vec3(...)` curl assignment.
+        win_lo = max(0, block_start - 300)
+        win_hi = min(len(src_clean), block_start + 600)
+        chunk = src_clean[win_lo:win_hi]
+        offsets_per_axis: dict[str, set[int]] = defaultdict(set)
         for off in re.finditer(
                 r'ivec3\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)', chunk):
             ox, oy, oz = (int(off.group(i)) for i in (1, 2, 3))
@@ -255,18 +284,37 @@ def _check_asymmetric_stencil(shader_name: str, src: str) -> list[dict]:
             if oz: offsets_per_axis['z'].add(oz)
         if len(offsets_per_axis) < 2:
             continue  # not a 3D stencil block -- skip
-        # All axes that are touched should have the same offset set
-        # (typically {-1, +1}).
         sets = {axis: tuple(sorted(s)) for axis, s in offsets_per_axis.items()}
         unique = set(sets.values())
-        if len(unique) > 1:
-            findings.append({
-                'severity': 'info',
-                'code': 'ASYMMETRIC_STENCIL',
-                'msg': (f"{shader_name}: stencil offsets differ per axis "
-                        f"({sets}) inside `{kw_match.group(0).strip()}` block"),
-                'detail': {'offsets': sets, 'line': _line_of(src, block_start)},
-            })
+        if len(unique) <= 1:
+            continue
+        # Tolerate "partial cache" patterns: an axis whose offset set is a
+        # strict subset of another axis's is almost always the result of
+        # the missing offsets having been read via a local-var cache that
+        # this static pass can't follow.  Real anisotropy bugs leave at
+        # least one axis with offsets that are *disjoint* from every
+        # other axis's set.
+        axis_sets = {axis: set(s) for axis, s in offsets_per_axis.items()}
+        suspicious = False
+        for axis, s in axis_sets.items():
+            others = set().union(*(o for a, o in axis_sets.items() if a != axis))
+            if not (s <= others or others <= s):
+                suspicious = True
+                break
+        if not suspicious:
+            continue
+        line = _line_of(src, block_start)
+        key = (shader_name, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append({
+            'severity': 'info',
+            'code': 'ASYMMETRIC_STENCIL',
+            'msg': (f"{shader_name}: stencil offsets differ per axis "
+                    f"({sets}) inside `{kw_match.group('kw')} =` block"),
+            'detail': {'offsets': sets, 'line': line},
+        })
     return findings
 
 
