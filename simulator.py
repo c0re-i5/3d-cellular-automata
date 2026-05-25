@@ -3162,7 +3162,17 @@ void main() {
     // and the entire medium locks into uniform excitation (u → 1
     // everywhere, a stable fixed point of the Barkley kinetics). The
     // 1/h_sq^1.5 factor cancels the (size/REF_SIZE)³ cell-count growth.
-    float nuc_rate = 2.0e-5 / max(pow(h_sq, 1.5), 1e-6);
+    //
+    // Per-time (not per-step) scaling: the dt-convergence probe caught
+    // that the previous `2e-5 / h_sq^1.5` was a per-FRAME probability,
+    // so refining u_dt silently rescaled the physical nucleation rate
+    // (4× more events at u_dt/4 over the same simulated time, which
+    // made the refined trajectory diverge from the coarse one at
+    // ratio = exactly 2.0 — the dt ratio).  Multiplying by
+    // ``u_dt / 0.05`` (the preset default) keeps the rate unchanged at
+    // the GUI's default dt while making it proportional to simulated
+    // time at any other dt the user selects.
+    float nuc_rate = (2.0e-5 * u_dt / 0.05) / max(pow(h_sq, 1.5), 1e-6);
     float nuc_thresh = 1.0 - clamp(nuc_rate, 0.0, 0.5);
     float nuc = hash_temporal(pos, 0);
     if (nuc > nuc_thresh && u < 0.1 && v < 0.1) {
