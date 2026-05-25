@@ -17666,9 +17666,13 @@ def init_nca_random_specks(size, rng):
     """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     n = max(8, size * size // 200)  # density ~1/(200 voxels per slice)
-    coords = rng.integers(0, size, size=(n, 3))
+    if hasattr(rng, 'integers'):
+        coords = rng.integers(0, size, size=(n, 3))
+    else:
+        coords = rng.randint(0, size, size=(n, 3))
     for x, y, z in coords:
-        data[x, y, z, :] = rng.random(4).astype(np.float32)
+        data[x, y, z, :] = rng.random(4).astype(np.float32) \
+            if hasattr(rng, 'integers') else rng.rand(4).astype(np.float32)
     return data
 
 
