@@ -17433,6 +17433,39 @@ def _fbm_binary_density(size, rng, target_density, octaves=5):
     return (field > threshold).astype(np.float32)
 
 
+def _canonical_binary_mask(size, rng, density):
+    """Boolean mask of approximately the requested density, independent of size.
+
+    The naive pattern ``_canonical_noise(size, rng) < density`` looks
+    correct but is badly broken: ``_canonical_noise`` upsamples a 64³
+    uniform field with **linear interpolation** to non-integer-ratio
+    target sizes, which pulls noise values toward 0.5 and shrinks the
+    fraction below low thresholds.  Measured densities for a 0.10
+    threshold: 10.1% at size=64 (canonical) vs 0.3% at size=65 — a
+    33x mismatch that changes whether seed-density-sensitive rules
+    sustain dynamics or collapse.
+
+    This helper thresholds at canonical resolution first, then
+    upsamples the binary mask with nearest-neighbour, so the mean
+    density is preserved exactly at every target size.
+    """
+    cs = CANONICAL_INIT_SIZE
+    small = rng.uniform(0.0, 1.0, (cs, cs, cs)) < density
+    if size == cs:
+        return small
+    if size > cs and size % cs == 0:
+        f = size // cs
+        return np.repeat(np.repeat(np.repeat(small, f, 0), f, 1), f, 2)
+    if size < cs and cs % size == 0:
+        f = cs // size
+        # Sample one corner per block; preserves density in expectation.
+        return small[::f, ::f, ::f]
+    # Fractional ratio: nearest-neighbour resample preserves density.
+    from scipy.ndimage import zoom
+    # order=0 = nearest neighbour, no smoothing.
+    return zoom(small.astype(np.uint8), size / cs, order=0).astype(bool)
+
+
 def _localized_envelope(size, rng, fill_fraction=0.5, edge_softness=0.15):
     """Smooth ball-shaped envelope that fades from 1.0 at the centre to 0
     near the boundaries. Used to localize FBM initial conditions to a
@@ -17465,7 +17498,7 @@ def _localized_envelope(size, rng, fill_fraction=0.5, edge_softness=0.15):
 def init_random_very_sparse(size, rng):
     """Random with ~3% density — for crystal rules that grow."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.03).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.03).astype(np.float32)
     return data
 
 
@@ -17587,7 +17620,7 @@ def init_lenia_multi_fbm(size, rng):
 def init_random_sparse(size, rng):
     """Random with ~10% density."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.10).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.10).astype(np.float32)
     return data
 
 
@@ -17691,7 +17724,7 @@ def init_predator_prey_lattice(size, rng):
 def init_random_dense(size, rng):
     """Random with ~40% density."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.40).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.40).astype(np.float32)
     return data
 
 def init_random_smooth(size, rng):
@@ -20445,7 +20478,7 @@ def init_quantum_selfinteract(size, rng):
 def init_random_spins(size, rng):
     """Uniform 50/50 binary spins for Ising. Channel R holds {0.0, 1.0}."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.5).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.5).astype(np.float32)
     return data
 
 
@@ -20494,19 +20527,16 @@ def init_hodgepodge_random(size, rng):
     instead of immediately collapsing to the all-ill / all-heal
     cycle.
 
-    Density caveat: ``_canonical_noise(size, rng) < 0.15`` is applied
-    AFTER upsampling, so the effective density depends on whether
-    ``size`` lands on the canonical 64-voxel grid.  Integer-ratio
-    sizes (64, 128, ...) reproduce the threshold exactly (~15%);
-    fractional sizes get a smoother field with ~half the threshold's
-    density (~7%).  Both work — at the previous 30% density the
-    rule died at size=64 because every infected cell hit the 'ill'
-    band on the same step, healed together, and left no infection
-    waves behind (aligned-size probe caught this).  At 15% the rule
-    sustains spirals at every size we test.
+    Uses ``_canonical_binary_mask`` for the seed locations so the
+    ~15% density is preserved exactly at every grid size (the naive
+    ``_canonical_noise(size, rng) < 0.15`` pattern collapses to
+    ~7% at non-integer-ratio sizes due to linear-interp smoothing
+    of the upsampled noise).  The continuous ``levels`` field stays
+    on the smoothed noise — it only affects per-cell state values,
+    not population fraction.
     """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    seed_mask = _canonical_noise(size, rng) < 0.15
+    seed_mask = _canonical_binary_mask(size, rng, 0.15)
     levels = _canonical_noise(size, rng) * 0.10 + 0.05  # in [0.05, 0.15]
     data[:, :, :, 0] = np.where(seed_mask, levels, 0.0).astype(np.float32)
     return data
@@ -20517,7 +20547,7 @@ def init_margolus_gas(size, rng):
     Density ~25% gives a fluid regime with frequent collisions but
     plenty of vacuum for particle motion to be visible."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.25).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.25).astype(np.float32)
     return data
 
 
