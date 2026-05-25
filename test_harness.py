@@ -729,6 +729,17 @@ def _acquire_textures(ctx, size, tex_dtype, tex_bpt, init_data_bytes):
         _texture_pool[key] = pool
         tex_a.write(init_data_bytes)
         tex_b.write(bytes(size ** 3 * tex_bpt))
+        # Force the CPU→GPU uploads to fully complete before the first
+        # compute pass binds these textures via imageLoad/imageStore.
+        # GL_TEXTURE_UPDATE_BARRIER_BIT alone was insufficient at large
+        # sizes (size=384, smoothlife_3d) -- the first pool-reuse run
+        # in a process diverged from subsequent runs (max|d|=1.0). A
+        # full ctx.finish() guarantees the uploads are visible.
+        try:
+            GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
+        except Exception:  # noqa: BLE001  GL barrier, best-effort
+            ctx.memory_barrier()
+        ctx.finish()
         return tex_a, tex_b
     tex_a = ctx.texture3d((size, size, size), 4, init_data_bytes, dtype=tex_dtype)
     tex_b = ctx.texture3d((size, size, size), 4, bytes(size ** 3 * tex_bpt),
