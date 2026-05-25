@@ -20485,7 +20485,7 @@ def init_hodgepodge_random(size, rng):
     because no infected neighbours remained to seed new waves.
 
     Real BZ media start essentially uniform with rare perturbations.
-    Here we mark ~30% of cells as low-level infected — encoded in the
+    We mark ~15% of cells as low-level infected — encoded in the
     [0.05, 0.15] band of the [0,1] channel so the shader's
     round(v * (N-1)) decode produces a low-but-nonzero state across
     the supported N range (state 1-2 at N=16, state 5-15 at N=100,
@@ -20494,12 +20494,19 @@ def init_hodgepodge_random(size, rng):
     instead of immediately collapsing to the all-ill / all-heal
     cycle.
 
-    Density 30% chosen to give >= k1=2..4 infected neighbours in a
-    26-cell Moore neighbourhood: expected 7.8, so even with k1=4
-    most cells get susceptibility A/k1 >= 1 each step.
+    Density caveat: ``_canonical_noise(size, rng) < 0.15`` is applied
+    AFTER upsampling, so the effective density depends on whether
+    ``size`` lands on the canonical 64-voxel grid.  Integer-ratio
+    sizes (64, 128, ...) reproduce the threshold exactly (~15%);
+    fractional sizes get a smoother field with ~half the threshold's
+    density (~7%).  Both work — at the previous 30% density the
+    rule died at size=64 because every infected cell hit the 'ill'
+    band on the same step, healed together, and left no infection
+    waves behind (aligned-size probe caught this).  At 15% the rule
+    sustains spirals at every size we test.
     """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    seed_mask = _canonical_noise(size, rng) < 0.30
+    seed_mask = _canonical_noise(size, rng) < 0.15
     levels = _canonical_noise(size, rng) * 0.10 + 0.05  # in [0.05, 0.15]
     data[:, :, :, 0] = np.where(seed_mask, levels, 0.0).astype(np.float32)
     return data
