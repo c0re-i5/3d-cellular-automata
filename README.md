@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with a five-probe physical-correctness suite (`ca_debug.*`) that audits every preset for shader hygiene, spatial equivariance, parameter coupling, conservation laws, and edge-case behaviour, plus an end-to-end recording → YouTube → Reddit publishing pipeline.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with an extensive physical-correctness suite (`ca_debug.*`, 17 audit probes covering shader hygiene, spatial equivariance, parameter coupling, conservation laws, determinism, dt/grid convergence, init-variant smoke, long-run drift, discovery-replay fidelity, slider-endpoint runnability and more), plus an end-to-end recording → YouTube → Reddit publishing pipeline.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -185,14 +185,30 @@ python test_harness.py                       # single headless run
 
 ### Correctness Probes
 
-All five probes run headless and exit non-zero on any `crit` finding, suitable for CI:
+All probes run headless and exit non-zero on any `crit` finding, suitable for CI:
 
 ```bash
+# Original five (static + per-step physics)
 python -m ca_debug.shader_lint               # static GLSL review (~2 s)
 python -m ca_debug.symmetry                  # spatial equivariance (~5 s, GPU)
 python -m ca_debug.coupling                  # parameter sensitivity (~12 s, GPU)
 python -m ca_debug.conservation              # mass/charge/prob drift (~10 s, GPU)
 python -m ca_debug.limits                    # determinism + edge cases (~8 s, GPU)
+
+# Extended suite (numerical correctness + coverage)
+python -m ca_debug.determinism               # bit-identical replays (~8 s, GPU)
+python -m ca_debug.aligned_sizes             # non-aligned grid sizes 65/100/127 (~12 s, GPU)
+python -m ca_debug.dt_convergence            # halve-dt double-steps scaling (~25 s, GPU)
+python -m ca_debug.boundary_honour           # toroidal/clamp/mirror honoured (~9 s, GPU)
+python -m ca_debug.init_variants             # each init variant evolves cleanly (~6 s, GPU)
+python -m ca_debug.long_run                  # 5000-step NaN/drift audit (~21 s, GPU)
+python -m ca_debug.vis_channels              # declared channels carry signal (~10 s, GPU)
+python -m ca_debug.recording_roundtrip       # recordings/*.json still replay (~5 s, GPU)
+python -m ca_debug.init_density_scaling      # init density invariant across grid sizes (~30 s, GPU)
+python -m ca_debug.param_coherence           # static u_paramK ↔ preset slot binding (~10 ms)
+python -m ca_debug.discoveries_replay        # discoveries.json catalogue replayable (~9 s, GPU)
+python -m ca_debug.param_endpoints           # every slider's full range is runnable (~8 s, GPU)
+python -m ca_debug.dt_endpoints              # dt_range endpoints stay finite (~1 s, GPU)
 ```
 
 Each probe accepts `--rules <comma-separated>` to scope to a single preset, and `--size`/`--steps` to widen or narrow the test window.
@@ -292,14 +308,30 @@ Shaders that use large neighbourhood radii (SmoothLife, Lenia) have an optimised
 
 ## Quality Assurance
 
-The `ca_debug/` package provides a five-probe correctness suite that audits every preset against a different physical-correctness criterion. All probes are headless and run end-to-end against the real simulator pipeline (the `HeadlessRunner` is the same one `test_harness.py` uses), so the verdict reflects the production code path.
+The `ca_debug/` package provides a 17-probe correctness suite that audits every preset against a different physical-correctness criterion. All probes are headless and run end-to-end against the real simulator pipeline (the `HeadlessRunner` is the same one `test_harness.py` uses), so the verdict reflects the production code path.
 
 ```bash
+# Original physics-correctness probes
 python -m ca_debug.shader_lint    # static-analysis pass over GLSL source
 python -m ca_debug.symmetry       # spatial-equivariance check (rotate / reflect / translate)
 python -m ca_debug.coupling       # parameter-sensitivity matrix
 python -m ca_debug.conservation   # mass / charge / probability drift
 python -m ca_debug.limits         # determinism + empty-IC + damping-zero edge cases
+
+# Numerical-correctness + coverage probes (added during the fcc-lattice bug-hunt)
+python -m ca_debug.determinism            # same seed → bit-identical output across 32..256
+python -m ca_debug.aligned_sizes          # behaviour at non-canonical grid sizes (65, 100, 127)
+python -m ca_debug.dt_convergence         # halve dt, double steps — verifies per-time scaling
+python -m ca_debug.boundary_honour        # toroidal/clamped/mirror actually differ at the edge
+python -m ca_debug.init_variants          # every declared init variant constructs and evolves
+python -m ca_debug.long_run               # 5000-step drift / NaN audit
+python -m ca_debug.vis_channels           # each declared vis-channel actually carries signal
+python -m ca_debug.recording_roundtrip    # recordings/*.json still reproducible under current engine
+python -m ca_debug.init_density_scaling   # alive-fraction invariant across grid sizes
+python -m ca_debug.param_coherence        # static GLSL u_paramK reads ↔ preset slot bindings
+python -m ca_debug.discoveries_replay     # discoveries.json catalogue (28k entries) replayable
+python -m ca_debug.param_endpoints        # every slider's full declared range runs without crash/NaN
+python -m ca_debug.dt_endpoints           # dt_range endpoints stay finite (catches over-generous dt_max)
 ```
 
 | Probe | What it catches |
@@ -309,6 +341,19 @@ python -m ca_debug.limits         # determinism + empty-IC + damping-zero edge c
 | **coupling** | Per-parameter sensitivity matrix: perturbs each slider ±10 % and measures the per-channel response. Flags `DEAD` (no effect), `EXP` (≥10× explosion), `ASYM` (one-sided response), and `SAT` (param is responsive at extreme values but the design ±10 % range is inside a shader-internal clamp). Distinguishes mode/init-time/normal params so categorical knobs don't false-positive. |
 | **conservation** | Tracks per-channel L¹ drift over a fixed number of steps for rules with explicit conservation laws (probability density for Schrödinger, mass for Cahn–Hilliard / Gray-Scott, integer particle count for sandpile). Per-voxel absolute-drift floor prevents near-zero-baseline rules from blowing up the relative-error metric. |
 | **limits** | Three edge cases per rule: (1) determinism — same seed twice must produce identical output; (2) empty IC must stay empty (catches "thermal" sources that bootstrap the sim from vacuum); (3) zeroing the damping coefficient must NOT cause an `inf`/`NaN` blow-up within the design step horizon. |
+| **determinism** | Multi-trial bit-identical replay at sizes 32, 64, 128, 192, 256. Caught a missing GL memory barrier in the texture-pool reuse path that produced silent corruption on the first reused allocation. |
+| **aligned_sizes** | Replays each rule at non-canonical grid sizes (65, 100, 127, 129) that exercise off-by-one paths in stencils, dispatch ceil-divisions, and init density math. Caught two density-discontinuity bugs in 6 binary-mask init functions whose `scipy.zoom(order=1)` smoothing collapsed occupancy 33× at fractional sizes. |
+| **dt_convergence** | Halves dt while doubling step count and compares the two trajectories; per-time-evolving rules should converge. Caught a Poisson nucleation term in `bz_excitable` whose probability was per-frame rather than per-time (ratio = 2.00 across dt halving), now scaled by `u_dt/0.05`. |
+| **boundary_honour** | Runs each rule under all three boundary modes (toroidal / clamped / mirror) from a common seed and verifies the outer slab actually differs between modes. Catches shaders that silently bake one boundary policy regardless of `u_boundary`. |
+| **init_variants** | Every declared init variant must construct without crash, produce a finite initial state, and evolve (not stay frozen at t=0). Caught an `rng.integers()` call in `init_nca_random_specks` that crashed under the legacy `RandomState` API. |
+| **long_run** | 5000-step replay at moderate size with checkpointed state, growth-ratio tracking, and NaN/Inf surveillance. Verifies integrator stability beyond the short-horizon probes' default windows. |
+| **vis_channels** | For rules using direct-mapping vis modes (density / bipolar / signed), each named channel must show signal within the preset's audit-step horizon. Catches dead-output or mis-wired vis_default settings. |
+| **recording_roundtrip** | Reconstructs every `.json` recording sidecar's `(rule, size, seed, params, dt)` and replays it; flags rule renames, schema drift, non-determinism, or NaN. Verifies the historical recording catalogue stays reproducible as the engine evolves. |
+| **init_density_scaling** | Measures `alive_frac` of channel-0 across grid sizes 32, 64, 96, 128, 192 per (rule, init variant). Two-regime grader (dense max/min ratio vs sparse log-log slope) catches density that should be size-invariant but isn't. Caught two "N seeds scattered in 3D but N was sized as if 2D" bugs in `nca_3d` and `greenberg_hastings_3d` init paths. |
+| **param_coherence** | Static GLSL parse: for every preset's pass, verifies the shader's `u_paramK` reads are bound to actual slots (no stale-zero sliders) and every declared preset param is read by at least one pass (no dead GUI sliders). Skips rules whose binding paths it doesn't model (viewport raymarchers, particle-SSBO compute, entity-arena shaders). |
+| **discoveries_replay** | Samples `discoveries.json` (28k entries, 82 rules, 170 (rule, init-variant) pairs) and re-runs each via `HeadlessRunner` with its recorded params/dt/seed; catches rule renames, param-schema drift, init-variant removal, and replay crashes. |
+| **param_endpoints** | For each rule × slider × endpoint (low/high from `preset['param_ranges']`), sets just that one param to the endpoint and replays for `--cap` steps; flags crash or NaN/Inf. Verifies every advertised slider range is actually runnable. |
+| **dt_endpoints** | Like `param_endpoints` but for the `dt_range` slider: tests dt at (dt_min, dt_max) with default params; flags CFL-violation blow-ups. Caught `compressible_euler_3d` advertising `dt_range=(0.005, 0.3)` while NaN-overflowing for dt ≥ 0.12 (CFL > 0.6). |
 
 Probes share a common headless harness in `ca_debug/recorder.py` and emit terminal-readable summaries plus optional JSON for CI:
 
