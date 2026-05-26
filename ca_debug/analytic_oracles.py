@@ -28,7 +28,7 @@ Usage::
     python -m ca_debug.analytic_oracles --rules reaction_diffusion_3d
     python -m ca_debug.analytic_oracles --severity ok --json /tmp/ora.json
 
-Currently registered (3):
+Currently registered (4):
   * reaction_diffusion_3d — Gray-Scott reduced to pure 3D diffusion via
     F=k=Dv=0, V≡0; verifies σ²(t) = σ²(0) + 2·D·t for an isotropic
     Gaussian initial condition (Green's function of the heat equation).
@@ -39,6 +39,9 @@ Currently registered (3):
     wave packet at rest; verifies the textbook quantum dispersion
     σ²(t) = σ₀² + (α·t/σ₀)² with α = ℏ/(2m) measured on the
     probability density |Ψ|² (channel A).
+  * sine_gordon_3d — small-amplitude (A≈0.05) Klein-Gordon limit
+    sin(u) ≈ u; verifies the massive dispersion ω² = c²·k² + m² via
+    the temporal correlation of a periodic standing wave.
 """
 from __future__ import annotations
 
@@ -405,6 +408,111 @@ def _quantum_free_gaussian_spread(ctx, size: int, seed: int, cap: int) -> dict:
             'rel_err': rel_err,
             'tol': tol_rel,
             'prob_mass': float(prob.sum()),
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('sine_gordon_3d')
+def _sine_gordon_klein_gordon_limit(ctx, size: int, seed: int, cap: int) -> dict:
+    """Sine-Gordon in the small-amplitude (Klein-Gordon) limit.
+
+    The shader integrates ∂²u/∂t² = c²·∇²u − m²·sin(u) − γ·v.  For
+    |u| ≪ 1 the nonlinearity linearises to sin(u) ≈ u and the equation
+    becomes the Klein-Gordon equation
+        ∂²u/∂t² = c²·∇²u − m²·u
+    with plane-wave dispersion
+        ω² = c²·k² + m²   (massive Klein-Gordon).
+
+    Periodic (toroidal) boundary: the discrete eigenmodes are
+    cos(2π·n·i/L), so k_voxel = 2π·n/L exactly, and k_phys = k_voxel/h.
+    We seed u = A·cos(k·x_0) with v = 0, damping = 0, drive = 0, A=0.05
+    (sin(u)/u ≈ 1 − u²/6 ≈ 1 − 4·10⁻⁴, well into the linear regime),
+    and verify C(t) = ⟨u(t)·u(0)⟩/⟨u(0)²⟩ matches cos(ω·t).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'sine_gordon_3d'
+    c2 = 1.0
+    m2 = 0.5            # massive enough that mass term dominates dispersion
+    dt = 0.05           # min of dt_range; gives ~29 steps to phase π/3
+    amplitude = 0.05    # small-amp linearisation: sin(u) ≈ u within 4·10⁻⁴
+    n_mode = 4
+    tol_rel = 0.05      # 5 % budget: 6-point Laplacian + symplectic-Euler order
+
+    params = {'c²': c2, 'Damping γ': 0.0, 'Mass m²': m2, 'Drive': 0.0}
+
+    h = _REF_SIZE / float(size)
+    # Periodic BC → k_voxel = 2π·n/L (NOT π·n/(L-1) which assumed mirror).
+    k_voxel = 2.0 * math.pi * n_mode / float(size)
+    k_phys = k_voxel / h
+    omega = math.sqrt(c2 * k_phys * k_phys + m2)
+
+    target_phase = math.pi / 3.0
+    steps = max(1, min(cap, int(round(target_phase / (omega * dt)))))
+    actual_phase = omega * steps * dt
+    expected_C = math.cos(actual_phase)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        idx = np.arange(size, dtype=np.float64)
+        cos_1d = (amplitude * np.cos(k_voxel * idx)).astype(np.float32)
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[:, :, :, 0] = cos_1d[:, None, None]   # u
+        # v (channel 1) and unused channels 2,3 all zero.
+        current_tex = r.tex_a if r.ping == 0 else r.tex_b
+        current_tex.write(data.tobytes())
+
+        g0 = np.asarray(r.read_grid())
+        u0 = g0[..., 0].astype(np.float64)
+        norm0 = float((u0 * u0).sum())
+        if norm0 <= 0.0:
+            return {'rule': rule, 'grade': 'err',
+                    'oracle': 'sine_gordon_klein_gordon_limit',
+                    'reason': f'zero IC norm (norm0={norm0})'}
+
+        for _ in range(steps):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'sine_gordon_klein_gordon_limit',
+                    'reason': f'NaN/Inf in grid after {steps} steps'}
+
+        u_t = g_t[..., 0].astype(np.float64)
+        C_t = float((u_t * u0).sum() / norm0)
+        amp_t = float(np.abs(u_t).max())
+        rel_err = abs(C_t - expected_C) / max(abs(expected_C), 0.1)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'sine_gordon_klein_gordon_limit',
+            'grade': grade,
+            'size': size,
+            'steps': steps,
+            'dt': dt,
+            'c2': c2,
+            'm2': m2,
+            'n_mode': n_mode,
+            'k_phys': k_phys,
+            'omega': omega,
+            'phase_rad': actual_phase,
+            'C_measured': C_t,
+            'C_expected': expected_C,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+            'amp_max': amp_t,
         }
     finally:
         with contextlib.suppress(Exception):
