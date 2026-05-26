@@ -1,0 +1,160 @@
+{
+  "rule": "eden_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "eden_seeds",
+  "params": {
+    "Sticking p": 0.5,
+    "X bias": 0.0,
+    "Y bias": 0.0,
+    "Z bias": 0.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "c628a0d4189df32d678d8d46dffff9045465922754b1c1450925890602e2a600",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.15065285563468933,
+            "std": 0.35771018266677856,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 16661,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.15071134269237518,
+            "std": 0.35167405009269714,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 17426,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.017786096781492233,
+            "std": 0.13217318058013916,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 1967,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "af186324202cdc27923887ea917d84557c0289b127eafa9b18f5eff4d0607533",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 1.0,
+            "std": 0.0,
+            "min": 1.0,
+            "max": 1.0,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 1.0,
+            "std": 0.0,
+            "min": 1.0,
+            "max": 1.0,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "af186324202cdc27923887ea917d84557c0289b127eafa9b18f5eff4d0607533",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 1.0,
+            "std": 0.0,
+            "min": 1.0,
+            "max": 1.0,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 1.0,
+            "std": 0.0,
+            "min": 1.0,
+            "max": 1.0,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:39+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

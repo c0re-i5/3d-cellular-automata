@@ -1,0 +1,160 @@
+{
+  "rule": "cyclic_ca_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "cyclic_ca",
+  "params": {
+    "N states": 10.0,
+    "Threshold": 2.0,
+    "unused_0": 0.0,
+    "unused_1": 0.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "7e36d222c35c44dade9c02373aac29018664e69d96159794a5a73de46100d8ed",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 3.7145092487335205,
+            "std": 2.6797120571136475,
+            "min": 0.0,
+            "max": 9.0,
+            "alive": 97984,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.37145093083381653,
+            "std": 0.2679711878299713,
+            "min": 0.0,
+            "max": 0.9000000357627869,
+            "alive": 97984,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "1e30783d2e15a7a13e36bc6a6f6f25aaa247b397aee5b4aa3fc34c93d113f75e",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 3.714970350265503,
+            "std": 2.6797051429748535,
+            "min": 0.0,
+            "max": 9.0,
+            "alive": 97984,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.3714970350265503,
+            "std": 0.2679705321788788,
+            "min": 0.0,
+            "max": 0.9000000357627869,
+            "alive": 97984,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "1e30783d2e15a7a13e36bc6a6f6f25aaa247b397aee5b4aa3fc34c93d113f75e",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 3.714970350265503,
+            "std": 2.6797051429748535,
+            "min": 0.0,
+            "max": 9.0,
+            "alive": 97984,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.3714970350265503,
+            "std": 0.2679705321788788,
+            "min": 0.0,
+            "max": 0.9000000357627869,
+            "alive": 97984,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:39+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

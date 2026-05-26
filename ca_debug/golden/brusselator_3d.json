@@ -1,0 +1,160 @@
+{
+  "rule": "brusselator_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 0.05,
+  "init": "brusselator",
+  "params": {
+    "A": 1.0,
+    "B": 3.0,
+    "Du": 2.0,
+    "Dv": 8.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "bf13f01a429a76b7eade16b2dfad58b29f17aebc4370168cbe1850f6cafe7a5f",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 1.0062083005905151,
+            "std": 0.05503130704164505,
+            "min": 0.878464937210083,
+            "max": 1.1861733198165894,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 2.9907333850860596,
+            "std": 0.036450739949941635,
+            "min": 2.840630531311035,
+            "max": 3.104419469833374,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "db4cbeaf052b33f0c14d0ef6c357038baca1a4e0d99801ef07bf53599ba2e6d2",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 1.1374181509017944,
+            "std": 0.5646169185638428,
+            "min": 0.5466348528862,
+            "max": 4.130444049835205,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 2.6725263595581055,
+            "std": 0.40042030811309814,
+            "min": 1.1220682859420776,
+            "max": 3.3508710861206055,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "d9d3f98648e49779c8aacea795c9b6d30ea73bd64793c7afab0f38d10d0b7f37",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 1.0046006441116333,
+            "std": 0.9764877557754517,
+            "min": 0.3860004246234894,
+            "max": 5.290008544921875,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 2.6110074520111084,
+            "std": 0.5564723014831543,
+            "min": 0.9055399298667908,
+            "max": 3.5218396186828613,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:38+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

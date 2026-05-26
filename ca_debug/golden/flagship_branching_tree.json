@@ -1,0 +1,160 @@
+{
+  "rule": "flagship_branching_tree",
+  "size": 48,
+  "seed": 1001,
+  "dt": 0.15,
+  "init": "lsystem:tree?channel=0&value=1.0",
+  "params": {
+    "Wave speed": 0.35,
+    "Damping": 0.02,
+    "Drive freq": 0.0,
+    "Drive amp": 0.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "1f20b7f8065869bcc7748b4be50da712970d2945ab1dec5b24d123f4155891b5",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0035807292442768812,
+            "std": 0.04463516175746918,
+            "min": 0.0,
+            "max": 0.9322033524513245,
+            "alive": 4492,
+            "nonfinite": 0
+          },
+          {
+            "mean": 3.368498882605486e-11,
+            "std": 0.00945642963051796,
+            "min": -0.19830180704593658,
+            "max": 0.17563921213150024,
+            "alive": 4592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "78a39c9de596ced2b07ca4999d754e8cb7a8f6d9d5128e9bae86095306f7dd54",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0035807297099381685,
+            "std": 0.03811824321746826,
+            "min": -0.5385897159576416,
+            "max": 0.8515262603759766,
+            "alive": 9927,
+            "nonfinite": 0
+          },
+          {
+            "mean": 9.674328699249557e-11,
+            "std": 0.007773689925670624,
+            "min": -0.2537073493003845,
+            "max": 0.15757673978805542,
+            "alive": 9564,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "49814e6da9433600b5b64524a37a13e38dd27b6daeb8c9dba3fb63f763d7f61f",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0035807329695671797,
+            "std": 0.027690980583429337,
+            "min": -0.5410482287406921,
+            "max": 0.45064136385917664,
+            "alive": 22451,
+            "nonfinite": 0
+          },
+          {
+            "mean": 1.8001257429123285e-10,
+            "std": 0.00658331997692585,
+            "min": -0.15950778126716614,
+            "max": 0.15728548169136047,
+            "alive": 21080,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:39+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

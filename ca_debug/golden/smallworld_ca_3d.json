@@ -1,0 +1,160 @@
+{
+  "rule": "smallworld_ca_3d",
+  "size": 96,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "smallworld_random",
+  "params": {
+    "Rewire p": 0.1,
+    "Birth": 2.0,
+    "Surv lo": 3.0,
+    "Surv hi": 4.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "44ad834845053604b26cb5d1205d986d4442d150a81a14f135b46046f77c100f",
+      "stats": {
+        "shape": [
+          96,
+          96,
+          96,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.1721089631319046,
+            "std": 0.37747514247894287,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 152271,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0173916295170784,
+            "std": 0.053332529962062836,
+            "min": 0.0,
+            "max": 0.6666666865348816,
+            "alive": 88457,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "2b4fb6732b1b1d8e24e4061910fc17d268da7eccb27dd29c27c14849e4ab9c3f",
+      "stats": {
+        "shape": [
+          96,
+          96,
+          96,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.150604248046875,
+            "std": 0.35766270756721497,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 133245,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.015057411044836044,
+            "std": 0.04970002546906471,
+            "min": 0.0,
+            "max": 0.6666666865348816,
+            "alive": 77013,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "00d027a11d9b1ce5d41e0af71042024a44387701e1eb1c3c9a82ac39b89f1ecf",
+      "stats": {
+        "shape": [
+          96,
+          96,
+          96,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.1524454802274704,
+            "std": 0.35945212841033936,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 134874,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.015268586575984955,
+            "std": 0.0500309057533741,
+            "min": 0.0,
+            "max": 0.6666666865348816,
+            "alive": 78069,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:57+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

@@ -1,0 +1,160 @@
+{
+  "rule": "greenberg_hastings_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "excitable_random",
+  "params": {
+    "States N": 8.0,
+    "Threshold k": 1.0,
+    "Spontaneous": 0.0001,
+    "Decay": 1.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "772ce6531aafde26838384a8206cfd5a25d185bba1a98595c2e6646f672d489f",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.04448655620217323,
+            "std": 0.16056983172893524,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 11585,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.03351960331201553,
+            "std": 0.17998899519443512,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 3707,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.02294921875,
+            "std": 0.10576177388429642,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 5532,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.024368850514292717,
+            "std": 0.15419146418571472,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 2695,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "bc6284f29eb69b7c00b1b2a422b52f6b65f637f687f795ef81b82f3af1d56472",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.18520715832710266,
+            "std": 0.2937238812446594,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 41171,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.073486328125,
+            "std": 0.2609331011772156,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 8127,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.06721101701259613,
+            "std": 0.17460301518440247,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 15437,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.03191008418798447,
+            "std": 0.17576071619987488,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 3529,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "7f94a5e0500a4c2973e7b9e443df6be06283609a89a64c494d35e11ad3a454d5",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.2813184857368469,
+            "std": 0.3651599586009979,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 49043,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0414767786860466,
+            "std": 0.1993902027606964,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 4587,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.049162689596414566,
+            "std": 0.15068310499191284,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 12167,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0850151926279068,
+            "std": 0.2789042890071869,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 9402,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:40+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

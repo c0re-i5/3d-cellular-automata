@@ -1,0 +1,164 @@
+{
+  "rule": "predator_prey_lattice_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "predator_prey_lattice",
+  "params": {
+    "Prey metab": 0.06,
+    "Pred metab": 0.005,
+    "Food value": 0.5,
+    "Prey value": 1.2,
+    "Prey repro": 0.85,
+    "Pred repro": 1.3,
+    "Food regrow": 0.003,
+    "(unused)": 0.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "ea79b47eb51afa2585ab87fc29a70e5e58353dfeae0ea9be0579a2b2dd8ec3dc",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.026905201375484467,
+            "std": 0.0814230740070343,
+            "min": 0.0,
+            "max": 0.75,
+            "alive": 11456,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.10189911723136902,
+            "std": 0.3015437126159668,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 11456,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "dca354768322efbdb0a8996b281a0ef617a796a04c0131647ccef2a8678bf54b",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0926242396235466,
+            "std": 0.13097701966762543,
+            "min": 0.0,
+            "max": 0.75,
+            "alive": 38808,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.340322881937027,
+            "std": 0.4696260988712311,
+            "min": 0.0,
+            "max": 1.157004475593567,
+            "alive": 38808,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "acb65be250890143b4fbb449f8fcc8b2d78fdc69dfeff56ae1f62ca50e8d2689",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.07131844758987427,
+            "std": 0.14650781452655792,
+            "min": 0.0,
+            "max": 0.75,
+            "alive": 24075,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.17640769481658936,
+            "std": 0.3642575144767761,
+            "min": 0.0,
+            "max": 1.2550950050354004,
+            "alive": 24074,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:42+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

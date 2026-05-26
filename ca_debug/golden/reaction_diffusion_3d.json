@@ -1,0 +1,160 @@
+{
+  "rule": "reaction_diffusion_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 0.5,
+  "init": "gray_scott",
+  "params": {
+    "Feed rate": 0.028,
+    "Kill rate": 0.062,
+    "U diffusion": 0.16,
+    "V diffusion": 0.08
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "c6657c739dd85f92dd01f924ed8e4b563943971af90011bf94f7a37d4e2c8d98",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.8963119387626648,
+            "std": 0.20696191489696503,
+            "min": 0.23560798168182373,
+            "max": 0.9999557733535767,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.04950696974992752,
+            "std": 0.10673116892576218,
+            "min": 0.0006892815581522882,
+            "max": 0.5014110207557678,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "228bbb051adaff96389682d8fb1f3f7a160b0faa88dab04eb143549e81996f5b",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.8439666032791138,
+            "std": 0.24720172584056854,
+            "min": 0.1969483196735382,
+            "max": 0.9999624490737915,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.05352364480495453,
+            "std": 0.10711141675710678,
+            "min": 4.208026803098619e-05,
+            "max": 0.6689372062683105,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "b668390b9c5e544a8ea53f942f0854136c49e4319c23790eb8c37b55c04aa992",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.8872948288917542,
+            "std": 0.16494975984096527,
+            "min": 0.20315250754356384,
+            "max": 0.999991238117218,
+            "alive": 110592,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.03116578795015812,
+            "std": 0.08104055374860764,
+            "min": 4.941167119909551e-08,
+            "max": 0.6579189300537109,
+            "alive": 102549,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:57+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

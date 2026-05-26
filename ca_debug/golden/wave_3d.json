@@ -1,0 +1,160 @@
+{
+  "rule": "wave_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 0.15,
+  "init": "wave_pulse",
+  "params": {
+    "Wave speed": 0.35,
+    "Damping": 0.02,
+    "Drive freq": 0.0,
+    "Drive amp": 0.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "e144e14087d3ce5a9bcba28453fc3878b66a9a62e47832ef57e0c07b7914ffb3",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.01460488885641098,
+            "std": 0.07369481027126312,
+            "min": 4.199915615652667e-35,
+            "max": 1.1757670640945435,
+            "alive": 47178,
+            "nonfinite": 0
+          },
+          {
+            "mean": 1.04019244606679e-10,
+            "std": 0.0006698162178508937,
+            "min": -0.014735710807144642,
+            "max": 0.0011331329587846994,
+            "alive": 37981,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "ce5853da2b27d76819600d2b1fee61815452af496ad9d4c15061bfda5a37ee2d",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.014604892581701279,
+            "std": 0.06138592213392258,
+            "min": 1.3810606886638613e-31,
+            "max": 0.8210449814796448,
+            "alive": 54644,
+            "nonfinite": 0
+          },
+          {
+            "mean": 3.7511604933371245e-10,
+            "std": 0.0020576135721057653,
+            "min": -0.04325351491570473,
+            "max": 0.00373635021969676,
+            "alive": 47119,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "b4c9ff9f5974a40ff4f6c34dfa6cdf21373f5c5d4be145c07d24d3b3f2c11edc",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.014604903757572174,
+            "std": 0.03643641620874405,
+            "min": -0.1475641429424286,
+            "max": 0.19984117150306702,
+            "alive": 70819,
+            "nonfinite": 0
+          },
+          {
+            "mean": 7.674788027323132e-10,
+            "std": 0.0019153368193656206,
+            "min": -0.023617586120963097,
+            "max": 0.0039238217286765575,
+            "alive": 62827,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:57+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}

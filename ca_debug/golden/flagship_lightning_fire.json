@@ -1,0 +1,164 @@
+{
+  "rule": "flagship_lightning_fire",
+  "size": 48,
+  "seed": 1001,
+  "dt": 0.1,
+  "init": "fire_fluid_sparse+lsystem:lightning?channel=0&value=1.0",
+  "params": {
+    "Buoyancy \u03b1": 4.0,
+    "Vorticity \u03b5": 1.5,
+    "Heat release": 2.5,
+    "Soot yield": 0.6,
+    "Radiative \u03c3": 0.2,
+    "Viscosity": 0.005,
+    "T-ignition": 0.2,
+    "Wind": 0.0
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "81743a3cef5293918dd76d6a72ef26ebcd28558c30d7169513637f61c2af9140",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0017275589052587748,
+            "std": 0.018439078703522682,
+            "min": 0.0,
+            "max": 0.4963454008102417,
+            "alive": 7587,
+            "nonfinite": 0
+          },
+          {
+            "mean": 9.864327239483828e-07,
+            "std": 7.07520594005473e-05,
+            "min": 0.0,
+            "max": 0.01300137210637331,
+            "alive": 168,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.13411949574947357,
+            "std": 0.20741237699985504,
+            "min": 4.370944051146353e-09,
+            "max": 1.0,
+            "alive": 109276,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "bae49728735b1d32ea0eadffd94f727d8ca5e58d649ccd151cc7087c8afca2ac",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.001505005988292396,
+            "std": 0.007843738421797752,
+            "min": 0.0,
+            "max": 0.10034649819135666,
+            "alive": 25015,
+            "nonfinite": 0
+          },
+          {
+            "mean": 1.4848160390101839e-06,
+            "std": 2.4967068384285085e-05,
+            "min": 0.0,
+            "max": 0.002027851529419422,
+            "alive": 1838,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.13586853444576263,
+            "std": 0.2089357227087021,
+            "min": 4.370944051146353e-09,
+            "max": 1.0,
+            "alive": 109276,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "051260c8710c66132ed1cb882551c1bb98090629623c33ba677bfb37ad808559",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0018153289565816522,
+            "std": 0.005153872538357973,
+            "min": 2.8566530589328225e-20,
+            "max": 0.036080192774534225,
+            "alive": 62919,
+            "nonfinite": 0
+          },
+          {
+            "mean": 2.5880092380248243e-06,
+            "std": 1.4133259355730843e-05,
+            "min": 0.0,
+            "max": 0.0002570735232438892,
+            "alive": 9520,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.14403043687343597,
+            "std": 0.21056461334228516,
+            "min": 4.370944051146353e-09,
+            "max": 1.0,
+            "alive": 109277,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-05-26T22:56:40+00:00",
+  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+}
