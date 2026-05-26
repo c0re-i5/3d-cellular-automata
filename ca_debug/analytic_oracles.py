@@ -28,10 +28,13 @@ Usage::
     python -m ca_debug.analytic_oracles --rules reaction_diffusion_3d
     python -m ca_debug.analytic_oracles --severity ok --json /tmp/ora.json
 
-Currently registered (1):
+Currently registered (2):
   * reaction_diffusion_3d — Gray-Scott reduced to pure 3D diffusion via
     F=k=Dv=0, V≡0; verifies σ²(t) = σ²(0) + 2·D·t for an isotropic
     Gaussian initial condition (Green's function of the heat equation).
+  * wave_3d — undriven, undamped standing wave cos(k·x); verifies
+    the temporal correlation ⟨u(t)·u(0)⟩/⟨u(0)²⟩ matches cos(ω·t)
+    with ω = c·|k| (d'Alembert plane-wave dispersion).
 """
 from __future__ import annotations
 
@@ -39,6 +42,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -199,6 +203,113 @@ def _gray_scott_pure_diffusion(ctx, size: int, seed: int, cap: int) -> dict:
             r.release()
 
 
+@oracle('wave_3d')
+def _wave_3d_standing_wave(ctx, size: int, seed: int, cap: int) -> dict:
+    """3D wave equation as an undriven, undamped standing wave.
+
+    For the linear wave equation  ∂²u/∂t² = c²·∇²u  with damping=0 and no
+    forcing, an eigenmode of the spatial Laplacian evolves as a perfect
+    harmonic oscillator:
+        u(x, t) = cos(k·x) · cos(ω·t),  ω = c·|k|.
+    The temporal autocorrelation of u therefore satisfies
+        C(t) = ⟨u(t)·u(0)⟩_x / ⟨u(0)²⟩_x = cos(ω·t).
+
+    We seed an axis-aligned cosine that exactly matches the engine's
+    mirror (Neumann) boundary (∂u/∂x = 0 at i=0 and i=L-1), step the
+    engine, and verify C(t) matches the analytic prediction.
+
+    Note: the `cap` argument is honoured as an upper bound on integration
+    length; the actual step count is chosen so that ω·t ≈ π/3 (a
+    well-conditioned phase, away from cos extrema).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'wave_3d'
+    c_wave = 0.5        # safely inside CFL at all sizes (c·dt·h_inv ≪ 1/√3)
+    dt = 0.15
+    amplitude = 0.5     # < 1 keeps us far from the |u|<100 clamp
+    n_mode = 4          # 4 half-wavelengths across the box
+    tol_rel = 0.03      # 3 % budget covers spatial dispersion (≈ 0.3 %) + slack
+
+    params = {'Wave speed': c_wave, 'Damping': 0.0,
+              'Drive freq': 0.0, 'Drive amp': 0.0}
+
+    # Continuum prediction.  h = REF/size; k in voxel units is π·n/(L-1),
+    # so k_phys = k_voxel / h.  Mirror BC enforces ∂u/∂x = 0 → cos with
+    # arg π·n·i/(L-1) is an exact discrete eigenmode of the boundary.
+    h = _REF_SIZE / float(size)
+    k_voxel = math.pi * n_mode / float(size - 1)
+    k_phys = k_voxel / h
+    omega = c_wave * k_phys
+
+    target_phase = math.pi / 3.0
+    steps = max(1, min(cap, int(round(target_phase / (omega * dt)))))
+    actual_phase = omega * steps * dt
+    expected_C = math.cos(actual_phase)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # Build IC: cosine along axis 0, zero velocity.
+        idx = np.arange(size, dtype=np.float64)
+        cos_1d = amplitude * np.cos(k_voxel * idx).astype(np.float32)
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[:, :, :, 0] = cos_1d[:, None, None]   # u
+        # v (channel 1), B, A all zero.
+        current_tex = r.tex_a if r.ping == 0 else r.tex_b
+        current_tex.write(data.tobytes())
+
+        g0 = np.asarray(r.read_grid())
+        u0 = g0[..., 0].astype(np.float64)
+        norm0 = float((u0 * u0).sum())
+        if norm0 <= 0.0:
+            return {'rule': rule, 'grade': 'err',
+                    'oracle': 'wave_3d_standing_wave',
+                    'reason': f'zero IC norm (norm0={norm0})'}
+
+        for _ in range(steps):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'wave_3d_standing_wave',
+                    'reason': f'NaN/Inf in grid after {steps} steps'}
+
+        u_t = g_t[..., 0].astype(np.float64)
+        C_t = float((u_t * u0).sum() / norm0)
+        rel_err = abs(C_t - expected_C) / max(abs(expected_C), 0.1)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'wave_3d_standing_wave',
+            'grade': grade,
+            'size': size,
+            'steps': steps,
+            'dt': dt,
+            'c_wave': c_wave,
+            'n_mode': n_mode,
+            'k_phys': k_phys,
+            'omega': omega,
+            'phase_rad': actual_phase,
+            'C_measured': C_t,
+            'C_expected': expected_C,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
 # ---------------------------------------------------------------------------
 # Probe driver
 # ---------------------------------------------------------------------------
@@ -280,12 +391,23 @@ def main(argv=None):
             if row.get('reason'):
                 print(f'          {row["reason"]}')
             if 'rel_err' in row:
-                print(f'          σ²(0)={row["sigma0_sq_phys"]:.4f}  '
-                      f'σ²(t)={row["sigma_t_sq_phys"]:.4f}  '
-                      f'expected={row["expected_sq_phys"]:.4f}  '
-                      f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
-                print(f'          mass_drift={row["mass_drift_rel"]:.2e}  '
-                      f'V_max={row["v_channel_max"]:.2e}')
+                # Diagnostic line is oracle-specific; emit whichever
+                # measured/expected pair the oracle produced.
+                if 'sigma_t_sq_phys' in row:
+                    print(f'          σ²(0)={row["sigma0_sq_phys"]:.4f}  '
+                          f'σ²(t)={row["sigma_t_sq_phys"]:.4f}  '
+                          f'expected={row["expected_sq_phys"]:.4f}  '
+                          f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
+                    print(f'          mass_drift={row["mass_drift_rel"]:.2e}  '
+                          f'V_max={row["v_channel_max"]:.2e}')
+                elif 'C_measured' in row:
+                    print(f'          ω={row["omega"]:.5f}  phase={row["phase_rad"]:.4f}rad  '
+                          f'C(t)={row["C_measured"]:.4f}  '
+                          f'expected={row["C_expected"]:.4f}  '
+                          f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
+                else:
+                    print(f'          rel_err={row["rel_err"]:.4f}  '
+                          f'(tol={row.get("tol", "?")})')
 
     if args.json:
         with open(args.json, 'w') as fh:
