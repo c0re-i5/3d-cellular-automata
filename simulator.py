@@ -17663,9 +17663,18 @@ def init_nca_random_specks(size, rng):
     network that's mildly diffusive lights up the whole cube quickly
     instead of spending hundreds of frames before the seed reaches a
     voxel boundary.
+
+    Speck count scales with grid *volume* so the volumetric density is
+    held roughly constant (~1 speck per 13k voxels, calibrated to give
+    n=20 at the canonical 64³ grid).  The earlier formula
+    ``size * size // 200`` scaled with grid *area*, which dropped the
+    volumetric density by ~16x going from size=32 to size=512 and
+    caused growing-NCA networks to starve at large grids.
     """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    n = max(8, size * size // 200)  # density ~1/(200 voxels per slice)
+    # 1 speck per ~13k voxels (≈ 20 at 64³); minimum 8 so tiny grids
+    # still get the "few seeds" feel.
+    n = max(8, size ** 3 // 13107)
     if hasattr(rng, 'integers'):
         coords = rng.integers(0, size, size=(n, 3))
     else:
@@ -20925,9 +20934,19 @@ def init_excitable_seed(size, rng):
 def init_excitable_random(size, rng):
     """Sparse random excited cells in a sea of rest. Asymmetric ignition
     geometry so the resulting waves break and form scroll structures
-    rather than concentric shells."""
+    rather than concentric shells.
+
+    Seed count scales with grid *volume* so the volumetric density is
+    held roughly constant (~1 seed per 16k voxels, calibrated to give
+    n=16 at the canonical 64³ grid).  The earlier formula
+    ``max(8, size // 4)`` scaled *linearly* with grid edge length,
+    which collapsed the volumetric density by ~64x going from
+    size=32 to size=192 and left large grids essentially empty —
+    Greenberg-Hastings then synchronised to a dead resting state
+    before any wave geometry could develop.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    n_seeds = max(8, size // 4)
+    n_seeds = max(8, size ** 3 // 16384)
     coords = rng.randint(0, size, size=(n_seeds, 3))
     for x, y, z in coords:
         data[int(x), int(y), int(z), 0] = 1.0 / 7.0
