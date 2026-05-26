@@ -28,7 +28,7 @@ Usage::
     python -m ca_debug.analytic_oracles --rules reaction_diffusion_3d
     python -m ca_debug.analytic_oracles --severity ok --json /tmp/ora.json
 
-Currently registered (4):
+Currently registered (5):
   * reaction_diffusion_3d — Gray-Scott reduced to pure 3D diffusion via
     F=k=Dv=0, V≡0; verifies σ²(t) = σ²(0) + 2·D·t for an isotropic
     Gaussian initial condition (Green's function of the heat equation).
@@ -37,11 +37,15 @@ Currently registered (4):
     with ω = c·|k| (d'Alembert plane-wave dispersion).
   * quantum_wavepacket — Schrödinger free-particle (V=0) Gaussian
     wave packet at rest; verifies the textbook quantum dispersion
-    σ²(t) = σ₀² + (α·t/σ₀)² with α = ℏ/(2m) measured on the
+    σ²(t) = σ₀² + (α·t/σ₀)² with α = ħ/(2m) measured on the
     probability density |Ψ|² (channel A).
   * sine_gordon_3d — small-amplitude (A≈0.05) Klein-Gordon limit
     sin(u) ≈ u; verifies the massive dispersion ω² = c²·k² + m² via
     the temporal correlation of a periodic standing wave.
+  * brusselator_3d — Hopf-spiral linearisation around (U*, V*) = (A, B/A)
+    with a spatially homogeneous perturbation; tests the reaction-kinetics
+    integrator in isolation (∇² ≡ 0) against the closed-form trajectory
+    ε(t) = ε₀·exp(½ t)·(cos, sin) of the complex eigenpair ½ ± i·√3/2.
 """
 from __future__ import annotations
 
@@ -519,6 +523,160 @@ def _sine_gordon_klein_gordon_limit(ctx, size: int, seed: int, cap: int) -> dict
             r.release()
 
 
+@oracle('brusselator_3d')
+def _brusselator_hopf_linear_growth(ctx, size: int, seed: int, cap: int) -> dict:
+    """Brusselator linearised around the homogeneous fixed point (Hopf spiral).
+
+    The Brusselator reaction equations are
+        ∂U/∂t = Dᵤ·∇²U + A − (B+1)·U + U²·V
+        ∂V/∂t = Dᵥ·∇²V       + B·U      − U²·V
+    with homogeneous fixed point (U*, V*) = (A, B/A).  Linearising
+    Ũ = U − A, Ṽ = V − B/A around the fixed point gives the Jacobian
+        J = [[ B − 1,   A²  ],
+             [ −B,     −A²  ]].
+    For default A=1, B=3:  J = [[2, 1], [−3, −1]],  tr = 1,  det = 1,
+    so the eigenvalues are λ = ½ ± i·√3/2 — a Hopf spiral with growth
+    rate σ = ½ and angular frequency Ω = √3/2.
+
+    With a *spatially homogeneous* perturbation the Laplacian is exactly
+    zero everywhere, so diffusion drops out and the dynamics reduce to
+    pure ODE integration of the reaction terms — a clean, independent
+    test of the engine's reaction kinetics (complementary to
+    `reaction_diffusion_3d` which tests pure diffusion).
+
+    We seed (U, V) = (A + ε, B/A − 1.5·ε) — the real part of the right
+    eigenvector for λ_+ = ½ + i·√3/2 — and verify that after t = N·dt
+    both (Ũ, Ṽ) match the closed-form trajectory
+        Ũ(t) = ε·exp(σt)·cos(Ωt)
+        Ṽ(t) = ε·exp(σt)·[−1.5·cos(Ωt) + Ω/σ·sin(Ωt)·σ/Ω... ]
+    Explicitly, from Re[c·v_+·exp(λ_+·t)] with c=1, v_+=(1, −1.5+i·√3/2):
+        Ũ(t) = ε·exp(σt)·cos(Ωt)
+        Ṽ(t) = ε·exp(σt)·[−1.5·cos(Ωt) − (√3/2)·sin(Ωt)·(−1)]
+             = ε·exp(σt)·[−1.5·cos(Ωt) + (√3/2)·sin(Ωt)]
+    (cross-checked: at t=0 gives (ε, −1.5ε) ✓).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'brusselator_3d'
+    A_param = 1.0
+    B_param = 3.0
+    Du = 2.0
+    Dv = 8.0
+    # The shader integrates with forward Euler (symplectic on a spiral
+    # over-rotates the growth eigenvalue).  Per-step ratio
+    # |1+λ·dt|/exp(σ·dt) at dt=0.05 leaks ~6 % over 100 steps, which
+    # blows the 5 % continuum-vs-discrete budget.  dt=0.01 (5× tighter)
+    # brings FE within <1 % of the continuum trajectory.
+    dt = 0.01
+    epsilon = 1.0e-3    # quadratic terms ~ε²/A ≈ 1e-6 stay 1000× below linear
+    tol_rel = 0.05      # 5 % budget: explicit-Euler O(dt²) phase + amplitude drift
+
+    params = {'A': A_param, 'B': B_param, 'Du': Du, 'Dv': Dv}
+
+    # Closed-form linear trajectory (J = [[B-1, A²], [-B, -A²]] at fixed pt).
+    U_star = A_param
+    V_star = B_param / A_param
+    trJ = (B_param - 1.0) - A_param * A_param          # = 1 at defaults
+    detJ = -A_param * A_param * (B_param - 1.0) + A_param * A_param * B_param  # = A²
+    sigma = trJ / 2.0
+    disc = trJ * trJ - 4.0 * detJ
+    if disc >= 0.0:
+        return {'rule': rule, 'grade': 'err',
+                'oracle': 'brusselator_hopf_linear_growth',
+                'reason': f'not in Hopf regime (disc={disc})'}
+    Omega = math.sqrt(-disc) / 2.0                     # = √3/2 at defaults
+
+    # IC: U = A + ε, V = B/A + ε·v_y where v_y = -1.5 (= (J11-σ)/J12·something)
+    # is the real part of the right eigenvector for λ_+.
+    # General formula: Re-part of v_+ has (1, (σ - J11)/J12) for J12 ≠ 0.
+    J11 = B_param - 1.0
+    J12 = A_param * A_param
+    v_y = (sigma - J11) / J12                           # = -1.5 at defaults
+
+    t_phys = float(cap) * dt
+    growth = math.exp(sigma * t_phys)
+    c_arg = Omega * t_phys
+    cos_c = math.cos(c_arg)
+    sin_c = math.sin(c_arg)
+    # Closed-form (derived from Re[v_+ · exp(λ_+ t)] with c=1, v_+=(1, v_y + i·Ω/J12)):
+    expected_dU = epsilon * growth * cos_c
+    expected_dV = epsilon * growth * (v_y * cos_c - (Omega / J12) * sin_c)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # Homogeneous IC ensures ∇²U = ∇²V ≡ 0 — diffusion drops out
+        # entirely so this is a pure-ODE test of the reaction kinetics.
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[:, :, :, 0] = np.float32(U_star + epsilon)
+        data[:, :, :, 1] = np.float32(V_star + epsilon * v_y)
+        current_tex = r.tex_a if r.ping == 0 else r.tex_b
+        current_tex.write(data.tobytes())
+
+        for _ in range(cap):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'brusselator_hopf_linear_growth',
+                    'reason': f'NaN/Inf in grid after {cap} steps'}
+
+        # Homogeneous dynamics: every voxel must hold the same value
+        # (modulo fp32 noise).  Measure deviation from the fixed point
+        # via mean, and homogeneity loss via spatial std.
+        U_t_field = g_t[..., 0].astype(np.float64)
+        V_t_field = g_t[..., 1].astype(np.float64)
+        U_t_mean = float(U_t_field.mean())
+        V_t_mean = float(V_t_field.mean())
+        U_t_std = float(U_t_field.std())
+        V_t_std = float(V_t_field.std())
+        dU = U_t_mean - U_star
+        dV = V_t_mean - V_star
+
+        # Relative error vs the predicted (Ũ, Ṽ) trajectory, normalised
+        # by ε·exp(σt) so growth doesn't artificially shrink small denoms.
+        denom = epsilon * growth
+        err_U = abs(dU - expected_dU) / denom
+        err_V = abs(dV - expected_dV) / denom
+        rel_err = max(err_U, err_V)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'brusselator_hopf_linear_growth',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'A': A_param,
+            'B': B_param,
+            'sigma_hopf': sigma,
+            'Omega_hopf': Omega,
+            't_phys': t_phys,
+            'growth_efold': growth,
+            'epsilon': epsilon,
+            'dU_measured': dU,
+            'dU_expected': expected_dU,
+            'dV_measured': dV,
+            'dV_expected': expected_dV,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+            'homogeneity_std_U': U_t_std,
+            'homogeneity_std_V': V_t_std,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
 # ---------------------------------------------------------------------------
 # Probe driver
 # ---------------------------------------------------------------------------
@@ -621,6 +779,13 @@ def main(argv=None):
                           f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
                     print(f'          α=ℏ/2m={row["hbar_2m"]:.3f}  '
                           f't={row["t_phys"]:.3f}  prob_mass={row["prob_mass"]:.4e}')
+                elif 'dU_measured' in row:
+                    print(f'          σ={row["sigma_hopf"]:.4f}  Ω={row["Omega_hopf"]:.4f}  '
+                          f't={row["t_phys"]:.3f}  growth={row["growth_efold"]:.4f}×  '
+                          f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
+                    print(f'          ΔU={row["dU_measured"]:+.5e} vs {row["dU_expected"]:+.5e}  '
+                          f'ΔV={row["dV_measured"]:+.5e} vs {row["dV_expected"]:+.5e}  '
+                          f'hom_std=(U:{row["homogeneity_std_U"]:.2e}, V:{row["homogeneity_std_V"]:.2e})')
                 else:
                     print(f'          rel_err={row["rel_err"]:.4f}  '
                           f'(tol={row.get("tol", "?")})')
