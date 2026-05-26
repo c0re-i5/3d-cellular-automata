@@ -16105,9 +16105,12 @@ RULE_PRESETS = {
         # and post-shock |u|≈2, max wave speed is ≈5. dt=0.05 gives a
         # CFL of ~0.25 — comfortably stable for the blast initial
         # condition, where momentum and energy build up fast.
+        # dt_range upper bound capped at 0.10 (CFL≈0.5): empirically
+        # dt≥0.12 NaN-overflows within 200 steps at default_size=96 as
+        # local wave speeds spike above the reference estimate.
         "default_size": 96,
         "dt": 0.05,
-        "dt_range": (0.005, 0.3),
+        "dt_range": (0.005, 0.10),
         "init": "euler_blast",
         "init_variants": ["euler_blast", "euler_shocktube",
                           "euler_kelvin_helmholtz"],
