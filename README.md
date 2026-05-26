@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with an extensive physical-correctness suite (`ca_debug.*`, 17 audit probes covering shader hygiene, spatial equivariance, parameter coupling, conservation laws, determinism, dt/grid convergence, init-variant smoke, long-run drift, discovery-replay fidelity, slider-endpoint runnability and more), plus an end-to-end recording → YouTube → Reddit publishing pipeline.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with an extensive physical-correctness suite (`ca_debug.*`, 19 audit probes covering shader hygiene, spatial equivariance, parameter coupling, conservation laws, determinism, dt/grid convergence, init-variant smoke, long-run drift, discovery-replay fidelity, slider-endpoint runnability, render-side visibility, and golden-snapshot regression guards), plus an end-to-end recording → YouTube → Reddit publishing pipeline.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -209,6 +209,8 @@ python -m ca_debug.param_coherence           # static u_paramK ↔ preset slot b
 python -m ca_debug.discoveries_replay        # discoveries.json catalogue replayable (~9 s, GPU)
 python -m ca_debug.param_endpoints           # every slider's full range is runnable (~8 s, GPU)
 python -m ca_debug.dt_endpoints              # dt_range endpoints stay finite (~1 s, GPU)
+python -m ca_debug.visibility_audit          # would-the-user-see-anything render mask (~15 s, GPU)
+python -m ca_debug.golden_snapshots          # bit-exact + tol-stat regression vs blessed state (~18 s, GPU)
 ```
 
 Each probe accepts `--rules <comma-separated>` to scope to a single preset, and `--size`/`--steps` to widen or narrow the test window.
@@ -308,7 +310,7 @@ Shaders that use large neighbourhood radii (SmoothLife, Lenia) have an optimised
 
 ## Quality Assurance
 
-The `ca_debug/` package provides a 17-probe correctness suite that audits every preset against a different physical-correctness criterion. All probes are headless and run end-to-end against the real simulator pipeline (the `HeadlessRunner` is the same one `test_harness.py` uses), so the verdict reflects the production code path.
+The `ca_debug/` package provides a 19-probe correctness suite that audits every preset against a different physical-correctness criterion. All probes are headless and run end-to-end against the real simulator pipeline (the `HeadlessRunner` is the same one `test_harness.py` uses), so the verdict reflects the production code path.
 
 ```bash
 # Original physics-correctness probes
@@ -332,6 +334,8 @@ python -m ca_debug.param_coherence        # static GLSL u_paramK reads ↔ prese
 python -m ca_debug.discoveries_replay     # discoveries.json catalogue (28k entries) replayable
 python -m ca_debug.param_endpoints        # every slider's full declared range runs without crash/NaN
 python -m ca_debug.dt_endpoints           # dt_range endpoints stay finite (catches over-generous dt_max)
+python -m ca_debug.visibility_audit       # would-the-user-see-anything (renderer mask on vis_default)
+python -m ca_debug.golden_snapshots       # bit-exact + tol-stat regression vs blessed engine state
 ```
 
 | Probe | What it catches |
@@ -354,6 +358,8 @@ python -m ca_debug.dt_endpoints           # dt_range endpoints stay finite (catc
 | **discoveries_replay** | Samples `discoveries.json` (28k entries, 82 rules, 170 (rule, init-variant) pairs) and re-runs each via `HeadlessRunner` with its recorded params/dt/seed; catches rule renames, param-schema drift, init-variant removal, and replay crashes. |
 | **param_endpoints** | For each rule × slider × endpoint (low/high from `preset['param_ranges']`), sets just that one param to the endpoint and replays for `--cap` steps; flags crash or NaN/Inf. Verifies every advertised slider range is actually runnable. |
 | **dt_endpoints** | Like `param_endpoints` but for the `dt_range` slider: tests dt at (dt_min, dt_max) with default params; flags CFL-violation blow-ups. Caught `compressible_euler_3d` advertising `dt_range=(0.005, 0.3)` while NaN-overflowing for dt ≥ 0.12 (CFL > 0.6). |
+| **visibility_audit** | Closes the render-side blind spot: replays each rule to its audit horizon and computes the same visibility mask the GPU renderer applies (`val > voxel_threshold` in voxel mode, `val > iso_threshold` in iso mode, normalised value above accumulation floor in volumetric mode) on the `vis_default` channel; grades by visible-voxel fraction. Catches the Bug J class — simulation evolves fine but renderer culls everything (e.g. unset `voxel_threshold` smaller than the channel's natural range). Bonus diagnostic: flags channels whose (p1,p99) percentile falls outside `vis_range` (dim / saturated / narrow). |
+| **golden_snapshots** | Level-3 regression guard: stores bit-exact byte hashes plus per-channel summary stats (mean/std/min/max/alive_count) of each rule's grid at fixed checkpoint steps in `ca_debug/golden/<rule>.json`. `--check` (default) grades divergence vs blessed state — `ok` for hash-identical, `high` for hash-differs/stats-within-tol (FP noise), `crit` for stats-diverged beyond `--rtol` (default 1%). Converts the user's act of visual approval into a permanent regression guard. Skips agent/particle/SSBO/viewport rules whose output isn't reproducibly hashable. |
 
 Probes share a common headless harness in `ca_debug/recorder.py` and emit terminal-readable summaries plus optional JSON for CI:
 
