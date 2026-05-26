@@ -28,13 +28,17 @@ Usage::
     python -m ca_debug.analytic_oracles --rules reaction_diffusion_3d
     python -m ca_debug.analytic_oracles --severity ok --json /tmp/ora.json
 
-Currently registered (2):
+Currently registered (3):
   * reaction_diffusion_3d — Gray-Scott reduced to pure 3D diffusion via
     F=k=Dv=0, V≡0; verifies σ²(t) = σ²(0) + 2·D·t for an isotropic
     Gaussian initial condition (Green's function of the heat equation).
   * wave_3d — undriven, undamped standing wave cos(k·x); verifies
     the temporal correlation ⟨u(t)·u(0)⟩/⟨u(0)²⟩ matches cos(ω·t)
     with ω = c·|k| (d'Alembert plane-wave dispersion).
+  * quantum_wavepacket — Schrödinger free-particle (V=0) Gaussian
+    wave packet at rest; verifies the textbook quantum dispersion
+    σ²(t) = σ₀² + (α·t/σ₀)² with α = ℏ/(2m) measured on the
+    probability density |Ψ|² (channel A).
 """
 from __future__ import annotations
 
@@ -310,6 +314,103 @@ def _wave_3d_standing_wave(ctx, size: int, seed: int, cap: int) -> dict:
             r.release()
 
 
+@oracle('quantum_wavepacket')
+def _quantum_free_gaussian_spread(ctx, size: int, seed: int, cap: int) -> dict:
+    """Free Schrödinger Gaussian wave packet at rest.
+
+    For ∂Ψ/∂t = i·α·∇²Ψ with α = ℏ/(2m) and V = 0, a minimum-uncertainty
+    Gaussian ψ_R(x,0) = exp(-r²/(4σ_ψ²)), ψ_I(x,0) = 0 spreads as
+        |Ψ|²(x,t) = (2π·σ(t)²)^(-3/2) · exp(-r²/(2σ(t)²))
+        σ²(t) = σ_ψ² + (α·t/σ_ψ)²
+    (textbook quantum dispersion of a Gaussian wave packet).  The 2nd
+    moment of |Ψ|² equals σ_ψ²(t) per axis.
+
+    Engine timestep convention: the Yee/FDTD staggered leapfrog advances
+    ψ_I on even frames and ψ_R on odd frames, each by u_dt.  After N
+    engine frames the joint (ψ_R, ψ_I) state has advanced by N·dt/2 in
+    physical time, so t_phys = N · dt / 2.  We verified this empirically
+    against the closed-form before committing.
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'quantum_wavepacket'
+    hbar_2m = 5.0       # large enough that 100 default steps give visible spread
+    dt = 0.1            # max of dt_range; stability: dt < h²/(2α) = 4/10 = 0.4 ✓
+    sigma_psi_voxels = 3.0   # ~6 voxel FWHM in |Ψ|²; tails decay to ~1e-4 by box edge
+    amplitude = 0.5     # peak |ψ| well under the 1e3 clamp
+    tol_rel = 0.05      # 5 % budget: 6-point Laplacian dispersion + leapfrog offset
+
+    params = {'ħ/2m': hbar_2m, 'V strength': 0.0}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # IC: ψ_R = A·exp(-r²/(4σ²))  (wavefunction shape, so |Ψ|² has
+        # second moment σ² directly).  ψ_I = V = 0; channel A is
+        # repopulated by the shader on the first step.
+        cc = (size - 1) * 0.5
+        ax = np.arange(size, dtype=np.float64) - cc
+        r2 = (ax[:, None, None] ** 2
+              + ax[None, :, None] ** 2
+              + ax[None, None, :] ** 2)
+        psi_r = (amplitude * np.exp(-r2 / (4.0 * sigma_psi_voxels ** 2))
+                 ).astype(np.float32)
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[:, :, :, 0] = psi_r
+        current_tex = r.tex_a if r.ping == 0 else r.tex_b
+        current_tex.write(data.tobytes())
+
+        for _ in range(cap):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'quantum_free_gaussian_spread',
+                    'reason': f'NaN/Inf in grid after {cap} steps'}
+
+        prob = g_t[..., 3].astype(np.float64)
+        s_t_vox, m_t = _measure_isotropic_sigma_sq(prob)
+        if not np.isfinite(s_t_vox) or m_t <= 0.0:
+            return {'rule': rule, 'grade': 'err',
+                    'oracle': 'quantum_free_gaussian_spread',
+                    'reason': f'bad |Ψ|²: mass={m_t}, sigma²={s_t_vox}'}
+
+        s0_phys = _voxel_sq_to_physical(sigma_psi_voxels ** 2, size)
+        s_t_phys = _voxel_sq_to_physical(s_t_vox, size)
+        t_phys = float(cap) * dt * 0.5   # Yee leapfrog half-step convention
+        expected_phys = s0_phys + (hbar_2m * t_phys) ** 2 / s0_phys
+        rel_err = abs(s_t_phys - expected_phys) / expected_phys
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'quantum_free_gaussian_spread',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'hbar_2m': hbar_2m,
+            't_phys': t_phys,
+            'sigma0_sq_phys_q': s0_phys,
+            'sigma_t_sq_phys_q': s_t_phys,
+            'expected_sq_phys_q': expected_phys,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+            'prob_mass': float(prob.sum()),
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
 # ---------------------------------------------------------------------------
 # Probe driver
 # ---------------------------------------------------------------------------
@@ -405,6 +506,13 @@ def main(argv=None):
                           f'C(t)={row["C_measured"]:.4f}  '
                           f'expected={row["C_expected"]:.4f}  '
                           f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
+                elif 'sigma_t_sq_phys_q' in row:
+                    print(f'          σ²(0)={row["sigma0_sq_phys_q"]:.4f}  '
+                          f'σ²(t)={row["sigma_t_sq_phys_q"]:.4f}  '
+                          f'expected={row["expected_sq_phys_q"]:.4f}  '
+                          f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
+                    print(f'          α=ℏ/2m={row["hbar_2m"]:.3f}  '
+                          f't={row["t_phys"]:.3f}  prob_mass={row["prob_mass"]:.4e}')
                 else:
                     print(f'          rel_err={row["rel_err"]:.4f}  '
                           f'(tol={row.get("tol", "?")})')
