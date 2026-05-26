@@ -211,7 +211,7 @@ python -m ca_debug.param_endpoints           # every slider's full range is runn
 python -m ca_debug.dt_endpoints              # dt_range endpoints stay finite (~1 s, GPU)
 python -m ca_debug.visibility_audit          # would-the-user-see-anything render mask (~15 s, GPU)
 python -m ca_debug.golden_snapshots          # bit-exact + tol-stat regression vs blessed state (~18 s, GPU)
-python -m ca_debug.analytic_oracles          # closed-form analytic ground truth (~1 s, GPU)
+python -m ca_debug.analytic_oracles          # closed-form analytic ground truth (heat / wave / Schrödinger / Klein-Gordon, ~0.2 s, GPU)
 ```
 
 Each probe accepts `--rules <comma-separated>` to scope to a single preset, and `--size`/`--steps` to widen or narrow the test window.
@@ -337,7 +337,7 @@ python -m ca_debug.param_endpoints        # every slider's full declared range r
 python -m ca_debug.dt_endpoints           # dt_range endpoints stay finite (catches over-generous dt_max)
 python -m ca_debug.visibility_audit       # would-the-user-see-anything (renderer mask on vis_default)
 python -m ca_debug.golden_snapshots       # bit-exact + tol-stat regression vs blessed engine state
-python -m ca_debug.analytic_oracles       # closed-form ground truth (heat-eq Gaussian, wave dispersion)
+python -m ca_debug.analytic_oracles       # closed-form ground truth (heat / wave / Schrödinger / Klein-Gordon)
 ```
 
 | Probe | What it catches |
@@ -362,7 +362,7 @@ python -m ca_debug.analytic_oracles       # closed-form ground truth (heat-eq Ga
 | **dt_endpoints** | Like `param_endpoints` but for the `dt_range` slider: tests dt at (dt_min, dt_max) with default params; flags CFL-violation blow-ups. Caught `compressible_euler_3d` advertising `dt_range=(0.005, 0.3)` while NaN-overflowing for dt ≥ 0.12 (CFL > 0.6). |
 | **visibility_audit** | Closes the render-side blind spot: replays each rule to its audit horizon and computes the same visibility mask the GPU renderer applies (`val > voxel_threshold` in voxel mode, `val > iso_threshold` in iso mode, normalised value above accumulation floor in volumetric mode) on the `vis_default` channel; grades by visible-voxel fraction. Catches the Bug J class — simulation evolves fine but renderer culls everything (e.g. unset `voxel_threshold` smaller than the channel's natural range). Bonus diagnostic: flags channels whose (p1,p99) percentile falls outside `vis_range` (dim / saturated / narrow). |
 | **golden_snapshots** | Level-3 regression guard: stores bit-exact byte hashes plus per-channel summary stats (mean/std/min/max/alive_count) of each rule's grid at fixed checkpoint steps in `ca_debug/golden/<rule>.json`. `--check` (default) grades divergence vs blessed state — `ok` for hash-identical, `high` for hash-differs/stats-within-tol (FP noise), `crit` for stats-diverged beyond `--rtol` (default 1%). Converts the user's act of visual approval into a permanent regression guard. Skips agent/particle/SSBO/viewport rules whose output isn't reproducibly hashable. |
-| **analytic_oracles** | Level-5 closed-form ground truth: each registered rule has a per-rule oracle that sets up a problem the engine can solve AND analytic theory can predict, runs the engine, measures an observable, and compares to the prediction within a relative-error tolerance.  Registered so far: `reaction_diffusion_3d` reduced to the pure heat equation (σ²(t) = σ²(0) + 2·D·t for a Gaussian IC — bit-perfect agreement at size=64, 100 steps); `wave_3d` undriven standing wave (temporal autocorrelation matches cos(ω·t) with ω = c·|k| to <1 %% rel-err).  Rules without an oracle skip cleanly; framework is extensible via the `@oracle(rule)` decorator. |
+| **analytic_oracles** | Level-5 closed-form ground truth: each registered rule has a per-rule oracle that sets up a problem the engine can solve AND analytic theory can predict, runs the engine, measures an observable, and compares to the prediction within a relative-error tolerance.  Registered so far (4): `reaction_diffusion_3d` reduced to the pure heat equation (σ²(t) = σ²(0) + 2·D·t for a Gaussian IC — **bit-perfect** at size=64, 100 steps); `wave_3d` undriven standing wave (temporal autocorrelation matches cos(ω·t) with ω = c·|k| to <1 %); `quantum_wavepacket` free-particle Schrödinger Gaussian (textbook quantum dispersion σ²(t) = σ₀² + (α·t/σ₀)² with α = ħ/(2m) — 0.3 % rel-err at ~50 % spread); `sine_gordon_3d` in the small-amplitude (A=0.05) Klein-Gordon limit sin(u)≈u (massive dispersion ω² = c²k² + m² — 3 % rel-err on a single eigenmode).  Rules without an oracle skip cleanly; framework is extensible via the `@oracle(rule)` decorator. |
 
 Probes share a common headless harness in `ca_debug/recorder.py` and emit terminal-readable summaries plus optional JSON for CI:
 
