@@ -74,10 +74,24 @@ _SEV_ORDER = {'err': 0, 'crit': 1, 'high': 2, 'med': 3, 'ok': 4, 'n/a': 5}
 # IC transforms.  Each is (forward, inverse) where both operate on a
 # (N, N, N, 4) numpy array.  Vector channels (if declared) are rotated
 # in lockstep.
+#
+# AXIS CONVENTION.  Grids are stored in numpy as ``arr[z, y, x, c]`` --
+# OpenGL's ``texture3d`` memory layout puts ``x`` in the fastest-varying
+# slot, which translates to the LAST spatial axis when read back into a
+# NumPy buffer.  The helpers below take ``axis`` in *shader* coordinates
+# (0=X, 1=Y, 2=Z) and translate to the corresponding NumPy axis via
+# ``_arr_axis = 2 - axis``.  Vector-channel indices stay in shader order
+# (vec_channels = (vx, vy, vz)) so callers can declare them directly.
 # ---------------------------------------------------------------------------
 
+# Convert a shader-space axis index (0=X, 1=Y, 2=Z) to the corresponding
+# NumPy array axis (last-axis = x, first-axis = z).
+def _arr_axis(shader_axis: int) -> int:
+    return 2 - shader_axis
+
+
 def _shift(arr: np.ndarray, axis: int, k: int) -> np.ndarray:
-    return np.roll(arr, k, axis=axis)
+    return np.roll(arr, k, axis=_arr_axis(axis))
 
 
 def _rot90(arr: np.ndarray, axis: int, k: int = 1,
@@ -89,7 +103,10 @@ def _rot90(arr: np.ndarray, axis: int, k: int = 1,
     """
     # `np.rot90` operates on a plane; we want a 3D rotation about an
     # axis, which is rot90 in the plane perpendicular to that axis.
-    plane = {0: (1, 2), 1: (2, 0), 2: (0, 1)}[axis]
+    # Map shader axes (X,Y,Z) -> array axes (last, mid, first).
+    plane = {0: (_arr_axis(1), _arr_axis(2)),   # X-rot: plane (Y,Z)
+             1: (_arr_axis(2), _arr_axis(0)),   # Y-rot: plane (Z,X)
+             2: (_arr_axis(0), _arr_axis(1))}[axis]  # Z-rot: plane (X,Y)
     out = np.rot90(arr, k=k, axes=plane).copy()
     if vec_channels is not None:
         vx, vy, vz = vec_channels
@@ -112,7 +129,7 @@ def _rot90(arr: np.ndarray, axis: int, k: int = 1,
 
 def _reflect(arr: np.ndarray, axis: int,
              vec_channels: tuple[int, int, int] | None = None) -> np.ndarray:
-    out = np.flip(arr, axis=axis).copy()
+    out = np.flip(arr, axis=_arr_axis(axis)).copy()
     if vec_channels is not None:
         vx, vy, vz = vec_channels
         comp = (vx, vy, vz)[axis]
@@ -147,6 +164,7 @@ def _detect_lab_noise_shaders() -> set[str]:
     pat = re.compile(
         r'\b(?:'
         r'hash_static|hash_temporal|hash_dir|block_hash|pp_hash|ppr_hash'
+        r'|sw_hash'                  # smallworld_ca_3d: quenched WS rewire graph
         r'|fbm3|noise3'
         r')\s*\('
         r'|fract\s*\(\s*sin\s*\([^)]*\bpos\b',
@@ -293,6 +311,7 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
     error message.
     """
     from test_harness import HeadlessRunner
+    from simulator import _resolve_composed_preset
 
     # Control: build runner, take a copy of the IC, evolve.
     r1 = HeadlessRunner(ctx, rule, size=size, seed=seed)
@@ -324,9 +343,20 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
         rsize = getattr(r2, 'size', size)
         ic2 = np.frombuffer(r2.tex_a2.read(), dtype=r2._tex_np_dtype).reshape(
             rsize, rsize, rsize, 4).astype(np.float32)
-        # Use vector_channels=(0,1,2) for pair2 since the convention is
-        # almost universally (vx, vy, vz, scalar) in this codebase.
-        ic2_t = probe.forward(ic2, (0, 1, 2))
+        # Pair-2 layout varies across rules.  Common conventions:
+        #   (vx, vy, vz, scalar)  -- fire, flocking, fluids, EM, ...
+        #   (scalar, scalar, scalar_mag, pseudo) -- e.g. compressible
+        #       Euler stores (E, p, |u|, helicity); none of these flip
+        #       under a parity transform of pair-1.  Negating E would
+        #       break the comparison even though the shader is fine.
+        # Presets can override the default (0,1,2) by declaring
+        # `pair2_vector_channels`; setting it to None disables the
+        # channel-sign flip while still applying the spatial transform.
+        preset = _resolve_composed_preset(rule)
+        pair2_vc = preset.get('pair2_vector_channels', (0, 1, 2))
+        if pair2_vc is not None:
+            pair2_vc = tuple(int(x) for x in pair2_vc)
+        ic2_t = probe.forward(ic2, pair2_vc)
         enc2 = ic2_t.astype(np.float32 if r2._tex_np_dtype == np.float32
                             else np.float16, copy=False).tobytes()
         r2.tex_a2.write(enc2)
@@ -352,12 +382,22 @@ def _run_pair(ctx, rule: str, *, size: int, steps: int, seed: int,
     ctrl_norm = float(np.linalg.norm(a))
     diff_norm = float(np.linalg.norm(diff))
     err = diff_norm / max(ctrl_norm, 1e-9)
-    return {
+    ic_norm = float(np.linalg.norm(ic))
+    out: dict[str, Any] = {
         'err': err,
         'ctrl_norm': ctrl_norm,
         'diff_norm': diff_norm,
-        'ic_norm': float(np.linalg.norm(ic)),
+        'ic_norm': ic_norm,
     }
+    # An IC of exactly (or essentially) zero produces a meaningless
+    # equivariance probe: the "control" and "transformed" runs both
+    # start from the same all-zeros state, so any later divergence is
+    # driven by floating-point chatter or per-frame noise, not by the
+    # rule's response to the IC.  Flag and skip.
+    if ic_norm < 1e-9:
+        out['skipped'] = True
+        out['skip_reason'] = 'ic_norm~=0 (empty initial condition)'
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +476,12 @@ def _vec_channels(preset: dict) -> tuple[int, int, int] | None:
         for axis, key in (('x', 'vx'), ('y', 'vy'), ('z', 'vz')):
             if (f'vel {axis}' in n or n.endswith(f'_{key}') or
                     n == key or n.endswith(f' {axis}') and 'vel' in n):
+                found[axis] = i
+            # Momentum components: "Mom_x", "Mom x", "momentum_x" etc.
+            # Under reflection ρu_i flips sign exactly like u_i, so they
+            # qualify as vector channels for symmetry purposes.
+            if ('mom' in n and (n.endswith(f'_{axis}') or n.endswith(f' {axis}')
+                                or n.endswith(axis))):
                 found[axis] = i
         # Also catch Bx/By/Bz, Ex/Ey/Ez
         if len(n) <= 3 and n.endswith(('x', 'y', 'z')) and n[0] in 'beuv':

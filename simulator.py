@@ -3162,7 +3162,17 @@ void main() {
     // and the entire medium locks into uniform excitation (u → 1
     // everywhere, a stable fixed point of the Barkley kinetics). The
     // 1/h_sq^1.5 factor cancels the (size/REF_SIZE)³ cell-count growth.
-    float nuc_rate = 2.0e-5 / max(pow(h_sq, 1.5), 1e-6);
+    //
+    // Per-time (not per-step) scaling: the dt-convergence probe caught
+    // that the previous `2e-5 / h_sq^1.5` was a per-FRAME probability,
+    // so refining u_dt silently rescaled the physical nucleation rate
+    // (4× more events at u_dt/4 over the same simulated time, which
+    // made the refined trajectory diverge from the coarse one at
+    // ratio = exactly 2.0 — the dt ratio).  Multiplying by
+    // ``u_dt / 0.05`` (the preset default) keeps the rate unchanged at
+    // the GUI's default dt while making it proportional to simulated
+    // time at any other dt the user selects.
+    float nuc_rate = (2.0e-5 * u_dt / 0.05) / max(pow(h_sq, 1.5), 1e-6);
     float nuc_thresh = 1.0 - clamp(nuc_rate, 0.0, 0.5);
     float nuc = hash_temporal(pos, 0);
     if (nuc > nuc_thresh && u < 0.1 && v < 0.1) {
@@ -3275,9 +3285,19 @@ void main() {
     // Tissue grows where activator is high, decays slowly elsewhere
     float d_rho = growth * (a - 0.3) * rho + 0.002 * lap_rho;
 
-    float new_a = clamp(a + d_a * u_dt, 0.0, 5.0);
-    float new_h = clamp(h + d_h * u_dt, 0.0, 10.0);
-    float new_rho = clamp(rho + d_rho * u_dt, 0.0, 1.0);
+    // CFL-safe dt clamp.  Explicit Euler 3D diffusion is stable when
+    // D * dt * h_sq <= 1/6.  At grids larger than REF_SIZE = 128
+    // h_sq > 1 and the preset's 'dt' (tuned at 128) violates CFL --
+    // observed in the scale-sweep as 'morphogen_spots' going
+    // saturated/NaN at sizes 256 and 384.  Same pattern as the
+    // gray_scott / schnakenberg / fitzhugh shaders below.
+    float D_max    = max(max(Da, Dh), 0.002);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float new_a = clamp(a + d_a * dt_eff, 0.0, 5.0);
+    float new_h = clamp(h + d_h * dt_eff, 0.0, 10.0);
+    float new_rho = clamp(rho + d_rho * dt_eff, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_a, new_h, new_rho, 0.0));
 }
@@ -9503,8 +9523,20 @@ void main() {
         }
     }
 
-    float v_new = v_val + force * u_dt;
-    float u_new = u_val + v_new * u_dt;
+    // CFL-safe dt clamp.  Explicit leapfrog for the 3D wave equation
+    // is stable when  c^2 * dt^2 * h_sq <= 1/3 (Courant condition with
+    // 6-point Laplacian).  At grids larger than REF_SIZE = 128 h_sq>1
+    // and the preset's 'dt' (tuned at 128) violates CFL -- observed in
+    // the scale-sweep as 'sine_gordon_3d' going NaN at size 384.
+    // Use a small safety margin (0.9) and drop the bound on c2=0 by
+    // falling back to the user-requested dt.
+    float dt_wave  = (c2 > 1e-8)
+                   ? sqrt(0.9 / 3.0 / max(c2 * h_sq, 1e-8))
+                   : u_dt;
+    float dt_eff   = min(u_dt, dt_wave);
+
+    float v_new = v_val + force * dt_eff;
+    float u_new = u_val + v_new * dt_eff;
 
     imageStore(u_dst, pos, vec4(u_new, v_new, 0.0, 0.0));
 }
@@ -16073,9 +16105,12 @@ RULE_PRESETS = {
         # and post-shock |u|≈2, max wave speed is ≈5. dt=0.05 gives a
         # CFL of ~0.25 — comfortably stable for the blast initial
         # condition, where momentum and energy build up fast.
+        # dt_range upper bound capped at 0.10 (CFL≈0.5): empirically
+        # dt≥0.12 NaN-overflows within 200 steps at default_size=96 as
+        # local wave speeds spike above the reference estimate.
         "default_size": 96,
         "dt": 0.05,
-        "dt_range": (0.005, 0.3),
+        "dt_range": (0.005, 0.10),
         "init": "euler_blast",
         "init_variants": ["euler_blast", "euler_shocktube",
                           "euler_kelvin_helmholtz"],
@@ -16092,6 +16127,10 @@ RULE_PRESETS = {
         "vis_default": 0,
         "vis_abs": False,
         "render_mode": "volumetric",
+        # Pair-2 layout is (E, p, |u|, helicity) -- all scalars/magnitudes,
+        # none of which flip sign under a parity transform of pair-1.
+        # Tell the symmetry probe not to negate any pair-2 channel.
+        "pair2_vector_channels": None,
         # Baseline ρ=1 floods the box at vis_range (0,4): every voxel
         # has alpha≈0.25 → 64-deep accumulation = opaque cube. Lifting
         # vis_lo above the baseline lets the shock-front overdensities
@@ -17407,6 +17446,39 @@ def _fbm_binary_density(size, rng, target_density, octaves=5):
     return (field > threshold).astype(np.float32)
 
 
+def _canonical_binary_mask(size, rng, density):
+    """Boolean mask of approximately the requested density, independent of size.
+
+    The naive pattern ``_canonical_noise(size, rng) < density`` looks
+    correct but is badly broken: ``_canonical_noise`` upsamples a 64³
+    uniform field with **linear interpolation** to non-integer-ratio
+    target sizes, which pulls noise values toward 0.5 and shrinks the
+    fraction below low thresholds.  Measured densities for a 0.10
+    threshold: 10.1% at size=64 (canonical) vs 0.3% at size=65 — a
+    33x mismatch that changes whether seed-density-sensitive rules
+    sustain dynamics or collapse.
+
+    This helper thresholds at canonical resolution first, then
+    upsamples the binary mask with nearest-neighbour, so the mean
+    density is preserved exactly at every target size.
+    """
+    cs = CANONICAL_INIT_SIZE
+    small = rng.uniform(0.0, 1.0, (cs, cs, cs)) < density
+    if size == cs:
+        return small
+    if size > cs and size % cs == 0:
+        f = size // cs
+        return np.repeat(np.repeat(np.repeat(small, f, 0), f, 1), f, 2)
+    if size < cs and cs % size == 0:
+        f = cs // size
+        # Sample one corner per block; preserves density in expectation.
+        return small[::f, ::f, ::f]
+    # Fractional ratio: nearest-neighbour resample preserves density.
+    from scipy.ndimage import zoom
+    # order=0 = nearest neighbour, no smoothing.
+    return zoom(small.astype(np.uint8), size / cs, order=0).astype(bool)
+
+
 def _localized_envelope(size, rng, fill_fraction=0.5, edge_softness=0.15):
     """Smooth ball-shaped envelope that fades from 1.0 at the centre to 0
     near the boundaries. Used to localize FBM initial conditions to a
@@ -17439,7 +17511,7 @@ def _localized_envelope(size, rng, fill_fraction=0.5, edge_softness=0.15):
 def init_random_very_sparse(size, rng):
     """Random with ~3% density — for crystal rules that grow."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.03).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.03).astype(np.float32)
     return data
 
 
@@ -17561,7 +17633,7 @@ def init_lenia_multi_fbm(size, rng):
 def init_random_sparse(size, rng):
     """Random with ~10% density."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.10).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.10).astype(np.float32)
     return data
 
 
@@ -17594,12 +17666,25 @@ def init_nca_random_specks(size, rng):
     network that's mildly diffusive lights up the whole cube quickly
     instead of spending hundreds of frames before the seed reaches a
     voxel boundary.
+
+    Speck count scales with grid *volume* so the volumetric density is
+    held roughly constant (~1 speck per 13k voxels, calibrated to give
+    n=20 at the canonical 64³ grid).  The earlier formula
+    ``size * size // 200`` scaled with grid *area*, which dropped the
+    volumetric density by ~16x going from size=32 to size=512 and
+    caused growing-NCA networks to starve at large grids.
     """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    n = max(8, size * size // 200)  # density ~1/(200 voxels per slice)
-    coords = rng.integers(0, size, size=(n, 3))
+    # 1 speck per ~13k voxels (≈ 20 at 64³); minimum 8 so tiny grids
+    # still get the "few seeds" feel.
+    n = max(8, size ** 3 // 13107)
+    if hasattr(rng, 'integers'):
+        coords = rng.integers(0, size, size=(n, 3))
+    else:
+        coords = rng.randint(0, size, size=(n, 3))
     for x, y, z in coords:
-        data[x, y, z, :] = rng.random(4).astype(np.float32)
+        data[x, y, z, :] = rng.random(4).astype(np.float32) \
+            if hasattr(rng, 'integers') else rng.rand(4).astype(np.float32)
     return data
 
 
@@ -17665,7 +17750,7 @@ def init_predator_prey_lattice(size, rng):
 def init_random_dense(size, rng):
     """Random with ~40% density."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.40).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.40).astype(np.float32)
     return data
 
 def init_random_smooth(size, rng):
@@ -20419,7 +20504,7 @@ def init_quantum_selfinteract(size, rng):
 def init_random_spins(size, rng):
     """Uniform 50/50 binary spins for Ising. Channel R holds {0.0, 1.0}."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.5).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.5).astype(np.float32)
     return data
 
 
@@ -20459,7 +20544,7 @@ def init_hodgepodge_random(size, rng):
     because no infected neighbours remained to seed new waves.
 
     Real BZ media start essentially uniform with rare perturbations.
-    Here we mark ~30% of cells as low-level infected — encoded in the
+    We mark ~15% of cells as low-level infected — encoded in the
     [0.05, 0.15] band of the [0,1] channel so the shader's
     round(v * (N-1)) decode produces a low-but-nonzero state across
     the supported N range (state 1-2 at N=16, state 5-15 at N=100,
@@ -20468,12 +20553,16 @@ def init_hodgepodge_random(size, rng):
     instead of immediately collapsing to the all-ill / all-heal
     cycle.
 
-    Density 30% chosen to give >= k1=2..4 infected neighbours in a
-    26-cell Moore neighbourhood: expected 7.8, so even with k1=4
-    most cells get susceptibility A/k1 >= 1 each step.
+    Uses ``_canonical_binary_mask`` for the seed locations so the
+    ~15% density is preserved exactly at every grid size (the naive
+    ``_canonical_noise(size, rng) < 0.15`` pattern collapses to
+    ~7% at non-integer-ratio sizes due to linear-interp smoothing
+    of the upsampled noise).  The continuous ``levels`` field stays
+    on the smoothed noise — it only affects per-cell state values,
+    not population fraction.
     """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    seed_mask = _canonical_noise(size, rng) < 0.30
+    seed_mask = _canonical_binary_mask(size, rng, 0.15)
     levels = _canonical_noise(size, rng) * 0.10 + 0.05  # in [0.05, 0.15]
     data[:, :, :, 0] = np.where(seed_mask, levels, 0.0).astype(np.float32)
     return data
@@ -20484,7 +20573,7 @@ def init_margolus_gas(size, rng):
     Density ~25% gives a fluid regime with frequent collisions but
     plenty of vacuum for particle motion to be visible."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    data[:, :, :, 0] = (_canonical_noise(size, rng) < 0.25).astype(np.float32)
+    data[:, :, :, 0] = _canonical_binary_mask(size, rng, 0.25).astype(np.float32)
     return data
 
 
@@ -20848,9 +20937,19 @@ def init_excitable_seed(size, rng):
 def init_excitable_random(size, rng):
     """Sparse random excited cells in a sea of rest. Asymmetric ignition
     geometry so the resulting waves break and form scroll structures
-    rather than concentric shells."""
+    rather than concentric shells.
+
+    Seed count scales with grid *volume* so the volumetric density is
+    held roughly constant (~1 seed per 16k voxels, calibrated to give
+    n=16 at the canonical 64³ grid).  The earlier formula
+    ``max(8, size // 4)`` scaled *linearly* with grid edge length,
+    which collapsed the volumetric density by ~64x going from
+    size=32 to size=192 and left large grids essentially empty —
+    Greenberg-Hastings then synchronised to a dead resting state
+    before any wave geometry could develop.
+    """
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    n_seeds = max(8, size // 4)
+    n_seeds = max(8, size ** 3 // 16384)
     coords = rng.randint(0, size, size=(n_seeds, 3))
     for x, y, z in coords:
         data[int(x), int(y), int(z), 0] = 1.0 / 7.0

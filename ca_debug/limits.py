@@ -96,6 +96,24 @@ _SPONTANEOUS_OK = {
     # which is non-zero even with zero starting field.
     'greenberg_hastings_3d', 'nucleation', 'erosion', 'viscous_fingers',
     'volcanic_3d',
+    # Morphogen (Gierer-Meinhardt): explicit basal activator
+    # production `sigma_a = 0.01` documented in the shader as
+    # "prevents dead state" — by design, not a bug.
+    'morphogen_spots',
+    # Lichen RPS: resource channel B has feed term `regen*(1-res)`
+    # that is non-zero at res=0 (substrate replenishment).  Same
+    # class as gray_scott / schnakenberg above.
+    'lichen',
+    # DLA / dielectric breakdown: Laplace solver has boundary-pull
+    # term `boundary_pull * (1.0 - pot)` that drives the potential
+    # field from boundary even with an empty cluster.  Required for
+    # the harmonic-measure growth to have anywhere to nucleate.
+    'crystal_dla',
+    # Stable-fluids / smoke-wind: external force / boundary injection
+    # (wind, gravity, deposition) is active every step regardless of
+    # the field's initial state — that's what makes them "external-
+    # forced" fluid sims rather than initial-value problems.
+    'stable_fluids_3d', 'smoke_wind_3d',
 }
 
 # Param-name patterns that mean "damping / decay / loss".  Setting
