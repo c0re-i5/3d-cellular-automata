@@ -8317,7 +8317,7 @@ void main() {
     # ("Wavefront") to see only the currently-active shell. Pick A
     # ("Sources") to see the stationary emitters.
     "causal_ca": """
-const float MAX_FRAMES_INV = 1.0 / 4096.0;
+const float MAX_FRAMES_INV = 1.0 / 512.0;
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -16564,7 +16564,15 @@ RULE_PRESETS = {
         "vis_channels": ["Wavefront", "Arrival", "Echo", "Sources"],
         "vis_default": 1,
         "vis_abs": False,
+        "vis_range": (0.0, 1.0),
         "render_mode": "voxel",
+        # Arrival channel latches in [1e-3, 1.0] (frame/512, clamped) and
+        # the wavefront R rarely exceeds ~1.0 either. The default voxel
+        # threshold of 0.5 culls every cell the wave has touched, so the
+        # GUI renders an empty box. Drop to 0.001 — the same minimum the
+        # shader uses when latching arrival — so every causally-reached
+        # cell appears as a rainbow voxel keyed to its arrival time.
+        "voxel_threshold": 0.001,
         "boundary": "toroidal",
     },
 
