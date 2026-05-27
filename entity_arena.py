@@ -1938,7 +1938,13 @@ void main() {
         }
     }
 
-    result.r = max(result.r, termite_max);
+    // Overwrite ch0 directly (NOT max-blend with prior value).  The
+    // decoded chip_supply / pheromone fields live in g/b and were
+    // written this frame by the accum-decode passes; we preserve them.
+    // Using max() against imageLoad's r would smear stale paint from
+    // previous frames into a static crust and the termites would look
+    // frozen even though they're moving.
+    result.r = termite_max;
     imageStore(u_grid_w, p, result);
 }
 """
