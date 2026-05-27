@@ -410,6 +410,13 @@ void main() {
     // pre-paint passes (clear, eco field, etc.) wrote.
     vec4 result = imageLoad(u_grid_r, p);
 
+    // Running per-team magnitudes for the signed channel reconcile.
+    // Accumulating max() inside the loop is associative & commutative
+    // (unlike the old chained max/min which depended on iteration order
+    // when both teams overlapped in the same voxel).
+    float pos_max = 0.0;
+    float neg_max = 0.0;
+
     // Hash cell containing this voxel. Span ±1 cell — sufficient because
     // entity radius is clamped to 4 and the hash cell edge is u_hash_cell
     // (default 8). If a future scenario sets either larger this span
@@ -447,21 +454,29 @@ void main() {
             float w = max(0.0, 1.0 - dist * inv_r);
 
             uint team_id = e.kind_team_role_flags.y;
-            float signed_sign = (team_id == 0u) ? 1.0
-                              : (team_id == 1u) ? -1.0
-                              : 0.0;
-
-            // Saturating max-blend per channel — deterministic because
-            // this voxel is owned by a single thread.
-            if (signed_sign > 0.0) {
-                result.r = max(result.r, signed_sign * w);
-            } else if (signed_sign < 0.0) {
-                result.r = min(result.r, signed_sign * w);
+            // Track per-team running max separately so the final value
+            // does not depend on the (atomicAdd-ordered) iteration order
+            // of hash entries. Reconciled after the loop below.
+            if (team_id == 0u) {
+                pos_max = max(pos_max, w);
+                result.g = max(result.g, w);
+            } else if (team_id == 1u) {
+                neg_max = max(neg_max, w);
+                result.b = max(result.b, w);
             }
-            if (team_id == 0u) result.g = max(result.g, w);
-            if (team_id == 1u) result.b = max(result.b, w);
             result.a = max(result.a, w);
         }
+    }
+
+    // Order-independent reconcile for the signed display channel.
+    // Pick the team with greater magnitude in this voxel; ties go
+    // positive. Then combine with the read-side value via the same
+    // max(+) / min(-) rule the per-entity loop used to use.
+    float signed_win = (pos_max >= neg_max) ? pos_max : -neg_max;
+    if (signed_win > 0.0) {
+        result.r = max(result.r, signed_win);
+    } else if (signed_win < 0.0) {
+        result.r = min(result.r, signed_win);
     }
 
     imageStore(u_grid_w, p, result);
@@ -622,6 +637,106 @@ void main() {
     e.pos_radius.xyz = p;
     e.vel_energy.xyz = v;
     entities[i] = e;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Physarum-3D — slime-mould-style agent ensemble using the accumulator
+# ---------------------------------------------------------------------------
+#
+# Each agent maintains a unit heading in vel_energy.xyz. Per step it
+# samples the trail accumulator (channel 0) at three points (left,
+# forward, right of heading), rotates toward the strongest, advances by
+# `speed`, and atomic-deposits trail at its new voxel. The trail decays
+# multiplicatively each frame via SHADER_ACCUM_DECAY and is read back
+# into the grid via SHADER_ACCUM_DECODE for visualisation.
+#
+# Uniforms (mapped from preset params via `param_names`):
+#   u_param0 -- sensor_angle  (radians; spread of L/R sensors from forward)
+#   u_param1 -- sensor_dist   (voxels; how far ahead sensors look)
+#   u_param2 -- turn_angle    (radians; per-step rotation magnitude)
+#   u_param3 -- deposit_amt   (consumed by SHADER_PHYSARUM_DEPOSIT only)
+#
+# Speed is fixed at 1.0 voxel per step (u_dt scales). Trail decay rate
+# lives on the decay pass spec, not here.
+# Two-pass design eliminates the read-after-write race that would otherwise
+# arise from agents sensing the same accum field that other agents in the
+# same dispatch are depositing into. SHADER_PHYSARUM_SENSE only reads accum
+# (and writes own entity slot); SHADER_PHYSARUM_DEPOSIT only writes accum
+# (one atomicAdd per agent). Reads and writes are now temporally separated.
+SHADER_PHYSARUM_SENSE = """
+// Small int hash for per-step jitter.
+float h11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+
+    uint seed = i * 1973u + uint(u_frame) * 9277u;
+
+    vec3 pos = e.pos_radius.xyz;
+    vec3 heading = e.vel_energy.xyz;
+    // First-frame guard: agents spawn with zero velocity. Pick a random
+    // unit heading per agent (deterministic from slot id).
+    if (dot(heading, heading) < 1e-6) {
+        heading = normalize(vec3(h11(i * 7u    ) - 0.5,
+                                 h11(i * 7u + 1u) - 0.5,
+                                 h11(i * 7u + 2u) - 0.5) + vec3(1e-5, 0.0, 0.0));
+    } else {
+        heading = normalize(heading);
+    }
+
+    float sensor_angle = u_param0;
+    float sensor_dist  = u_param1;
+    float turn_angle   = u_param2;
+    // u_param3 (deposit_amt) is consumed by SHADER_PHYSARUM_DEPOSIT.
+    float speed        = 1.0;
+
+    vec3 axis = perp_axis(heading);
+    vec3 s = sense_three_3d(0, pos, heading, axis, sensor_angle, sensor_dist);
+    float L = s.x, F = s.y, R = s.z;
+
+    float turn = 0.0;
+    if (F >= L && F >= R) {
+        turn = 0.0;
+    } else if (L > R) {
+        turn = +turn_angle;
+    } else if (R > L) {
+        turn = -turn_angle;
+    } else {
+        // Tie-break: random nudge so agents don't all freeze identically.
+        turn = (h11(seed + 3u) - 0.5) * turn_angle * 2.0;
+    }
+    heading = rotate_around(heading, axis, turn);
+
+    // Advance + wrap.
+    pos = mod(pos + heading * speed * u_dt, u_world_size);
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = heading;
+    entities[i] = e;
+}
+"""
+
+SHADER_PHYSARUM_DEPOSIT = """
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    // atomicAdd of fixed-point uint — commutative; race-free regardless of
+    // how many agents land in the same voxel within one dispatch.
+    accum_deposit(0, ivec3(floor(e.pos_radius.xyz)), u_param3);
 }
 """
 

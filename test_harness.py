@@ -1262,7 +1262,9 @@ class HeadlessRunner:
                 source = AGENT_COMPUTE_HEADER + AGENT_RULES[key]
             elif kind in ('entity_clear_hash', 'entity_build_hash',
                           'entity_step', 'entity_paint', 'entity_paint_clear',
-                          'entity_field'):
+                          'entity_field',
+                          'entity_accum_clear', 'entity_accum_decay',
+                          'entity_accum_decode'):
                 if kind == 'entity_clear_hash':
                     body = entity_arena.SHADER_CLEAR_HASH
                 elif kind == 'entity_build_hash':
@@ -1272,6 +1274,12 @@ class HeadlessRunner:
                                            entity_arena.SHADER_PAINT)
                 elif kind == 'entity_paint_clear':
                     body = entity_arena.SHADER_PAINT_CLEAR
+                elif kind == 'entity_accum_clear':
+                    body = entity_arena.SHADER_ACCUM_CLEAR
+                elif kind == 'entity_accum_decay':
+                    body = entity_arena.SHADER_ACCUM_DECAY
+                elif kind == 'entity_accum_decode':
+                    body = entity_arena.SHADER_ACCUM_DECODE
                 elif kind == 'entity_field':
                     # 3D voxel-style pass: full COMPUTE_HEADER. Body comes
                     # from preset['entity_shaders']; uses standard u_src/u_dst.
@@ -1521,7 +1529,10 @@ class HeadlessRunner:
                 max_entities=int(cfg.pop('max_entities', entity_arena.DEFAULT_MAX_ENTITIES)),
                 max_teams=int(cfg.pop('max_teams', entity_arena.DEFAULT_MAX_TEAMS)),
                 max_goals=int(cfg.pop('max_goals', entity_arena.DEFAULT_MAX_GOALS)),
-                hash_cell=int(cfg.pop('hash_cell', entity_arena.DEFAULT_HASH_CELL)))
+                hash_cell=int(cfg.pop('hash_cell', entity_arena.DEFAULT_HASH_CELL)),
+                accum_channels=int(cfg.pop('accum_channels', 0)),
+                accum_scale=float(cfg.pop('accum_scale',
+                                          entity_arena.DEFAULT_ACCUM_SCALE)))
             self.arena.alloc_gpu()
             on_init = self.preset.get('on_init')
             if on_init is not None:
@@ -1629,7 +1640,8 @@ class HeadlessRunner:
                 cur.bind_to_image(0, read=True, write=True)
                 cur.bind_to_image(1, read=True, write=True)
             elif is_entity_pass:
-                if kind in ('entity_paint', 'entity_paint_clear', 'entity_field'):
+                if kind in ('entity_paint', 'entity_paint_clear',
+                            'entity_field', 'entity_accum_decode'):
                     src = self.tex_a if self.ping == 0 else self.tex_b
                     dst = self.tex_b if self.ping == 0 else self.tex_a
                     src.bind_to_image(0, read=True, write=False)
@@ -1659,6 +1671,15 @@ class HeadlessRunner:
             if self.arena is not None:
                 self.arena.bind_all()
                 self.arena.set_uniforms(prog)
+                if kind in ('entity_accum_clear', 'entity_accum_decay',
+                            'entity_accum_decode'):
+                    if 'u_accum_ch' in prog:
+                        prog['u_accum_ch'].value = int(spec.get('channel', 0))
+                    if 'u_accum_dst_ch' in prog:
+                        prog['u_accum_dst_ch'].value = int(
+                            spec.get('dst_channel', spec.get('dst_ch', 0)))
+                    if 'u_accum_rate' in prog:
+                        prog['u_accum_rate'].value = float(spec.get('rate', 1.0))
 
             u = self._u_per_pass[pass_idx]
             if u['size'] is not None:
@@ -1690,7 +1711,9 @@ class HeadlessRunner:
                 if kind == 'entity_clear_hash':
                     g = entity_arena.hash_groups(self.arena.hash_total)
                     prog.run(g, 1, 1)
-                elif kind == 'entity_paint_clear':
+                elif kind in ('entity_paint_clear', 'entity_paint',
+                              'entity_accum_clear', 'entity_accum_decay',
+                              'entity_accum_decode'):
                     total = self.size * self.size * self.size
                     prog.run((total + 63) // 64, 1, 1)
                 elif kind == 'entity_field':
@@ -1710,7 +1733,7 @@ class HeadlessRunner:
             # only advance ping when they actually write the field.
             if kind == 'agent':
                 pass
-            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field'):
+            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field', 'entity_accum_decode'):
                 pass
             else:
                 if 'p1' in spec['writes']:

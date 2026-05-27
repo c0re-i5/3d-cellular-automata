@@ -12914,6 +12914,99 @@ def _wandering_voxels_preset():
     }
 
 
+def _physarum_3d_preset():
+    """Physarum-style 3D slime mould using the atomic accumulator.
+
+    Each agent samples a trail field (accum channel 0) at three points
+    (left/forward/right of its heading), rotates toward the strongest,
+    advances one voxel, and atomic-deposits trail at the new position.
+    The trail decays multiplicatively every step and is decoded into the
+    grid for visualisation.
+
+    Pipeline per frame:
+      1. entity_accum_decay  (ch=0, rate=0.92)  -- own-voxel-only mul
+      2. physarum_sense      (entity_step)      -- sense + steer + move
+      3. physarum_deposit    (entity_step)      -- atomic trail deposit
+      4. entity_paint_clear                     -- zero grid
+      5. entity_accum_decode (ch=0 -> grid ch0) -- copy trail to grid
+    """
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        # Single team — colour the trail white-ish in display.
+        arena.set_team(0, color=(0.85, 0.95, 1.0, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        # Density-scaled population: ~1 agent per 100 voxels so the trail
+        # network has enough reinforcement to form coherent veins.
+        n_voxels = size ** 3
+        n_agents = min(arena.max_entities - 1,  # slot 0 reserved
+                       max(2000, n_voxels // 100))
+        for _ in range(n_agents):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=1, team=0, pos=p, radius=1.0)
+
+    return {
+        "label": "Physarum 3D (slime mould)",
+        "shader": "noop",
+        "passes": [
+            {"shader": "_decay",   "kind": "entity_accum_decay",
+             "channel": 0, "rate": 0.92},
+            {"shader": "physarum_sense", "kind": "entity_step",
+             "param_names": ["Sensor angle", "Sensor dist",
+                             "Turn angle", "Deposit"]},
+            {"shader": "physarum_deposit", "kind": "entity_step",
+             "param_names": ["Sensor angle", "Sensor dist",
+                             "Turn angle", "Deposit"]},
+            {"shader": "_clear",   "kind": "entity_paint_clear", "writes": ["p1"]},
+            {"shader": "_decode",  "kind": "entity_accum_decode", "writes": ["p1"],
+             "channel": 0, "dst_channel": 0},
+        ],
+        "entity_arena": {
+            "max_entities": 32768,
+            "max_teams": 1,
+            "hash_cell": 8,
+            "accum_channels": 1,
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "physarum_sense":   entity_arena.SHADER_PHYSARUM_SENSE,
+            "physarum_deposit": entity_arena.SHADER_PHYSARUM_DEPOSIT,
+        },
+        "on_init": on_init,
+        "params": {
+            "Sensor angle": 0.55,   # radians (~31°)
+            "Sensor dist":  4.0,    # voxels
+            "Turn angle":   0.40,   # radians per step
+            "Deposit":      1.0,    # accum units per step
+        },
+        "param_ranges": {
+            "Sensor angle": (0.05, 1.5),
+            "Sensor dist":  (1.0, 12.0),
+            "Turn angle":   (0.05, 1.5),
+            "Deposit":      (0.1, 5.0),
+        },
+        "dt": 1.0,
+        "init": "blank",
+        "vis_channels": ["Trail (ch0)"],
+        "vis_default": 0,
+        "vis_abs": 0,
+        "colormap": 3,           # something warm; tweak after first look
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.02,
+        "boundary": "toroidal",
+        "description": (
+            "Slime-mould-style agents (Physarum) in 3D. Each agent senses "
+            "a chemical trail in three directions, steers toward the "
+            "strongest, moves forward and deposits more trail. The trail "
+            "decays each step. With enough agents the field self-organises "
+            "into transport networks. Built on the atomic accumulator "
+            "infrastructure — race-free regardless of population density."
+        ),
+        "short_description": "3D slime-mould trail networks.",
+    }
+
+
 def _predator_prey_preset():
     """Full-scale predator-prey ecosystem.
 
@@ -15184,6 +15277,7 @@ RULE_PRESETS = {
 
     "wandering_voxels_3d": _wandering_voxels_preset(),
     "predator_prey_3d":    _predator_prey_preset(),
+    "physarum_3d":         _physarum_3d_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",
