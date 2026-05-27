@@ -59,6 +59,8 @@ BIND_TEAMS      = 10
 BIND_GOALS      = 11
 BIND_HASH_COUNT = 12
 BIND_HASH_ENTRY = 13
+# 14 reserved (NCA weights), 15 reserved (deposit_tex); use 16 for accum.
+BIND_ACCUM      = 16
 
 # Per-entity record size in bytes (5 vec4s).
 ENTITY_BYTES = 80
@@ -74,6 +76,14 @@ DEFAULT_MAX_GOALS    = 64
 # common case (we wrap, so non-divisors still work but waste a bit of cells).
 DEFAULT_HASH_CELL = 8
 HASH_MAX_PER_CELL = 32  # max entities per spatial cell — overflow drops
+
+# Atomic-uint accumulator field (Infra A: many-to-one deterministic deposit
+# into voxel-indexed scalar fields). Floats are encoded as fixed-point
+# uints (multiply by SCALE, round). SCALE=1024 gives ~10 fractional bits;
+# max representable amount ≈ 4.2 million which is more than enough for
+# bounded-deposit rules (pheromone, food consumption, build deposits).
+DEFAULT_ACCUM_SCALE      = 1024.0
+DEFAULT_MAX_ACCUM_CHANNELS = 4
 
 # Reserved kind ids:
 KIND_DEAD = 0  # slot is empty / available for reuse
@@ -116,6 +126,11 @@ layout(std430, binding=10) buffer TeamBuf      { Team   teams[];    };
 layout(std430, binding=11) buffer GoalBuf      { Goal   goals[];    };
 layout(std430, binding=12) buffer HashCountBuf { uint   hash_count[]; };
 layout(std430, binding=13) buffer HashEntryBuf { uint   hash_entry[]; };
+// AccumBuf — voxel-indexed atomic uint accumulator (Infra A). Sized as
+// (u_size^3 * u_accum_channels) when arena.accum_channels > 0. Floats are
+// encoded as fixed-point uints (multiply by u_accum_scale, round). Layout
+// is voxel-major: index = voxel_flat * u_accum_channels + ch.
+layout(std430, binding=16) buffer AccumBuf    { uint   accum[]; };
 
 // Filled by host on every dispatch.
 uniform int u_size;              // voxel grid edge (replaced w/ const at compile)
@@ -134,6 +149,17 @@ uniform int  u_hash_cell;        // edge length in voxels of each hash cell
 uniform int  u_hash_dim;         // grid is (u_hash_dim)^3 cells
 uniform int  u_hash_max_per_cell;
 uniform float u_world_size;      // == float(u_size); duplicated for clarity
+// Accumulator-field controls (Infra A). Channels==0 means the AccumBuf
+// is not allocated and the accum_* helpers are no-ops.
+uniform int   u_accum_channels;
+uniform float u_accum_scale;
+uniform float u_accum_inv_scale;
+// Per-pass parameters used by built-in accumulator passes
+// (accum_clear / accum_decay / accum_decode). Shader bodies that don't
+// need them simply ignore them.
+uniform int   u_accum_ch;        // which accum channel the pass targets
+uniform int   u_accum_dst_ch;    // which voxel grid channel decode writes
+uniform float u_accum_rate;      // decay multiplier or diffuse fraction
 
 // Spatial hash helpers --------------------------------------------------
 ivec3 hash_cell_of(vec3 pos) {
@@ -186,6 +212,72 @@ vec3 wrap_delta(vec3 a, vec3 b) {
 
 // True if entity slot is occupied (kind != 0).
 bool is_alive(Entity e) { return e.kind_team_role_flags.x != 0u; }
+
+// ── Accumulator field helpers (Infra A) ─────────────────────────────────
+// These are no-ops when u_accum_channels == 0. Always safe to call.
+
+uint voxel_flat_index(ivec3 p) {
+    // 1D linear index for voxel p ∈ [0, u_size)^3. Z-major, then Y, X.
+    return uint((p.z * u_size + p.y) * u_size + p.x);
+}
+
+uint accum_buf_index(int ch, ivec3 p) {
+    return voxel_flat_index(p) * uint(u_accum_channels) + uint(ch);
+}
+
+// Atomic-add a scalar amount into the accumulator at (channel, voxel).
+// Negative amounts are clamped to 0 — use a separate consume helper for
+// subtraction (the unsigned accumulator can't go below 0). Tiny amounts
+// that round to 0 uints are dropped (sub-quantization noise).
+void accum_deposit(int ch, ivec3 p, float amount) {
+    if (u_accum_channels <= 0 || ch < 0 || ch >= u_accum_channels) return;
+    if (amount <= 0.0) return;
+    uint q = uint(amount * u_accum_scale + 0.5);
+    if (q == 0u) return;
+    atomicAdd(accum[accum_buf_index(ch, p)], q);
+}
+
+// Atomically consume up to `request` from (ch, p). Returns the float
+// amount actually consumed (≤ request, ≥ 0). Implemented as a bounded
+// CAS loop so concurrent consumers each get a deterministic share
+// (specifically: the first to arrive at any given iteration takes its
+// requested amount; subsequent arrivals see the reduced balance). The
+// per-thread result depends on arrival order, but the total consumed
+// across all threads is bounded by the initial value — no over-draw.
+// For perfectly arrival-order-independent consumption use a 2-phase
+// reduce pattern (see Infra C in the design doc).
+float accum_consume(int ch, ivec3 p, float request) {
+    if (u_accum_channels <= 0 || ch < 0 || ch >= u_accum_channels) return 0.0;
+    if (request <= 0.0) return 0.0;
+    uint q_req = uint(request * u_accum_scale + 0.5);
+    if (q_req == 0u) return 0.0;
+    uint idx = accum_buf_index(ch, p);
+    // CAS-loop: read current, compute take=min(cur, q_req), CAS to cur-take.
+    for (int tries = 0; tries < 16; ++tries) {
+        uint cur = accum[idx];
+        if (cur == 0u) return 0.0;
+        uint take = min(cur, q_req);
+        uint observed = atomicCompSwap(accum[idx], cur, cur - take);
+        if (observed == cur) {
+            return float(take) * u_accum_inv_scale;
+        }
+        // Contended — retry. Bounded loop keeps the worst case finite.
+    }
+    return 0.0;
+}
+
+// Sample (read) the accumulator value at (ch, p) as a float.
+float accum_sample(int ch, ivec3 p) {
+    if (u_accum_channels <= 0 || ch < 0 || ch >= u_accum_channels) return 0.0;
+    return float(accum[accum_buf_index(ch, p)]) * u_accum_inv_scale;
+}
+
+// Toroidal-wrap variant for periodic boundaries.
+float accum_sample_wrap(int ch, ivec3 p) {
+    if (u_accum_channels <= 0 || ch < 0 || ch >= u_accum_channels) return 0.0;
+    ivec3 q = ((p % u_size) + u_size) % u_size;
+    return float(accum[accum_buf_index(ch, q)]) * u_accum_inv_scale;
+}
 """
 
 
@@ -350,6 +442,91 @@ void main() {
     int y = int((i / uint(sz)) % uint(sz));
     int z = int(i / uint(sz * sz));
     imageStore(u_grid_w, ivec3(x, y, z), vec4(0.0));
+}
+"""
+
+
+# ── Infra A built-in passes: accumulator clear / decay / decode ─────────
+#
+# All three are per-voxel 1D dispatches (voxel_count threads, workgroup
+# 64). They use the standard ENTITY_LAYOUT_HEADER so no special compile
+# path is needed.
+#
+# The per-pass uniforms (u_accum_ch, u_accum_dst_ch, u_accum_rate) are
+# populated by the simulator from the pass spec:
+#     {"kind": "entity_accum_clear",  "channel":  0}
+#     {"kind": "entity_accum_decay",  "channel":  0, "rate": 0.95}
+#     {"kind": "entity_accum_decode", "channel":  0, "dst_ch": 1}
+#                                                   #  0=r 1=g 2=b 3=a
+
+# Clear: zero out one channel of the accumulator across every voxel.
+SHADER_ACCUM_CLEAR = """
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (i >= total) return;
+    if (u_accum_channels <= 0) return;
+    int ch = u_accum_ch;
+    if (ch < 0 || ch >= u_accum_channels) return;
+    uint idx = i * uint(u_accum_channels) + uint(ch);
+    accum[idx] = 0u;
+}
+"""
+
+# Decay: multiplies one channel by u_accum_rate. Decode → multiply →
+# re-encode. Race-free because each thread reads & writes exactly its own
+# voxel's uint slot — no neighbour access.
+SHADER_ACCUM_DECAY = """
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (i >= total) return;
+    if (u_accum_channels <= 0) return;
+    int ch = u_accum_ch;
+    if (ch < 0 || ch >= u_accum_channels) return;
+    uint idx = i * uint(u_accum_channels) + uint(ch);
+    uint cur = accum[idx];
+    if (cur == 0u) return;
+    float f = float(cur) * u_accum_inv_scale;
+    f *= clamp(u_accum_rate, 0.0, 1.0);
+    uint q = uint(f * u_accum_scale + 0.5);
+    accum[idx] = q;
+}
+"""
+
+# Decode: copy the float value at accum[ch, voxel] into one channel of
+# the rgba32f voxel grid. Standard src→dst pattern (same binding scheme
+# as entity_paint). Caller chooses dst_ch in 0..3 (r,g,b,a). All other
+# channels of the destination are preserved from u_grid_r.
+SHADER_ACCUM_DECODE = """
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (i >= total) return;
+    int S = u_size;
+    int idx = int(i);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
+
+    vec4 v = imageLoad(u_grid_r, p);
+    float f = 0.0;
+    if (u_accum_channels > 0 && u_accum_ch >= 0
+        && u_accum_ch < u_accum_channels) {
+        uint q = accum[i * uint(u_accum_channels) + uint(u_accum_ch)];
+        f = float(q) * u_accum_inv_scale;
+    }
+    int dst = clamp(u_accum_dst_ch, 0, 3);
+    if      (dst == 0) v.r = f;
+    else if (dst == 1) v.g = f;
+    else if (dst == 2) v.b = f;
+    else               v.a = f;
+    imageStore(u_grid_w, p, v);
 }
 """
 
@@ -790,7 +967,9 @@ class EntityArena:
                  max_entities=DEFAULT_MAX_ENTITIES,
                  max_teams=DEFAULT_MAX_TEAMS,
                  max_goals=DEFAULT_MAX_GOALS,
-                 hash_cell=DEFAULT_HASH_CELL):
+                 hash_cell=DEFAULT_HASH_CELL,
+                 accum_channels=0,
+                 accum_scale=DEFAULT_ACCUM_SCALE):
         self.ctx = ctx
         self.size = int(size)
         self.max_entities = int(max_entities)
@@ -800,6 +979,14 @@ class EntityArena:
         # hash dim: number of cells per axis; ceil so we cover the world.
         self.hash_dim = max(1, (self.size + self.hash_cell - 1) // self.hash_cell)
         self.hash_total = self.hash_dim ** 3
+        # Accumulator field (Infra A). 0 = disabled.
+        self.accum_channels = int(accum_channels)
+        if self.accum_channels < 0 or self.accum_channels > DEFAULT_MAX_ACCUM_CHANNELS:
+            raise ValueError(
+                f"accum_channels must be in [0, {DEFAULT_MAX_ACCUM_CHANNELS}], "
+                f"got {self.accum_channels}")
+        self.accum_scale = float(accum_scale)
+        self.voxel_count = self.size ** 3
 
         # Staging arrays. Slot 0 reserved as null entity.
         self.entities = np.zeros(self.max_entities, dtype=self.ENTITY_DTYPE)
@@ -817,6 +1004,7 @@ class EntityArena:
         self.goal_ssbo   = None
         self.hash_count_ssbo = None
         self.hash_entry_ssbo = None
+        self.accum_ssbo = None
 
         # Set when first team/goal is created so push only sends in-use slots.
         self.team_count = 0
@@ -836,10 +1024,15 @@ class EntityArena:
         self.hash_entry_ssbo = self.ctx.buffer(
             data=np.zeros(self.hash_total * HASH_MAX_PER_CELL,
                           dtype=np.uint32).tobytes())
+        # Accumulator buffer (Infra A). Sized voxel_count * channels.
+        if self.accum_channels > 0:
+            self.accum_ssbo = self.ctx.buffer(
+                data=np.zeros(self.voxel_count * self.accum_channels,
+                              dtype=np.uint32).tobytes())
 
     def release(self):
         for attr in ('entity_ssbo', 'team_ssbo', 'goal_ssbo',
-                     'hash_count_ssbo', 'hash_entry_ssbo'):
+                     'hash_count_ssbo', 'hash_entry_ssbo', 'accum_ssbo'):
             buf = getattr(self, attr, None)
             if buf is not None:
                 try:
@@ -856,9 +1049,12 @@ class EntityArena:
         self.goal_ssbo.bind_to_storage_buffer(BIND_GOALS)
         self.hash_count_ssbo.bind_to_storage_buffer(BIND_HASH_COUNT)
         self.hash_entry_ssbo.bind_to_storage_buffer(BIND_HASH_ENTRY)
+        if self.accum_ssbo is not None:
+            self.accum_ssbo.bind_to_storage_buffer(BIND_ACCUM)
 
     def set_uniforms(self, prog):
         """Set entity-arena uniforms on a compute program if they exist."""
+        inv_scale = (1.0 / self.accum_scale) if self.accum_scale > 0 else 1.0
         for name, val in (
             ('u_entity_count',      self.max_entities),
             ('u_team_count',        self.team_count),
@@ -867,6 +1063,9 @@ class EntityArena:
             ('u_hash_dim',          self.hash_dim),
             ('u_hash_max_per_cell', HASH_MAX_PER_CELL),
             ('u_world_size',        float(self.size)),
+            ('u_accum_channels',    self.accum_channels),
+            ('u_accum_scale',       self.accum_scale),
+            ('u_accum_inv_scale',   inv_scale),
         ):
             cu = prog.get(name, None)
             if cu is not None:

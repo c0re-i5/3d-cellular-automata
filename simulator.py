@@ -23046,7 +23046,9 @@ class Simulator:
                 source = AGENT_COMPUTE_HEADER + AGENT_RULES[key]
             elif kind in ('entity_clear_hash', 'entity_build_hash',
                           'entity_step', 'entity_paint', 'entity_paint_clear',
-                          'entity_field'):
+                          'entity_field',
+                          'entity_accum_clear', 'entity_accum_decay',
+                          'entity_accum_decode'):
                 # Entity-arena pass: pick the body and concat the shared header.
                 if kind == 'entity_clear_hash':
                     body = entity_arena.SHADER_CLEAR_HASH
@@ -23057,6 +23059,12 @@ class Simulator:
                                            entity_arena.SHADER_PAINT)
                 elif kind == 'entity_paint_clear':
                     body = entity_arena.SHADER_PAINT_CLEAR
+                elif kind == 'entity_accum_clear':
+                    body = entity_arena.SHADER_ACCUM_CLEAR
+                elif kind == 'entity_accum_decay':
+                    body = entity_arena.SHADER_ACCUM_DECAY
+                elif kind == 'entity_accum_decode':
+                    body = entity_arena.SHADER_ACCUM_DECODE
                 elif kind == 'entity_field':
                     # 3D voxel-style pass: full COMPUTE_HEADER (8x8x8 layout,
                     # u_src/u_dst image bindings, u_param0..3, u_dt, etc.)
@@ -24097,10 +24105,14 @@ class Simulator:
         max_teams    = int(cfg.pop('max_teams',    entity_arena.DEFAULT_MAX_TEAMS))
         max_goals    = int(cfg.pop('max_goals',    entity_arena.DEFAULT_MAX_GOALS))
         hash_cell    = int(cfg.pop('hash_cell',    entity_arena.DEFAULT_HASH_CELL))
+        accum_channels = int(cfg.pop('accum_channels', 0))
+        accum_scale    = float(cfg.pop('accum_scale',
+                                       entity_arena.DEFAULT_ACCUM_SCALE))
         self.arena = entity_arena.EntityArena(
             self.ctx, self.size,
             max_entities=max_entities, max_teams=max_teams, max_goals=max_goals,
-            hash_cell=hash_cell)
+            hash_cell=hash_cell,
+            accum_channels=accum_channels, accum_scale=accum_scale)
         self.arena.alloc_gpu()
         on_init = self.preset.get('on_init')
         if on_init is not None:
@@ -24851,7 +24863,7 @@ class Simulator:
                 # field bound read-only on unit 0 in case the step shader
                 # samples it.
                 if kind in ('entity_paint', 'entity_paint_clear',
-                            'entity_field'):
+                            'entity_field', 'entity_accum_decode'):
                     src = self.tex_a if self.ping == 0 else self.tex_b
                     dst = self.tex_b if self.ping == 0 else self.tex_a
                     src.bind_to_image(0, read=True, write=False)
@@ -24896,6 +24908,19 @@ class Simulator:
             if has_arena:
                 self.arena.bind_all()
                 self.arena.set_uniforms(self._cu_per_pass[pass_idx]['prog'])
+                # Per-pass accum config (only the accum-kind passes care,
+                # but the uniforms are declared by ENTITY_GLSL_HEADER so
+                # other entity passes may also accept them harmlessly).
+                if kind in ('entity_accum_clear', 'entity_accum_decay',
+                            'entity_accum_decode'):
+                    prog = self._cu_per_pass[pass_idx]['prog']
+                    if 'u_accum_ch' in prog:
+                        prog['u_accum_ch'].value = int(spec.get('channel', 0))
+                    if 'u_accum_dst_ch' in prog:
+                        prog['u_accum_dst_ch'].value = int(
+                            spec.get('dst_channel', spec.get('dst_ch', 0)))
+                    if 'u_accum_rate' in prog:
+                        prog['u_accum_rate'].value = float(spec.get('rate', 1.0))
             # 3D Neural CA weights live at binding 14.  Bound only when
             # the active rule is `nca_3d`; otherwise nothing references it.
             if (kind == 'voxel' and spec['shader'] == 'nca_3d'
@@ -24973,17 +24998,15 @@ class Simulator:
                 if kind == 'entity_clear_hash':
                     groups = entity_arena.hash_groups(self.arena.hash_total)
                     self.compute_progs[pass_idx].run(groups, 1, 1)
-                elif kind == 'entity_paint_clear':
-                    # Flat 1D dispatch over W*H*D voxels (workgroup 64).
-                    total = self.voxel_count
-                    groups = (total + 63) // 64
-                    self.compute_progs[pass_idx].run(groups, 1, 1)
-                elif kind == 'entity_paint':
-                    # Per-voxel reduce (Bug O fix): each voxel iterates its
-                    # hash neighbourhood and computes its own max-blend.
-                    # Dispatched 1D over voxel_count to match SHADER_PAINT /
-                    # SHADER_ECO_PAINT (both use ENTITY_LAYOUT_HEADER which
-                    # is local_size_x=64).
+                elif kind in ('entity_paint_clear', 'entity_paint',
+                              'entity_accum_clear', 'entity_accum_decay',
+                              'entity_accum_decode'):
+                    # Per-voxel 1D dispatch (workgroup 64). All of:
+                    #   entity_paint_clear  — clear voxel grid channels
+                    #   entity_paint        — per-voxel max-blend reduce (Bug O fix)
+                    #   entity_accum_clear  — zero one accum channel everywhere
+                    #   entity_accum_decay  — multiply one accum channel by rate
+                    #   entity_accum_decode — copy accum channel into rgba32f grid
                     total = self.voxel_count
                     groups = (total + 63) // 64
                     self.compute_progs[pass_idx].run(groups, 1, 1)
