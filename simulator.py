@@ -21810,9 +21810,10 @@ def _resolve_composed_preset(name):
             if isinstance(raw, str):
                 spec = {"shader": raw, "writes": ("p1",), "kind": "voxel"}
             else:
-                spec = {"shader": raw["shader"],
-                        "writes": tuple(raw.get("writes", ("p1",))),
-                        "kind": raw.get("kind", "voxel")}
+                # Preserve all keys (channel, dst_channel, rate, etc.).
+                spec = dict(raw)
+                spec["writes"] = tuple(raw.get("writes", ("p1",)))
+                spec["kind"] = raw.get("kind", "voxel")
             # Determine which sub-rule param names this pass binds.
             override = sub_pass_params.get(spec["shader"])
             if override is not None:
@@ -23140,9 +23141,12 @@ class Simulator:
             if isinstance(entry, str):
                 spec = {"shader": entry, "writes": ("p1",), "kind": "voxel"}
             else:
-                spec = {"shader": entry["shader"],
-                        "writes": tuple(entry.get("writes", ("p1",))),
-                        "kind": entry.get("kind", "voxel")}
+                # Preserve all keys from the preset spec (channel, src_channel,
+                # dst_channel, rate, etc. are consumed by accum/scratch passes).
+                # Only normalize the three required keys.
+                spec = dict(entry)
+                spec["writes"] = tuple(entry.get("writes", ("p1",)))
+                spec["kind"] = entry.get("kind", "voxel")
             override = pass_param_map.get(spec["shader"])
             if override is not None:
                 spec["param_names"] = list(override)
