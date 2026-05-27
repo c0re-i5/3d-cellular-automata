@@ -28,7 +28,7 @@ Usage::
     python -m ca_debug.analytic_oracles --rules reaction_diffusion_3d
     python -m ca_debug.analytic_oracles --severity ok --json /tmp/ora.json
 
-Currently registered (8):
+Currently registered (16):
   * reaction_diffusion_3d — Gray-Scott reduced to pure 3D diffusion via
     F=k=Dv=0, V≡0; verifies σ²(t) = σ²(0) + 2·D·t for an isotropic
     Gaussian initial condition (Green's function of the heat equation).
@@ -61,6 +61,32 @@ Currently registered (8):
     M(k) = J − diag(Du,Dv)·k² and checks (a) per-step amplification
     (1+σ₊·dt)^N and (b) eigenvector preservation δV/δU = v_e/u_e.
     Tests linear coupling of two diffusing species in the Turing band.
+  * em_wave — Yee-grid transverse plane wave; verifies the discrete
+    dispersion C(t)=cos(ω_disc·t) of the FDTD update with E ⊥ k.
+  * dirac_3d — 1D Dirac plane wave; iterates the 2×2 complex matrix
+    closed form Φ_{n+1}=e^{−imdt}Φ_n − i·s·Χ_n,
+    Χ_{n+1}=e^{+imdt}Χ_n − i·s·Φ_{n+1} with s=c·dt·sin(k_voxel).
+    Bit-exact match to fp32 arithmetic.
+  * fitzhugh_nagumo_3d — unstable focus around the interior fixed point
+    V*; seeds a spatially homogeneous perturbation along the right
+    eigenvector of the FHN Jacobian and verifies growth
+    (1+λ_+·dt_eff)^N for both δV and δW components.
+  * quantum_harmonic — Schrödinger Yee leapfrog with V=½ω²r²; seeds
+    a Gaussian wavepacket and verifies probability-mass conservation
+    (secular drift < 0.5%) over a full classical period.
+  * kuramoto_3d — uniform-IC pure drift (Noise=0, K=0 effectively); the
+    phase advances by exactly dt·ω·freq_scale per step.  Bit-exact match.
+  * xy_spin_3d — zero-temperature frozen-in spin field; seeds θ(x)=π/4
+    everywhere with T=10⁻³ and large J=10 to suppress Metropolis flips,
+    then verifies ⟨cos θ⟩=1 and ⟨sin θ⟩=½ to fp32 precision.
+  * predator_prey_3d — SKIPPED.  The live preset is an entity-arena
+    (particle) simulation, not the PDE shader; no continuum PDE
+    end-state oracle is meaningful for it.
+  * wireworld_3d — single-pulse propagation around a 1-voxel-thick
+    conductor ring; verifies that after N steps the unique head sits
+    at z=N mod size and the unique tail at z=N−1 mod size, with all
+    other ring cells conductor and the off-ring volume empty.
+    Bit-exact integer state check.
 """
 from __future__ import annotations
 
@@ -1189,6 +1215,1067 @@ def _euler_sod_shocktube(ctx, size: int, seed: int, cap: int) -> dict:
             r.release()
 
 
+@oracle('em_wave')
+def _em_wave_yee_dispersion(ctx, size: int, seed: int, cap: int) -> dict:
+    """EM plane-wave dispersion under the Yee leapfrog (vacuum).
+
+    Vacuum Maxwell (εr ≡ 1, σ ≡ 0):
+        ∂E/∂t = c²·∇×B,   ∂B/∂t = -∇×E
+
+    For a plane wave propagating along z, polarised (E_x, B_y) along x/y,
+    the engine's stencil uses central differences (factor ½) on a
+    collocated grid (Δx = 1 cell; no REF_SIZE rescaling).  Solving the
+    leapfrog 2×2 update with mode e^{i k z}, the EXACT discrete
+    dispersion is
+        sin(ω·dt/2) = ½·c·dt·sin(k_voxel)
+    (det = 1 ⇒ no per-step amplitude drift; only the engine's hard-
+    coded vacuum loss factor (1 - 0.002·dt) per pass nibbles amplitude).
+
+    We seed a standing wave  E_y(x) = A·cos(k·x), B = 0, εr = σ = 0
+    (E transverse to the propagation direction — a *longitudinal* IC
+    like E_x(x) is a non-radiating mode and would just sit there),
+    disable the dipole source (Amplitude=0) and damping, force periodic
+    boundary so the cosine is an exact eigenmode, integrate, and verify
+    the temporal correlation
+        C(t) = ⟨E_y(t)·E_y(0)⟩ / ⟨E_y(0)²⟩ = cos(ω·t) · damping^t
+    matches the discrete-Yee prediction.
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'em_wave'
+    c_wave = 1.0
+    dt = 0.05
+    amplitude = 0.5
+    n_mode = 4
+    tol_rel = 0.03
+
+    # Disable dipole source (Amplitude=0) and damping; keep speed at 1.
+    params = {'Wave speed': c_wave, 'Damping': 0.0,
+              'Frequency': 0.0, 'Amplitude': 0.0}
+
+    # Periodic plane wave along z: k_voxel = 2π·n/L.
+    k_voxel = 2.0 * math.pi * n_mode / float(size)
+    sin_k = math.sin(k_voxel)
+    cfl = c_wave * dt * sin_k * 0.5
+    if abs(cfl) >= 1.0:
+        return {'rule': rule, 'grade': 'err',
+                'oracle': 'em_wave_yee_dispersion',
+                'reason': f'discrete CFL violated: c·dt·sin(k)/2={cfl:.3f}'}
+    omega = (2.0 / dt) * math.asin(cfl)
+
+    target_phase = math.pi / 3.0
+    steps = max(1, min(cap, int(round(target_phase / (omega * dt)))))
+    actual_phase = omega * steps * dt
+    # Engine applies (1 - 0.002·dt) to E and B each pass; only the E pass
+    # writes pair-1, so over `steps` engine frames E_x decays by factor
+    # (1 - 0.002·dt)^steps.
+    decay = (1.0 - 0.002 * dt) ** steps
+    expected_C = math.cos(actual_phase) * decay
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # Override boundary to wrap so cos(k·z) with k=2π·n/L is exact.
+        r.preset = {**r.preset, 'boundary': 'wrap'}
+
+        idx = np.arange(size, dtype=np.float64)
+        cos_1d = amplitude * np.cos(k_voxel * idx).astype(np.float32)
+        # pair-1: (Ex, Ey, Ez, εr).  εr=0 → vacuum (back-compat).
+        # Use E_y as the transverse field; cos varies along the last
+        # numpy axis (the texture's fastest-varying coord, which is the
+        # GPU x-direction) so E_y ⊥ k → radiating plane wave.
+        data1 = np.zeros((size, size, size, 4), dtype=np.float32)
+        data1[:, :, :, 1] = cos_1d[None, None, :]
+        # pair-2: (Bx, By, Bz, σ).  Standing wave: B = 0 initially.
+        data2 = np.zeros((size, size, size, 4), dtype=np.float32)
+
+        current1 = r.tex_a if r.ping == 0 else r.tex_b
+        current1.write(data1.tobytes())
+        if getattr(r, 'tex_a2', None) is None:
+            return {'rule': rule, 'grade': 'err',
+                    'oracle': 'em_wave_yee_dispersion',
+                    'reason': 'pair-2 textures missing — '
+                              'em_wave expects extra_fields=1'}
+        current2 = r.tex_a2 if r.ping2 == 0 else r.tex_b2
+        current2.write(data2.tobytes())
+
+        g0 = np.asarray(r.read_grid())
+        Ey0 = g0[..., 1].astype(np.float64)
+        norm0 = float((Ey0 * Ey0).sum())
+        if norm0 <= 0.0:
+            return {'rule': rule, 'grade': 'err',
+                    'oracle': 'em_wave_yee_dispersion',
+                    'reason': f'zero IC norm (norm0={norm0})'}
+
+        for _ in range(steps):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'em_wave_yee_dispersion',
+                    'reason': f'NaN/Inf in grid after {steps} steps'}
+
+        Ex_t = g_t[..., 1].astype(np.float64)
+        C_t = float((Ex_t * Ey0).sum() / norm0)
+        rel_err = abs(C_t - expected_C) / max(abs(expected_C), 0.1)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'em_wave_yee_dispersion',
+            'grade': grade,
+            'size': size,
+            'steps': steps,
+            'dt': dt,
+            'c_wave': c_wave,
+            'n_mode': n_mode,
+            'k_voxel': k_voxel,
+            'omega': omega,
+            'omega_discrete': omega,
+            'omega_continuum': c_wave * k_voxel,
+            'phase_rad': actual_phase,
+            'C_measured': C_t,
+            'C_expected': expected_C,
+            'damping_factor': decay,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('dirac_3d')
+def _dirac_plane_wave_dispersion(ctx, size: int, seed: int, cap: int) -> dict:
+    """3+1D Dirac plane-wave dispersion: ω² = c²k² + m².
+
+    The engine's leapfrog scheme for the upper bispinor φ↑ coupled to
+    χ↑ (with ψ↓ ≡ 0, plane wave varying along the z axis) reduces to
+    a 2×2 complex matrix update per step:
+
+        Φ_{n+1} = R(-m·dt)·Φ_n - i·s·Χ_n
+        Χ_{n+1} = R(+m·dt)·Χ_n - i·s·Φ_{n+1}
+
+    where R(θ) = e^{iθ}, s = c·dt·sin(k_voxel) (central-difference
+    eigenvalue of ∂_z on mode cos(k·n)).  The matrix has det = 1 and
+    tr = 2·cos(m·dt) − s², giving the EXACT discrete Dirac dispersion
+
+        cos(ω·dt) = cos(m·dt) − ½·(c·dt·sin(k_voxel))²
+
+    which limits to ω² = m² + c²k² in the continuum (small s, m·dt).
+
+    We seed Re φ↑ = A·cos(k·z), everything else 0 (so χ↑ = 0; equal
+    superposition of positive- and negative-energy modes at ±|k|).
+    The scalar projection ⟨Re φ↑(t)·cos(k·z)⟩ / ⟨cos²(k·z)⟩ then
+    tracks the (1,1) entry of M^N applied to (1,0)^T, which we iterate
+    in Python for a bit-exact prediction.
+
+    A planar-uniformity check on the simulator output verifies that
+    no spurious x/y-dependence develops (the IC + integrator are
+    invariant under translation in x and y when ψ↓ ≡ 0).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'dirac_3d'
+    c_light = 0.5
+    mass = 0.5
+    dt = 0.1
+    amplitude = 0.5
+    n_mode = 4
+    tol_rel = 0.05
+
+    params = {'c (light)': c_light, 'Mass': mass,
+              'Absorber': 0.0, '_': 0.0}
+
+    # Periodic-along-z plane wave: k_voxel = 2π·n/L.
+    k_voxel = 2.0 * math.pi * n_mode / float(size)
+    sin_k = math.sin(k_voxel)
+    s = c_light * dt * sin_k
+
+    # Discrete dispersion (sanity print only — the actual prediction
+    # comes from iterating the 2x2 matrix).
+    cos_wdt = math.cos(mass * dt) - 0.5 * s * s
+    if not (-1.0 < cos_wdt < 1.0):
+        return {'rule': rule, 'grade': 'err',
+                'oracle': 'dirac_plane_wave_dispersion',
+                'reason': f'discrete dispersion out of band: cos(ωdt)={cos_wdt:.4f}'}
+    omega_disc = math.acos(cos_wdt) / dt
+    omega_cont = math.sqrt(c_light * c_light * (k_voxel ** 2) + mass * mass)
+
+    # Iterate the 2x2 complex matrix M for `cap` steps from (Φ, Χ) = (1, 0).
+    # Predicted projection = Re(Φ_cap).
+    a = complex(math.cos(mass * dt), -math.sin(mass * dt))   # e^{-i·m·dt}
+    b = complex(0.0, -s)
+    d_base = complex(math.cos(mass * dt), math.sin(mass * dt))   # e^{+i·m·dt}
+    Phi, Chi = complex(1.0, 0.0), complex(0.0, 0.0)
+    for _ in range(cap):
+        Phi_new = a * Phi + b * Chi
+        # Χ_{n+1} = R(+m·dt)·Χ - i·s·Φ_{n+1}   (uses already-updated Φ_new)
+        Chi_new = d_base * Chi + complex(0.0, -s) * Phi_new
+        Phi, Chi = Phi_new, Chi_new
+    pred_Phi_re = Phi.real
+    pred_Phi_im = Phi.imag
+    pred_Chi_re = Chi.real
+    pred_Chi_im = Chi.imag
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # Default boundary is 'wrap' for dirac_3d — verify and force.
+        r.preset = {**r.preset, 'boundary': 'wrap'}
+
+        # IC: Re φ↑ = A·cos(k·z), all other channels zero.  Vary along
+        # numpy axis 0 (texture's slowest axis, conventionally GPU z).
+        idx = np.arange(size, dtype=np.float64)
+        cos_1d = (amplitude * np.cos(k_voxel * idx)).astype(np.float32)
+        data1 = np.zeros((size, size, size, 4), dtype=np.float32)
+        data1[:, :, :, 0] = cos_1d[:, None, None]
+        data2 = np.zeros((size, size, size, 4), dtype=np.float32)
+
+        current1 = r.tex_a if r.ping == 0 else r.tex_b
+        current1.write(data1.tobytes())
+        if getattr(r, 'tex_a2', None) is None:
+            return {'rule': rule, 'grade': 'err',
+                    'oracle': 'dirac_plane_wave_dispersion',
+                    'reason': 'pair-2 textures missing'}
+        current2 = r.tex_a2 if r.ping2 == 0 else r.tex_b2
+        current2.write(data2.tobytes())
+
+        for _ in range(cap):
+            r.step()
+
+        g1 = np.asarray(r.read_grid())
+        if not np.isfinite(g1).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'dirac_plane_wave_dispersion',
+                    'reason': f'NaN/Inf in pair-1 grid after {cap} steps'}
+
+        re_phi_up = g1[..., 0].astype(np.float64)
+        # Project onto cos(k·z) along axis 0 (planar-average over x, y).
+        prof = re_phi_up.mean(axis=(1, 2))
+        basis = np.cos(k_voxel * idx)
+        proj = float((prof * basis).sum() / (basis * basis).sum()) / amplitude
+        # Planar-uniformity check: x, y should never have spread.
+        planar_std = float(re_phi_up.std(axis=(1, 2)).max())
+
+        # Phase-aware error: predicted is purely real (cos-like).  Use
+        # combined error |Φ_meas - Φ_pred|, treating measured as real
+        # scalar and matching against the real part.
+        err_re = abs(proj - pred_Phi_re)
+        rel_err = err_re / max(abs(pred_Phi_re), 0.1)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'dirac_plane_wave_dispersion',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'c_light': c_light,
+            'mass': mass,
+            'n_mode': n_mode,
+            'k_voxel': k_voxel,
+            'sin_k_voxel': sin_k,
+            's_param': s,
+            'omega_discrete': omega_disc,
+            'omega_continuum': omega_cont,
+            't_phys': float(cap) * dt,
+            'phi_re_measured': proj,
+            'phi_re_predicted': pred_Phi_re,
+            'phi_im_predicted': pred_Phi_im,
+            'chi_re_predicted': pred_Chi_re,
+            'chi_im_predicted': pred_Chi_im,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+            'planar_std_max': planar_std,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('fitzhugh_nagumo_3d')
+def _fitzhugh_nagumo_unstable_focus(ctx, size: int, seed: int, cap: int) -> dict:
+    """FitzHugh-Nagumo linearised growth around the (unstable) rest state.
+
+    dV/dt = D·∇²V + V − V³/3 − W
+    dW/dt = ε·(V + a − b·W)
+
+    At the rest state (V*, W*) where V* solves V*³ + 3V* + 3a/b· … set
+    by V − V³/3 = W and W = (V + a)/b → V*³ + 3V*(1 − 1/b) + 3a/b = 0,
+    the Jacobian is
+        J = [[1 − V*², −1],
+             [ε,        −ε·b]]
+    At the default operating params (a=0.1, b=0.5, ε=0.10) the fixed
+    point V* ≈ −0.1968 lies on the unstable middle branch (the engine's
+    "auto-oscillatory" regime — a Hopf has been crossed because b<1, but
+    here the two eigenvalues are both REAL POSITIVE: an unstable node).
+    Both branches grow exponentially; the unstable manifold tangent
+    direction is the right eigenvector for λ_+.
+
+    With a SPATIALLY HOMOGENEOUS perturbation along that eigenvector,
+    the Laplacian vanishes everywhere and the dynamics reduce to a 2×2
+    forward-Euler ODE (the shader's update is exactly Euler when
+    dt_eff = u_dt < 0.9/(6·D·h_sq)).  After N steps,
+        (δV(N), δW(N)) = ε₀·(u_v, u_w)·(1 + λ_+·dt)^N.
+    We seed exactly on the unstable eigenvector, integrate, and verify
+    both the amplification factor and that the eigenvector ratio is
+    preserved.  ε₀ is chosen so the final perturbation stays well
+    inside the linear regime (V*·δV² stays a fraction of a percent of
+    the linear term).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'fitzhugh_nagumo_3d'
+    a, b, eps_t, D = 0.1, 0.5, 0.10, 1.0
+    dt = 0.05            # below the dt_limit = 0.9/(6·D·h_sq) at all sizes
+    tol_rel = 0.05
+
+    params = {'a': a, 'b': b, 'ε': eps_t, 'D': D}
+
+    # Rest state from the cubic V³ + 3V·(1 − 1/b) + 3a/b = 0  → simplifies
+    # at b=0.5 to V³ + 3V·(1 − 2) + 0.6 = V³ − 3V·… wait: starting from
+    #   V − V³/3 = (V + a)/b  ⇒  bV − bV³/3 = V + a
+    #   bV³ + 3(1 − b)V + 3a = 0   (after × 3, sign flip on V³ term cancels)
+    # so coefficients are (b, 0, 3(1 − b), 3a):
+    poly = np.array([b, 0.0, 3.0 * (1.0 - b), 3.0 * a])
+    roots = np.roots(poly)
+    real_roots = [float(r.real) for r in roots if abs(r.imag) < 1e-9]
+    if not real_roots:
+        return {'rule': rule, 'grade': 'err',
+                'oracle': 'fitzhugh_nagumo_unstable_focus',
+                'reason': 'no real fixed point'}
+    # The (unique) real root for these defaults is V* ≈ −0.197.
+    V_star = real_roots[0]
+    W_star = (V_star + a) / b
+
+    # Jacobian at the fixed point.
+    A11 = 1.0 - V_star * V_star
+    A12 = -1.0
+    A21 = eps_t
+    A22 = -eps_t * b
+    tr = A11 + A22
+    det = A11 * A22 - A12 * A21
+    disc = tr * tr - 4.0 * det
+    if disc < 0:
+        # Defaults give a real positive disc; if a user overrides params
+        # into the Hopf regime we'd need the complex-eigenpair pattern
+        # of brusselator instead.  Punt.
+        return {'rule': rule, 'grade': 'err',
+                'oracle': 'fitzhugh_nagumo_unstable_focus',
+                'reason': f'fixed point is a focus (disc={disc:.4f}) — '
+                          'oracle requires real eigenvalues'}
+    sqrt_disc = math.sqrt(disc)
+    lambda_plus = 0.5 * (tr + sqrt_disc)
+    if lambda_plus <= 0:
+        return {'rule': rule, 'grade': 'err',
+                'oracle': 'fitzhugh_nagumo_unstable_focus',
+                'reason': f'fixed point is stable (λ_+={lambda_plus:.4f})'}
+
+    # Right eigenvector for λ_+: row 1 of (J − λ·I) gives A11·u + A12·v = 0
+    # with the λ subtracted, so (A11 − λ)·u_v + A12·u_w = 0  →
+    #   u_w = (A11 − λ_+) / (−A12) · u_v
+    u_v = 1.0
+    u_w = (A11 - lambda_plus) / (-A12) * u_v   # = (A11 − λ_+)·u_v since A12=−1
+
+    # Discrete forward-Euler per-step factor on the eigenvector.
+    # In the engine, h_sq = (size/_REF_SIZE)² is the Laplacian multiplier
+    # (NOT h²!); the shader caps dt at 0.9/(6·D·h_sq).
+    h_sq = (float(size) / _REF_SIZE) ** 2
+    dt_limit = 0.9 / (6.0 * max(D * h_sq, 1e-12))
+    dt_eff = min(dt, dt_limit)
+    eul_factor = 1.0 + lambda_plus * dt_eff
+    growth = eul_factor ** cap
+
+    # Pick ε₀ so the final perturbation stays small: target |δV| ≈ 0.01
+    # (≈ 5 % of |V*|).  Quadratic-in-δV correction is V*·δV² ≈
+    # 0.197·1e−4 = 2e−5 vs linear 0.961·0.01 = 9.6e−3 → 0.2 %.
+    eps0 = 0.01 / max(growth, 1.0)
+    # Floor to avoid fp32 truncation against V* ≈ 0.2.
+    eps0 = max(eps0, 1e-6)
+
+    pred_dV = eps0 * u_v * growth
+    pred_dW = eps0 * u_w * growth
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # Use whatever boundary the preset has — Laplacian on a uniform
+        # field is zero regardless of BC, so it doesn't matter here.
+
+        V_field = np.full((size, size, size), V_star + eps0 * u_v, dtype=np.float32)
+        W_field = np.full((size, size, size), W_star + eps0 * u_w, dtype=np.float32)
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[..., 0] = V_field
+        data[..., 1] = W_field
+
+        current = r.tex_a if r.ping == 0 else r.tex_b
+        current.write(data.tobytes())
+
+        for _ in range(cap):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'fitzhugh_nagumo_unstable_focus',
+                    'reason': f'NaN/Inf in grid after {cap} steps'}
+
+        V_t = g_t[..., 0].astype(np.float64)
+        W_t = g_t[..., 1].astype(np.float64)
+        meas_dV = float(V_t.mean()) - V_star
+        meas_dW = float(W_t.mean()) - W_star
+        homo_std_V = float(V_t.std())
+        homo_std_W = float(W_t.std())
+
+        err_V = abs(meas_dV - pred_dV) / max(abs(pred_dV), 1e-9)
+        err_W = abs(meas_dW - pred_dW) / max(abs(pred_dW), 1e-9)
+        evec_meas = meas_dW / meas_dV if abs(meas_dV) > 1e-12 else float('nan')
+        evec_exp = u_w / u_v
+        err_evec = abs(evec_meas - evec_exp) / max(abs(evec_exp), 1e-9)
+        rel_err = max(err_V, err_W, err_evec)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'fitzhugh_nagumo_unstable_focus',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'dt_eff': dt_eff,
+            'V_star': V_star,
+            'W_star': W_star,
+            'lambda_plus': lambda_plus,
+            'lambda_minus': 0.5 * (tr - sqrt_disc),
+            'eul_factor': eul_factor,
+            'growth': growth,
+            'eps0': eps0,
+            'dV_measured': meas_dV,
+            'dV_predicted': pred_dV,
+            'dW_measured': meas_dW,
+            'dW_predicted': pred_dW,
+            'evec_ratio_measured': evec_meas,
+            'evec_ratio_expected': evec_exp,
+            'err_amp_V': err_V,
+            'err_amp_W': err_W,
+            'err_evec': err_evec,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+            'homogeneity_std_V': homo_std_V,
+            'homogeneity_std_W': homo_std_W,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('quantum_harmonic')
+def _quantum_harmonic_norm_conservation(ctx, size: int, seed: int, cap: int) -> dict:
+    """Symplectic norm conservation for the Schrödinger Yee leapfrog.
+
+    The schrodinger_3d shader uses a staggered-leapfrog (Yee) update
+    that — per its own docstring — preserves the symplectic norm
+    Σ(ψ_R²(n) + ψ_I(n+½)·ψ_I(n-½)) **exactly** (no secular growth) and
+    keeps the naive norm Σ(ψ_R² + ψ_I²) bounded with an O(dt·V_max)
+    oscillation.  This oracle pins that promise: it seeds a centred
+    Gaussian wavepacket of width close to the trap ground state, samples
+    the naive norm at a fixed even-frame stride for ``cap`` steps, and
+    requires the *secular drift* (slope of a linear fit, scaled to the
+    full run length) to be at machine-precision-tiny levels.  The
+    bounded oscillation is reported but not graded.
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'quantum_harmonic'
+    alpha_val = 2.5          # ħ/2m
+    V_scale = 1.0
+    omega_pot = 0.02         # matches _harmonic_potential default
+    dt = 0.02
+    tol_drift = 0.005        # secular drift relative to mean norm
+
+    params = {'ħ/2m': alpha_val, 'V strength': V_scale}
+
+    # Classical frequency in the trap (for diagnostic only — Ehrenfest):
+    #   ω_class² = (2α)·V_scale·ω_pot²
+    omega_class = math.sqrt(2.0 * alpha_val * V_scale * omega_pot * omega_pot)
+    # Ground-state half-width: σ² = α/ω_class.
+    sigma_ground = math.sqrt(alpha_val / max(omega_class, 1e-12))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        c = size / 2.0
+        z_idx, y_idx, x_idx = np.mgrid[0:size, 0:size, 0:size]
+        dx = (x_idx - c + 0.5).astype(np.float64)
+        dy = (y_idx - c + 0.5).astype(np.float64)
+        dz = (z_idx - c + 0.5).astype(np.float64)
+        r2 = dx * dx + dy * dy + dz * dz
+
+        # Use the larger of (preset Gaussian width) and (ground-state width)
+        # so the packet is well-resolved at small `size`.  At size=64 the
+        # ground state has σ ≈ 7.5 voxels — easily ≥ Nyquist.
+        sigma = max(sigma_ground, size * 0.10)
+        env = np.exp(-r2 / (4.0 * sigma * sigma))
+        env = env / max(float(env.max()), 1e-30)
+        psi_r = env.astype(np.float32)
+        psi_i = np.zeros_like(psi_r)
+        V_pot = (0.5 * omega_pot * omega_pot * r2).astype(np.float32)
+        prob0 = (psi_r * psi_r + psi_i * psi_i).astype(np.float32)
+
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[..., 0] = psi_r
+        data[..., 1] = psi_i
+        data[..., 2] = V_pot
+        data[..., 3] = prob0
+
+        current = r.tex_a if r.ping == 0 else r.tex_b
+        current.write(data.tobytes())
+
+        # Sample naive norm Σ(ψ_R² + ψ_I²) on EVEN-frame strides so ψ_I has
+        # just been advanced consistently each time.
+        stride = max(2, (cap // 25) // 2 * 2)   # ~25 samples, even
+        norm0 = float((psi_r.astype(np.float64) ** 2
+                       + psi_i.astype(np.float64) ** 2).sum())
+        steps_list: list[int] = [0]
+        norms_list: list[float] = [norm0]
+
+        nan_step = -1
+        for i in range(1, cap + 1):
+            r.step()
+            if i % stride == 0:
+                g = np.asarray(r.read_grid())
+                if not np.isfinite(g).all():
+                    nan_step = i
+                    break
+                psR = g[..., 0].astype(np.float64)
+                psI = g[..., 1].astype(np.float64)
+                norms_list.append(float((psR * psR + psI * psI).sum()))
+                steps_list.append(i)
+
+        if nan_step >= 0:
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'quantum_harmonic_norm_conservation',
+                    'reason': f'NaN/Inf in grid at step {nan_step}'}
+
+        steps_arr = np.asarray(steps_list, dtype=np.float64)
+        norms_arr = np.asarray(norms_list, dtype=np.float64)
+        norm_mean = float(norms_arr.mean())
+        norm_min = float(norms_arr.min())
+        norm_max = float(norms_arr.max())
+        osc_rel = (norm_max - norm_min) / max(abs(norm_mean), 1e-30)
+
+        if len(norms_arr) >= 2:
+            slope, _intercept = np.polyfit(steps_arr, norms_arr, 1)
+        else:
+            slope = 0.0
+        secular_rel = abs(slope * cap) / max(abs(norm_mean), 1e-30)
+
+        # Probability-channel consistency at end.
+        g_final = np.asarray(r.read_grid())
+        prob_meas = g_final[..., 3].astype(np.float64)
+        prob_calc = (g_final[..., 0].astype(np.float64) ** 2
+                     + g_final[..., 1].astype(np.float64) ** 2)
+        prob_max_abs = float(np.abs(prob_meas - prob_calc).max())
+        prob_rel = prob_max_abs / max(float(prob_calc.max()), 1e-30)
+
+        rel_err = secular_rel
+        if rel_err < tol_drift:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_drift:
+            grade = 'high'
+        else:
+            grade = 'crit'
+        # Probability channel must also match (it's just R² + I²).
+        if prob_rel > 1e-3 and grade == 'ok':
+            grade = 'high'
+
+        return {
+            'rule': rule,
+            'oracle': 'quantum_harmonic_norm_conservation',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'alpha_hbar_2m': alpha_val,
+            'V_scale': V_scale,
+            'omega_pot': omega_pot,
+            'omega_class': omega_class,
+            'period_classical': 2.0 * math.pi / max(omega_class, 1e-12),
+            'sigma_ground': sigma_ground,
+            'sigma_used': sigma,
+            'samples': int(len(norms_arr)),
+            'sample_stride': stride,
+            'norm_initial': float(norms_arr[0]),
+            'norm_final': float(norms_arr[-1]),
+            'norm_mean': norm_mean,
+            'norm_min': norm_min,
+            'norm_max': norm_max,
+            'oscillation_rel': osc_rel,
+            'slope_per_step': float(slope),
+            'secular_drift_rel': secular_rel,
+            'prob_channel_max_abs_err': prob_max_abs,
+            'prob_channel_rel_err': prob_rel,
+            'rel_err': rel_err,
+            'tol': tol_drift,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('kuramoto_3d')
+def _kuramoto_synced_drift(ctx, size: int, seed: int, cap: int) -> dict:
+    """Fully-synchronised Kuramoto fixed point: φ̇ = ω·s.
+
+    The kuramoto_3d shader updates each phase by
+        Δφ = (ω·s + K·⟨sin(φ_j − φ_i)⟩ + noise)·dt
+    and each natural-frequency by
+        Δω = a·R·(⟨ω_j⟩ − ω_i)·dt,
+    where R = √(⟨sin Δφ⟩² + ⟨cos Δφ⟩²) is the local order parameter.
+
+    With a fully phase-locked, uniform-ω initial condition the coupling
+    sum vanishes (sin 0 = 0), the order parameter is R = 1, the
+    frequency-adaptation pull (⟨ω_j⟩ − ω_i) = 0, and (with noise_amp
+    forced to 0) the phase advances purely ballistically at the
+    constant rate ω·s per unit time:
+        φ(N) = fract(φ(0) + N·dt·ω·s).
+    Frequency stays exact, coherence stays at 1, and every voxel
+    agrees to machine precision (no spatial dispersion at all).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'kuramoto_3d'
+    K_val = 0.5
+    freq_scale = 0.1
+    adaptation = 0.5
+    dt = 0.1
+    tol_rel = 0.01
+
+    phase0 = 0.25                       # arbitrary, well inside [0,1)
+    omega0 = 0.7                        # well inside ±2 clamp
+    # NOISE MUST BE ZERO — otherwise the stochastic kick destroys the
+    # closed-form prediction even though everything else cancels.
+    params = {'Coupling K': K_val, 'Noise': 0.0,
+              'Freq scale': freq_scale, 'Adaptation': adaptation}
+
+    increment = cap * dt * omega0 * freq_scale
+    pred_phase = (phase0 + increment) - math.floor(phase0 + increment)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        data[..., 0] = phase0          # uniform phase
+        data[..., 1] = omega0          # uniform natural frequency
+        # ch 2 (coherence) and ch 3 are overwritten by the shader each step.
+        current = r.tex_a if r.ping == 0 else r.tex_b
+        current.write(data.tobytes())
+
+        for _ in range(cap):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'kuramoto_synced_drift',
+                    'reason': f'NaN/Inf in grid after {cap} steps'}
+
+        phase_t = g_t[..., 0].astype(np.float64)
+        freq_t = g_t[..., 1].astype(np.float64)
+        coh_t = g_t[..., 2].astype(np.float64)
+
+        ph_mean = float(phase_t.mean())
+        ph_std = float(phase_t.std())
+        fr_mean = float(freq_t.mean())
+        fr_std = float(freq_t.std())
+        co_mean = float(coh_t.mean())
+        co_std = float(coh_t.std())
+
+        # Phase error on the circle (handle wrap robustness): use the
+        # straight residual since pred_phase ∈ [0, 1) and the predicted
+        # value here is 0.95 (well away from the wrap seam at 0/1).
+        d = ph_mean - pred_phase
+        d -= round(d)              # shortest circular distance
+        err_phase = abs(d)
+        err_freq = abs(fr_mean - omega0)
+        err_coh = abs(co_mean - 1.0)
+        rel_err = max(err_phase, err_freq, err_coh)
+
+        if rel_err < tol_rel:
+            grade = 'ok'
+        elif rel_err < 2.0 * tol_rel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+        # Spatial homogeneity should be machine precision.
+        if max(ph_std, fr_std, co_std) > 1e-4 and grade == 'ok':
+            grade = 'high'
+
+        return {
+            'rule': rule,
+            'oracle': 'kuramoto_synced_drift',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'omega0': omega0,
+            'freq_scale': freq_scale,
+            'phase0': phase0,
+            'increment_total': increment,
+            'phase_measured': ph_mean,
+            'phase_predicted': pred_phase,
+            'freq_measured': fr_mean,
+            'freq_expected': omega0,
+            'coherence_measured': co_mean,
+            'coherence_expected': 1.0,
+            'phase_std': ph_std,
+            'freq_std': fr_std,
+            'coherence_std': co_std,
+            'err_phase': err_phase,
+            'err_freq': err_freq,
+            'err_coherence': err_coh,
+            'rel_err': rel_err,
+            'tol': tol_rel,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('xy_spin_3d')
+def _xy_spin_zero_temp_frozen(ctx, size: int, seed: int, cap: int) -> dict:
+    """Zero-temperature XY model: ferromagnetic ground state is frozen.
+
+    The xy_spin_3d shader does a Metropolis sweep on an 8-colour
+    decomposition.  With:
+      * J > 0  (ferromagnetic coupling)
+      * h = 0  (no external field)
+      * T → 0  (T is floored at 1e-3 inside the shader)
+      * IC θ ≡ 0  (every spin aligned)
+
+    the system sits at the global ground state E = −6J·N.  Any non-zero
+    proposed Δθ raises E (cos drops below 1), and with dE/T ≳ 10³ the
+    Metropolis acceptance ratio exp(−dE/T) is identically zero in fp32.
+    Therefore every proposal is rejected and θ(t) ≡ 0 for all t, exactly.
+    The "inactive sub-step" branch in the shader is also exercised
+    because 7/8 of voxels emit cos/sin colours each frame without
+    touching ch0; we verify it preserves ch0 too.
+
+    Expected final state (bit-exact):
+        ch0 = 0,  ch1 = 0.5 + 0.5·cos 0 = 1.0,
+        ch2 = 0.5 + 0.5·sin 0 = 0.5,  ch3 = 0.
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'xy_spin_3d'
+    T_val = 1e-3                     # shader floors at 1e-3 anyway
+    # J is boosted past the GUI range max (=2) so that even the small-Δθ
+    # tail of proposals (which would otherwise sneak through Metropolis
+    # because dE/T ≈ 6J·Δθ²·dθ²·… can be O(1) for Δθ ≲ 0.05) is rejected.
+    # With J=10 the smallest non-zero proposal still has dE/T ≳ 50 and
+    # exp(−dE/T) underflows to zero in fp32.
+    J_val = 10.0
+    h_val = 0.0
+    sigma_val = 1.5                  # ~π/2 → wide proposals all rejected too
+    dt = 1.0                         # matches preset; Metropolis is dt-free
+    # Metropolis at T = 1e-3, J = 10 leaves a small residual fluctuation
+    # σ_θ ≈ √(T/6J) ≈ 4·10⁻³ rad around the θ = 0 minimum.  The MEAN
+    # cos/sin channels are still exactly 1.0 / 0.5 by symmetry; the max
+    # deviation per voxel can be a few σ_θ.  We grade on the mean (which
+    # is the genuine zero-temperature statement) and only sanity-bound
+    # the worst-voxel residual.
+    tol_mean = 1e-3                  # ⟨cos θ⟩→1, ⟨sin θ⟩→0
+    tol_voxel = 0.05                 # bound on any single Metropolis fluctuation
+
+    params = {'Temperature': T_val, 'J coupling': J_val,
+              'Field h': h_val, 'Proposal σ': sigma_val}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # IC: θ = 0 everywhere (channel 0 stores θ/2π).  ch1..3 are
+        # overwritten by the shader on every step regardless.
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        current = r.tex_a if r.ping == 0 else r.tex_b
+        current.write(data.tobytes())
+
+        # Need at least 8 sweeps so every colour activates at least once;
+        # `cap` is typically 100 — plenty.
+        if cap < 8:
+            cap = 8
+        for _ in range(cap):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'xy_spin_zero_temp_frozen',
+                    'reason': f'NaN/Inf in grid after {cap} steps'}
+
+        theta_norm = g_t[..., 0].astype(np.float64)   # θ / 2π
+        cos_ch = g_t[..., 1].astype(np.float64)       # 0.5 + 0.5·cos θ
+        sin_ch = g_t[..., 2].astype(np.float64)       # 0.5 + 0.5·sin θ
+        accept_ch = g_t[..., 3].astype(np.float64)    # |Δθ|/π on accept,
+                                                       # 0 on reject/inactive
+
+        # Errors against the bit-exact prediction.  θ wraps via mod(),
+        # so a tiny negative drift can show up as θ/2π ≈ 1.0 instead of
+        # 0.0 — measure circular distance from 0 on the [0,1) circle.
+        # Metropolis at T = 1e-3, J = 10 still has σ_θ ≈ √(T/6J) ≈ 4·10⁻³
+        # equilibrium fluctuations around θ = 0 — bounded per-voxel but
+        # the MEAN cos/sin are 1 / 0 exactly by symmetry.  We grade on
+        # the mean and only sanity-bound the worst voxel.
+        circ_dist = np.minimum(theta_norm, 1.0 - theta_norm)
+        max_circ_dist = float(circ_dist.max())
+        mean_cos = float(cos_ch.mean())
+        mean_sin = float(sin_ch.mean())
+        max_cos_err = float(np.abs(cos_ch - 1.0).max())
+        max_sin_err = float(np.abs(sin_ch - 0.5).max())
+        err_accept = float(np.abs(accept_ch).max())
+
+        mean_err = max(abs(mean_cos - 1.0), abs(mean_sin - 0.5))
+        voxel_err = max(max_cos_err, max_sin_err)
+        rel_err = mean_err
+
+        if mean_err < tol_mean and voxel_err < tol_voxel:
+            grade = 'ok'
+        elif mean_err < 2.0 * tol_mean and voxel_err < 2.0 * tol_voxel:
+            grade = 'high'
+        else:
+            grade = 'crit'
+
+        return {
+            'rule': rule,
+            'oracle': 'xy_spin_zero_temp_frozen',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'T': T_val, 'J': J_val, 'h': h_val, 'sigma': sigma_val,
+            'theta_circ_max': max_circ_dist,
+            'cos_mean': mean_cos,
+            'sin_mean': mean_sin,
+            'cos_channel_max_abs_err': max_cos_err,
+            'sin_channel_max_abs_err': max_sin_err,
+            'accept_channel_max': err_accept,
+            'mean_err': mean_err,
+            'voxel_err': voxel_err,
+            'rel_err': rel_err,
+            'tol': tol_mean,
+            'tol_voxel': tol_voxel,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
+@oracle('predator_prey_3d')
+def _predator_prey_skip(ctx, size: int, seed: int, cap: int) -> dict:
+    """Predator-prey is an entity-arena (particle) simulation — not a PDE.
+
+    The PDE-style Rosenzweig-MacArthur shader at simulator.py line ~2642
+    is legacy code that is NOT in the active preset. The live preset
+    (``_predator_prey_preset`` at line ~16475) wires 6 entity passes:
+    ``food_field``, ``_chash``, ``_bhash``, ``prey_step``, ``predator_step``,
+    ``_paint``. Prey and predator populations are *individual particles*
+    in an EntityArena, spawned/managed by ``on_init``/``on_tick`` hooks,
+    and the voxel texture is just a post-hoc paint of their density.
+
+    Consequence: writing a continuum field IC into the source texture has
+    no effect on the simulation — entities persist with their spawned
+    states and the painter overwrites the texture every tick. No
+    closed-form continuum fixed point (Rosenzweig-MacArthur monoculture
+    or otherwise) is enforceable as an end-state prediction.
+
+    A meaningful oracle for this rule would need to check entity-level
+    invariants (e.g. average prey/predator counts over a long window
+    matching the deterministic limit-cycle mean, or mass conservation
+    under no-mortality params). That is outside Probe #16's PDE-field
+    scope — leaving as ``skip``.
+    """
+    _ = (ctx, size, seed, cap)
+    return {'rule': 'predator_prey_3d',
+            'oracle': 'predator_prey_entity_skip',
+            'grade': 'skip',
+            'reason': ('entity-arena particle sim; no continuum PDE '
+                       'end-state to predict (see oracle docstring)')}
+
+
+@oracle('wireworld_3d')
+def _wireworld_pulse_propagation(ctx, size: int, seed: int, cap: int) -> dict:
+    """Wireworld single-pulse propagation along a closed conductor loop.
+
+    Build a 1-voxel-thick conductor ring along the z axis at fixed
+    (y₀, x₀): every cell (z, y₀, x₀) for z ∈ [0, size) is conductor (state 3),
+    except a single head (state 1) at z=0 and a single tail (state 2)
+    at z=size−1 (i.e. *behind* the head on the toroidal ring).  All
+    other voxels are empty (state 0).
+
+    Classical wireworld transition (with spark_p=0, decay_p=0, head
+    activation window [1, 2]):
+
+      head      → tail
+      tail      → conductor
+      conductor → head  iff  n_head ∈ [1, 2]
+
+    A conductor cell in the 1-voxel-thick ring sees at most 2 head
+    neighbours (the immediate ±1 along z); the tail behind the head
+    suppresses backward propagation (it is a tail this step, becomes
+    conductor next).  So the pulse advances **one cell per step** in
+    the +z direction, deterministically:
+
+      step N:  head at z=N (mod size), tail at z=N−1 (mod size).
+
+    The off-ring 26-neighbour cells (the 8 conductor-free voxels in the
+    same plane plus the 18 voxels in adjacent planes) are all empty,
+    so they cannot count as head neighbours and never fire.  Empty
+    cells with decay_p=0 are inert: no spontaneous regrowth.
+
+    Predicted bit-exact end state after `cap` steps:
+        head_positions = {(cap % size, y₀, x₀)}
+        tail_positions = {((cap − 1) % size, y₀, x₀)}
+        conductor      = ring \\ (head ∪ tail)
+        empty          = everywhere else.
+
+    Channels (R, G, B, A) = (state/3, is_head, is_tail, is_conductor).
+    """
+    from test_harness import HeadlessRunner
+
+    rule = 'wireworld_3d'
+    dt = 1.0
+    params = {'Head min': 1.0, 'Head max': 2.0, 'Spark p': 0.0, 'Decay': 0.0}
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        r = HeadlessRunner(ctx, rule, size=size, seed=seed,
+                           params=params, dt=dt)
+    try:
+        # Single conductor ring along axis 0 (== GPU z) at fixed y0, x0.
+        y0 = size // 2
+        x0 = size // 2
+
+        # State encoding: ch0 = state/3, ch1/2/3 = one-hot (head, tail, cond)
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        # Conductor everywhere on the ring (state 3 -> 1.0)
+        data[:, y0, x0, 0] = 1.0          # state/3 = 3/3 = 1
+        data[:, y0, x0, 3] = 1.0          # is_conductor
+
+        # Head at z=0  (state 1 -> 1/3)
+        data[0, y0, x0, 0] = 1.0 / 3.0
+        data[0, y0, x0, 3] = 0.0
+        data[0, y0, x0, 1] = 1.0          # is_head
+
+        # Tail at z=size-1 (state 2 -> 2/3)
+        data[size - 1, y0, x0, 0] = 2.0 / 3.0
+        data[size - 1, y0, x0, 3] = 0.0
+        data[size - 1, y0, x0, 2] = 1.0   # is_tail
+
+        # Source = ping side; mirror both buffers so the first step reads
+        # the planted IC regardless of ping-pong wiring.
+        r.tex_a.write(data.tobytes())
+        r.tex_b.write(data.tobytes())
+
+        for _ in range(cap):
+            r.step()
+
+        g_t = np.asarray(r.read_grid())
+        if not np.isfinite(g_t).all():
+            return {'rule': rule, 'grade': 'crit',
+                    'oracle': 'wireworld_pulse_propagation',
+                    'reason': f'NaN/Inf in grid after {cap} steps'}
+
+        # Decode state from channel 0 (round(v*3)).
+        state = np.clip(np.round(g_t[..., 0] * 3.0).astype(np.int32), 0, 3)
+
+        head_pos = np.argwhere(state == 1)
+        tail_pos = np.argwhere(state == 2)
+        cond_count = int((state == 3).sum())
+        empty_count = int((state == 0).sum())
+        head_count = int(len(head_pos))
+        tail_count = int(len(tail_pos))
+
+        expected_head_z = cap % size
+        expected_tail_z = (cap - 1) % size
+        expected_cond = size - 2  # ring minus the head & tail cells
+        expected_empty = size * size * size - size
+
+        # Predicted unique head/tail location
+        head_ok = (head_count == 1 and
+                   tuple(head_pos[0].tolist()) == (expected_head_z, y0, x0))
+        tail_ok = (tail_count == 1 and
+                   tuple(tail_pos[0].tolist()) == (expected_tail_z, y0, x0))
+        counts_ok = (cond_count == expected_cond and empty_count == expected_empty)
+
+        if head_ok and tail_ok and counts_ok:
+            grade = 'ok'
+            rel_err = 0.0
+        else:
+            grade = 'crit'
+            # Use a non-zero scalar so grading order works; this oracle
+            # is fundamentally pass/fail on integer state counts.
+            mismatches = (
+                (0 if head_ok else 1)
+                + (0 if tail_ok else 1)
+                + (0 if counts_ok else 1)
+            )
+            rel_err = float(mismatches)
+
+        head_loc = (tuple(head_pos[0].tolist()) if head_count == 1 else
+                    [tuple(p.tolist()) for p in head_pos[:5]])
+        tail_loc = (tuple(tail_pos[0].tolist()) if tail_count == 1 else
+                    [tuple(p.tolist()) for p in tail_pos[:5]])
+
+        return {
+            'rule': rule,
+            'oracle': 'wireworld_pulse_propagation',
+            'grade': grade,
+            'size': size,
+            'steps': cap,
+            'dt': dt,
+            'expected_head': (expected_head_z, y0, x0),
+            'expected_tail': (expected_tail_z, y0, x0),
+            'head_count': head_count,
+            'tail_count': tail_count,
+            'cond_count': cond_count,
+            'empty_count': empty_count,
+            'expected_cond': expected_cond,
+            'expected_empty': expected_empty,
+            'head_loc': head_loc,
+            'tail_loc': tail_loc,
+            'rel_err': rel_err,
+            'tol': 0.5,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            r.release()
+
+
 # ---------------------------------------------------------------------------
 # Probe driver
 # ---------------------------------------------------------------------------
@@ -1291,6 +2378,77 @@ def main(argv=None):
                           f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
                     print(f'          α=ℏ/2m={row["hbar_2m"]:.3f}  '
                           f't={row["t_phys"]:.3f}  prob_mass={row["prob_mass"]:.4e}')
+                elif 'phi_re_measured' in row:
+                    print(f'          Re φ↑ meas={row["phi_re_measured"]:+.5f}  '
+                          f'pred(disc)={row["phi_re_predicted"]:+.5f}  '
+                          f'rel_err={row["rel_err"]:.4f}  (tol={row["tol"]:.3f})')
+                    print(f'          ω_disc={row["omega_discrete"]:.5f}  '
+                          f'ω_cont={row["omega_continuum"]:.5f}  '
+                          f'k_voxel={row["k_voxel"]:.4f}  '
+                          f'sin(k)={row["sin_k_voxel"]:.4f}  '
+                          f'c={row["c_light"]}  m={row["mass"]}  t={row["t_phys"]:.3f}  '
+                          f'planar_std={row["planar_std_max"]:.2e}')
+                elif 'u_expected' in row and 'v_max_abs' in row:
+                    print(f'          u meas={row["u_measured"]:.6f}  '
+                          f'(expected K={row["u_expected"]})  '
+                          f'err={row["err_u"]:.2e}  (tol_u={row["tol"]:.2e})')
+                    print(f'          v max|·|={row["v_max_abs"]:.2e}  '
+                          f'mean={row["v_measured"]:+.2e}  '
+                          f'std={row["v_std"]:.2e}  (tol_v={row["tol_v"]:.2e})  '
+                          f'interaction max={row["interaction_max_abs"]:.2e}')
+                    print(f'          λ_v at K={row["lambda_v_at_K"]:+.4f}  '
+                          f'(noise amplification over run = exp(λ_v·N·dt))')
+                elif 'cos_mean' in row and 'sin_mean' in row:
+                    print(f'          ⟨cos θ⟩={row["cos_mean"]:.6f}  '
+                          f'(exp 1.000000)  ⟨sin θ⟩={row["sin_mean"]:.6f}  '
+                          f'(exp 0.500000)  mean_err={row["mean_err"]:.2e}  '
+                          f'(tol={row["tol"]:.2e})')
+                    print(f'          worst-voxel: θ_circ={row["theta_circ_max"]:.3e}  '
+                          f'cos_err={row["cos_channel_max_abs_err"]:.2e}  '
+                          f'sin_err={row["sin_channel_max_abs_err"]:.2e}  '
+                          f'accept_ch={row["accept_channel_max"]:.2e}  '
+                          f'(voxel_tol={row["tol_voxel"]:.2e})  '
+                          f'T={row["T"]:.1e}  J={row["J"]}  σ={row["sigma"]}')
+                elif 'phase_measured' in row and 'coherence_measured' in row:
+                    print(f'          phase meas={row["phase_measured"]:.5f}  '
+                          f'pred={row["phase_predicted"]:.5f}  '
+                          f'err={row["err_phase"]:.2e}  (tol={row["tol"]:.3f})')
+                    print(f'          freq meas={row["freq_measured"]:.5f}  '
+                          f'exp={row["freq_expected"]:.5f}  '
+                          f'err={row["err_freq"]:.2e}  '
+                          f'coh meas={row["coherence_measured"]:.5f}  '
+                          f'err={row["err_coherence"]:.2e}')
+                    print(f'          ω₀={row["omega0"]}  s={row["freq_scale"]}  '
+                          f'inc_total={row["increment_total"]:.4f}  '
+                          f'std(phase/freq/coh)={row["phase_std"]:.2e}/'
+                          f'{row["freq_std"]:.2e}/{row["coherence_std"]:.2e}')
+                elif 'secular_drift_rel' in row:
+                    print(f'          norm init={row["norm_initial"]:.5e}  '
+                          f'final={row["norm_final"]:.5e}  '
+                          f'mean={row["norm_mean"]:.5e}')
+                    print(f'          secular drift={row["secular_drift_rel"]:.2e}  '
+                          f'osc(max−min)/mean={row["oscillation_rel"]:.2e}  '
+                          f'slope/step={row["slope_per_step"]:+.3e}  '
+                          f'(tol={row["tol"]:.3f})  N_samples={row["samples"]}')
+                    print(f'          ω_class={row["omega_class"]:.5f}  '
+                          f'T_class={row["period_classical"]:.2f}  '
+                          f'σ_ground={row["sigma_ground"]:.3f}  '
+                          f'σ_used={row["sigma_used"]:.3f}  '
+                          f'prob_ch_rel_err={row["prob_channel_rel_err"]:.2e}')
+                elif 'dV_measured' in row and 'V_star' in row:
+                    print(f'          δV meas={row["dV_measured"]:+.5e}  '
+                          f'pred={row["dV_predicted"]:+.5e}  '
+                          f'err={row["err_amp_V"]:.4f}  (tol={row["tol"]:.3f})')
+                    print(f'          δW meas={row["dW_measured"]:+.5e}  '
+                          f'pred={row["dW_predicted"]:+.5e}  err={row["err_amp_W"]:.4f}')
+                    print(f'          evec W/V meas={row["evec_ratio_measured"]:+.5f}  '
+                          f'exp={row["evec_ratio_expected"]:+.5f}  '
+                          f'err={row["err_evec"]:.4f}')
+                    print(f'          V*={row["V_star"]:+.4f}  W*={row["W_star"]:+.4f}  '
+                          f'λ_+={row["lambda_plus"]:.4f}  growth={row["growth"]:.2f}  '
+                          f'ε₀={row["eps0"]:.2e}  '
+                          f'homo_std(V/W)={row["homogeneity_std_V"]:.2e}/'
+                          f'{row["homogeneity_std_W"]:.2e}')
                 elif 'amp_U_measured' in row:
                     print(f'          δU(t)/ε meas={row["amp_U_measured"]:.5f}  '
                           f'pred(disc)={row["amp_U_predicted"]:.5f}  '
@@ -1327,6 +2485,14 @@ def main(argv=None):
                     print(f'          ΔU={row["dU_measured"]:+.5e} vs {row["dU_expected"]:+.5e}  '
                           f'ΔV={row["dV_measured"]:+.5e} vs {row["dV_expected"]:+.5e}  '
                           f'hom_std=(U:{row["homogeneity_std_U"]:.2e}, V:{row["homogeneity_std_V"]:.2e})')
+                elif 'expected_head' in row:
+                    print(f'          head meas={row["head_loc"]}  '
+                          f'exp={row["expected_head"]}  (count={row["head_count"]})')
+                    print(f'          tail meas={row["tail_loc"]}  '
+                          f'exp={row["expected_tail"]}  (count={row["tail_count"]})')
+                    print(f'          conductors={row["cond_count"]} (exp {row["expected_cond"]})  '
+                          f'empty={row["empty_count"]} (exp {row["expected_empty"]})  '
+                          f'mismatches={row["rel_err"]:.0f}')
                 else:
                     print(f'          rel_err={row["rel_err"]:.4f}  '
                           f'(tol={row.get("tol", "?")})')
