@@ -75,7 +75,16 @@ DEFAULT_MAX_GOALS    = 64
 # Spatial hash: cube cell size in voxel-cells. Must divide u_size in the
 # common case (we wrap, so non-divisors still work but waste a bit of cells).
 DEFAULT_HASH_CELL = 8
-HASH_MAX_PER_CELL = 32  # max entities per spatial cell — overflow drops
+# Max entities tracked per spatial hash cell. The build_hash pass keeps
+# the K SMALLEST entity slot IDs that map to each cell (atomicMin-chain
+# insertion). When more than K candidates map to one cell, the K
+# survivors are deterministic across runs regardless of GPU dispatch
+# order. Raised from 32 -> 128 (May 2026, M3.5 "Bug O5" fix) so dense
+# clustered presets (wandering_voxels, ant colonies, termite mounds) do
+# not silently truncate. Memory cost: hash_total * K * 4 bytes; at
+# size=128 / hash_cell=8 this is 4096 * 128 * 4 = 2 MB.
+HASH_MAX_PER_CELL = 128
+HASH_EMPTY_SLOT = 0xFFFFFFFF  # sentinel: slot is empty / available
 
 # Atomic-uint accumulator field (Infra A: many-to-one deterministic deposit
 # into voxel-indexed scalar fields). Floats are encoded as fixed-point
@@ -337,14 +346,38 @@ HASH_LAYOUT_HEADER = "#version 430\nlayout(local_size_x=64, local_size_y=1, loca
 
 
 SHADER_CLEAR_HASH = """
+// One thread per hash cell. Resets the per-cell entity count and writes
+// the EMPTY sentinel (0xFFFFFFFF) into every slot of that cell so the
+// atomicMin chain in SHADER_BUILD_HASH can detect "first writer wins".
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= hash_count.length()) return;
     hash_count[i] = 0u;
+    uint K = uint(u_hash_max_per_cell);
+    uint base = i * K;
+    for (uint k = 0u; k < K; ++k) {
+        hash_entry[base + k] = 0xFFFFFFFFu;
+    }
 }
 """
 
 SHADER_BUILD_HASH = """
+// Deterministic hash insertion. The cell will contain the K smallest
+// entity slot IDs that map to it (a min-heap by slot id, sorted ascending).
+// Algorithm (atomicMin chain):
+//   for k in 0..K-1:
+//     old = atomicMin(slot[k], candidate)
+//     if old == EMPTY:   we took an empty slot, increment count, done
+//     else if old > candidate: we displaced 'old', set candidate=old, retry
+//     else:              slot already had a smaller id, keep candidate, retry
+//   (if loop ends with no empty slot found, candidate is dropped)
+//
+// Order-independence proof: the final state is determined entirely by
+// the SET of (entity_id, cell) tuples, not the order they are inserted.
+// Each slot can only transition EMPTY -> non-EMPTY once (atomicMin
+// monotonically decreases), so 'count' = # of non-EMPTY slots is exactly
+// correct. Slots stay compact (no holes) because chains always take the
+// first EMPTY slot they encounter while scanning from k=0.
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= uint(u_entity_count)) return;
@@ -352,11 +385,25 @@ void main() {
     if (!is_alive(e)) return;
     ivec3 c = hash_cell_of(e.pos_radius.xyz);
     uint ci = hash_cell_index(c);
-    uint slot = atomicAdd(hash_count[ci], 1u);
-    if (slot < uint(u_hash_max_per_cell)) {
-        hash_entry[ci * uint(u_hash_max_per_cell) + slot] = i;
+    uint K = uint(u_hash_max_per_cell);
+    uint base = ci * K;
+    uint candidate = i;
+    for (uint k = 0u; k < K; ++k) {
+        uint old = atomicMin(hash_entry[base + k], candidate);
+        if (old == 0xFFFFFFFFu) {
+            // Took a previously-empty slot. Increment cell count.
+            atomicAdd(hash_count[ci], 1u);
+            return;
+        }
+        if (old > candidate) {
+            // We displaced 'old'; it now needs a new home.
+            candidate = old;
+        }
+        // else: slot already held a smaller id; keep candidate, try next k.
     }
-    // overflow drops silently (cell saturated; behavior is approximate).
+    // Loop exhausted; 'candidate' is greater than all K smallest ids in
+    // the cell -> truncated. Deterministic across runs because the SET
+    // of all candidates mapping to this cell is the same every run.
 }
 """
 
