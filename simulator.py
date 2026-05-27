@@ -13142,35 +13142,58 @@ def _predator_prey_preset():
         "shader": "noop",
         "passes": [
             {"shader": "food_field",  "kind": "entity_field",      "writes": ["p1"]},
-            # M4 O3 fix: encode current food channel (grid ch3) into the
-            # atomic accumulator (channel 0) so prey grazing in this
-            # frame uses race-free accum_consume instead of the old
-            # non-atomic imageLoad/imageStore RMW.
+            # M4c determinism stack: 2-channel accumulator.
+            #   ch0 = food supply (encoded from grid ch3 each frame)
+            #   ch1 = grazing demand (atomicAdd'd by SHADER_PREY_DEMAND)
             {"shader": "_food_enc",   "kind": "entity_accum_encode", "writes": [],
              "channel": 0, "src_channel": 3},
+            # Clear demand channel before prey deposit.
+            {"shader": "_dclear",     "kind": "entity_accum_clear", "writes": [],
+             "channel": 1},
             {"shader": "_chash",      "kind": "entity_clear_hash", "writes": []},
             {"shader": "_bhash",      "kind": "entity_build_hash", "writes": []},
-            {"shader": "prey_step",   "kind": "entity_step",       "writes": []},
-            # Decode the (grazed) accumulator back into grid ch3 so the
-            # next frame's food_field pass and the paint pass see the
-            # consumed amounts. writes p1 → advances ping; eco_paint
-            # reads the freshly-written ch3 via its imageLoad.
+            # M4c fair-share grazing (replaces non-deterministic
+            # accum_consume CAS-loop in legacy prey_step):
+            #   prey_demand   — atomicAdd request into accum[ch=1]
+            #   prey_consume  — read supply+demand; bite = request *
+            #                   min(1, supply/demand); update entity.
+            {"shader": "prey_demand",  "kind": "entity_step",       "writes": []},
+            {"shader": "prey_consume", "kind": "entity_step",       "writes": []},
+            # Resolve: supply -= min(supply, demand); demand = 0.
+            # Per-voxel, race-free (own-slot only).
+            {"shader": "_resolve",    "kind": "entity_accum_resolve_demand",
+             "writes": [], "channel": 0, "dst_channel": 1},
+            # Decode food back into grid ch3 for next frame + paint.
             {"shader": "_food_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
              "channel": 0, "dst_channel": 3},
-            {"shader": "predator_step", "kind": "entity_step",     "writes": []},
+            # M4b O4 fix: 2-phase predator election. Replaces the legacy
+            # single-pass predator_step (which used a non-deterministic
+            # atomicCompSwap on prey.kind for kill arbitration).
+            #   1. scratch_clear   — wipe per-entity claim slots
+            #   2. predator_propose — each predator atomicMin its id+1
+            #                          into scratch[chosen_prey]
+            #   3. predator_commit  — winner (lowest id) kills + moves;
+            #                          losers just move.
+            {"shader": "_sclear",     "kind": "entity_scratch_clear", "writes": [],
+             "channel": 0},
+            {"shader": "predator_propose", "kind": "entity_step",  "writes": []},
+            {"shader": "predator_commit",  "kind": "entity_step",  "writes": []},
             {"shader": "_paint",      "kind": "entity_paint",      "writes": ["p1"]},
         ],
         "entity_arena": {
             "max_entities": 32768,
             "max_teams": 2,
             "hash_cell": 6,
-            "accum_channels": 1,
+            "accum_channels": 2,
             "accum_scale": 1024.0,
+            "scratch_channels": 1,
         },
         "entity_shaders": {
-            "food_field":     entity_arena.SHADER_FOOD_FIELD_UPDATE,
-            "prey_step":      entity_arena.SHADER_PREY_STEP,
-            "predator_step":  entity_arena.SHADER_PREDATOR_STEP,
+            "food_field":       entity_arena.SHADER_FOOD_FIELD_UPDATE,
+            "prey_demand":      entity_arena.SHADER_PREY_DEMAND,
+            "prey_consume":     entity_arena.SHADER_PREY_CONSUME,
+            "predator_propose": entity_arena.SHADER_PREDATOR_PROPOSE,
+            "predator_commit":  entity_arena.SHADER_PREDATOR_COMMIT,
         },
         # Override the default SHADER_PAINT for entity_paint passes.
         # Compile branch in _build_compute_progs honors this key.
@@ -23156,7 +23179,9 @@ class Simulator:
                           'entity_step', 'entity_paint', 'entity_paint_clear',
                           'entity_field',
                           'entity_accum_clear', 'entity_accum_decay',
-                          'entity_accum_decode', 'entity_accum_encode'):
+                          'entity_accum_decode', 'entity_accum_encode',
+                          'entity_accum_resolve_demand',
+                          'entity_scratch_clear'):
                 # Entity-arena pass: pick the body and concat the shared header.
                 if kind == 'entity_clear_hash':
                     body = entity_arena.SHADER_CLEAR_HASH
@@ -23175,6 +23200,10 @@ class Simulator:
                     body = entity_arena.SHADER_ACCUM_DECODE
                 elif kind == 'entity_accum_encode':
                     body = entity_arena.SHADER_ACCUM_ENCODE
+                elif kind == 'entity_accum_resolve_demand':
+                    body = entity_arena.SHADER_ACCUM_RESOLVE_DEMAND
+                elif kind == 'entity_scratch_clear':
+                    body = entity_arena.SHADER_ENT_SCRATCH_CLEAR
                 elif kind == 'entity_field':
                     # 3D voxel-style pass: full COMPUTE_HEADER (8x8x8 layout,
                     # u_src/u_dst image bindings, u_param0..3, u_dt, etc.)
@@ -24218,11 +24247,13 @@ class Simulator:
         accum_channels = int(cfg.pop('accum_channels', 0))
         accum_scale    = float(cfg.pop('accum_scale',
                                        entity_arena.DEFAULT_ACCUM_SCALE))
+        scratch_channels = int(cfg.pop('scratch_channels', 0))
         self.arena = entity_arena.EntityArena(
             self.ctx, self.size,
             max_entities=max_entities, max_teams=max_teams, max_goals=max_goals,
             hash_cell=hash_cell,
-            accum_channels=accum_channels, accum_scale=accum_scale)
+            accum_channels=accum_channels, accum_scale=accum_scale,
+            scratch_channels=scratch_channels)
         self.arena.alloc_gpu()
         on_init = self.preset.get('on_init')
         if on_init is not None:
@@ -25023,7 +25054,9 @@ class Simulator:
                 # but the uniforms are declared by ENTITY_GLSL_HEADER so
                 # other entity passes may also accept them harmlessly).
                 if kind in ('entity_accum_clear', 'entity_accum_decay',
-                            'entity_accum_decode', 'entity_accum_encode'):
+                            'entity_accum_decode', 'entity_accum_encode',
+                            'entity_accum_resolve_demand',
+                            'entity_scratch_clear'):
                     prog = self._cu_per_pass[pass_idx]['prog']
                     if 'u_accum_ch' in prog:
                         prog['u_accum_ch'].value = int(spec.get('channel', 0))
@@ -25115,7 +25148,8 @@ class Simulator:
                     self.compute_progs[pass_idx].run(groups, 1, 1)
                 elif kind in ('entity_paint_clear', 'entity_paint',
                               'entity_accum_clear', 'entity_accum_decay',
-                              'entity_accum_decode', 'entity_accum_encode'):
+                              'entity_accum_decode', 'entity_accum_encode',
+                              'entity_accum_resolve_demand'):
                     # Per-voxel 1D dispatch (workgroup 64). All of:
                     #   entity_paint_clear  — clear voxel grid channels
                     #   entity_paint        — per-voxel max-blend reduce (Bug O fix)

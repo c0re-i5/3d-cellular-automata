@@ -1264,7 +1264,9 @@ class HeadlessRunner:
                           'entity_step', 'entity_paint', 'entity_paint_clear',
                           'entity_field',
                           'entity_accum_clear', 'entity_accum_decay',
-                          'entity_accum_decode', 'entity_accum_encode'):
+                          'entity_accum_decode', 'entity_accum_encode',
+                          'entity_accum_resolve_demand',
+                          'entity_scratch_clear'):
                 if kind == 'entity_clear_hash':
                     body = entity_arena.SHADER_CLEAR_HASH
                 elif kind == 'entity_build_hash':
@@ -1282,6 +1284,10 @@ class HeadlessRunner:
                     body = entity_arena.SHADER_ACCUM_DECODE
                 elif kind == 'entity_accum_encode':
                     body = entity_arena.SHADER_ACCUM_ENCODE
+                elif kind == 'entity_accum_resolve_demand':
+                    body = entity_arena.SHADER_ACCUM_RESOLVE_DEMAND
+                elif kind == 'entity_scratch_clear':
+                    body = entity_arena.SHADER_ENT_SCRATCH_CLEAR
                 elif kind == 'entity_field':
                     # 3D voxel-style pass: full COMPUTE_HEADER. Body comes
                     # from preset['entity_shaders']; uses standard u_src/u_dst.
@@ -1534,7 +1540,8 @@ class HeadlessRunner:
                 hash_cell=int(cfg.pop('hash_cell', entity_arena.DEFAULT_HASH_CELL)),
                 accum_channels=int(cfg.pop('accum_channels', 0)),
                 accum_scale=float(cfg.pop('accum_scale',
-                                          entity_arena.DEFAULT_ACCUM_SCALE)))
+                                          entity_arena.DEFAULT_ACCUM_SCALE)),
+                scratch_channels=int(cfg.pop('scratch_channels', 0)))
             self.arena.alloc_gpu()
             on_init = self.preset.get('on_init')
             if on_init is not None:
@@ -1675,7 +1682,9 @@ class HeadlessRunner:
                 self.arena.bind_all()
                 self.arena.set_uniforms(prog)
                 if kind in ('entity_accum_clear', 'entity_accum_decay',
-                            'entity_accum_decode', 'entity_accum_encode'):
+                            'entity_accum_decode', 'entity_accum_encode',
+                            'entity_accum_resolve_demand',
+                            'entity_scratch_clear'):
                     if 'u_accum_ch' in prog:
                         prog['u_accum_ch'].value = int(spec.get('channel', 0))
                     if 'u_accum_dst_ch' in prog:
@@ -1718,7 +1727,8 @@ class HeadlessRunner:
                     prog.run(g, 1, 1)
                 elif kind in ('entity_paint_clear', 'entity_paint',
                               'entity_accum_clear', 'entity_accum_decay',
-                              'entity_accum_decode', 'entity_accum_encode'):
+                              'entity_accum_decode', 'entity_accum_encode',
+                              'entity_accum_resolve_demand'):
                     total = self.size * self.size * self.size
                     prog.run((total + 63) // 64, 1, 1)
                 elif kind == 'entity_field':
@@ -1738,7 +1748,7 @@ class HeadlessRunner:
             # only advance ping when they actually write the field.
             if kind == 'agent':
                 pass
-            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field', 'entity_accum_decode', 'entity_accum_encode'):
+            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field', 'entity_accum_decode', 'entity_accum_encode', 'entity_accum_resolve_demand'):
                 pass
             else:
                 if 'p1' in spec['writes']:

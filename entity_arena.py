@@ -59,8 +59,12 @@ BIND_TEAMS      = 10
 BIND_GOALS      = 11
 BIND_HASH_COUNT = 12
 BIND_HASH_ENTRY = 13
-# 14 reserved (NCA weights), 15 reserved (deposit_tex); use 16 for accum.
-BIND_ACCUM      = 16
+# 14 reserved (NCA weights), 15 reserved (deposit_tex); use 16 for accum,
+# 17 for per-entity scratch (used by 2-phase election patterns: e.g.
+# predators atomicMin their id into ent_scratch[prey_id] then check
+# winner in a second pass; deterministic vs. atomicCompSwap race).
+BIND_ACCUM       = 16
+BIND_ENT_SCRATCH = 17
 
 # Per-entity record size in bytes (5 vec4s).
 ENTITY_BYTES = 80
@@ -140,6 +144,15 @@ layout(std430, binding=13) buffer HashEntryBuf { uint   hash_entry[]; };
 // encoded as fixed-point uints (multiply by u_accum_scale, round). Layout
 // is voxel-major: index = voxel_flat * u_accum_channels + ch.
 layout(std430, binding=16) buffer AccumBuf    { uint   accum[]; };
+// EntScratchBuf — per-entity-slot atomic uint scratch (Infra B for
+// 2-phase election). Sized max_entities * u_ent_scratch_channels when
+// arena.scratch_channels > 0; layout is entity-major:
+//   index = entity_id * u_ent_scratch_channels + ch.
+// Sentinel value 0xFFFFFFFF (== ENT_SCRATCH_EMPTY in this header) means
+// "no winner yet". Use atomicMin to propose, then re-read and compare
+// in a separate pass to commit deterministically.
+layout(std430, binding=17) buffer EntScratchBuf { uint ent_scratch[]; };
+#define ENT_SCRATCH_EMPTY 0xFFFFFFFFu
 
 // Filled by host on every dispatch.
 uniform int u_size;              // voxel grid edge (replaced w/ const at compile)
@@ -169,6 +182,11 @@ uniform float u_accum_inv_scale;
 uniform int   u_accum_ch;        // which accum channel the pass targets
 uniform int   u_accum_dst_ch;    // which voxel grid channel decode writes
 uniform float u_accum_rate;      // decay multiplier or diffuse fraction
+// Per-entity scratch (Infra B). 0 means EntScratchBuf is not allocated;
+// the scratch_* helpers are no-ops in that case. Currently the only
+// pass that touches scratch is SHADER_ENT_SCRATCH_CLEAR plus user
+// shaders that hand-roll atomicMin/atomicCompSwap on it.
+uniform int u_ent_scratch_channels;
 
 // Spatial hash helpers --------------------------------------------------
 ivec3 hash_cell_of(vec3 pos) {
@@ -674,6 +692,62 @@ void main() {
 """
 
 
+# Per-entity scratch clear (Infra B). One thread per entity slot; sets
+# ent_scratch[i*channels + ch] = 0xFFFFFFFF (no winner). Caller chooses
+# channel via u_accum_ch (reused uniform — scratch passes are rare
+# enough that adding a dedicated uniform isn't worth it).
+# Race-free: each thread writes exactly its own slot.
+SHADER_ENT_SCRATCH_CLEAR = """
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    if (u_ent_scratch_channels <= 0) return;
+    int ch = u_accum_ch;
+    if (ch < 0 || ch >= u_ent_scratch_channels) return;
+    ent_scratch[i * uint(u_ent_scratch_channels) + uint(ch)] = ENT_SCRATCH_EMPTY;
+}
+"""
+
+
+# Resolve demand-vs-supply for proportional fair-share consumption
+# (M4c — addresses the residual nondeterminism in `accum_consume`'s
+# CAS-loop where multiple consumers of a scarce resource get different
+# bite amounts depending on warp execution order).
+#
+# Use pattern (e.g. predator-prey grazing):
+#   ch_supply (e.g. 0)  — current food/resource per voxel (encoded floats)
+#   ch_demand (e.g. 1)  — atomicAdd'd request from each consumer
+#   After all consumers' demand pass + barrier, consumers read both
+#   channels to compute their share = request * min(1, supply/demand)
+#   (deterministic — atomicAdd is commutative, individual divisions
+#   are pure functions of the same inputs).
+#   Then this resolve pass subtracts demand from supply (clamped to 0)
+#   and clears demand for the next frame.
+#
+# Channels: u_accum_ch = supply, u_accum_dst_ch = demand (overloaded;
+# same convention as ACCUM_ENCODE).
+SHADER_ACCUM_RESOLVE_DEMAND = """
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (i >= total) return;
+    if (u_accum_channels <= 0) return;
+    int chs = u_accum_ch;
+    int chd = u_accum_dst_ch;
+    if (chs < 0 || chs >= u_accum_channels) return;
+    if (chd < 0 || chd >= u_accum_channels) return;
+    if (chs == chd) return;
+
+    uint sidx = i * uint(u_accum_channels) + uint(chs);
+    uint didx = i * uint(u_accum_channels) + uint(chd);
+    uint supply = accum[sidx];
+    uint demand = accum[didx];
+    accum[sidx] = (demand >= supply) ? 0u : (supply - demand);
+    accum[didx] = 0u;
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Validation scenario: wandering voxels (proves substrate works end-to-end)
 # ---------------------------------------------------------------------------
@@ -906,6 +980,13 @@ void main() {
 
 
 # ── Shader 2 of 4: prey step (entity_step, read+write field) ───────────
+#
+# LEGACY — kept for reference. Use SHADER_PREY_DEMAND + SHADER_PREY_CONSUME
+# below for bit-deterministic grazing. accum_consume's CAS loop is
+# atomic but distribution-nondeterministic: when two prey contend for
+# scarce food, the warp that wins the first CAS takes its full bite
+# and the loser retries against a reduced cur, getting less. Totals
+# match across runs but individual bites diverge.
 SHADER_PREY_STEP = """
 // Per-entity prey update. Grazes a food field stored in accum channel 0
 // (encoded from grid ch3 once per frame by SHADER_ACCUM_ENCODE; decoded
@@ -984,20 +1065,209 @@ void main() {
 """
 
 
-# ── Shader 3 of 4: predator step (entity_step, hunts prey) ──────────────
-SHADER_PREDATOR_STEP = """
-// Per-entity predator update. Bound to image unit 0 read+write (we don't
-// write the field but binding is shared with prey step).
-//
-// Active iff entity is alive AND kind == 2 (PREDATOR).
-//
-// Params:
-//   u_param0 — predator wander jitter (when no prey in sight)
-//   u_param1 — UNUSED here (prey graze rate)
-//   u_param2 — predator sight radius scale (multiplies entity.genome.y)
-//   u_param3 — global metabolism multiplier
+# ── Shader 2a / 2b: deterministic fair-share grazing (M4c) ─────────────
+#
+# Replaces SHADER_PREY_STEP with two passes that yield bit-identical
+# per-entity energies across runs:
+#
+#   2a SHADER_PREY_DEMAND
+#     - each prey atomicAdds its requested bite (u_param1*u_dt) into
+#       accum channel 1 (demand) at its voxel. atomicAdd of uint is
+#       commutative → sum is bit-identical regardless of warp order.
+#     - does NOT move the entity; only deposits demand. Position used
+#       for binning is the prey's CURRENT position (not post-move),
+#       which matches SHADER_PREY_STEP's read-before-move semantics.
+#
+#   2b SHADER_PREY_CONSUME
+#     - reads supply = accum[0, vp], demand = accum[1, vp]. Both are
+#       frozen between the demand pass barrier and this pass.
+#     - share = request * min(1, supply/demand) — pure function of two
+#       float reads, deterministic.
+#     - updates energy / pos / vel / starvation.
+#
+# After both passes, SHADER_ACCUM_RESOLVE_DEMAND (per-voxel) subtracts
+# demand from supply (clamped to 0) and clears demand to 0. Then the
+# regular SHADER_ACCUM_DECODE writes the new food back to grid ch3.
+#
+# Total cost: 2 entity passes + 1 voxel pass (instead of 1 entity pass),
+# all O(N) or O(V). Worth it for full determinism.
 
-layout(rgba32f, binding=0) uniform image3D u_field;
+SHADER_PREY_DEMAND = """
+// Active iff alive AND kind == 1 (PREY). See SHADER_PREY_STEP for params.
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+    // Demand is request * dt. Deposit at current voxel (pre-move).
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    accum_deposit(1, vp, u_param1 * u_dt);
+}
+"""
+
+
+SHADER_PREY_CONSUME = """
+// Per-entity prey update — reads supply & demand (both frozen since
+// SHADER_PREY_DEMAND barrier), computes proportional bite, applies
+// energy/motion/death logic. Bit-deterministic.
+
+float h11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+
+    uint seed = i * 1973u + uint(u_frame) * 9277u;
+    vec3 jitter = vec3(h11(seed), h11(seed + 1u), h11(seed + 2u)) - 0.5;
+
+    float max_speed = max(e.genome.x, 0.01);
+    vec3 v = e.vel_energy.xyz * 0.85 + jitter * u_param0;
+    float vlen = length(v);
+    if (vlen > max_speed) v *= max_speed / vlen;
+
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+
+    // Bite at PRE-MOVE voxel (matches demand deposit). Read frozen
+    // supply & demand; bite = request * min(1, supply/demand).
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    float supply  = accum_sample(0, vp);
+    float demand  = accum_sample(1, vp);
+    float request = u_param1 * u_dt;
+    float bite = 0.0;
+    if (demand > 0.0) {
+        // request is exactly this prey's contribution to demand, so
+        // share = request when demand<=supply, else request*supply/demand.
+        bite = (demand <= supply) ? request : request * (supply / demand);
+    }
+
+    float energy = e.vel_energy.w + bite - u_param3 * u_dt;
+    if (energy <= 0.0) {
+        e.kind_team_role_flags.x = 0u;
+        entities[i] = e;
+        return;
+    }
+    energy = min(energy, 3.0);
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    e.vel_energy.w   = energy;
+    entities[i] = e;
+}
+"""
+
+
+
+#
+# M4b fix for Bug O4: the original single-pass SHADER_PREDATOR_STEP used
+# `atomicCompSwap(prey.kind, 1, 0)` to claim a kill. atomicCompSwap is
+# atomic but the WINNER depends on which warp reaches the instruction
+# first — pure GPU scheduling. When multiple predators were within 1.5
+# cells of the same prey, the kill assignment differed across runs,
+# cascading into CPU reproduction divergence.
+#
+# Replaced with 2-phase election using per-entity scratch (Infra B):
+#   Pass A  SHADER_ENT_SCRATCH_CLEAR  — scratch[prey_id] = 0xFFFFFFFF
+#   Pass B  SHADER_PREDATOR_PROPOSE   — each predator finds its target,
+#           then atomicMin(scratch[prey_id], my_id+1). Winner is the
+#           lowest-id predator — a function of state alone, not warp
+#           scheduling.
+#   Pass C  SHADER_PREDATOR_COMMIT    — each predator re-reads
+#           scratch[its_target], and if (claim == my_id+1) does the kill
+#           (writes prey.kind=0) and gains energy. Also runs the wander
+#           branch + position/energy update for ALL predators.
+#
+# The propose pass writes nothing to the entity struct — only to scratch.
+# The commit pass writes the full entity struct (pos, vel, energy) for
+# every alive predator. Because the kill is committed by exactly one
+# predator (the winner), no race exists on prey.kind.
+
+SHADER_PREDATOR_PROPOSE = """
+// Phase B: each alive predator finds its nearest live prey within
+// sight, STORES that target in its own entity.target field (so COMMIT
+// reads it without re-deriving), and — if within bite range (dist<1.5)
+// — proposes itself via atomicMin into the prey's scratch slot.
+//
+// Only own-slot writes (entity.target) + per-prey atomicMin. No reads
+// of mutable shared state besides the (now post-O3-deterministic)
+// hash and entity positions, so this pass is bit-deterministic.
+//
+// Params: u_param2 — sight scale.
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 2u) return;  // not predator
+    if (u_ent_scratch_channels <= 0) return;     // misconfigured preset
+
+    float sight = max(e.genome.y, 1.0) * max(u_param2, 0.01);
+
+    uint nb_ids[64]; int nb_n = 0;
+    gather_neighbours(e.pos_radius.xyz, sight, nb_ids, nb_n, 64);
+
+    // Find nearest live prey within sight. Tie-break by id (the
+    // first-encountered hash-ordered match wins; hash is deterministic
+    // post-O5 so this is reproducible).
+    int best = -1;
+    float best_d2 = sight * sight;
+    for (int k = 0; k < nb_n; ++k) {
+        uint id = nb_ids[k];
+        if (id == i) continue;
+        Entity o = entities[id];
+        if (o.kind_team_role_flags.x != 1u) continue;
+        vec3 d = wrap_delta(o.pos_radius.xyz, e.pos_radius.xyz);
+        float d2 = dot(d, d);
+        if (d2 < best_d2) {
+            best = int(id);
+            best_d2 = d2;
+        }
+    }
+
+    // Store target+1 in our own slot (own-write, no race). 0 = no target.
+    uint target_plus1 = (best >= 0) ? uint(best) + 1u : 0u;
+    entities[i].target_partner_timer_payload.x = target_plus1;
+
+    // Propose for kill iff within bite range.
+    if (best >= 0 && best_d2 < 1.5 * 1.5) {
+        atomicMin(ent_scratch[uint(best) * uint(u_ent_scratch_channels)],
+                  uint(i) + 1u);
+    }
+}
+"""
+
+
+SHADER_PREDATOR_COMMIT = """
+// Phase C: every alive predator reads its OWN target field (set by
+// PROPOSE — no re-derivation) and updates pos / vel / energy. If the
+// target is within bite range AND we won the phase-B election
+// (scratch[target] == self_id+1), commit the kill.
+//
+// Race safety:
+//   * Each predator writes only entities[i] (its own slot) for pos/vel/
+//     energy. No two predators write the same predator slot.
+//   * Kill write entities[best].kind_team_role_flags.x = 0u happens
+//     for exactly one predator per prey (the unique scratch winner).
+//   * Reads of entities[best].pos_radius for movement are race-free
+//     because positions are never written in PROPOSE or COMMIT.
+//
+// Params: u_param0=wander jitter, u_param3=metabolism.
+
+layout(rgba32f, binding=0) uniform image3D u_field;  // unused; binding parity
 
 float h11(uint x) {
     x = (x ^ 61u) ^ (x >> 16);
@@ -1016,41 +1286,30 @@ void main() {
     if (e.kind_team_role_flags.x != 2u) return;  // not predator
 
     float max_speed = max(e.genome.x, 0.01);
-    float sight     = max(e.genome.y, 1.0) * max(u_param2, 0.01);
-
-    // Find nearest live prey within sight via spatial hash.
-    uint nb_ids[64]; int nb_n = 0;
-    gather_neighbours(e.pos_radius.xyz, sight, nb_ids, nb_n, 64);
-
-    int best = -1;
-    float best_d2 = sight * sight;
-    for (int k = 0; k < nb_n; ++k) {
-        uint id = nb_ids[k];
-        if (id == i) continue;
-        Entity o = entities[id];
-        if (o.kind_team_role_flags.x != 1u) continue;  // only chase prey
-        vec3 d = wrap_delta(o.pos_radius.xyz, e.pos_radius.xyz);
-        float d2 = dot(d, d);
-        if (d2 < best_d2) {
-            best = int(id);
-            best_d2 = d2;
-        }
-    }
+    uint target_plus1 = e.target_partner_timer_payload.x;
 
     vec3 v;
-    if (best >= 0) {
-        // Pursue: steer toward prey at max_speed.
+    bool ate = false;
+    if (target_plus1 > 0u) {
+        uint best = target_plus1 - 1u;
+        // Read prey position (race-free — positions not written in
+        // either phase). Note: we do NOT re-check prey.kind; PROPOSE
+        // already saw it alive, and even if another predator killed it
+        // in this commit pass we still want to pursue toward its
+        // last-known position this frame.
         Entity prey = entities[best];
         vec3 toward = wrap_delta(prey.pos_radius.xyz, e.pos_radius.xyz);
         float dist = length(toward) + 1e-5;
         v = (toward / dist) * max_speed;
 
-        // Eat if close enough (within 1.5 cells). Use atomicCompSwap on the
-        // prey's kind to ensure only one predator wins.
-        if (dist < 1.5) {
-            uint won = atomicCompSwap(entities[best].kind_team_role_flags.x, 1u, 0u);
-            if (won == 1u) {
-                e.vel_energy.w += 1.2;  // gulp — must cover several steps of metabolism
+        // Try to commit the kill iff we won the phase-B election.
+        if (dist < 1.5 && u_ent_scratch_channels > 0) {
+            uint claim_idx = uint(best) * uint(u_ent_scratch_channels);
+            uint winner = ent_scratch[claim_idx];
+            if (winner == uint(i) + 1u) {
+                // We are the sole winner; kill the prey.
+                entities[best].kind_team_role_flags.x = 0u;
+                ate = true;
             }
         }
     } else {
@@ -1064,9 +1323,8 @@ void main() {
 
     vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
 
-    // Predators have slightly higher metabolism than prey, but not so
-    // high that a single bad search kills them.
     float energy = e.vel_energy.w - u_param3 * 1.1 * u_dt;
+    if (ate) energy += 1.2;  // gulp — covers several steps of metabolism
     if (energy <= 0.0) {
         e.kind_team_role_flags.x = 0u;
         entities[i] = e;
@@ -1074,6 +1332,76 @@ void main() {
     }
     energy = min(energy, 3.0);
 
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    e.vel_energy.w   = energy;
+    entities[i] = e;
+}
+"""
+
+
+# Legacy single-pass predator (BUG O4: atomicCompSwap order race). Kept
+# only for reference / older presets that may reference it; new code
+# should compose PROPOSE + COMMIT (with an ENT_SCRATCH_CLEAR before).
+SHADER_PREDATOR_STEP = """
+layout(rgba32f, binding=0) uniform image3D u_field;
+
+float h11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 2u) return;
+
+    float max_speed = max(e.genome.x, 0.01);
+    float sight     = max(e.genome.y, 1.0) * max(u_param2, 0.01);
+
+    uint nb_ids[64]; int nb_n = 0;
+    gather_neighbours(e.pos_radius.xyz, sight, nb_ids, nb_n, 64);
+
+    int best = -1;
+    float best_d2 = sight * sight;
+    for (int k = 0; k < nb_n; ++k) {
+        uint id = nb_ids[k];
+        if (id == i) continue;
+        Entity o = entities[id];
+        if (o.kind_team_role_flags.x != 1u) continue;
+        vec3 d = wrap_delta(o.pos_radius.xyz, e.pos_radius.xyz);
+        float d2 = dot(d, d);
+        if (d2 < best_d2) { best = int(id); best_d2 = d2; }
+    }
+
+    vec3 v;
+    if (best >= 0) {
+        Entity prey = entities[best];
+        vec3 toward = wrap_delta(prey.pos_radius.xyz, e.pos_radius.xyz);
+        float dist = length(toward) + 1e-5;
+        v = (toward / dist) * max_speed;
+        if (dist < 1.5) {
+            uint won = atomicCompSwap(entities[best].kind_team_role_flags.x, 1u, 0u);
+            if (won == 1u) e.vel_energy.w += 1.2;
+        }
+    } else {
+        uint seed = i * 4079u + uint(u_frame) * 7561u;
+        vec3 jitter = vec3(h11(seed), h11(seed + 1u), h11(seed + 2u)) - 0.5;
+        v = e.vel_energy.xyz * 0.9 + jitter * u_param0;
+        float vlen = length(v);
+        if (vlen > max_speed) v *= max_speed / vlen;
+    }
+
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+    float energy = e.vel_energy.w - u_param3 * 1.1 * u_dt;
+    if (energy <= 0.0) { e.kind_team_role_flags.x = 0u; entities[i] = e; return; }
+    energy = min(energy, 3.0);
     e.pos_radius.xyz = pos;
     e.vel_energy.xyz = v;
     e.vel_energy.w   = energy;
@@ -1226,7 +1554,8 @@ class EntityArena:
                  max_goals=DEFAULT_MAX_GOALS,
                  hash_cell=DEFAULT_HASH_CELL,
                  accum_channels=0,
-                 accum_scale=DEFAULT_ACCUM_SCALE):
+                 accum_scale=DEFAULT_ACCUM_SCALE,
+                 scratch_channels=0):
         self.ctx = ctx
         self.size = int(size)
         self.max_entities = int(max_entities)
@@ -1243,6 +1572,11 @@ class EntityArena:
                 f"accum_channels must be in [0, {DEFAULT_MAX_ACCUM_CHANNELS}], "
                 f"got {self.accum_channels}")
         self.accum_scale = float(accum_scale)
+        # Per-entity scratch (Infra B). 0 = disabled.
+        self.scratch_channels = int(scratch_channels)
+        if self.scratch_channels < 0 or self.scratch_channels > 4:
+            raise ValueError(
+                f"scratch_channels must be in [0, 4], got {self.scratch_channels}")
         self.voxel_count = self.size ** 3
 
         # Staging arrays. Slot 0 reserved as null entity.
@@ -1262,6 +1596,7 @@ class EntityArena:
         self.hash_count_ssbo = None
         self.hash_entry_ssbo = None
         self.accum_ssbo = None
+        self.scratch_ssbo = None
 
         # Set when first team/goal is created so push only sends in-use slots.
         self.team_count = 0
@@ -1286,10 +1621,18 @@ class EntityArena:
             self.accum_ssbo = self.ctx.buffer(
                 data=np.zeros(self.voxel_count * self.accum_channels,
                               dtype=np.uint32).tobytes())
+        # Per-entity scratch buffer (Infra B). Sized max_entities * channels.
+        # Initial contents don't matter — every pass that reads it must
+        # be preceded by ENT_SCRATCH_CLEAR in the same frame.
+        if self.scratch_channels > 0:
+            self.scratch_ssbo = self.ctx.buffer(
+                data=np.zeros(self.max_entities * self.scratch_channels,
+                              dtype=np.uint32).tobytes())
 
     def release(self):
         for attr in ('entity_ssbo', 'team_ssbo', 'goal_ssbo',
-                     'hash_count_ssbo', 'hash_entry_ssbo', 'accum_ssbo'):
+                     'hash_count_ssbo', 'hash_entry_ssbo', 'accum_ssbo',
+                     'scratch_ssbo'):
             buf = getattr(self, attr, None)
             if buf is not None:
                 try:
@@ -1308,6 +1651,8 @@ class EntityArena:
         self.hash_entry_ssbo.bind_to_storage_buffer(BIND_HASH_ENTRY)
         if self.accum_ssbo is not None:
             self.accum_ssbo.bind_to_storage_buffer(BIND_ACCUM)
+        if self.scratch_ssbo is not None:
+            self.scratch_ssbo.bind_to_storage_buffer(BIND_ENT_SCRATCH)
 
     def set_uniforms(self, prog):
         """Set entity-arena uniforms on a compute program if they exist."""
@@ -1323,6 +1668,7 @@ class EntityArena:
             ('u_accum_channels',    self.accum_channels),
             ('u_accum_scale',       self.accum_scale),
             ('u_accum_inv_scale',   inv_scale),
+            ('u_ent_scratch_channels', self.scratch_channels),
         ):
             cu = prog.get(name, None)
             if cu is not None:
