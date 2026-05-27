@@ -23182,12 +23182,23 @@ class Simulator:
         """True when the active rule uses the second 4-channel scratchpad texture
         (bindings 2/3, ping-ponged in lockstep with the primary pair).
 
-        A rule opts in either by setting `extra_fields: 1` (or higher) in its
-        preset, or — for backward compatibility — by being one of the historical
-        users (crystal_growth) that adopted the pair before the flag existed."""
+        A rule opts in by any of:
+          - declaring `extra_fields: 1` (or higher) in its preset
+          - being one of the historical users (crystal_growth) that adopted
+            the pair before the flag existed
+          - having any pass that writes to 'p2' (e.g. flocking_3d's predator
+            pass) — caught here so multi-pass rules that only declare 'p2'
+            in their `passes` list don't silently run with bindings 2/3
+            unbound (Probe #20: live ran with unbound image3D u_src2 →
+            shader read garbage → flocking dynamics diverged from headless)."""
         if self.preset.get('extra_fields', 0) >= 1:
             return True
-        return self.preset.get('shader', '') == 'crystal_growth'
+        if self.preset.get('shader', '') == 'crystal_growth':
+            return True
+        specs = getattr(self, '_pass_specs', None) or []
+        if any('p2' in s.get('writes', ()) for s in specs):
+            return True
+        return False
 
     def _extras_count(self):
         """Number of ADDITIONAL fields beyond field2 (i.e. fields 3..N).

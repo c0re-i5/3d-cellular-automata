@@ -1536,13 +1536,34 @@ class HeadlessRunner:
         method on simulator.PhysicsSimulator: defaults to zeros, but a
         few rules need a non-trivial init (crystal solute, genome
         weights). Without this match, multi-pass rules whose dynamics
-        depend on pair 2 silently degenerate to the trivial zero state."""
+        depend on pair 2 silently degenerate to the trivial zero state.
+
+        NOTE: This is a parallel implementation of `Simulator._make_field_init`
+        in simulator.py. Probe #20 (`ca_debug/live_vs_headless`) catches
+        drift between the two. When adding a new `field2_init`/`field_inits`
+        name to the live engine, mirror it here or `flocking_3d`-style bugs
+        recur (live runs the real init, headless silently runs zeros, and
+        every multi-pass rule whose dynamics depend on pair-2 quietly
+        produces wrong behaviour in search/audit).
+        """
         init_name = self.preset.get('field2_init')
         if init_name is None and self.preset.get('shader') == 'crystal_growth':
             init_name = 'crystal_solute'
         arr = np.zeros((size, size, size, 4), dtype=np.float32)
         if init_name == 'crystal_solute':
             arr[..., 0] = 1.0
+        elif init_name == 'fire_oxygen':
+            arr[..., 3] = 1.0
+        elif init_name == 'fear_seed':
+            # Small Gaussian fear bump used by flocking_3d's predator pass.
+            # Must match simulator.py:_make_field_init('fear_seed') exactly.
+            cx = size * 0.7
+            cy = size * 0.3
+            cz = size * 0.5
+            sigma = max(size / 8.0, 2.0)
+            zz, yy, xx = np.mgrid[0:size, 0:size, 0:size]
+            r2 = (xx - cx) ** 2 + (yy - cy) ** 2 + (zz - cz) ** 2
+            arr[..., 0] = (0.3 * np.exp(-r2 / (2.0 * sigma * sigma))).astype(np.float32)
         elif init_name == 'genome_random':
             rng = np.random.default_rng(seed if seed is not None else 0)
             r = rng.random((size, size, size, 4), dtype=np.float32)
