@@ -31232,15 +31232,20 @@ void main() {
             dt = float(getattr(self, 'dt', 1.0))
             lines.append(f"Step {self.step_count}  t={self.step_count * dt:.2f}")
             lines.append(f"Score {self._score:.2f}")
-            snap = self._debug_history[-1] if self._debug_history else None
-            if snap is not None:
-                af = snap.get('active_frac', 0.0)
-                lines.append(f"Active {100.0 * af:.1f}%")
-                means = snap.get('mean')
-                if means:
-                    m0 = means[0]
-                    if m0 == m0:  # not NaN
-                        lines.append(f"Mean {m0:.3f}")
+            # Voxel count from the cheap live-score reduction shader
+            # (populated every _score_interval frames; same source the
+            # GUI uses). No dependency on the heavy debug pipeline.
+            m = getattr(self, '_score_metrics', None) or {}
+            ac = int(m.get('alive_count', 0))
+            ar = float(m.get('alive_ratio', 0.0))
+            if ac or ar:
+                # ffmpeg drawtext treats ',' / '.' as filter separators
+                # AND parses '%' as the start of a %{expansion} -- a stray
+                # '%' triggers "Stray % near …" and the whole textfile
+                # silently renders blank. Group thousands with plain
+                # spaces and report ratio as a 0-1 fraction (no '%').
+                ac_str = f"{ac:,}".replace(',', ' ')
+                lines.append(f"Voxels {ac_str}  (ratio {ar:.3f})")
         except Exception:  # noqa: BLE001  optional attribute probe
             return
         text = '\n'.join(lines)
