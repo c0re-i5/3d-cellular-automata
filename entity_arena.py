@@ -103,6 +103,144 @@ KIND_DEAD = 0  # slot is empty / available for reuse
 
 
 # ---------------------------------------------------------------------------
+# M5: Named aux-field DSL helpers
+# ---------------------------------------------------------------------------
+#
+# Presets can declare named aux/scratch fields:
+#
+#   "entity_arena": {
+#       ...
+#       "aux_fields":     ["food_supply", "graze_demand"],
+#       "scratch_fields": ["predator_claim"],
+#   }
+#
+# Channel indices are assigned in list order (food_supply=0, ...). The
+# arena's accum_channels and scratch_channels are auto-derived from the
+# list lengths.
+#
+# Pass specs reference fields by name; these are the recognized keys
+# and the integer-channel keys they expand into:
+#
+#   "field"          → "channel"      (single-channel passes: clear/decay)
+#   "src_field"      → "src_channel"  (encode pass)
+#   "dst_field"      → "dst_channel"  (decode pass)
+#   "supply_field"   → "channel"      ) resolve_demand pass: supply, demand
+#   "demand_field"   → "dst_channel"  )
+#   "scratch_field"  → "channel"      (scratch_clear pass)
+#
+# Pre-existing integer "channel"/"src_channel"/"dst_channel" keys still
+# work as a fallback. Unknown field names raise KeyError at
+# normalization (no silent fallthrough to channel 0).
+
+# Names of pass-spec keys we resolve and the integer-channel key each
+# expands into. (named_key → int_key)
+_AUX_FIELD_KEYS = {
+    'field':         'channel',
+    'src_field':     'src_channel',
+    'dst_field':     'dst_channel',
+    'supply_field':  'channel',
+    'demand_field':  'dst_channel',
+}
+_SCRATCH_FIELD_KEYS = {
+    'scratch_field': 'channel',
+}
+
+
+def resolve_named_fields(spec, aux_field_names, scratch_field_names,
+                         preset_label=None):
+    """Mutate `spec` in place, expanding any named-field keys into their
+    integer-channel equivalents using the preset's aux/scratch field lists.
+
+    `aux_field_names` and `scratch_field_names` are tuples/lists of
+    names in channel order (channel = index in list).
+
+    Raises KeyError if a named field is not declared in the preset.
+    Raises ValueError if both a named and integer key are set for the
+    same target (caller's spec is ambiguous).
+    """
+    def _lookup(name, names, kind):
+        try:
+            return names.index(name)
+        except ValueError:
+            avail = ', '.join(names) if names else '(none declared)'
+            prefix = f"preset {preset_label!r}: " if preset_label else ""
+            raise KeyError(
+                f"{prefix}pass shader {spec.get('shader')!r} "
+                f"references unknown {kind} field {name!r}. "
+                f"Declared {kind} fields: {avail}") from None
+
+    for named_key, int_key in _AUX_FIELD_KEYS.items():
+        if named_key not in spec:
+            continue
+        if int_key in spec:
+            raise ValueError(
+                f"pass {spec.get('shader')!r} sets both {named_key!r} "
+                f"and {int_key!r}; pick one.")
+        spec[int_key] = _lookup(spec.pop(named_key),
+                                aux_field_names, 'aux')
+    for named_key, int_key in _SCRATCH_FIELD_KEYS.items():
+        if named_key not in spec:
+            continue
+        if int_key in spec:
+            raise ValueError(
+                f"pass {spec.get('shader')!r} sets both {named_key!r} "
+                f"and {int_key!r}; pick one.")
+        spec[int_key] = _lookup(spec.pop(named_key),
+                                scratch_field_names, 'scratch')
+    return spec
+
+
+def extract_aux_field_config(arena_cfg):
+    """Pop and validate aux_fields / scratch_fields from an
+    `entity_arena` config dict. Returns (aux_names, scratch_names,
+    accum_channels, scratch_channels).
+
+    Mutates arena_cfg by popping the four keys (so the caller's
+    leftover-key check still works).
+
+    Behaviour:
+      - If `aux_fields` is given, channels = len(aux_fields) and any
+        explicit `accum_channels` must match.
+      - Same for `scratch_fields` / `scratch_channels`.
+      - Either or both lists may be omitted (channels default to 0
+        or to the explicit count).
+    """
+    aux_names = tuple(arena_cfg.pop('aux_fields', ()) or ())
+    scratch_names = tuple(arena_cfg.pop('scratch_fields', ()) or ())
+    explicit_accum = arena_cfg.pop('accum_channels', None)
+    explicit_scratch = arena_cfg.pop('scratch_channels', None)
+
+    if aux_names:
+        ac = len(aux_names)
+        if explicit_accum is not None and int(explicit_accum) != ac:
+            raise ValueError(
+                f"aux_fields={list(aux_names)} implies "
+                f"accum_channels={ac}, but preset sets "
+                f"accum_channels={explicit_accum}.")
+        accum_channels = ac
+    else:
+        accum_channels = int(explicit_accum) if explicit_accum is not None else 0
+
+    if scratch_names:
+        sc = len(scratch_names)
+        if explicit_scratch is not None and int(explicit_scratch) != sc:
+            raise ValueError(
+                f"scratch_fields={list(scratch_names)} implies "
+                f"scratch_channels={sc}, but preset sets "
+                f"scratch_channels={explicit_scratch}.")
+        scratch_channels = sc
+    else:
+        scratch_channels = int(explicit_scratch) if explicit_scratch is not None else 0
+
+    if len(set(aux_names)) != len(aux_names):
+        raise ValueError(f"aux_fields contains duplicates: {list(aux_names)}")
+    if len(set(scratch_names)) != len(scratch_names):
+        raise ValueError(f"scratch_fields contains duplicates: {list(scratch_names)}")
+
+    return aux_names, scratch_names, accum_channels, scratch_channels
+
+
+# ---------------------------------------------------------------------------
 # GLSL header — included in every entity_* shader
 # ---------------------------------------------------------------------------
 

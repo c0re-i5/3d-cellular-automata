@@ -1233,6 +1233,10 @@ class HeadlessRunner:
         else:
             raw_passes = [shader_key]
         pass_param_map = self.preset.get('pass_params', {})
+        # M5: resolve named aux/scratch fields → integer channel indices.
+        arena_cfg_ro = self.preset.get('entity_arena', {})
+        aux_field_names = tuple(arena_cfg_ro.get('aux_fields', ()) or ())
+        scratch_field_names = tuple(arena_cfg_ro.get('scratch_fields', ()) or ())
         self._pass_specs = []
         for entry in raw_passes:
             if isinstance(entry, str):
@@ -1244,6 +1248,9 @@ class HeadlessRunner:
                 spec = dict(entry)
                 spec["writes"] = tuple(entry.get("writes", ("p1",)))
                 spec["kind"] = entry.get("kind", "voxel")
+            entity_arena.resolve_named_fields(
+                spec, aux_field_names, scratch_field_names,
+                preset_label=self.preset.get('label'))
             override = pass_param_map.get(spec["shader"])
             if override is not None:
                 spec["param_names"] = list(override)
@@ -1535,16 +1542,19 @@ class HeadlessRunner:
         self.arena = None
         if self._has_arena:
             cfg = dict(self.preset['entity_arena'])
+            # M5: aux_fields/scratch_fields lists derive channel counts.
+            _aux_names, _scratch_names, _accum_channels, _scratch_channels = \
+                entity_arena.extract_aux_field_config(cfg)
             self.arena = entity_arena.EntityArena(
                 ctx, size,
                 max_entities=int(cfg.pop('max_entities', entity_arena.DEFAULT_MAX_ENTITIES)),
                 max_teams=int(cfg.pop('max_teams', entity_arena.DEFAULT_MAX_TEAMS)),
                 max_goals=int(cfg.pop('max_goals', entity_arena.DEFAULT_MAX_GOALS)),
                 hash_cell=int(cfg.pop('hash_cell', entity_arena.DEFAULT_HASH_CELL)),
-                accum_channels=int(cfg.pop('accum_channels', 0)),
+                accum_channels=_accum_channels,
                 accum_scale=float(cfg.pop('accum_scale',
                                           entity_arena.DEFAULT_ACCUM_SCALE)),
-                scratch_channels=int(cfg.pop('scratch_channels', 0)))
+                scratch_channels=_scratch_channels)
             self.arena.alloc_gpu()
             on_init = self.preset.get('on_init')
             if on_init is not None:

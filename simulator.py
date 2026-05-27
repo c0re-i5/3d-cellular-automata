@@ -13143,18 +13143,18 @@ def _predator_prey_preset():
         "passes": [
             {"shader": "food_field",  "kind": "entity_field",      "writes": ["p1"]},
             # M4c determinism stack: 2-channel accumulator.
-            #   ch0 = food supply (encoded from grid ch3 each frame)
-            #   ch1 = grazing demand (atomicAdd'd by SHADER_PREY_DEMAND)
+            #   food_supply  = grid ch3 encoded each frame
+            #   graze_demand = atomicAdd'd by SHADER_PREY_DEMAND
             {"shader": "_food_enc",   "kind": "entity_accum_encode", "writes": [],
-             "channel": 0, "src_channel": 3},
+             "field": "food_supply", "src_channel": 3},
             # Clear demand channel before prey deposit.
             {"shader": "_dclear",     "kind": "entity_accum_clear", "writes": [],
-             "channel": 1},
+             "field": "graze_demand"},
             {"shader": "_chash",      "kind": "entity_clear_hash", "writes": []},
             {"shader": "_bhash",      "kind": "entity_build_hash", "writes": []},
             # M4c fair-share grazing (replaces non-deterministic
             # accum_consume CAS-loop in legacy prey_step):
-            #   prey_demand   — atomicAdd request into accum[ch=1]
+            #   prey_demand   — atomicAdd request into accum[graze_demand]
             #   prey_consume  — read supply+demand; bite = request *
             #                   min(1, supply/demand); update entity.
             {"shader": "prey_demand",  "kind": "entity_step",       "writes": []},
@@ -13162,10 +13162,11 @@ def _predator_prey_preset():
             # Resolve: supply -= min(supply, demand); demand = 0.
             # Per-voxel, race-free (own-slot only).
             {"shader": "_resolve",    "kind": "entity_accum_resolve_demand",
-             "writes": [], "channel": 0, "dst_channel": 1},
+             "writes": [],
+             "supply_field": "food_supply", "demand_field": "graze_demand"},
             # Decode food back into grid ch3 for next frame + paint.
             {"shader": "_food_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
-             "channel": 0, "dst_channel": 3},
+             "field": "food_supply", "dst_channel": 3},
             # M4b O4 fix: 2-phase predator election. Replaces the legacy
             # single-pass predator_step (which used a non-deterministic
             # atomicCompSwap on prey.kind for kill arbitration).
@@ -13175,7 +13176,7 @@ def _predator_prey_preset():
             #   3. predator_commit  — winner (lowest id) kills + moves;
             #                          losers just move.
             {"shader": "_sclear",     "kind": "entity_scratch_clear", "writes": [],
-             "channel": 0},
+             "scratch_field": "predator_claim"},
             {"shader": "predator_propose", "kind": "entity_step",  "writes": []},
             {"shader": "predator_commit",  "kind": "entity_step",  "writes": []},
             {"shader": "_paint",      "kind": "entity_paint",      "writes": ["p1"]},
@@ -13184,9 +13185,10 @@ def _predator_prey_preset():
             "max_entities": 32768,
             "max_teams": 2,
             "hash_cell": 6,
-            "accum_channels": 2,
+            # M5: named aux/scratch fields (auto-derives channel counts).
+            "aux_fields":     ["food_supply", "graze_demand"],
+            "scratch_fields": ["predator_claim"],
             "accum_scale": 1024.0,
-            "scratch_channels": 1,
         },
         "entity_shaders": {
             "food_field":       entity_arena.SHADER_FOOD_FIELD_UPDATE,
@@ -23136,6 +23138,12 @@ class Simulator:
         # this pass.  Without it, the first 4 of self.params (in insertion
         # order) are used for every pass (legacy behaviour).
         pass_param_map = self.preset.get('pass_params', {})
+        # M5: resolve named aux/scratch fields → integer channel indices.
+        # Reads aux_fields / scratch_fields lists from the preset's
+        # entity_arena cfg (if any); empty tuples disable resolution.
+        arena_cfg_ro = self.preset.get('entity_arena', {})
+        aux_field_names = tuple(arena_cfg_ro.get('aux_fields', ()) or ())
+        scratch_field_names = tuple(arena_cfg_ro.get('scratch_fields', ()) or ())
         self._pass_specs = []
         for entry in raw_passes:
             if isinstance(entry, str):
@@ -23147,6 +23155,9 @@ class Simulator:
                 spec = dict(entry)
                 spec["writes"] = tuple(entry.get("writes", ("p1",)))
                 spec["kind"] = entry.get("kind", "voxel")
+            entity_arena.resolve_named_fields(
+                spec, aux_field_names, scratch_field_names,
+                preset_label=self.preset.get('label'))
             override = pass_param_map.get(spec["shader"])
             if override is not None:
                 spec["param_names"] = list(override)
@@ -24248,10 +24259,11 @@ class Simulator:
         max_teams    = int(cfg.pop('max_teams',    entity_arena.DEFAULT_MAX_TEAMS))
         max_goals    = int(cfg.pop('max_goals',    entity_arena.DEFAULT_MAX_GOALS))
         hash_cell    = int(cfg.pop('hash_cell',    entity_arena.DEFAULT_HASH_CELL))
-        accum_channels = int(cfg.pop('accum_channels', 0))
+        # M5: aux_fields/scratch_fields lists derive channel counts.
+        _aux_names, _scratch_names, accum_channels, scratch_channels = \
+            entity_arena.extract_aux_field_config(cfg)
         accum_scale    = float(cfg.pop('accum_scale',
                                        entity_arena.DEFAULT_ACCUM_SCALE))
-        scratch_channels = int(cfg.pop('scratch_channels', 0))
         self.arena = entity_arena.EntityArena(
             self.ctx, self.size,
             max_entities=max_entities, max_teams=max_teams, max_goals=max_goals,
