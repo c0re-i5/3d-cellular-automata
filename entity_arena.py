@@ -278,6 +278,49 @@ float accum_sample_wrap(int ch, ivec3 p) {
     ivec3 q = ((p % u_size) + u_size) % u_size;
     return float(accum[accum_buf_index(ch, q)]) * u_accum_inv_scale;
 }
+
+// ── Sensor helpers (M2) ────────────────────────────────────────────────
+// Continuous-position sample of an accumulator channel with toroidal
+// wrap. `wp` is in world/voxel coordinates (0..u_size). Uses floor —
+// no interpolation. Adequate for Physarum-style discrete sensors.
+float accum_sample_world_wrap(int ch, vec3 wp) {
+    return accum_sample_wrap(ch, ivec3(floor(wp)));
+}
+
+// An arbitrary unit vector perpendicular to `v` (assumed non-zero).
+// Stable: picks a world axis that is least parallel to v, then cross.
+vec3 perp_axis(vec3 v) {
+    vec3 vn = normalize(v);
+    vec3 ref = (abs(vn.y) < 0.9) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    return normalize(cross(vn, ref));
+}
+
+// Rodrigues' rotation: rotate `v` around unit `axis` by `angle` radians.
+vec3 rotate_around(vec3 v, vec3 axis, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return v * c
+         + cross(axis, v) * s
+         + axis * dot(axis, v) * (1.0 - c);
+}
+
+// Three-sensor read (left, forward, right) used by Physarum-style
+// steering. `pos` is the agent world position; `heading` the unit
+// forward vector; `axis` the unit rotation axis (e.g. perp_axis(heading)
+// for a stable per-agent frame, or vec3(0,1,0) for world-yaw); `angle`
+// the sensor half-spread in radians; `dist` the sensor offset in voxel
+// units. Returns (.x = left, .y = forward, .z = right).
+vec3 sense_three_3d(int ch, vec3 pos, vec3 heading, vec3 axis,
+                    float angle, float dist) {
+    vec3 hL = rotate_around(heading, axis,  angle);
+    vec3 hF = heading;
+    vec3 hR = rotate_around(heading, axis, -angle);
+    return vec3(
+        accum_sample_world_wrap(ch, pos + hL * dist),
+        accum_sample_world_wrap(ch, pos + hF * dist),
+        accum_sample_world_wrap(ch, pos + hR * dist)
+    );
+}
 """
 
 
