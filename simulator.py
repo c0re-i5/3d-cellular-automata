@@ -13242,6 +13242,148 @@ def _predator_prey_preset():
     }
 
 
+def _termites_preset():
+    """Classical termite-mound construction in 3D.
+
+    Each termite either carries a chip or doesn't. Empty termites pick
+    up chips from cells that contain them (fair-share via M5 demand
+    pattern). Carrying termites stochastically drop their chip with a
+    probability proportional to local chip density — positive feedback
+    that produces emergent mound formation. Carriers also deposit a
+    decaying pheromone trail that biases other carriers toward existing
+    work sites.
+
+    Aux fields (3 — exercises the M5 named-field DSL under load):
+      chip_supply    — chip density per voxel (loop-conserved via
+                       encode→ops→decode)
+      pickup_demand  — atomicAdd by empty termites; cleared & resolved
+                       each frame (same pattern as predator-prey grazing)
+      pheromone      — atomicAdd by carriers; persists with decay;
+                       gradients bias carrier movement
+
+    Grid channel layout:
+      ch0 (r) — termite paint (carriers brighter than wanderers)
+      ch1 (g) — chip_supply visualization
+      ch2 (b) — pheromone visualization
+      ch3 (a) — unused
+
+    No CPU on_tick: termites neither reproduce nor die in this scenario.
+    All state evolution happens on GPU.
+    """
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        arena.set_team(0, color=(1.00, 0.55, 0.10, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        # Density-scaled termite population (~1 per 200 voxels).
+        n_voxels = size ** 3
+        n_termites = min(arena.max_entities - 1,
+                         max(500, n_voxels // 200))
+        for _ in range(n_termites):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            # genome.x = per-termite max speed (small per-individual
+            # variation prevents lock-step motion).
+            speed = 1.5 + rng.random() * 1.0
+            arena.spawn(kind=1, team=0, pos=p, radius=1.0,
+                        genome=(speed, 0.0, 0.0, 0.0))
+
+    return {
+        "label": "Termite Mounds (3D)",
+        "shader": "noop",
+        "passes": [
+            # Encode current visible chip field → atomic chip_supply
+            # (idempotent each frame; closes the loop with decode below).
+            {"shader": "_chip_enc",  "kind": "entity_accum_encode", "writes": [],
+             "field": "chip_supply", "src_channel": 1},
+            # Clear pickup_demand for this frame's accumulation.
+            {"shader": "_dclear",    "kind": "entity_accum_clear",  "writes": [],
+             "field": "pickup_demand"},
+            # Pheromone decays geometrically each frame (literal rate;
+            # not user-tunable in v1 to keep the slider count at four).
+            {"shader": "_phdecay",   "kind": "entity_accum_decay",  "writes": [],
+             "field": "pheromone", "rate": 0.95},
+            {"shader": "_chash",     "kind": "entity_clear_hash",   "writes": []},
+            {"shader": "_bhash",     "kind": "entity_build_hash",   "writes": []},
+            # Empty termites on chip cells register a pickup request.
+            {"shader": "termite_pickup_demand", "kind": "entity_step", "writes": []},
+            # Empty termites: stochastic pickup (fair share via
+            # supply/demand) + random-walk move.
+            {"shader": "termite_pickup_step",   "kind": "entity_step", "writes": []},
+            # Per-voxel: chip_supply -= min(supply, pickup_demand);
+            # pickup_demand cleared. Race-free.
+            {"shader": "_resolve",   "kind": "entity_accum_resolve_demand",
+             "writes": [],
+             "supply_field": "chip_supply", "demand_field": "pickup_demand"},
+            # Carrying termites: decide drop (writes only payload.y) +
+            # pheromone-biased move.  Pure reads of frozen accum.
+            {"shader": "termite_drop_step",     "kind": "entity_step", "writes": []},
+            # Apply carrier deposits: pheromone for all carriers, chip
+            # drop for those whose payload.y was set by DROP_STEP.
+            # Kept in its own pass so DROP_STEP can be race-free.
+            {"shader": "termite_deposit",       "kind": "entity_step", "writes": []},
+            # Decode aux fields back to visible grid channels for
+            # rendering AND for next frame's encode loop.
+            {"shader": "_chip_dec",  "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "chip_supply", "dst_channel": 1},
+            {"shader": "_phero_dec", "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "pheromone",   "dst_channel": 2},
+            # Paint termites into ch0. Preserves ch1/ch2/ch3.
+            {"shader": "_paint",     "kind": "entity_paint",        "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 32768,
+            "max_teams": 1,
+            "hash_cell": 6,
+            # M5 named fields: 3 aux, 0 scratch.
+            "aux_fields": ["chip_supply", "pickup_demand", "pheromone"],
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "termite_pickup_demand": entity_arena.SHADER_TERMITE_PICKUP_DEMAND,
+            "termite_pickup_step":   entity_arena.SHADER_TERMITE_PICKUP_STEP,
+            "termite_drop_step":     entity_arena.SHADER_TERMITE_DROP_STEP,
+            "termite_deposit":       entity_arena.SHADER_TERMITE_DEPOSIT,
+        },
+        "entity_paint_shader": entity_arena.SHADER_TERMITE_PAINT,
+        "on_init": on_init,
+        "params": {
+            "Speed":             1.5,
+            "Pheromone deposit": 0.8,
+            "Drop affinity":     0.25,
+            "Pheromone bias":    0.6,
+        },
+        "param_ranges": {
+            "Speed":             (0.2, 4.0),
+            "Pheromone deposit": (0.0, 4.0),
+            "Drop affinity":     (0.0, 0.5),
+            "Pheromone bias":    (0.0, 3.0),
+        },
+        "dt": 1.0,
+        "init": "termite_chips",
+        "vis_channels": ["Termites", "Chips", "Pheromone", "(unused)"],
+        "vis_default": 1,        # default view = chip distribution
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.05,
+        "boundary": "toroidal",
+        "description": (
+            "Classical Wilson/Resnick termite-mound construction in 3D. "
+            "Each termite carries at most one chip; empty termites pick "
+            "up chips from cells that contain them, while carrying ones "
+            "drop them with probability proportional to local chip "
+            "density. Carriers also deposit a decaying pheromone trail "
+            "that pulls other carriers toward existing work sites. "
+            "Initial scattered chips coalesce into mounds and columns; "
+            "the pheromone field reveals the active construction "
+            "scaffold."
+        ),
+        "short_description":
+            "Termites self-organize scattered chips into mounds via "
+            "positive feedback + pheromone trails.",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -15317,6 +15459,7 @@ RULE_PRESETS = {
     "wandering_voxels_3d": _wandering_voxels_preset(),
     "predator_prey_3d":    _predator_prey_preset(),
     "physarum_3d":         _physarum_3d_preset(),
+    "termites_3d":         _termites_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",
@@ -16537,6 +16680,22 @@ def init_nca_random_specks(size, rng):
     for x, y, z in coords:
         data[x, y, z, :] = rng.random(4).astype(np.float32) \
             if hasattr(rng, 'integers') else rng.rand(4).astype(np.float32)
+    return data
+
+
+def init_termite_chips(size, rng):
+    """Scatter chips into ch1 (chip_supply visible channel) at ~10% of
+    voxels, density 1.0. Used by the termite preset; the first frame's
+    accum_encode lifts these into the chip_supply atomic field.
+
+    All other channels start at 0 — ch0 (termite paint) and ch2
+    (pheromone) are populated during the first tick; ch3 is unused.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # ~5% chip-bearing voxels with full density: sparse enough for
+    # mounds to stand out, dense enough that termites find chips fast.
+    mask = rng.random((size, size, size)).astype(np.float32) < 0.05
+    data[..., 1] = mask.astype(np.float32) * 1.0
     return data
 
 
@@ -20457,6 +20616,7 @@ INIT_FUNCS = {
     'random_smooth': init_random_smooth,
     'blank': init_blank,
     'food_seed': init_food_seed,
+    'termite_chips': init_termite_chips,
     'nca_seed': init_nca_seed,
     'nca_random_specks': init_nca_random_specks,
     'predator_prey_lattice': init_predator_prey_lattice,

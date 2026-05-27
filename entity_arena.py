@@ -1642,6 +1642,309 @@ void main() {
 
 
 # ---------------------------------------------------------------------------
+# M6 termites: chip pickup / drop / pheromone-trail emergence
+# ---------------------------------------------------------------------------
+#
+# Classical termite-mound simulation (Wilson 1976 / Resnick 1994 style)
+# lifted to deterministic GPU. Each termite either CARRIES a chip
+# (tptp.x == 1) or doesn't (tptp.x == 0). Carrying termites drop their
+# chip with probability proportional to local chip density (positive
+# feedback → mound formation). Empty termites pick up chips from cells
+# that contain them, using the same fair-share demand pattern as
+# predator-prey grazing.
+#
+# Three named aux fields (validates the M5 DSL under realistic load):
+#   chip_supply    — voxel chip density (encoded from grid ch1 each
+#                    frame, modified by pickup/drop, decoded back)
+#   pickup_demand  — atomicAdd'd by empty termites on chip cells;
+#                    cleared and resolved each frame
+#   pheromone      — atomicAdd'd by carrying termites; persists with
+#                    decay; biases carrier movement toward existing
+#                    trails (helps clusters form)
+#
+# Channels (chosen to keep the paint pass simple — it only touches
+# the .b channel and preserves everything else):
+#   grid ch0 (r)  — termite paint (written by SHADER_TERMITE_PAINT)
+#   grid ch1 (g)  — chip_supply visualization (decoded each frame)
+#   grid ch2 (b)  — pheromone visualization (decoded each frame)
+#   grid ch3 (a)  — unused
+#
+# Termite entity state:
+#   kind_team_role_flags.x = 1u (single kind)
+#   target_partner_timer_payload.x = carrying flag (0 empty / 1 holding)
+#   genome.x = per-termite max speed
+#
+# Uniform contract (u_param0..u_param3) for all three termite shaders:
+#   u_param0 — termite move speed (max velocity in voxel-cells/step)
+#   u_param1 — pheromone deposit rate per carrier per dt
+#   u_param2 — drop affinity scale (drop_prob = min(1, supply * scale))
+#   u_param3 — pheromone-attraction strength (carrier movement bias)
+
+SHADER_TERMITE_PICKUP_DEMAND = """
+// Empty termites on a chip cell register a request to pick up one
+// chip. Pure atomicAdd → bit-deterministic sum.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;       // termite kind
+    if (e.target_partner_timer_payload.x != 0u) return; // already carrying
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    float supply = accum_sample(0, vp);  // chip_supply
+    if (supply <= 0.0) return;
+
+    accum_deposit(1, vp, 1.0);  // pickup_demand
+}
+"""
+
+
+SHADER_TERMITE_PICKUP_STEP = """
+// Empty termites: stochastic pickup decision (fair-share via
+// supply/demand), then random-walk move. Pickup probability is
+// (supply / max(demand, supply)) — deterministic per (id, frame).
+// Carrying termites are handled in SHADER_TERMITE_DROP_STEP.
+float th11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+    if (e.target_partner_timer_payload.x != 0u) return; // skip carriers
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+
+    // ---- pickup decision (before move) -------------------------------
+    float supply = accum_sample(0, vp);
+    float demand = accum_sample(1, vp);
+    uint seed = i * 1973u + uint(u_frame) * 9277u;
+    if (supply > 0.0 && demand > 0.0) {
+        float bite_prob = (demand <= supply) ? 1.0 : (supply / demand);
+        float r = th11(seed + 13u);
+        if (r < bite_prob) {
+            e.target_partner_timer_payload.x = 1u;  // becomes carrier
+        }
+    }
+
+    // ---- random-walk move (Brownian + velocity inertia) --------------
+    vec3 jitter = vec3(th11(seed),
+                       th11(seed + 1u),
+                       th11(seed + 2u)) - 0.5;
+    float max_speed = max(e.genome.x, 0.01);
+    vec3 v = e.vel_energy.xyz * 0.80 + jitter * u_param0;
+    float vlen = length(v);
+    if (vlen > max_speed) v *= max_speed / vlen;
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_TERMITE_DROP_STEP = """
+// Carrying termites: stochastic drop decision (probability rises with
+// local chip density → positive feedback / mound formation) + pheromone-
+// biased move. Reads only (chip_supply, pheromone are frozen from prior
+// passes); all deposits happen in the separate SHADER_TERMITE_DEPOSIT
+// pass to keep this kernel bit-deterministic (no intra-pass deposit/
+// sample race).
+//
+// The "did_drop" decision is stored in payload.y (1 = drop this frame,
+// 0 = keep carrying). SHADER_TERMITE_DEPOSIT consumes & clears it.
+float td11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x = x ^ (x >> 4);
+    x *= 0x27d4eb2du;
+    x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+    if (e.target_partner_timer_payload.x == 0u) return; // only carriers
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+
+    // ---- drop decision (reads only) ----------------------------------
+    // drop_prob = clamp(supply * drop_scale, 0, 1).  Empty cell → 0
+    // probability; dense cell → near-certain drop. Combined with the
+    // pheromone deposit this creates the classic positive-feedback
+    // mound-formation dynamic.
+    uint seed = i * 1973u + uint(u_frame) * 9277u;
+    float supply = accum_sample(0, vp);
+    float drop_prob = clamp(supply * u_param2, 0.0, 1.0);
+    // Always allow a tiny baseline drop chance so the very first chip
+    // ever placed somewhere doesn't have zero probability of seeding
+    // a new cluster.
+    drop_prob = max(drop_prob, 0.02);
+    float r = td11(seed + 17u);
+    e.target_partner_timer_payload.y = (r < drop_prob) ? 1u : 0u;
+
+    // ---- pheromone-biased move ---------------------------------------
+    // Sample pheromone at 6 axis-neighbours, pick the strongest as a
+    // bias direction. Deterministic (pure reads of frozen accum).
+    int S = u_size;
+    ivec3 pe = ((vp + ivec3( 1, 0, 0)) % S + S) % S;
+    ivec3 pw = ((vp + ivec3(-1, 0, 0)) % S + S) % S;
+    ivec3 pn = ((vp + ivec3( 0, 1, 0)) % S + S) % S;
+    ivec3 ps = ((vp + ivec3( 0,-1, 0)) % S + S) % S;
+    ivec3 pu = ((vp + ivec3( 0, 0, 1)) % S + S) % S;
+    ivec3 pd = ((vp + ivec3( 0, 0,-1)) % S + S) % S;
+    float xe = accum_sample(2, pe);
+    float xw = accum_sample(2, pw);
+    float xn = accum_sample(2, pn);
+    float xs = accum_sample(2, ps);
+    float xu = accum_sample(2, pu);
+    float xd = accum_sample(2, pd);
+    vec3 grad = vec3(xe - xw, xn - xs, xu - xd);
+    float glen = length(grad);
+    vec3 bias = (glen > 1e-5) ? (grad / glen) * u_param3 : vec3(0.0);
+
+    vec3 jitter = vec3(td11(seed),
+                       td11(seed + 1u),
+                       td11(seed + 2u)) - 0.5;
+    float max_speed = max(e.genome.x, 0.01);
+    vec3 v = e.vel_energy.xyz * 0.80 + jitter * u_param0 + bias;
+    float vlen = length(v);
+    if (vlen > max_speed) v *= max_speed / vlen;
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_TERMITE_DEPOSIT = """
+// Apply pending carrier writes after SHADER_TERMITE_DROP_STEP.  Splits
+// deposit-side work into its own pass so the decide kernel can be
+// purely read-only (eliminates deposit/sample race that would otherwise
+// make the gradient non-deterministic across runs).
+//
+// For each carrier (kind==1, payload.x==1):
+//   - always deposit pheromone at current voxel
+//   - if payload.y == 1 (drop_this_frame, set by DROP_STEP) then
+//     deposit chip into chip_supply and flip payload.x → 0
+//   - clear payload.y
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+    if (e.target_partner_timer_payload.x == 0u) return; // only carriers
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+
+    // Pheromone (commutative atomicAdd → deterministic sum).
+    accum_deposit(2, vp, u_param1 * u_dt);
+
+    if (e.target_partner_timer_payload.y == 1u) {
+        accum_deposit(0, vp, 1.0);                  // drop chip back
+        e.target_partner_timer_payload.x = 0u;       // become empty
+    }
+    e.target_partner_timer_payload.y = 0u;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_TERMITE_PAINT = """
+// Minimal voxel-paint pass for the termite preset: writes ONLY the
+// .r channel (termite presence) and preserves r=undef? no — actually
+// we paint into result.r and leave g/b/a alone. Channel layout:
+//   r (ch0) — termite paint  (this pass)
+//   g (ch1) — chip_supply    (decoded earlier)
+//   b (ch2) — pheromone      (decoded earlier)
+//   a (ch3) — unused (preserved)
+//
+// Carriers paint brighter than empty termites so structures of
+// activity stand out from background wanderers.
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;
+
+void main() {
+    uint flat_idx = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (flat_idx >= total) return;
+
+    int S = u_size;
+    int idx = int(flat_idx);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
+
+    vec4 result = imageLoad(u_grid_r, p);
+    float termite_max = 0.0;
+
+    ivec3 base = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
+    int half_s = S / 2;
+
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base + ivec3(dx, dy, dz);
+        c = ((c % u_hash_dim) + u_hash_dim) % u_hash_dim;
+        uint ci = hash_cell_index(c);
+        uint n = min(hash_count[ci], uint(u_hash_max_per_cell));
+        for (uint k = 0u; k < n; ++k) {
+            uint eid = hash_entry[ci * uint(u_hash_max_per_cell) + k];
+            Entity e = entities[eid];
+            if (!is_alive(e)) continue;
+            if (e.kind_team_role_flags.x != 1u) continue;
+
+            ivec3 center = ivec3(floor(e.pos_radius.xyz));
+            ivec3 off = p - center;
+            off.x = ((off.x % S) + S) % S; if (off.x > half_s) off.x -= S;
+            off.y = ((off.y % S) + S) % S; if (off.y > half_s) off.y -= S;
+            off.z = ((off.z % S) + S) % S; if (off.z > half_s) off.z -= S;
+
+            int rmax = int(ceil(e.pos_radius.w));
+            rmax = clamp(rmax, 0, 4);
+            if (abs(off.x) > rmax || abs(off.y) > rmax || abs(off.z) > rmax)
+                continue;
+
+            float dist = length(vec3(off));
+            if (dist > e.pos_radius.w) continue;
+            float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+            float w = max(0.0, 1.0 - dist * inv_r);
+            // Carriers paint 1.6x brighter than empty wanderers.
+            if (e.target_partner_timer_payload.x != 0u) w *= 1.6;
+            termite_max = max(termite_max, w);
+        }
+    }
+
+    result.r = max(result.r, termite_max);
+    imageStore(u_grid_w, p, result);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # CPU-side container
 # ---------------------------------------------------------------------------
 
