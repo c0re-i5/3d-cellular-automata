@@ -16,6 +16,12 @@ Detected signatures (per channel, per size):
                baseline max stayed bounded < 10. Catches saturation
                at unit-bound clamps (e.g. Cahn-Hilliard clip(±1)) and
                raw fp32 explosion before NaN.
+    saturated  channel std collapsed (>50× drop vs baseline) while
+               |val|_max stayed comparable. Fingerprint of frozen
+               attractors at large size: rule had rich spatial
+               structure at REF_SIZE but locked to a uniform extreme
+               (e.g. phase_separation pegged at ±1) when scaled up.
+               Distinct from clamp_hi: bound may be sub-unit.
 
 Grading (worst across sizes × channels):
 
@@ -61,6 +67,13 @@ _CLAMP_TOL   = 10.0
 # max = 1000 -> 1000× jump).
 _BLOWUP_RATIO   = 100.0
 _BASELINE_OK_MAX = 10.0   # baseline must be physically bounded to flag
+# Saturation/freeze detector: large size's spatial std collapses far
+# below baseline's. Empirical thresholds: schnakenberg_3d at size 384
+# gives 24x drop from baseline (real bug — dt_eff silent clamp); CH
+# late-time coarsening gives <5x. 20x catches both bug families.
+# Require baseline to have meaningful structure (std > 0.01).
+_STD_COLLAPSE_RATIO = 20.0
+_BASELINE_MIN_STD   = 0.01
 
 
 def _gather_rules(args):
@@ -96,17 +109,20 @@ def _channel_stats(g: np.ndarray) -> list[dict]:
         nan = int(np.isnan(a).sum()) + int(np.isinf(a).sum())
         if nan == g.size // nch:
             out.append({'nan': nan, 'max_abs': float('nan'),
-                        'min': float('nan'), 'max': float('nan')})
+                        'min': float('nan'), 'max': float('nan'),
+                        'std': float('nan')})
             continue
         finite = a[np.isfinite(a)]
         if finite.size == 0:
             out.append({'nan': nan, 'max_abs': float('nan'),
-                        'min': float('nan'), 'max': float('nan')})
+                        'min': float('nan'), 'max': float('nan'),
+                        'std': float('nan')})
             continue
         out.append({'nan': nan,
                     'max_abs': float(np.abs(finite).max()),
                     'min': float(finite.min()),
-                    'max': float(finite.max())})
+                    'max': float(finite.max()),
+                    'std': float(finite.std())})
     return out
 
 
@@ -161,6 +177,7 @@ def _classify(rule: str, per_size: dict, sizes: list[int]) -> dict:
         else:
             cur = None
             for ci, st in enumerate(stats):
+                base_st = base[ci] if ci < len(base) else None
                 if st['nan'] > 0:
                     cand = {'status': 'crit', 'sig': 'nan',
                             'worst_size': s, 'worst_channel': ci,
@@ -193,6 +210,24 @@ def _classify(rule: str, per_size: dict, sizes: list[int]) -> dict:
                                 'ratio': ratio}
                     else:
                         cand = None
+                # Independently check std-collapse on top of any other
+                # signature: if rule pegged to a uniform extreme at
+                # large size (std ≪ baseline std) and baseline was
+                # structured, that's an attractor lock-up bug.
+                if (cand is None and base_st is not None
+                        and s != base_size):
+                    bs = base_st.get('std', 0.0)
+                    cs = st.get('std', 0.0)
+                    if (bs == bs and cs == cs  # not NaN
+                            and bs > _BASELINE_MIN_STD
+                            and cs > 0
+                            and bs / max(cs, 1e-12) > _STD_COLLAPSE_RATIO):
+                        cand = {'status': 'high', 'sig': 'saturated',
+                                'worst_size': s, 'worst_channel': ci,
+                                'worst_max': st['max_abs'],
+                                'baseline_max': base_max,
+                                'std_ratio': bs / max(cs, 1e-12),
+                                'baseline_std': bs, 'worst_std': cs}
                 if cand is None:
                     continue
                 if cur is None or sev_rank[cand['status']] > sev_rank[cur['status']]:
