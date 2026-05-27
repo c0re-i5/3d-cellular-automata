@@ -237,52 +237,99 @@ void main() {
 #   B (ch2) — team 1 mass (positive only) — for single-team views.
 #   A (ch3) — total density (any team) — useful for alpha / iso.
 #
-# This pass dispatches once per entity, NOT once per voxel — each entity
-# imageStores a small bounding box of voxels. Race conditions on writes
-# are tolerated (we just want a visualisation).
+# DETERMINISM (Bug O fix, May 2026):
+# Original implementation dispatched per entity and did a non-atomic RMW
+# (imageLoad → max() → imageStore). When two entities painted overlapping
+# voxels the read could miss a concurrent write, producing run-to-run
+# variation on the GPU.
+#
+# This shader is now dispatched per VOXEL (size^3 threads). Each voxel
+# computes its own max-blend by iterating over the entities in its own
+# hash cell + the 26 neighbour cells (entities can have radius ≤ 4 and
+# hash_cell defaults to 8, so a 1-cell span covers every possible
+# contributor). Since max() is associative & commutative, the iteration
+# order inside each voxel does not matter — the result is deterministic
+# regardless of which entities the hash builder happened to slot first.
+#
+# The dispatch sizing change (per-entity → per-voxel) is handled by the
+# simulator's entity_paint kind branch; see simulator.py search for
+# kind == 'entity_paint'.
 SHADER_PAINT = """
 layout(rgba32f, binding=0) uniform image3D u_grid_r;
 layout(rgba32f, binding=1) uniform image3D u_grid_w;
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(u_entity_count)) return;
-    Entity e = entities[i];
-    if (!is_alive(e)) return;
+    uint flat_idx = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (flat_idx >= total) return;
 
-    uint team_id = e.kind_team_role_flags.y;
-    // Signed contribution for ch0: team 0 → positive, team 1 → negative.
-    // Other teams (>=2) paint nothing into the signed channel; they get
-    // captured in alpha only.
-    float signed_sign = (team_id == 0u) ? 1.0
-                      : (team_id == 1u) ? -1.0
-                      : 0.0;
+    int S = u_size;
+    int idx = int(flat_idx);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
 
-    int r = int(ceil(e.pos_radius.w));
-    r = clamp(r, 0, 4);
-    ivec3 center = ivec3(floor(e.pos_radius.xyz));
-    float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+    // Start from the read-side value so we preserve anything the
+    // pre-paint passes (clear, eco field, etc.) wrote.
+    vec4 result = imageLoad(u_grid_r, p);
 
-    for (int dz = -r; dz <= r; ++dz)
-    for (int dy = -r; dy <= r; ++dy)
-    for (int dx = -r; dx <= r; ++dx) {
-        vec3 d = vec3(dx, dy, dz);
-        float dist = length(d);
-        if (dist > e.pos_radius.w) continue;
-        ivec3 p = center + ivec3(dx, dy, dz);
-        p = ((p % u_size) + u_size) % u_size;
-        float w = max(0.0, 1.0 - dist * inv_r);
+    // Hash cell containing this voxel. Span ±1 cell — sufficient because
+    // entity radius is clamped to 4 and the hash cell edge is u_hash_cell
+    // (default 8). If a future scenario sets either larger this span
+    // would need to grow.
+    ivec3 base = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
+    int half_s = S / 2;
 
-        vec4 cur = imageLoad(u_grid_r, p);
-        // Saturating max-blend per axis to avoid race-doubled values.
-        float new_r = (signed_sign >= 0.0)
-            ? max(cur.r, signed_sign * w)
-            : min(cur.r, signed_sign * w);
-        float new_g = (team_id == 0u) ? max(cur.g, w) : cur.g;
-        float new_b = (team_id == 1u) ? max(cur.b, w) : cur.b;
-        float new_a = max(cur.a, w);
-        imageStore(u_grid_w, p, vec4(new_r, new_g, new_b, new_a));
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base + ivec3(dx, dy, dz);
+        c = ((c % u_hash_dim) + u_hash_dim) % u_hash_dim;
+        uint ci = hash_cell_index(c);
+        uint n = min(hash_count[ci], uint(u_hash_max_per_cell));
+        for (uint k = 0u; k < n; ++k) {
+            uint eid = hash_entry[ci * uint(u_hash_max_per_cell) + k];
+            Entity e = entities[eid];
+            if (!is_alive(e)) continue;
+
+            // Signed wrap of (p - center) onto [-S/2, S/2).
+            ivec3 center = ivec3(floor(e.pos_radius.xyz));
+            ivec3 off = p - center;
+            off.x = ((off.x % S) + S) % S; if (off.x > half_s) off.x -= S;
+            off.y = ((off.y % S) + S) % S; if (off.y > half_s) off.y -= S;
+            off.z = ((off.z % S) + S) % S; if (off.z > half_s) off.z -= S;
+
+            int rmax = int(ceil(e.pos_radius.w));
+            rmax = clamp(rmax, 0, 4);
+            if (abs(off.x) > rmax || abs(off.y) > rmax || abs(off.z) > rmax)
+                continue;
+
+            float dist = length(vec3(off));
+            if (dist > e.pos_radius.w) continue;
+            float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+            float w = max(0.0, 1.0 - dist * inv_r);
+
+            uint team_id = e.kind_team_role_flags.y;
+            float signed_sign = (team_id == 0u) ? 1.0
+                              : (team_id == 1u) ? -1.0
+                              : 0.0;
+
+            // Saturating max-blend per channel — deterministic because
+            // this voxel is owned by a single thread.
+            if (signed_sign > 0.0) {
+                result.r = max(result.r, signed_sign * w);
+            } else if (signed_sign < 0.0) {
+                result.r = min(result.r, signed_sign * w);
+            }
+            if (team_id == 0u) result.g = max(result.g, w);
+            if (team_id == 1u) result.b = max(result.b, w);
+            result.a = max(result.a, w);
+        }
     }
+
+    imageStore(u_grid_w, p, result);
 }
 """
 
@@ -614,51 +661,82 @@ void main() {
 
 # ── Shader 4 of 4: ecosystem paint (preserves food background) ──────────
 SHADER_ECO_PAINT = """
-// Variant of SHADER_PAINT that:
+// Per-voxel variant of SHADER_PAINT for the predator/prey scenario:
 //   - blends prey (kind=1) as POSITIVE additive into ch0 (max blend)
 //   - blends predator (kind=2) as NEGATIVE additive into ch0 (min blend)
 //   - accumulates per-species density into ch1 (prey) / ch2 (predator)
 //   - DOES NOT touch ch3 (food field — preserved across the paint pass)
 //
-// Reads u_grid_r, writes u_grid_w. The eco_field_update pass already
-// composited the food background into ch0; we just paint entities on top.
+// See SHADER_PAINT for the per-voxel determinism rationale.
 layout(rgba32f, binding=0) uniform image3D u_grid_r;
 layout(rgba32f, binding=1) uniform image3D u_grid_w;
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(u_entity_count)) return;
-    Entity e = entities[i];
-    if (!is_alive(e)) return;
+    uint flat_idx = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (flat_idx >= total) return;
 
-    uint kind = e.kind_team_role_flags.x;
-    float signed_w = (kind == 1u) ? +1.0 : (kind == 2u) ? -1.0 : 0.0;
-    if (signed_w == 0.0) return;
+    int S = u_size;
+    int idx = int(flat_idx);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
 
-    int r = int(ceil(e.pos_radius.w));
-    r = clamp(r, 0, 4);
-    ivec3 center = ivec3(floor(e.pos_radius.xyz));
-    float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+    vec4 result = imageLoad(u_grid_r, p);
+    // Ch3 (food) is explicitly preserved at write time below.
+    float preserved_food = result.a;
 
-    for (int dz = -r; dz <= r; ++dz)
-    for (int dy = -r; dy <= r; ++dy)
-    for (int dx = -r; dx <= r; ++dx) {
-        vec3 d = vec3(dx, dy, dz);
-        float dist = length(d);
-        if (dist > e.pos_radius.w) continue;
-        ivec3 p = center + ivec3(dx, dy, dz);
-        p = ((p % u_size) + u_size) % u_size;
-        float w = max(0.0, 1.0 - dist * inv_r);
+    ivec3 base = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
+    int half_s = S / 2;
 
-        vec4 cur = imageLoad(u_grid_r, p);
-        // ch0: additive over food background (max for prey, min for predator).
-        float new_r = (signed_w >= 0.0) ? max(cur.r,  w) : min(cur.r, -w);
-        // ch1/ch2: per-species density.
-        float new_g = (kind == 1u) ? max(cur.g, w) : cur.g;
-        float new_b = (kind == 2u) ? max(cur.b, w) : cur.b;
-        // ch3: PRESERVE food.
-        imageStore(u_grid_w, p, vec4(new_r, new_g, new_b, cur.a));
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base + ivec3(dx, dy, dz);
+        c = ((c % u_hash_dim) + u_hash_dim) % u_hash_dim;
+        uint ci = hash_cell_index(c);
+        uint n = min(hash_count[ci], uint(u_hash_max_per_cell));
+        for (uint k = 0u; k < n; ++k) {
+            uint eid = hash_entry[ci * uint(u_hash_max_per_cell) + k];
+            Entity e = entities[eid];
+            if (!is_alive(e)) continue;
+
+            uint kind = e.kind_team_role_flags.x;
+            float signed_w_sign = (kind == 1u) ? +1.0
+                                : (kind == 2u) ? -1.0
+                                : 0.0;
+            if (signed_w_sign == 0.0) continue;
+
+            ivec3 center = ivec3(floor(e.pos_radius.xyz));
+            ivec3 off = p - center;
+            off.x = ((off.x % S) + S) % S; if (off.x > half_s) off.x -= S;
+            off.y = ((off.y % S) + S) % S; if (off.y > half_s) off.y -= S;
+            off.z = ((off.z % S) + S) % S; if (off.z > half_s) off.z -= S;
+
+            int rmax = int(ceil(e.pos_radius.w));
+            rmax = clamp(rmax, 0, 4);
+            if (abs(off.x) > rmax || abs(off.y) > rmax || abs(off.z) > rmax)
+                continue;
+
+            float dist = length(vec3(off));
+            if (dist > e.pos_radius.w) continue;
+            float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+            float w = max(0.0, 1.0 - dist * inv_r);
+
+            // ch0: prey adds positively (max), predator subtracts (min).
+            if (signed_w_sign > 0.0) {
+                result.r = max(result.r,  w);
+            } else {
+                result.r = min(result.r, -w);
+            }
+            if (kind == 1u) result.g = max(result.g, w);
+            if (kind == 2u) result.b = max(result.b, w);
+        }
     }
+
+    imageStore(u_grid_w, p, vec4(result.r, result.g, result.b, preserved_food));
 }
 """
 

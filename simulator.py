@@ -24978,11 +24978,20 @@ class Simulator:
                     total = self.voxel_count
                     groups = (total + 63) // 64
                     self.compute_progs[pass_idx].run(groups, 1, 1)
+                elif kind == 'entity_paint':
+                    # Per-voxel reduce (Bug O fix): each voxel iterates its
+                    # hash neighbourhood and computes its own max-blend.
+                    # Dispatched 1D over voxel_count to match SHADER_PAINT /
+                    # SHADER_ECO_PAINT (both use ENTITY_LAYOUT_HEADER which
+                    # is local_size_x=64).
+                    total = self.voxel_count
+                    groups = (total + 63) // 64
+                    self.compute_progs[pass_idx].run(groups, 1, 1)
                 elif kind == 'entity_field':
                     # 3D dispatch over the voxel grid (workgroup 8x8x8).
                     self.compute_progs[pass_idx].run(*self._cu_groups)
                 else:
-                    # entity_build_hash, entity_step, entity_paint:
+                    # entity_build_hash, entity_step:
                     # 1D dispatch over entity slot count.
                     groups = entity_arena.entity_groups(self.arena.max_entities)
                     self.compute_progs[pass_idx].run(groups, 1, 1)
