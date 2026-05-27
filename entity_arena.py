@@ -635,6 +635,44 @@ void main() {
 }
 """
 
+# Encode: read one channel of the rgba32f voxel grid and store the
+# fixed-point uint representation into accum[ch, voxel]. Inverse of
+# DECODE. Used when grid-side passes (diffusion, regrowth) own the
+# field and per-entity reservation logic (accum_consume) needs an
+# atomic view of the same data for one step. Caller chooses src
+# channel via u_accum_dst_ch (overloaded — same uniform, opposite
+# direction) and target accum channel via u_accum_ch.
+# Race-free: one thread per voxel; only writes own slot.
+SHADER_ACCUM_ENCODE = """
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;  // unused; bound for parity
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (i >= total) return;
+    if (u_accum_channels <= 0) return;
+    int ch = u_accum_ch;
+    if (ch < 0 || ch >= u_accum_channels) return;
+
+    int S = u_size;
+    int idx = int(i);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
+
+    vec4 v = imageLoad(u_grid_r, p);
+    int src = clamp(u_accum_dst_ch, 0, 3);  // overloaded: src channel here
+    float f = (src == 0) ? v.r : (src == 1) ? v.g : (src == 2) ? v.b : v.a;
+    f = max(f, 0.0);
+    // Saturate at scale to avoid wraparound when float exceeds uint range.
+    float scaled = min(f * u_accum_scale, float(0xFFFFFF00u));
+    accum[i * uint(u_accum_channels) + uint(ch)] = uint(scaled + 0.5);
+}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Validation scenario: wandering voxels (proves substrate works end-to-end)
@@ -869,11 +907,17 @@ void main() {
 
 # ── Shader 2 of 4: prey step (entity_step, read+write field) ───────────
 SHADER_PREY_STEP = """
-// Per-entity prey update. Bound to image unit 0 read+write so we can
-// graze food from ch3.
+// Per-entity prey update. Grazes a food field stored in accum channel 0
+// (encoded from grid ch3 once per frame by SHADER_ACCUM_ENCODE; decoded
+// back to grid ch3 after this pass by SHADER_ACCUM_DECODE).
 //
-// Active iff this entity is alive AND kind == 1 (PREY). We don't have a
-// dispatch-level filter so each invocation re-checks.
+// O3 fix (M4): grazing now uses accum_consume — a bounded CAS loop on
+// the per-voxel uint slot — so multiple prey in the same voxel cannot
+// overconsume food regardless of warp execution order. The previous
+// imageLoad/imageStore-on-ch3 implementation was non-atomic and let two
+// prey in the same voxel both 'see' the full bite amount.
+//
+// Active iff this entity is alive AND kind == 1 (PREY).
 //
 // Params (passed via u_param0..3):
 //   u_param0 — prey wander jitter scale (random-walk noise)
@@ -883,8 +927,6 @@ SHADER_PREY_STEP = """
 //
 // genome layout (per entity):
 //   genome.x — max_speed (cells/step)
-
-layout(rgba32f, binding=0) uniform image3D u_field;
 
 float h11(uint x) {
     x = (x ^ 61u) ^ (x >> 16);
@@ -913,14 +955,13 @@ void main() {
 
     vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
 
-    // Graze: read food at current voxel, take a bite, write it back.
+    // Atomic graze: request u_param1*u_dt units; actual = what was there.
+    // accum_consume does a CAS loop on the uint slot, so any number of
+    // prey can graze the same voxel in the same dispatch without
+    // overconsumption.
     ivec3 vp = ivec3(floor(pos));
     vp = ((vp % u_size) + u_size) % u_size;
-    vec4 vc = imageLoad(u_field, vp);
-    float food = vc.a;
-    float bite = min(food, u_param1 * u_dt);
-    vc.a = food - bite;
-    imageStore(u_field, vp, vc);
+    float bite = accum_consume(0, vp, u_param1 * u_dt);
 
     // Energy: gain from grazing, lose to metabolism.
     float energy = e.vel_energy.w + bite - u_param3 * u_dt;
@@ -1070,6 +1111,12 @@ void main() {
     // Ch3 (food) is explicitly preserved at write time below.
     float preserved_food = result.a;
 
+    // Track per-kind running max separately so the final signed channel
+    // value does not depend on the (atomicAdd-ordered) iteration order
+    // over hash entries — same fix as SHADER_PAINT's O6 retrofit.
+    float prey_max = 0.0;
+    float pred_max = 0.0;
+
     ivec3 base = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
     int half_s = S / 2;
 
@@ -1086,10 +1133,7 @@ void main() {
             if (!is_alive(e)) continue;
 
             uint kind = e.kind_team_role_flags.x;
-            float signed_w_sign = (kind == 1u) ? +1.0
-                                : (kind == 2u) ? -1.0
-                                : 0.0;
-            if (signed_w_sign == 0.0) continue;
+            if (kind != 1u && kind != 2u) continue;
 
             ivec3 center = ivec3(floor(e.pos_radius.xyz));
             ivec3 off = p - center;
@@ -1107,15 +1151,23 @@ void main() {
             float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
             float w = max(0.0, 1.0 - dist * inv_r);
 
-            // ch0: prey adds positively (max), predator subtracts (min).
-            if (signed_w_sign > 0.0) {
-                result.r = max(result.r,  w);
-            } else {
-                result.r = min(result.r, -w);
+            if (kind == 1u) {
+                prey_max  = max(prey_max,  w);
+                result.g  = max(result.g,  w);
+            } else {  // kind == 2u
+                pred_max  = max(pred_max,  w);
+                result.b  = max(result.b,  w);
             }
-            if (kind == 1u) result.g = max(result.g, w);
-            if (kind == 2u) result.b = max(result.b, w);
         }
+    }
+
+    // Order-independent reconcile for signed display channel.
+    // Pick the kind with greater magnitude; ties go positive (prey).
+    float signed_win = (prey_max >= pred_max) ? prey_max : -pred_max;
+    if (signed_win > 0.0) {
+        result.r = max(result.r,  signed_win);
+    } else if (signed_win < 0.0) {
+        result.r = min(result.r,  signed_win);
     }
 
     imageStore(u_grid_w, p, vec4(result.r, result.g, result.b, preserved_food));

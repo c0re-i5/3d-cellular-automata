@@ -13142,9 +13142,21 @@ def _predator_prey_preset():
         "shader": "noop",
         "passes": [
             {"shader": "food_field",  "kind": "entity_field",      "writes": ["p1"]},
+            # M4 O3 fix: encode current food channel (grid ch3) into the
+            # atomic accumulator (channel 0) so prey grazing in this
+            # frame uses race-free accum_consume instead of the old
+            # non-atomic imageLoad/imageStore RMW.
+            {"shader": "_food_enc",   "kind": "entity_accum_encode", "writes": [],
+             "channel": 0, "src_channel": 3},
             {"shader": "_chash",      "kind": "entity_clear_hash", "writes": []},
             {"shader": "_bhash",      "kind": "entity_build_hash", "writes": []},
             {"shader": "prey_step",   "kind": "entity_step",       "writes": []},
+            # Decode the (grazed) accumulator back into grid ch3 so the
+            # next frame's food_field pass and the paint pass see the
+            # consumed amounts. writes p1 → advances ping; eco_paint
+            # reads the freshly-written ch3 via its imageLoad.
+            {"shader": "_food_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
+             "channel": 0, "dst_channel": 3},
             {"shader": "predator_step", "kind": "entity_step",     "writes": []},
             {"shader": "_paint",      "kind": "entity_paint",      "writes": ["p1"]},
         ],
@@ -13152,6 +13164,8 @@ def _predator_prey_preset():
             "max_entities": 32768,
             "max_teams": 2,
             "hash_cell": 6,
+            "accum_channels": 1,
+            "accum_scale": 1024.0,
         },
         "entity_shaders": {
             "food_field":     entity_arena.SHADER_FOOD_FIELD_UPDATE,
@@ -23142,7 +23156,7 @@ class Simulator:
                           'entity_step', 'entity_paint', 'entity_paint_clear',
                           'entity_field',
                           'entity_accum_clear', 'entity_accum_decay',
-                          'entity_accum_decode'):
+                          'entity_accum_decode', 'entity_accum_encode'):
                 # Entity-arena pass: pick the body and concat the shared header.
                 if kind == 'entity_clear_hash':
                     body = entity_arena.SHADER_CLEAR_HASH
@@ -23159,6 +23173,8 @@ class Simulator:
                     body = entity_arena.SHADER_ACCUM_DECAY
                 elif kind == 'entity_accum_decode':
                     body = entity_arena.SHADER_ACCUM_DECODE
+                elif kind == 'entity_accum_encode':
+                    body = entity_arena.SHADER_ACCUM_ENCODE
                 elif kind == 'entity_field':
                     # 3D voxel-style pass: full COMPUTE_HEADER (8x8x8 layout,
                     # u_src/u_dst image bindings, u_param0..3, u_dt, etc.)
@@ -24957,7 +24973,8 @@ class Simulator:
                 # field bound read-only on unit 0 in case the step shader
                 # samples it.
                 if kind in ('entity_paint', 'entity_paint_clear',
-                            'entity_field', 'entity_accum_decode'):
+                            'entity_field', 'entity_accum_decode',
+                            'entity_accum_encode'):
                     src = self.tex_a if self.ping == 0 else self.tex_b
                     dst = self.tex_b if self.ping == 0 else self.tex_a
                     src.bind_to_image(0, read=True, write=False)
@@ -25006,13 +25023,17 @@ class Simulator:
                 # but the uniforms are declared by ENTITY_GLSL_HEADER so
                 # other entity passes may also accept them harmlessly).
                 if kind in ('entity_accum_clear', 'entity_accum_decay',
-                            'entity_accum_decode'):
+                            'entity_accum_decode', 'entity_accum_encode'):
                     prog = self._cu_per_pass[pass_idx]['prog']
                     if 'u_accum_ch' in prog:
                         prog['u_accum_ch'].value = int(spec.get('channel', 0))
                     if 'u_accum_dst_ch' in prog:
+                        # For encode: dst_channel is overloaded as SOURCE
+                        # grid channel (read side). For decode: actual dst.
                         prog['u_accum_dst_ch'].value = int(
-                            spec.get('dst_channel', spec.get('dst_ch', 0)))
+                            spec.get('dst_channel',
+                                     spec.get('src_channel',
+                                              spec.get('dst_ch', 0))))
                     if 'u_accum_rate' in prog:
                         prog['u_accum_rate'].value = float(spec.get('rate', 1.0))
             # 3D Neural CA weights live at binding 14.  Bound only when
@@ -25094,13 +25115,14 @@ class Simulator:
                     self.compute_progs[pass_idx].run(groups, 1, 1)
                 elif kind in ('entity_paint_clear', 'entity_paint',
                               'entity_accum_clear', 'entity_accum_decay',
-                              'entity_accum_decode'):
+                              'entity_accum_decode', 'entity_accum_encode'):
                     # Per-voxel 1D dispatch (workgroup 64). All of:
                     #   entity_paint_clear  — clear voxel grid channels
                     #   entity_paint        — per-voxel max-blend reduce (Bug O fix)
                     #   entity_accum_clear  — zero one accum channel everywhere
                     #   entity_accum_decay  — multiply one accum channel by rate
                     #   entity_accum_decode — copy accum channel into rgba32f grid
+                    #   entity_accum_encode — copy grid channel into uint accum
                     total = self.voxel_count
                     groups = (total + 63) // 64
                     self.compute_progs[pass_idx].run(groups, 1, 1)

@@ -1264,7 +1264,7 @@ class HeadlessRunner:
                           'entity_step', 'entity_paint', 'entity_paint_clear',
                           'entity_field',
                           'entity_accum_clear', 'entity_accum_decay',
-                          'entity_accum_decode'):
+                          'entity_accum_decode', 'entity_accum_encode'):
                 if kind == 'entity_clear_hash':
                     body = entity_arena.SHADER_CLEAR_HASH
                 elif kind == 'entity_build_hash':
@@ -1280,6 +1280,8 @@ class HeadlessRunner:
                     body = entity_arena.SHADER_ACCUM_DECAY
                 elif kind == 'entity_accum_decode':
                     body = entity_arena.SHADER_ACCUM_DECODE
+                elif kind == 'entity_accum_encode':
+                    body = entity_arena.SHADER_ACCUM_ENCODE
                 elif kind == 'entity_field':
                     # 3D voxel-style pass: full COMPUTE_HEADER. Body comes
                     # from preset['entity_shaders']; uses standard u_src/u_dst.
@@ -1641,7 +1643,8 @@ class HeadlessRunner:
                 cur.bind_to_image(1, read=True, write=True)
             elif is_entity_pass:
                 if kind in ('entity_paint', 'entity_paint_clear',
-                            'entity_field', 'entity_accum_decode'):
+                            'entity_field', 'entity_accum_decode',
+                            'entity_accum_encode'):
                     src = self.tex_a if self.ping == 0 else self.tex_b
                     dst = self.tex_b if self.ping == 0 else self.tex_a
                     src.bind_to_image(0, read=True, write=False)
@@ -1672,12 +1675,14 @@ class HeadlessRunner:
                 self.arena.bind_all()
                 self.arena.set_uniforms(prog)
                 if kind in ('entity_accum_clear', 'entity_accum_decay',
-                            'entity_accum_decode'):
+                            'entity_accum_decode', 'entity_accum_encode'):
                     if 'u_accum_ch' in prog:
                         prog['u_accum_ch'].value = int(spec.get('channel', 0))
                     if 'u_accum_dst_ch' in prog:
                         prog['u_accum_dst_ch'].value = int(
-                            spec.get('dst_channel', spec.get('dst_ch', 0)))
+                            spec.get('dst_channel',
+                                     spec.get('src_channel',
+                                              spec.get('dst_ch', 0))))
                     if 'u_accum_rate' in prog:
                         prog['u_accum_rate'].value = float(spec.get('rate', 1.0))
 
@@ -1713,7 +1718,7 @@ class HeadlessRunner:
                     prog.run(g, 1, 1)
                 elif kind in ('entity_paint_clear', 'entity_paint',
                               'entity_accum_clear', 'entity_accum_decay',
-                              'entity_accum_decode'):
+                              'entity_accum_decode', 'entity_accum_encode'):
                     total = self.size * self.size * self.size
                     prog.run((total + 63) // 64, 1, 1)
                 elif kind == 'entity_field':
@@ -1733,7 +1738,7 @@ class HeadlessRunner:
             # only advance ping when they actually write the field.
             if kind == 'agent':
                 pass
-            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field', 'entity_accum_decode'):
+            elif is_entity_pass and kind not in ('entity_paint', 'entity_paint_clear', 'entity_field', 'entity_accum_decode', 'entity_accum_encode'):
                 pass
             else:
                 if 'p1' in spec['writes']:
