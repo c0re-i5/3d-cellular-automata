@@ -13532,6 +13532,185 @@ def _wolf_sheep_grass_preset():
     }
 
 
+def _wolf_sheep_grass_lv_preset():
+    """Lotka-Volterra wolf-sheep-grass with GPU reproduction (M8).
+
+    Extends `_wolf_sheep_grass_preset` (M7) by adding three new entity
+    passes that implement deterministic reproduction entirely on the
+    GPU — no per-frame CPU readback needed:
+
+      decide_spawn  — kind-aware energy threshold flips wants_spawn
+      spawn_propose — hash(parent_id, frame) → candidate child slot,
+                      atomicMin election into scratch[*][spawn_claim_ch]
+      spawn_commit  — winners write child entity, halve own energy
+
+    Birth rate is capped by hash-slot collisions: at low population,
+    nearly every spawn succeeds; as the arena fills, more parents
+    collide on candidate slots and most lose the atomicMin election.
+    This gives an emergent soft carrying-capacity even before the
+    arena hits MAX_ENTITIES — and crucially, all of it is
+    bit-deterministic (same seed + same frame ⇒ same winners ⇒
+    same children, run after run).
+
+    Initial densities are lower than M7 to leave room for offspring;
+    spawn thresholds are kind-specific so wolves reproduce more
+    sparingly than sheep (matching classic LV dynamics where r_prey
+    > r_predator).
+    """
+    KIND_SHEEP = 1
+    KIND_WOLF  = 2
+    SHEEP_DENSITY = 0.003    # higher than M7 — provide hunt density
+                             # so wolves can survive bootstrap window
+    WOLF_DENSITY  = 0.0003   # 5x M7 — need critical mass to survive
+                             # the bootstrap before reproduction kicks in
+    MAX_SHEEP = 24000
+    MAX_WOLF  = 1000
+    MAX_ENTITIES = 65536     # 2x M7 — accommodate population peaks
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        n_voxels = size ** 3
+        n_sheep = min(MAX_SHEEP, int(n_voxels * SHEEP_DENSITY))
+        n_wolf  = min(MAX_WOLF,  int(n_voxels * WOLF_DENSITY))
+        arena.set_team(0, color=(0.92, 0.92, 0.88, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        arena.set_team(1, color=(0.30, 0.20, 0.15, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        # Seed sheep with energy near (but below) the spawn threshold
+        # so reproduction kicks in after a few grazing cycles, not
+        # immediately at frame 0.
+        for _ in range(n_sheep):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=KIND_SHEEP, team=0, pos=p, radius=1.2,
+                        energy=1.2 + rng.random() * 0.6,
+                        genome=(0.6 + rng.random() * 0.3, 0.0, 0.0, 0.0))
+        for _ in range(n_wolf):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=KIND_WOLF, team=1, pos=p, radius=1.8,
+                        energy=2.4 + rng.random() * 0.4,
+                        genome=(0.9 + rng.random() * 0.4,
+                                4.0 + rng.random() * 4.0,
+                                0.0, 0.0))
+
+    def on_tick(arena, frame, params):
+        # Per-team alive counts for UI (spawn happens fully on GPU;
+        # CPU only reads counts, never writes entities).
+        arena.pull_entities()
+        kinds = arena.entities['ktrf'][:, 0]
+        sheep_alive = int(np.count_nonzero(kinds == KIND_SHEEP))
+        wolf_alive  = int(np.count_nonzero(kinds == KIND_WOLF))
+        arena.teams[0]['saskf'][1] = sheep_alive
+        arena.teams[1]['saskf'][1] = wolf_alive
+
+    return {
+        "label": "Wolf-Sheep-Grass LV (3D)",
+        "shader": "noop",
+        "passes": [
+            {"shader": "grass_field", "kind": "entity_field",      "writes": ["p1"]},
+            {"shader": "_grass_enc",  "kind": "entity_accum_encode", "writes": [],
+             "field": "grass_supply", "src_channel": 3},
+            {"shader": "_dclear",     "kind": "entity_accum_clear",  "writes": [],
+             "field": "graze_demand"},
+            {"shader": "_chash",      "kind": "entity_clear_hash",   "writes": []},
+            {"shader": "_bhash",      "kind": "entity_build_hash",   "writes": []},
+            {"shader": "sheep_demand",  "kind": "entity_step",       "writes": []},
+            {"shader": "sheep_consume", "kind": "entity_step",       "writes": []},
+            {"shader": "_resolve",      "kind": "entity_accum_resolve_demand",
+             "writes": [],
+             "supply_field": "grass_supply", "demand_field": "graze_demand"},
+            {"shader": "_grass_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "grass_supply", "dst_channel": 3},
+            # Wolf hunt (M4b election on wolf_claim, scratch ch 0).
+            {"shader": "_wclear",      "kind": "entity_scratch_clear", "writes": [],
+             "scratch_field": "wolf_claim"},
+            {"shader": "wolf_propose", "kind": "entity_step",        "writes": []},
+            {"shader": "wolf_commit",  "kind": "entity_step",        "writes": []},
+            # M8 GPU spawn (scratch ch 1: spawn_claim).
+            {"shader": "_spclear",     "kind": "entity_scratch_clear", "writes": [],
+             "scratch_field": "spawn_claim"},
+            {"shader": "decide_spawn", "kind": "entity_step",        "writes": []},
+            {"shader": "spawn_propose","kind": "entity_step",        "writes": [],
+             "scratch_field": "spawn_claim"},
+            {"shader": "spawn_commit", "kind": "entity_step",        "writes": [],
+             "scratch_field": "spawn_claim"},
+            {"shader": "_paint",       "kind": "entity_paint",       "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": MAX_ENTITIES,
+            "max_teams": 2,
+            "hash_cell": 6,
+            "aux_fields":     ["grass_supply", "graze_demand"],
+            "scratch_fields": ["wolf_claim", "spawn_claim"],
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "grass_field":   entity_arena.SHADER_GRASS_FIELD_UPDATE,
+            "sheep_demand":  entity_arena.SHADER_PREY_DEMAND,
+            "sheep_consume": entity_arena.SHADER_PREY_CONSUME,
+            "wolf_propose":  entity_arena.SHADER_PREDATOR_PROPOSE,
+            "wolf_commit":   entity_arena.SHADER_PREDATOR_COMMIT,
+            "decide_spawn":  entity_arena.SHADER_WSG_DECIDE_SPAWN,
+            "spawn_propose": entity_arena.SHADER_SPAWN_PROPOSE,
+            "spawn_commit":  entity_arena.SHADER_SPAWN_COMMIT,
+        },
+        "entity_paint_shader": entity_arena.SHADER_ECO_PAINT,
+        "on_init": on_init,
+        "on_tick": on_tick,
+        "params": {
+            "Grass regrow":   0.6,
+            "Graze rate":     0.8,
+            "Wolf sight":     1.0,
+            "Metabolism":     0.15,
+            "Sheep spawn E":  2.8,
+            "Wolf spawn E":   2.4,
+        },
+        "param_ranges": {
+            "Grass regrow":   (0.0, 2.0),
+            "Graze rate":     (0.0, 2.0),
+            "Wolf sight":     (0.2, 4.0),
+            "Metabolism":     (0.05, 1.0),
+            "Sheep spawn E":  (1.0, 5.0),
+            "Wolf spawn E":   (1.0, 5.0),
+        },
+        # decide_spawn reads u_param0 = sheep threshold, u_param1 = wolf
+        # threshold from the global param row. Override its slot to
+        # surface only those two params (others would be 0 by default
+        # and confuse the kind-thresh logic).
+        "pass_params": {
+            "decide_spawn": ["Sheep spawn E", "Wolf spawn E"],
+        },
+        "dt": 0.5,
+        "init": "food_seed",
+        "vis_channels": ["Composite (grass+entities)",
+                         "Sheep only", "Wolf only", "Grass only"],
+        "vis_default": 0,
+        "vis_abs": 2,
+        "colormap": 6,
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.6,
+        "boundary": "toroidal",
+        "description": (
+            "Wolf-sheep-grass ecosystem with GPU reproduction (M8). "
+            "Both sheep and wolves spawn deterministically when their "
+            "energy crosses a kind-specific threshold: a hash of "
+            "(parent_id, frame) picks a candidate child slot, and "
+            "an atomicMin election resolves collisions in "
+            "lowest-parent-id order. No CPU readback, no "
+            "race conditions, fully bit-deterministic. With default "
+            "params sheep tend to outpace wolves (energy cap at 3.0 "
+            "limits wolf stockpiling); this preset validates the "
+            "spawn primitive — fine-tuning to sustain classical "
+            "Lotka-Volterra oscillations is left to user param "
+            "exploration or follow-up work on per-kind metabolism."
+        ),
+        "short_description":
+            "Wolf-sheep-grass with deterministic GPU reproduction "
+            "(M8 spawn primitive demo).",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -15609,6 +15788,7 @@ RULE_PRESETS = {
     "physarum_3d":         _physarum_3d_preset(),
     "termites_3d":         _termites_preset(),
     "wolf_sheep_grass_3d": _wolf_sheep_grass_preset(),
+    "wolf_sheep_grass_lv_3d": _wolf_sheep_grass_lv_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",
@@ -25378,10 +25558,13 @@ class Simulator:
                 # Per-pass accum config (only the accum-kind passes care,
                 # but the uniforms are declared by ENTITY_GLSL_HEADER so
                 # other entity passes may also accept them harmlessly).
+                # entity_step is included so M8 spawn shaders can read
+                # the channel offset for spawn_claim via u_accum_ch.
                 if kind in ('entity_accum_clear', 'entity_accum_decay',
                             'entity_accum_decode', 'entity_accum_encode',
                             'entity_accum_resolve_demand',
-                            'entity_scratch_clear'):
+                            'entity_scratch_clear',
+                            'entity_step'):
                     prog = self._cu_per_pass[pass_idx]['prog']
                     if 'u_accum_ch' in prog:
                         prog['u_accum_ch'].value = int(spec.get('channel', 0))

@@ -1697,7 +1697,8 @@ class HeadlessRunner:
                 if kind in ('entity_accum_clear', 'entity_accum_decay',
                             'entity_accum_decode', 'entity_accum_encode',
                             'entity_accum_resolve_demand',
-                            'entity_scratch_clear'):
+                            'entity_scratch_clear',
+                            'entity_step'):
                     if 'u_accum_ch' in prog:
                         prog['u_accum_ch'].value = int(spec.get('channel', 0))
                     if 'u_accum_dst_ch' in prog:

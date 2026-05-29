@@ -1584,6 +1584,170 @@ void main() {
 """
 
 
+# ---------------------------------------------------------------------------
+# M8: GPU spawn primitive
+# ---------------------------------------------------------------------------
+#
+# Deterministic reproduction without a CPU readback every frame. The
+# challenge is slot allocation: atomicAdd into a counter gives unique
+# slots but in non-deterministic order, so the same parent_id can end
+# up at different child slots across runs.
+#
+# Solution: each parent hashes (parent_id, frame) to a deterministic
+# candidate child slot.  When multiple parents collide on the same
+# candidate, the M4b 2-phase election pattern picks a winner (lowest
+# parent id wins via atomicMin).  Hash collisions cap effective birth
+# rate, which is acceptable: the substrate-level guarantee is
+# bit-determinism, not maximum throughput.
+#
+# Pipeline (caller wires three new entity_step passes plus a scratch
+# clear; see _wolf_sheep_grass_lv_preset for the canonical wiring):
+#
+#   1. entity_scratch_clear { scratch_field: "spawn_claim" }
+#   2. SHADER_WSG_DECIDE_SPAWN  — sets entity.tptp.z = 1u when
+#      kind-specific energy threshold met (u_param0 = sheep, u_param1
+#      = wolf). Hardcoded kind ids 1/2 — this shader is wolf-sheep
+#      specific; generalize later if other ecologies need it.
+#   3. SHADER_SPAWN_PROPOSE     — each entity with wants_spawn picks
+#      a candidate child slot and atomicMin's its id+1 into spawn_claim.
+#   4. SHADER_SPAWN_COMMIT      — winner writes child entity at slot,
+#      halves parent energy, clears wants_spawn. Losers just clear
+#      wants_spawn.
+#
+# Entity layout contract:
+#   tptp.z (target_partner_timer_payload.z) = wants_spawn flag (0/1)
+#   The CPU side (or DECIDE_SPAWN) is responsible for initializing it
+#   to 0 for newborn entities (uvec4(0u,0u,0u,0u) does this).
+
+
+SHADER_WSG_DECIDE_SPAWN = """
+// Per-entity: mark for spawning if energy exceeds kind-specific
+// threshold. Pure own-slot write — no race.
+//
+// Params:
+//   u_param0 — sheep (kind==1) spawn energy threshold
+//   u_param1 — wolf  (kind==2) spawn energy threshold
+//   (other kinds never spawn via this shader.)
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    uint kind = e.kind_team_role_flags.x;
+    float thresh;
+    if (kind == 1u)      thresh = u_param0;
+    else if (kind == 2u) thresh = u_param1;
+    else                 thresh = 1e30;
+    uint want = (e.vel_energy.w > thresh) ? 1u : 0u;
+    entities[i].target_partner_timer_payload.z = want;
+}
+"""
+
+
+SHADER_SPAWN_PROPOSE = """
+// Each parent with wants_spawn==1 picks a deterministic candidate
+// child slot via hash(parent_id, frame) and atomicMin's its (id+1)
+// into spawn_claim[candidate_slot].  Lowest parent_id wins
+// collisions → bit-deterministic.
+//
+// Skips: slot 0 (reserved sentinel), self-slot, currently-alive
+// slots. The is_alive check is safe — no other pass writes
+// entities[].kind between this PROPOSE and the matching COMMIT.
+
+uint spawn_hash(uint pid, uint frame) {
+    uint x = pid * 2654435761u + frame * 0x9E3779B9u;
+    x ^= (x >> 16);
+    x *= 0x85ebca6bu;
+    x ^= (x >> 13);
+    x *= 0xc2b2ae35u;
+    x ^= (x >> 16);
+    return x;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.target_partner_timer_payload.z != 1u) return;
+    if (u_ent_scratch_channels <= 0) return;
+
+    uint cap  = uint(u_entity_count);
+    uint slot = spawn_hash(i, uint(u_frame)) % cap;
+    if (slot == 0u || slot == i) return;
+    if (is_alive(entities[slot])) return;
+
+    atomicMin(ent_scratch[slot * uint(u_ent_scratch_channels)
+                          + uint(u_accum_ch)],
+              i + 1u);
+}
+"""
+
+
+SHADER_SPAWN_COMMIT = """
+// Re-compute candidate slot. If we were the atomicMin winner AND the
+// slot is still dead, write the child entity and halve our energy.
+// Whether or not we spawned, clear wants_spawn so the flag doesn't
+// linger into the next frame.
+
+uint spawn_hash(uint pid, uint frame) {
+    uint x = pid * 2654435761u + frame * 0x9E3779B9u;
+    x ^= (x >> 16); x *= 0x85ebca6bu;
+    x ^= (x >> 13); x *= 0xc2b2ae35u;
+    x ^= (x >> 16);
+    return x;
+}
+
+float sh11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u; x = x ^ (x >> 4);
+    x *= 0x27d4eb2du; x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.target_partner_timer_payload.z != 1u) return;
+    if (u_ent_scratch_channels <= 0) return;
+
+    bool spawned = false;
+    uint cap  = uint(u_entity_count);
+    uint slot = spawn_hash(i, uint(u_frame)) % cap;
+    if (slot != 0u && slot != i && !is_alive(entities[slot])) {
+        uint claim_idx = slot * uint(u_ent_scratch_channels)
+                         + uint(u_accum_ch);
+        if (ent_scratch[claim_idx] == i + 1u) {
+            // Construct child.
+            uint seed = i * 7919u + uint(u_frame) * 104729u;
+            vec3 offs = vec3(sh11(seed),
+                             sh11(seed + 1u),
+                             sh11(seed + 2u)) - 0.5;
+            offs *= 2.0;
+            vec3 cpos = mod(e.pos_radius.xyz + offs, u_world_size);
+
+            Entity child;
+            child.pos_radius = vec4(cpos, e.pos_radius.w);
+            child.vel_energy = vec4(0.0, 0.0, 0.0, e.vel_energy.w * 0.4);
+            child.kind_team_role_flags = e.kind_team_role_flags;
+            child.target_partner_timer_payload = uvec4(0u, 0u, 0u, 0u);
+            child.genome = e.genome;
+            entities[slot] = child;
+            spawned = true;
+        }
+    }
+
+    // Single consolidated write of parent state (avoid partial-write
+    // races even though no other thread targets this slot).
+    if (spawned) e.vel_energy.w *= 0.5;
+    e.target_partner_timer_payload.z = 0u;
+    entities[i] = e;
+}
+"""
+
+
 # ── Shader 4 of 4: ecosystem paint (preserves food background) ──────────
 SHADER_ECO_PAINT = """
 // Per-voxel variant of SHADER_PAINT for the predator/prey scenario:
