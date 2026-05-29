@@ -14039,6 +14039,7 @@ def _ant_colony_rivalry_preset():
                          "Ants only", "Trails", "Food"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",  # paint shader writes per-team RGB directly
         "colormap": 0,
         "render_mode": "volumetric",
         "voxel_threshold": 0.05,
@@ -14258,6 +14259,7 @@ def _ant_colony_lifecycle_preset():
                          "Workers + queens", "Trails", "Food"],
         "vis_default": 0,
         "vis_abs": False,
+        "vis_mode": "rgb_channels",  # paint shader writes per-team RGB directly
         "colormap": 0,
         "render_mode": "volumetric",
         "voxel_threshold": 0.05,

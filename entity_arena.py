@@ -2691,7 +2691,12 @@ void main() {
         }
     }
 
-    result.rgb = ant_rgb + nest_rgb + trail_rgb;
+    // Food rendered as warm amber so it's visible in rgb_channels vis mode
+    // (alpha is otherwise discarded). Distinct from team colors (R/G/B).
+    float food = clamp(result.a, 0.0, 1.0);
+    vec3 food_rgb = vec3(0.95, 0.75, 0.20) * food;
+
+    result.rgb = ant_rgb + nest_rgb + trail_rgb + food_rgb;
     imageStore(u_grid_w, p, result);
 }
 """
@@ -3031,7 +3036,12 @@ void main() {
         }
     }
 
-    result.rgb = ant_rgb + trail_rgb;
+    // Food rendered as warm amber so it's visible in rgb_channels vis mode
+    // (alpha is otherwise discarded). Distinct from team colors (R/G/B).
+    float food = clamp(result.a, 0.0, 1.0);
+    vec3 food_rgb = vec3(0.95, 0.75, 0.20) * food;
+
+    result.rgb = ant_rgb + trail_rgb + food_rgb;
     imageStore(u_grid_w, p, result);
 }
 """
