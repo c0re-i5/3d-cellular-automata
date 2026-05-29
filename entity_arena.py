@@ -1117,6 +1117,42 @@ void main() {
 """
 
 
+# Wolf-sheep-grass variant: in-place logistic regrowth, NO diffusion.
+# Grass tiles regrow independently — distinguishes the discrete-patch
+# NetLogo-style ecology from the continuous diffusing food in
+# predator_prey_3d. Same uniform contract (u_param0 = regrow rate).
+SHADER_GRASS_FIELD_UPDATE = """
+// 3D voxel pass — grass regrowth only. No diffusion: each tile
+// regrows in place at logistic rate (newcomers stay where they are).
+//
+// Params:
+//   u_param0 — grass regrow rate (logistic dr/dt = r * g * (1 - g))
+//   u_param1 — UNUSED (kept for uniform compatibility)
+//   u_param2 — UNUSED
+//   u_param3 — UNUSED
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, ivec3(u_size)))) return;
+
+    vec4 c = imageLoad(u_src, p);
+    float grass = c.a;
+
+    // Logistic regrowth in place. A tile at grass=0 stays at 0
+    // (multiplicative growth needs a seed) — so we add a small
+    // baseline so eaten tiles eventually re-seed themselves.
+    grass += u_param0 * (grass * (1.0 - grass) + 0.002) * u_dt;
+    grass = clamp(grass, 0.0, 1.0);
+
+    // Background tint for ch0 composite display (faint green tinge from
+    // the alpha=grass channel via diverging colormap). Clear the
+    // entity density channels — paint pass rebuilds them.
+    float bg = grass * 0.25;
+    imageStore(u_dst, p, vec4(bg, 0.0, 0.0, grass));
+}
+"""
+
+
 # ── Shader 2 of 4: prey step (entity_step, read+write field) ───────────
 #
 # LEGACY — kept for reference. Use SHADER_PREY_DEMAND + SHADER_PREY_CONSUME

@@ -13384,6 +13384,154 @@ def _termites_preset():
     }
 
 
+def _wolf_sheep_grass_preset():
+    """NetLogo-style wolf-sheep-grass ecosystem (fixed population variant).
+
+    Differences from predator_prey_3d:
+      • Grass regrows in place (NO diffusion) — discrete patches, not
+        a smoothly-spreading food field.
+      • No CPU reproduction: both species' populations only decrease
+        (energy-starvation deaths). Validates the substrate without
+        relying on the spawn primitive — M8 will add GPU spawn and
+        unlock classic Lotka-Volterra oscillations.
+      • Reuses M4b predator election + M4c fair-share grazing shaders
+        unchanged (kind=1=sheep, kind=2=wolf — identical layout to
+        predator_prey).
+
+    Channel layout (matches predator_prey for visual continuity):
+      ch0 (r) — composite background tint + entity paint
+      ch3 (a) — grass density [0,1]
+    """
+    KIND_SHEEP = 1
+    KIND_WOLF  = 2
+    SHEEP_DENSITY = 0.0024
+    WOLF_DENSITY  = 0.0001
+    MAX_SHEEP = 24000
+    MAX_WOLF  = 1000
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        n_voxels = size ** 3
+        n_sheep = min(MAX_SHEEP, int(n_voxels * SHEEP_DENSITY))
+        n_wolf  = min(MAX_WOLF,  int(n_voxels * WOLF_DENSITY))
+        arena.set_team(0, color=(0.92, 0.92, 0.88, 1.0),  # off-white sheep
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        arena.set_team(1, color=(0.30, 0.20, 0.15, 1.0),  # dark brown wolves
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=s * 0.45)
+        for _ in range(n_sheep):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=KIND_SHEEP, team=0, pos=p, radius=1.2,
+                        energy=1.0 + rng.random() * 0.5,
+                        genome=(0.6 + rng.random() * 0.3, 0.0, 0.0, 0.0))
+        for _ in range(n_wolf):
+            p = (rng.random() * s, rng.random() * s, rng.random() * s)
+            arena.spawn(kind=KIND_WOLF, team=1, pos=p, radius=1.8,
+                        energy=1.5 + rng.random() * 0.5,
+                        genome=(0.9 + rng.random() * 0.4,
+                                4.0 + rng.random() * 4.0,
+                                0.0, 0.0))
+
+    def on_tick(arena, frame, params):
+        # No reproduction in M7 — just refresh the per-team alive
+        # counts so the UI shows population dynamics.
+        arena.pull_entities()
+        kinds = arena.entities['ktrf'][:, 0]
+        sheep_alive = int(np.count_nonzero(kinds == KIND_SHEEP))
+        wolf_alive  = int(np.count_nonzero(kinds == KIND_WOLF))
+        arena.teams[0]['saskf'][1] = sheep_alive
+        arena.teams[1]['saskf'][1] = wolf_alive
+
+    return {
+        "label": "Wolf-Sheep-Grass (3D)",
+        "shader": "noop",
+        "passes": [
+            # Grass regrowth on grid ch3 (in-place logistic, no diffusion).
+            {"shader": "grass_field", "kind": "entity_field",      "writes": ["p1"]},
+            # M4c determinism stack: encode grass into atomic supply, run
+            # demand/consume/resolve, decode back to grid for display +
+            # next frame's encode.
+            {"shader": "_grass_enc",  "kind": "entity_accum_encode", "writes": [],
+             "field": "grass_supply", "src_channel": 3},
+            {"shader": "_dclear",     "kind": "entity_accum_clear",  "writes": [],
+             "field": "graze_demand"},
+            {"shader": "_chash",      "kind": "entity_clear_hash",   "writes": []},
+            {"shader": "_bhash",      "kind": "entity_build_hash",   "writes": []},
+            # Sheep graze (M4c fair-share). The prey shaders kind-filter
+            # on kind==1; sheep are kind==1, so they reuse unchanged.
+            {"shader": "sheep_demand",  "kind": "entity_step",       "writes": []},
+            {"shader": "sheep_consume", "kind": "entity_step",       "writes": []},
+            {"shader": "_resolve",      "kind": "entity_accum_resolve_demand",
+             "writes": [],
+             "supply_field": "grass_supply", "demand_field": "graze_demand"},
+            {"shader": "_grass_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "grass_supply", "dst_channel": 3},
+            # M4b predator election (wolves target sheep). The predator
+            # shaders kind-filter wolf==2 / prey==1 — identical layout.
+            {"shader": "_sclear",      "kind": "entity_scratch_clear", "writes": [],
+             "scratch_field": "wolf_claim"},
+            {"shader": "wolf_propose", "kind": "entity_step",        "writes": []},
+            {"shader": "wolf_commit",  "kind": "entity_step",        "writes": []},
+            {"shader": "_paint",       "kind": "entity_paint",       "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 32768,
+            "max_teams": 2,
+            "hash_cell": 6,
+            "aux_fields":     ["grass_supply", "graze_demand"],
+            "scratch_fields": ["wolf_claim"],
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "grass_field":   entity_arena.SHADER_GRASS_FIELD_UPDATE,
+            "sheep_demand":  entity_arena.SHADER_PREY_DEMAND,
+            "sheep_consume": entity_arena.SHADER_PREY_CONSUME,
+            "wolf_propose":  entity_arena.SHADER_PREDATOR_PROPOSE,
+            "wolf_commit":   entity_arena.SHADER_PREDATOR_COMMIT,
+        },
+        "entity_paint_shader": entity_arena.SHADER_ECO_PAINT,
+        "on_init": on_init,
+        "on_tick": on_tick,
+        "params": {
+            "Grass regrow": 0.6,
+            "Graze rate":   0.8,
+            "Wolf sight":   1.0,
+            "Metabolism":   0.15,
+        },
+        "param_ranges": {
+            "Grass regrow": (0.0, 2.0),
+            "Graze rate":   (0.0, 2.0),
+            "Wolf sight":   (0.2, 4.0),
+            "Metabolism":   (0.05, 1.0),
+        },
+        "dt": 0.5,
+        "init": "food_seed",   # same seeding pattern: ch3 noise
+        "vis_channels": ["Composite (grass+entities)",
+                         "Sheep only", "Wolf only", "Grass only"],
+        "vis_default": 0,
+        "vis_abs": 2,
+        "colormap": 6,
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.6,
+        "boundary": "toroidal",
+        "description": (
+            "NetLogo-style wolf-sheep-grass ecosystem in 3D. Sheep "
+            "(off-white) graze grass tiles (faint green background); "
+            "wolves (dark brown) hunt sheep via spatial-hash queries. "
+            "Both starve when energy hits zero. Population only "
+            "decreases in this M7 fixed-population variant — M8 will "
+            "add GPU reproduction and unlock classic Lotka-Volterra "
+            "oscillations. Grass regrows in place (no diffusion), "
+            "making patch dynamics visible: heavily-grazed regions "
+            "go bare and slowly recover."
+        ),
+        "short_description":
+            "Wolf-sheep-grass ecosystem (fixed population). M7 "
+            "validates multi-kind interactions; M8 adds reproduction.",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -15460,6 +15608,7 @@ RULE_PRESETS = {
     "predator_prey_3d":    _predator_prey_preset(),
     "physarum_3d":         _physarum_3d_preset(),
     "termites_3d":         _termites_preset(),
+    "wolf_sheep_grass_3d": _wolf_sheep_grass_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",
