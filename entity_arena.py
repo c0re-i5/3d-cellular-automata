@@ -2698,6 +2698,346 @@ void main() {
 
 
 # ---------------------------------------------------------------------------
+# M11: Ant colony lifecycle (queens, worker energy, GPU spawn)
+# ---------------------------------------------------------------------------
+#
+# Extends M10 rivalry with:
+#   * kind=2 QUEEN entity per team (stationary, lives at nest cell).
+#   * Workers (kind=1) carry energy in vel_energy.w. Drains at rate
+#     METABOLISM per frame. Workers die (kind=DEAD) at energy <= 0.
+#   * Worker delivering food at OWN nest: full energy refill, AND
+#     atomicAdd 1 into stockpile_t{team} accum channel.
+#   * Per-frame QUEEN_ABSORB pass: each queen reads stockpile at her
+#     cell and adds it to her own energy (= stockpile). Then the
+#     stockpile channels are cleared for next frame.
+#   * Once a queen has energy >= SPAWN_COST, M8 PROPOSE/COMMIT spawn a
+#     new worker (kind=1, not queen) at the queen's cell with full
+#     energy. SPAWN_COST is subtracted from queen's stockpile.
+#
+# Accum layout for the lifecycle preset (T=3 teams - 11 channels):
+#   ch0                  food_supply           (shared)
+#   ch1                  food_demand           (shared)
+#   ch2 + 2t + 0         phero_to_food for t
+#   ch2 + 2t + 1         phero_to_home for t
+#   ch2 + 2*T + t        stockpile for team t  (new in M11)
+#
+# Lifecycle constants are baked into the shaders rather than wired
+# through u_param0..3 (those stay reserved for the foraging knobs).
+# Numbers chosen so a starter colony of ~50 workers reaches a
+# sustainable steady state at default food density.
+
+
+SHADER_ANT_MOVE_LIFE = """
+// Worker-only move (RIVAL variant + lifecycle):
+//   * metabolism: energy -= METABOLISM each frame
+//   * death:      energy <= 0 → kind = DEAD; return
+//   * delivery:   carrier crossing own-nest drop radius gets full
+//                 refill AND deposits 1 unit into own stockpile
+//                 accum channel.
+// Pickup remains delegated to ANT_PICKUP_DEMAND / DECIDE.
+
+float al11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u; x = x ^ (x >> 4);
+    x *= 0x27d4eb2du; x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;   // workers only
+
+    // ---- metabolism + death -------------------------------------------
+    const float METABOLISM = 0.08;
+    const float INIT_ENERGY = 100.0;
+    e.vel_energy.w -= METABOLISM * u_dt;
+    if (e.vel_energy.w <= 0.0) {
+        e.kind_team_role_flags.x = 0u;            // DEAD
+        entities[i] = e;
+        return;
+    }
+
+    uint team = e.kind_team_role_flags.y;
+    int  team_base    = 2 + int(team) * 2;
+    int  ch_to_food   = team_base + 0;
+    int  ch_to_home   = team_base + 1;
+    int  ch_stockpile = 2 + 2 * u_team_count + int(team);
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    int S = u_size;
+
+    int sense_ch = (e.target_partner_timer_payload.x == 0u)
+                   ? ch_to_food : ch_to_home;
+
+    ivec3 pe = ((vp + ivec3( 1, 0, 0)) % S + S) % S;
+    ivec3 pw = ((vp + ivec3(-1, 0, 0)) % S + S) % S;
+    ivec3 pn = ((vp + ivec3( 0, 1, 0)) % S + S) % S;
+    ivec3 ps = ((vp + ivec3( 0,-1, 0)) % S + S) % S;
+    ivec3 pu = ((vp + ivec3( 0, 0, 1)) % S + S) % S;
+    ivec3 pd = ((vp + ivec3( 0, 0,-1)) % S + S) % S;
+    float xe = accum_sample(sense_ch, pe);
+    float xw = accum_sample(sense_ch, pw);
+    float xn = accum_sample(sense_ch, pn);
+    float xs = accum_sample(sense_ch, ps);
+    float xu = accum_sample(sense_ch, pu);
+    float xd = accum_sample(sense_ch, pd);
+    vec3 grad = vec3(xe - xw, xn - xs, xu - xd);
+    float glen = length(grad);
+    vec3 bias = (glen > 1e-5) ? (grad / glen) * u_param2 : vec3(0.0);
+
+    vec3 nest = teams[team].spawn_pos_radius.xyz;
+    if (e.target_partner_timer_payload.x == 1u) {
+        vec3 to_nest = nest - e.pos_radius.xyz;
+        to_nest -= u_world_size * floor(to_nest / u_world_size + 0.5);
+        float dlen = length(to_nest);
+        if (dlen > 1e-3) bias += (to_nest / dlen) * (u_param2 * 0.25);
+    }
+
+    uint seed = i * 2477u + uint(u_frame) * 8101u;
+    vec3 jitter = vec3(al11(seed),
+                       al11(seed + 1u),
+                       al11(seed + 2u)) - 0.5;
+    float max_speed = max(e.genome.x, 0.01);
+    vec3 v = e.vel_energy.xyz * 0.75 + jitter * u_param0 + bias;
+    float vlen = length(v);
+    if (vlen > max_speed) v *= max_speed / vlen;
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+
+    // ---- delivery at own nest -----------------------------------------
+    if (e.target_partner_timer_payload.x == 1u) {
+        vec3 d = pos - nest;
+        d -= u_world_size * floor(d / u_world_size + 0.5);
+        if (length(d) < u_param3) {
+            e.target_partner_timer_payload.x = 0u;
+            e.vel_energy.w = INIT_ENERGY;         // full refill on delivery
+            v = -v;
+            // Deposit 1 stockpile unit at the OWN-nest voxel (the
+            // queen sits there and absorbs it next pass).
+            ivec3 nvp = ivec3(floor(nest));
+            nvp = ((nvp % S) + S) % S;
+            accum_deposit(ch_stockpile, nvp, 1.0);
+        }
+    }
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_QUEEN_ABSORB = """
+// Per-queen (kind=2): read stockpile accum at own voxel and add it
+// directly to own energy. No movement, no death. The stockpile
+// channels are cleared by an entity_accum_clear pass after this
+// shader runs so the absorption is exact (not double-counted).
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 2u) return;   // queens only
+
+    uint team = e.kind_team_role_flags.y;
+    int  ch_stockpile = 2 + 2 * u_team_count + int(team);
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    float gained = accum_sample(ch_stockpile, vp);
+    if (gained > 0.0) {
+        e.vel_energy.w += gained;
+        entities[i] = e;
+    }
+}
+"""
+
+
+SHADER_QUEEN_DECIDE_SPAWN = """
+// Per-queen: mark wants_spawn=1 iff stockpile (vel_energy.w) is
+// sufficient to afford a new worker. Other kinds are unaffected.
+// SPAWN_COST is baked here; PROPOSE/COMMIT (M8) handle the rest.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 2u) return;
+
+    const float SPAWN_COST = 1.0;
+    uint want = (e.vel_energy.w >= SPAWN_COST) ? 1u : 0u;
+    entities[i].target_partner_timer_payload.z = want;
+}
+"""
+
+
+SHADER_QUEEN_SPAWN_COMMIT = """
+// Forked from SHADER_SPAWN_COMMIT: same atomicMin-election semantics,
+// but child entity is a WORKER (kind=1, same team as queen) with
+// full energy, and the queen's stockpile is decremented by
+// SPAWN_COST (not halved as in the generic WSG variant).
+
+uint qspawn_hash(uint pid, uint frame) {
+    uint x = pid * 2654435761u + frame * 0x9E3779B9u;
+    x ^= (x >> 16); x *= 0x85ebca6bu;
+    x ^= (x >> 13); x *= 0xc2b2ae35u;
+    x ^= (x >> 16);
+    return x;
+}
+
+float qsh11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u; x = x ^ (x >> 4);
+    x *= 0x27d4eb2du; x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 2u) return;             // queens only
+    if (e.target_partner_timer_payload.z != 1u) return;
+    if (u_ent_scratch_channels <= 0) return;
+
+    const float SPAWN_COST  = 1.0;
+    const float INIT_ENERGY = 100.0;
+
+    bool spawned = false;
+    uint cap  = uint(u_entity_count);
+    uint slot = qspawn_hash(i, uint(u_frame)) % cap;
+    if (slot != 0u && slot != i && !is_alive(entities[slot])) {
+        uint claim_idx = slot * uint(u_ent_scratch_channels)
+                         + uint(u_accum_ch);
+        if (ent_scratch[claim_idx] == i + 1u) {
+            // Construct worker child at queen's cell (small jitter).
+            uint seed = i * 7919u + uint(u_frame) * 104729u;
+            vec3 offs = vec3(qsh11(seed),
+                             qsh11(seed + 1u),
+                             qsh11(seed + 2u)) - 0.5;
+            offs *= 1.5;
+            vec3 cpos = mod(e.pos_radius.xyz + offs, u_world_size);
+
+            Entity child;
+            child.pos_radius = vec4(cpos, 1.0);
+            // Random initial heading via jitter — small magnitude so
+            // wander dominates the first few frames.
+            vec3 v0 = vec3(qsh11(seed + 3u),
+                           qsh11(seed + 4u),
+                           qsh11(seed + 5u)) - 0.5;
+            child.vel_energy = vec4(v0 * 0.5, INIT_ENERGY);
+            // kind=1 worker; same team as queen.
+            child.kind_team_role_flags = uvec4(1u, e.kind_team_role_flags.y,
+                                               0u, 0u);
+            child.target_partner_timer_payload = uvec4(0u, 0u, 0u, 0u);
+            // Inherit queen's genome (speed, ...). New workers will
+            // get the queen's wander speed for now; trait drift can
+            // be added later.
+            child.genome = e.genome;
+            entities[slot] = child;
+            spawned = true;
+        }
+    }
+
+    if (spawned) e.vel_energy.w -= SPAWN_COST;
+    e.target_partner_timer_payload.z = 0u;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_ANT_PAINT_LIFE = """
+// Paint shader for the M11 lifecycle preset. Same as PAINT_RIVAL but:
+//   * Includes queens (kind=2) in the entity loop, painted with a
+//     larger fixed radius and brightness scaling with stockpile.
+//   * Nest highlight intensity also scales subtly with team size
+//     (read from teams[t].score_alive_kills_flags.y if updated by
+//     on_tick) so collapsing colonies are visible at a glance.
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;
+
+void main() {
+    uint flat_idx = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (flat_idx >= total) return;
+
+    int S = u_size;
+    int idx = int(flat_idx);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
+
+    vec4 result = imageLoad(u_grid_r, p);
+
+    vec3 trail_rgb = vec3(0.0);
+    int T = u_team_count;
+    for (int t = 0; t < T; ++t) {
+        int base = 2 + t * 2;
+        float pf = accum_sample(base + 0, p);
+        float ph = accum_sample(base + 1, p);
+        trail_rgb += teams[uint(t)].color.rgb * (pf + ph) * 0.35;
+    }
+
+    vec3 ant_rgb = vec3(0.0);
+    ivec3 base_c = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
+    int half_s = S / 2;
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base_c + ivec3(dx, dy, dz);
+        c = ((c % u_hash_dim) + u_hash_dim) % u_hash_dim;
+        uint ci = hash_cell_index(c);
+        uint n = min(hash_count[ci], uint(u_hash_max_per_cell));
+        for (uint k = 0u; k < n; ++k) {
+            uint eid = hash_entry[ci * uint(u_hash_max_per_cell) + k];
+            Entity e = entities[eid];
+            if (!is_alive(e)) continue;
+            uint kind = e.kind_team_role_flags.x;
+            if (kind != 1u && kind != 2u) continue;
+
+            // Queens are drawn larger and brighter than workers.
+            float radius = (kind == 2u) ? 2.0 : e.pos_radius.w;
+
+            ivec3 center = ivec3(floor(e.pos_radius.xyz));
+            ivec3 off = p - center;
+            off.x = ((off.x % S) + S) % S; if (off.x > half_s) off.x -= S;
+            off.y = ((off.y % S) + S) % S; if (off.y > half_s) off.y -= S;
+            off.z = ((off.z % S) + S) % S; if (off.z > half_s) off.z -= S;
+
+            int rmax = int(ceil(radius));
+            rmax = clamp(rmax, 0, 4);
+            if (abs(off.x) > rmax || abs(off.y) > rmax || abs(off.z) > rmax)
+                continue;
+
+            float dist = length(vec3(off));
+            if (dist > radius) continue;
+            float inv_r = (radius > 0.001) ? 1.0 / radius : 1.0;
+            float w = max(0.0, 1.0 - dist * inv_r);
+
+            if (kind == 2u) {
+                // Queen brightness scales gently with stockpile.
+                w *= 1.5 + min(e.vel_energy.w / 50.0, 2.0);
+            } else if (e.target_partner_timer_payload.x != 0u) {
+                w *= 1.4;  // carriers brighter
+            }
+            vec3 tint = teams[uint(e.kind_team_role_flags.y)].color.rgb;
+            ant_rgb = max(ant_rgb, tint * w);
+        }
+    }
+
+    result.rgb = ant_rgb + trail_rgb;
+    imageStore(u_grid_w, p, result);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # CPU-side container
 # ---------------------------------------------------------------------------
 

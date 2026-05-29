@@ -14060,6 +14060,225 @@ def _ant_colony_rivalry_preset():
     }
 
 
+def _ant_colony_lifecycle_preset():
+    """Ant lifecycle — workers age, queens spawn from stockpile (M11).
+
+    Builds on M10 rivalry by adding:
+      * One QUEEN entity (kind=2) per team, stationary at the nest.
+      * Workers (kind=1) have energy that drains every frame; they
+        die (kind=DEAD) when energy ≤ 0.
+      * Workers refill energy by DELIVERING food to their own nest.
+        Each delivery also deposits 1 unit into per-team stockpile
+        accum channel.
+      * Queens read their stockpile each frame and accumulate it as
+        own-energy.  Once stockpile ≥ SPAWN_COST=3, M8 PROPOSE/COMMIT
+        spawn a new worker at the queen's cell with full energy.
+
+    Accum layout (11 channels for T=3):
+      0           food_supply
+      1           food_demand
+      2+2t..2t+1  phero_to_food/home per team
+      8+t         stockpile per team
+
+    Scratch (1 channel):
+      spawn_claim — M8 election scratch (atomicMin id+1 per slot)
+
+    Demonstrates the full M9+M10+M8 stack end-to-end: stigmergic
+    foraging, per-team rivalry, deterministic GPU reproduction, and
+    energy-driven population dynamics in one preset. Successful
+    colonies grow, unsuccessful ones shrink and may die out.
+    """
+    KIND_WORKER = 1
+    KIND_QUEEN  = 2
+    N_TEAMS = 3
+    TEAM_COLORS = [
+        (1.00, 0.30, 0.30, 1.0),
+        (0.30, 1.00, 0.40, 1.0),
+        (0.40, 0.55, 1.00, 1.0),
+    ]
+    INIT_WORKER_ENERGY = 100.0
+    INIT_QUEEN_ENERGY  = 12.0   # ~4 immediate spawns to bootstrap
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        nests = []
+        for t in range(N_TEAMS):
+            ang = 2.0 * np.pi * t / N_TEAMS + np.pi / 6.0
+            cx = s * 0.5 + s * 0.22 * float(np.cos(ang))
+            cy = s * 0.5 + s * 0.22 * float(np.sin(ang))
+            cz = s * 0.5
+            nests.append((cx, cy, cz))
+            arena.set_team(t, color=TEAM_COLORS[t],
+                           spawn_pos=(cx, cy, cz), spawn_radius=2.0)
+
+        # Spawn one stationary queen per team (kind=2). Queen radius
+        # matches the worker radius so PAINT_LIFE's queen scaling
+        # is the only visual difference.
+        for t in range(N_TEAMS):
+            arena.spawn(kind=KIND_QUEEN, team=t, pos=nests[t],
+                        radius=1.0, energy=INIT_QUEEN_ENERGY,
+                        genome=(0.0, 0.0, 0.0, 0.0))  # max_speed=0 ⇒ static
+
+        # Starter population (~60 workers/team) — needs enough to
+        # quickly bootstrap the phero_to_food trail; below ~30 the
+        # search phase stays random for many thousands of frames.
+        per_team = 60
+        for t in range(N_TEAMS):
+            nx, ny, nz = nests[t]
+            for _ in range(per_team):
+                ox = (rng.random() - 0.5) * 1.5
+                oy = (rng.random() - 0.5) * 1.5
+                oz = (rng.random() - 0.5) * 1.5
+                p = (nx + ox, ny + oy, nz + oz)
+                speed = 1.2 + rng.random() * 0.6
+                arena.spawn(kind=KIND_WORKER, team=t, pos=p,
+                            radius=1.0, energy=INIT_WORKER_ENERGY,
+                            genome=(speed, 0.0, 0.0, 0.0))
+
+    def on_tick(arena, frame, params):
+        if frame % 30 != 0:
+            return
+        arena.pull_entities()
+        kinds  = arena.entities['ktrf'][:, 0]
+        teams  = arena.entities['ktrf'][:, 1]
+        carry  = arena.entities['tptp'][:, 0]
+        energy = arena.entities['vel_energy'][:, 3]
+        for t in range(N_TEAMS):
+            mask = (teams == t)
+            workers = mask & (kinds == KIND_WORKER)
+            queens  = mask & (kinds == KIND_QUEEN)
+            n_workers = int(np.count_nonzero(workers))
+            n_carry   = int(np.count_nonzero(workers & (carry == 1)))
+            queen_e   = float(energy[queens].sum())
+            arena.teams[t]['saskf'][1] = n_workers
+            arena.teams[t]['saskf'][2] = n_carry
+            arena.teams[t]['saskf'][0] = int(queen_e)  # display stockpile
+
+    # 8 phero/food channels + 3 stockpile = 11 accum channels.
+    aux_fields = ["food_supply", "food_demand"]
+    for t in range(N_TEAMS):
+        aux_fields.append(f"phero_to_food_t{t}")
+        aux_fields.append(f"phero_to_home_t{t}")
+    for t in range(N_TEAMS):
+        aux_fields.append(f"stockpile_t{t}")
+
+    decay_passes = []
+    for t in range(N_TEAMS):
+        decay_passes.append(
+            {"shader": f"_pfdecay_t{t}", "kind": "entity_accum_decay",
+             "writes": [], "field": f"phero_to_food_t{t}", "rate": 0.97})
+        decay_passes.append(
+            {"shader": f"_phdecay_t{t}", "kind": "entity_accum_decay",
+             "writes": [], "field": f"phero_to_home_t{t}", "rate": 0.97})
+
+    # Stockpile must be cleared BEFORE ant_move (so this frame's
+    # deliveries are the only deposits queens see). Clearing AFTER
+    # absorb would also work but means a 1-frame absorb latency.
+    stockpile_clear = [
+        {"shader": f"_sclear_t{t}", "kind": "entity_accum_clear",
+         "writes": [], "field": f"stockpile_t{t}"}
+        for t in range(N_TEAMS)
+    ]
+
+    return {
+        "label": "Ant Colony Lifecycle (queens + GPU spawn)",
+        "shader": "noop",
+        "passes": [
+            {"shader": "_food_enc",   "kind": "entity_accum_encode", "writes": [],
+             "field": "food_supply", "src_channel": 3},
+            {"shader": "_dclear",     "kind": "entity_accum_clear",  "writes": [],
+             "field": "food_demand"},
+            *stockpile_clear,
+            *decay_passes,
+            {"shader": "_chash",      "kind": "entity_clear_hash",   "writes": []},
+            {"shader": "_bhash",      "kind": "entity_build_hash",   "writes": []},
+            # Workers: metabolism, sense+move, drop at own nest →
+            # refill energy + deposit 1 stockpile unit. Workers
+            # whose energy hits 0 die here.
+            {"shader": "ant_move_life",     "kind": "entity_step",  "writes": []},
+            # Pickup (shared food, unchanged from M9/M10).
+            {"shader": "ant_pickup_demand", "kind": "entity_step",  "writes": []},
+            {"shader": "ant_pickup_decide", "kind": "entity_step",  "writes": []},
+            {"shader": "_resolve",   "kind": "entity_accum_resolve_demand",
+             "writes": [],
+             "supply_field": "food_supply", "demand_field": "food_demand"},
+            # Per-team pheromone deposit (worker only — queens
+            # standing still on phero channels would spike them).
+            {"shader": "ant_deposit_r",     "kind": "entity_step",  "writes": []},
+            # Queens absorb this frame's stockpile into own energy.
+            {"shader": "queen_absorb",      "kind": "entity_step",  "writes": []},
+            # M8 GPU spawn pipeline (queen-only DECIDE + worker-child COMMIT).
+            {"shader": "_spclear",     "kind": "entity_scratch_clear", "writes": [],
+             "scratch_field": "spawn_claim"},
+            {"shader": "queen_decide_spawn", "kind": "entity_step", "writes": []},
+            {"shader": "spawn_propose", "kind": "entity_step",     "writes": [],
+             "scratch_field": "spawn_claim"},
+            {"shader": "queen_spawn_commit", "kind": "entity_step", "writes": [],
+             "scratch_field": "spawn_claim"},
+            {"shader": "_food_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "food_supply", "dst_channel": 3},
+            {"shader": "_paint",      "kind": "entity_paint",       "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 16384,
+            "max_teams": N_TEAMS,
+            "hash_cell": 6,
+            "aux_fields":     aux_fields,
+            "scratch_fields": ["spawn_claim"],
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "ant_move_life":      entity_arena.SHADER_ANT_MOVE_LIFE,
+            "ant_pickup_demand":  entity_arena.SHADER_ANT_PICKUP_DEMAND,
+            "ant_pickup_decide":  entity_arena.SHADER_ANT_PICKUP_DECIDE,
+            "ant_deposit_r":      entity_arena.SHADER_ANT_DEPOSIT_RIVAL,
+            "queen_absorb":       entity_arena.SHADER_QUEEN_ABSORB,
+            "queen_decide_spawn": entity_arena.SHADER_QUEEN_DECIDE_SPAWN,
+            "spawn_propose":      entity_arena.SHADER_SPAWN_PROPOSE,
+            "queen_spawn_commit": entity_arena.SHADER_QUEEN_SPAWN_COMMIT,
+        },
+        "entity_paint_shader": entity_arena.SHADER_ANT_PAINT_LIFE,
+        "on_init": on_init,
+        "on_tick": on_tick,
+        "params": {
+            "Wander jitter":     1.0,
+            "Pheromone deposit": 1.2,
+            "Pheromone bias":    0.8,
+            "Nest drop radius":  3.0,
+        },
+        "param_ranges": {
+            "Wander jitter":     (0.0, 3.0),
+            "Pheromone deposit": (0.0, 4.0),
+            "Pheromone bias":    (0.0, 3.0),
+            "Nest drop radius":  (1.0, 6.0),
+        },
+        "dt": 1.0,
+        "init": "ant_food",
+        "vis_channels": ["Composite (team-tinted + queens)",
+                         "Workers + queens", "Trails", "Food"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "colormap": 0,
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.05,
+        "boundary": "toroidal",
+        "description": (
+            "Ant lifecycle (M11, final part of 3). Three rival "
+            "colonies each have a stationary QUEEN that absorbs "
+            "delivered-food stockpile and spawns new workers via "
+            "the M8 deterministic GPU spawn primitive (hash-to-slot "
+            "+ atomicMin election). Workers age — energy drains "
+            "every frame and refills only on delivery — so colonies "
+            "that fail to find food shrink and die. Watch population "
+            "and territory dynamics co-evolve until shared food runs "
+            "out. Demonstrates the full M9+M10+M8 stack end-to-end."
+        ),
+        "short_description":
+            "Ant lifecycle: queens spawn workers from food stockpile "
+            "via GPU spawn primitive (M11 part 3 of 3).",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -16140,6 +16359,7 @@ RULE_PRESETS = {
     "wolf_sheep_grass_lv_3d": _wolf_sheep_grass_lv_preset(),
     "ant_colony_3d": _ant_colony_preset(),
     "ant_colony_rivalry_3d": _ant_colony_rivalry_preset(),
+    "ant_colony_lifecycle_3d": _ant_colony_lifecycle_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",
