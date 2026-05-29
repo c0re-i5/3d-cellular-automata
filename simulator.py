@@ -13711,6 +13711,175 @@ def _wolf_sheep_grass_lv_preset():
     }
 
 
+def _ant_colony_preset():
+    """Stigmergic ant colony foraging in 3D (M9).
+
+    A single nest sits at the world centre.  Ants spawn there and
+    wander outward; food blobs are scattered in a spherical shell
+    far from the nest (see init_ant_food).  Ants pick up food on
+    contact and carry it back via classic stigmergic trails:
+
+      ch2 (accum) — pheromone-to-food: deposited by RETURNING
+                    carriers; followed by SEARCHERS.
+      ch3 (accum) — pheromone-to-home: deposited by OUTGOING
+                    searchers; followed by CARRIERS.
+
+    Carriers also feel a weak gravitational pull toward the nest
+    centre as a bootstrap, so the first few cohorts don't wander
+    forever before any to_home trail exists.
+
+    Aux fields (4 — exercises M5 DSL under realistic load):
+      food_supply       — encoded each frame from voxel ch3
+      food_demand       — atomicAdd by searchers on food cells
+      phero_to_food     — atomicAdd by carriers; geometric decay
+      phero_to_home     — atomicAdd by searchers; geometric decay
+
+    Grid channel layout (post-paint):
+      ch0 (r) — ant paint + nest marker
+      ch1 (g) — phero_to_food overlay
+      ch2 (b) — phero_to_home overlay
+      ch3 (a) — food (depleting via accum loop)
+
+    No reproduction in M9 (fixed colony size).  M10 will add
+    multi-colony rivalry; M11 will add queen/worker lifecycle.
+    """
+    KIND_ANT = 1
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        arena.set_team(0, color=(1.00, 0.85, 0.40, 1.0),
+                       spawn_pos=(s * 0.5, s * 0.5, s * 0.5),
+                       spawn_radius=2.0)
+        # Density-scaled ant population (~1 per 150 voxels), all
+        # initialized at the nest centre with random heading.
+        n_voxels = size ** 3
+        n_ants = min(arena.max_entities - 1,
+                     max(400, n_voxels // 150))
+        nest = (s * 0.5, s * 0.5, s * 0.5)
+        for _ in range(n_ants):
+            # Tiny radial jitter so they don't all overlap exactly.
+            ox = (rng.random() - 0.5) * 1.5
+            oy = (rng.random() - 0.5) * 1.5
+            oz = (rng.random() - 0.5) * 1.5
+            p = (nest[0] + ox, nest[1] + oy, nest[2] + oz)
+            speed = 1.2 + rng.random() * 0.6
+            arena.spawn(kind=KIND_ANT, team=0, pos=p, radius=1.0,
+                        genome=(speed, 0.0, 0.0, 0.0))
+
+    def on_tick(arena, frame, params):
+        # Track carrying / searching counts in team scoreboard for
+        # UI display. Cheap CPU readback — no per-frame guarantee.
+        if frame % 30 != 0:
+            return
+        arena.pull_entities()
+        kinds = arena.entities['ktrf'][:, 0]
+        carry = arena.entities['tptp'][:, 0]
+        alive = kinds == KIND_ANT
+        n_carry  = int(np.count_nonzero(alive & (carry == 1)))
+        n_search = int(np.count_nonzero(alive & (carry == 0)))
+        arena.teams[0]['saskf'][1] = n_search + n_carry
+        # Store carriers in saskf[2] for UI overlay.
+        arena.teams[0]['saskf'][2] = n_carry
+
+    return {
+        "label": "Ant Colony (3D)",
+        "shader": "noop",
+        "passes": [
+            # Encode current food field into accum food_supply.
+            {"shader": "_food_enc",   "kind": "entity_accum_encode", "writes": [],
+             "field": "food_supply", "src_channel": 3},
+            # Clear demand for this frame.
+            {"shader": "_dclear",     "kind": "entity_accum_clear",  "writes": [],
+             "field": "food_demand"},
+            # Both pheromones decay geometrically (literal rates).
+            {"shader": "_pfdecay",    "kind": "entity_accum_decay",  "writes": [],
+             "field": "phero_to_food", "rate": 0.97},
+            {"shader": "_phdecay",    "kind": "entity_accum_decay",  "writes": [],
+             "field": "phero_to_home", "rate": 0.97},
+            # Spatial hash for paint (and future neighbour-interactions).
+            {"shader": "_chash",      "kind": "entity_clear_hash",   "writes": []},
+            {"shader": "_bhash",      "kind": "entity_build_hash",   "writes": []},
+            # Per-ant: sense pheromones, move, possibly drop (carriers
+            # near nest). Writes new pos to entity. NO pickup logic
+            # here — pickup needs to check the POST-move cell.
+            {"shader": "ant_move",          "kind": "entity_step",  "writes": []},
+            # Now that entities carry post-move pos: searchers on food
+            # cells register demand.
+            {"shader": "ant_pickup_demand", "kind": "entity_step",  "writes": []},
+            # Per-ant: read frozen supply+demand at POST-move cell,
+            # decide pickup via fair-share bite_prob.
+            {"shader": "ant_pickup_decide", "kind": "entity_step",  "writes": []},
+            # Per-voxel: food_supply -= min(supply, demand); clear demand.
+            {"shader": "_resolve",   "kind": "entity_accum_resolve_demand",
+             "writes": [],
+             "supply_field": "food_supply", "demand_field": "food_demand"},
+            # Pheromone deposits (state-asymmetric).
+            {"shader": "ant_deposit",       "kind": "entity_step",  "writes": []},
+            # Decode food_supply back to voxel ch3 (for visualization
+            # and next frame's encode loop).
+            {"shader": "_food_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "food_supply", "dst_channel": 3},
+            # Paint ants + nest marker + pheromone overlays.
+            {"shader": "_paint",      "kind": "entity_paint",       "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 16384,
+            "max_teams": 1,
+            "hash_cell": 6,
+            "aux_fields": ["food_supply", "food_demand",
+                           "phero_to_food", "phero_to_home"],
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "ant_move":          entity_arena.SHADER_ANT_MOVE,
+            "ant_pickup_demand": entity_arena.SHADER_ANT_PICKUP_DEMAND,
+            "ant_pickup_decide": entity_arena.SHADER_ANT_PICKUP_DECIDE,
+            "ant_deposit":       entity_arena.SHADER_ANT_DEPOSIT,
+        },
+        "entity_paint_shader": entity_arena.SHADER_ANT_PAINT,
+        "on_init": on_init,
+        "on_tick": on_tick,
+        "params": {
+            "Wander jitter":     1.0,
+            "Pheromone deposit": 1.2,
+            "Pheromone bias":    0.8,
+            "Nest drop radius":  3.0,
+        },
+        "param_ranges": {
+            "Wander jitter":     (0.0, 3.0),
+            "Pheromone deposit": (0.0, 4.0),
+            "Pheromone bias":    (0.0, 3.0),
+            "Nest drop radius":  (1.0, 6.0),
+        },
+        "dt": 1.0,
+        "init": "ant_food",
+        "vis_channels": ["Composite (ants+phero+food)",
+                         "Ants only", "Phero-to-food", "Phero-to-home"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "colormap": 6,
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.05,
+        "boundary": "toroidal",
+        "description": (
+            "Stigmergic ant-colony foraging in 3D (M9 flagship "
+            "milestone, part 1 of 3).  A single nest at the world "
+            "centre spawns ants that wander outward; food is scattered "
+            "in a spherical shell far from the nest. Ants leave a "
+            "pheromone-to-HOME trail as they search; once they find "
+            "food they carry it back, leaving a pheromone-to-FOOD "
+            "trail. Searchers follow the to-food trail; carriers "
+            "follow the to-home trail. Stable highways emerge between "
+            "the nest and food blobs, and dissipate as each blob is "
+            "depleted. All deterministic — same seed, same trails, "
+            "every run."
+        ),
+        "short_description":
+            "Ant-colony foraging via stigmergic pheromone trails "
+            "(M9 part 1 of ant-colonies flagship).",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -15789,6 +15958,7 @@ RULE_PRESETS = {
     "termites_3d":         _termites_preset(),
     "wolf_sheep_grass_3d": _wolf_sheep_grass_preset(),
     "wolf_sheep_grass_lv_3d": _wolf_sheep_grass_lv_preset(),
+    "ant_colony_3d": _ant_colony_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",
@@ -17025,6 +17195,44 @@ def init_termite_chips(size, rng):
     # mounds to stand out, dense enough that termites find chips fast.
     mask = rng.random((size, size, size)).astype(np.float32) < 0.05
     data[..., 1] = mask.astype(np.float32) * 1.0
+    return data
+
+
+def init_ant_food(size, rng):
+    """Seed ch3 with discrete food blobs far from the world centre.
+
+    The ant colony preset (M9) treats voxel ch3 as a depleting food
+    field which is encoded into accum food_supply each frame. Food
+    spawned near the nest defeats the purpose of pheromone trails —
+    we want ants to have to search.
+
+    Blob layout: 6-12 small clusters placed in a spherical shell
+    between r=0.3*S and r=0.45*S from the centre. Each blob is a few
+    voxels wide, density 1.0.
+    """
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    centre = size * 0.5
+    n_blobs = 6 + int(rng.random() * 7)
+    inner_r = size * 0.30
+    outer_r = size * 0.45
+    rr = max(2, size // 16)
+    for _ in range(n_blobs):
+        # Sample a direction uniformly on the sphere, radius uniform in
+        # the [inner, outer] shell.
+        u, v = rng.random(), rng.random()
+        theta = 2.0 * np.pi * u
+        phi = np.arccos(2.0 * v - 1.0)
+        radius = inner_r + (outer_r - inner_r) * rng.random()
+        cx = int(centre + radius * np.sin(phi) * np.cos(theta))
+        cy = int(centre + radius * np.sin(phi) * np.sin(theta))
+        cz = int(centre + radius * np.cos(phi))
+        cx = max(rr, min(size - rr - 1, cx))
+        cy = max(rr, min(size - rr - 1, cy))
+        cz = max(rr, min(size - rr - 1, cz))
+        x0, x1 = cx - rr, cx + rr + 1
+        y0, y1 = cy - rr, cy + rr + 1
+        z0, z1 = cz - rr, cz + rr + 1
+        data[x0:x1, y0:y1, z0:z1, 3] = 1.0
     return data
 
 
@@ -20946,6 +21154,7 @@ INIT_FUNCS = {
     'blank': init_blank,
     'food_seed': init_food_seed,
     'termite_chips': init_termite_chips,
+    'ant_food': init_ant_food,
     'nca_seed': init_nca_seed,
     'nca_random_specks': init_nca_random_specks,
     'predator_prey_lattice': init_predator_prey_lattice,

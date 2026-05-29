@@ -2151,6 +2151,315 @@ void main() {
 
 
 # ---------------------------------------------------------------------------
+# M9: Ant colony foraging
+# ---------------------------------------------------------------------------
+#
+# Classic Langton-style ant colony in 3D.  A single nest sits at the
+# centre of the world; food is scattered in voxel ch3 (depleting, no
+# regrowth).  Ants wander from the nest, pick up food, and carry it
+# back via stigmergic trails:
+#
+#   accum ch0 = food_supply   (encoded from voxel ch3 each frame)
+#   accum ch1 = food_demand   (atomicAdd by empty ants on food cells)
+#   accum ch2 = pheromone_to_food  (deposited by RETURNING carriers)
+#   accum ch3 = pheromone_to_home  (deposited by OUTGOING searchers)
+#
+# Ant state (tptp.x):
+#   0 — searching (hunting for food; follows phero_to_food gradient)
+#   1 — carrying  (returning to nest; follows phero_to_home gradient)
+#
+# Three new shaders + reuse of PAINT-style overlay:
+#   SHADER_ANT_PICKUP_DEMAND  — empty ants on food cell ⊕= demand
+#   SHADER_ANT_STEP           — gradient-biased move + state transitions
+#                               (pickup probability + nest-drop check).
+#                               Pure reads of pheromone — no deposits
+#                               here (avoids intra-pass sample/deposit
+#                               race; same lesson as termites M6).
+#   SHADER_ANT_DEPOSIT        — writes pheromone based on POST-step
+#                               state (searcher → phero_to_home;
+#                               carrier → phero_to_food).
+#
+# Nest location is hardcoded to the world centre.  M10/M11 will
+# generalise to per-colony nests by reading nest pos from a fixed
+# entity slot.
+#
+# Convention for params:
+#   u_param0 — wander jitter strength
+#   u_param1 — pheromone deposit strength
+#   u_param2 — pheromone-attraction gradient bias
+#   u_param3 — nest drop radius (in voxels)
+
+
+SHADER_ANT_PICKUP_DEMAND = """
+// Empty ants standing on a food cell register one unit of demand.
+// Pure atomicAdd → bit-deterministic sum.
+//
+// IMPORTANT: this runs AFTER ant_move, so e.pos_radius is the
+// POST-move position (the cell the ant just arrived at). Pickup
+// must check the cell the ant is currently ON, not the one it
+// came from — see M9 PICKUP CELL TIMING note in repo memory.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;          // ant kind
+    if (e.target_partner_timer_payload.x != 0u) return;  // carriers skip
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    float supply = accum_sample(0, vp);
+    if (supply <= 0.0) return;
+
+    accum_deposit(1, vp, 1.0);           // food_demand
+}
+"""
+
+
+SHADER_ANT_MOVE = """
+// Per-ant: read both pheromone fields, choose direction biased by the
+// gradient appropriate for the ant's current state, move, then apply
+// the drop transition (carriers near nest go back to searching).
+// Pickup logic lives in SHADER_ANT_PICKUP_DECIDE which runs AFTER
+// this pass so it can read the POST-move position.
+float a11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u; x = x ^ (x >> 4);
+    x *= 0x27d4eb2du; x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;  // ants only
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    int S = u_size;
+
+    // ---- gradient sense ------------------------------------------------
+    // Searchers (state=0) climb phero_to_food (ch2).
+    // Carriers (state=1) climb phero_to_home (ch3).
+    int sense_ch = (e.target_partner_timer_payload.x == 0u) ? 2 : 3;
+
+    ivec3 pe = ((vp + ivec3( 1, 0, 0)) % S + S) % S;
+    ivec3 pw = ((vp + ivec3(-1, 0, 0)) % S + S) % S;
+    ivec3 pn = ((vp + ivec3( 0, 1, 0)) % S + S) % S;
+    ivec3 ps = ((vp + ivec3( 0,-1, 0)) % S + S) % S;
+    ivec3 pu = ((vp + ivec3( 0, 0, 1)) % S + S) % S;
+    ivec3 pd = ((vp + ivec3( 0, 0,-1)) % S + S) % S;
+    float xe = accum_sample(sense_ch, pe);
+    float xw = accum_sample(sense_ch, pw);
+    float xn = accum_sample(sense_ch, pn);
+    float xs = accum_sample(sense_ch, ps);
+    float xu = accum_sample(sense_ch, pu);
+    float xd = accum_sample(sense_ch, pd);
+    vec3 grad = vec3(xe - xw, xn - xs, xu - xd);
+    float glen = length(grad);
+    vec3 bias = (glen > 1e-5) ? (grad / glen) * u_param2 : vec3(0.0);
+
+    // Carriers also feel an attractive pull TOWARDS the nest centre as
+    // a fallback when no trail exists yet — otherwise the first cohort
+    // of carriers (no phero_to_home laid yet) would wander forever.
+    if (e.target_partner_timer_payload.x == 1u) {
+        vec3 nest = vec3(u_world_size * 0.5);
+        vec3 to_nest = nest - e.pos_radius.xyz;
+        // Wrap to shortest periodic distance.
+        to_nest -= u_world_size * floor(to_nest / u_world_size + 0.5);
+        float dlen = length(to_nest);
+        if (dlen > 1e-3) bias += (to_nest / dlen) * (u_param2 * 0.25);
+    }
+
+    // ---- move (wander + bias) -----------------------------------------
+    uint seed = i * 2477u + uint(u_frame) * 8101u;
+    vec3 jitter = vec3(a11(seed),
+                       a11(seed + 1u),
+                       a11(seed + 2u)) - 0.5;
+    float max_speed = max(e.genome.x, 0.01);
+    vec3 v = e.vel_energy.xyz * 0.75 + jitter * u_param0 + bias;
+    float vlen = length(v);
+    if (vlen > max_speed) v *= max_speed / vlen;
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+
+    // ---- drop decision (carrier near nest) ----------------------------
+    if (e.target_partner_timer_payload.x == 1u) {
+        vec3 nest = vec3(u_world_size * 0.5);
+        vec3 d = pos - nest;
+        // Periodic-shortest distance.
+        d -= u_world_size * floor(d / u_world_size + 0.5);
+        if (length(d) < u_param3) {
+            e.target_partner_timer_payload.x = 0u;  // delivered → search
+            v = -v;  // reverse heading so searcher doesn't loop in place
+        }
+    }
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_ANT_PICKUP_DECIDE = """
+// After ant_move (entity now has post-move pos) and after
+// ant_pickup_demand has registered total demand at each food cell,
+// each searcher reads supply+demand at its cell and decides pickup
+// with the same fair-share bite_prob as M6 termites:
+//   bite_prob = supply / max(demand, supply)
+// Deterministic per (entity id, frame).
+float a11p(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u; x = x ^ (x >> 4);
+    x *= 0x27d4eb2du; x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+    if (e.target_partner_timer_payload.x != 0u) return;  // carriers skip
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    float supply = accum_sample(0, vp);
+    if (supply <= 0.0) return;
+    float demand = accum_sample(1, vp);
+    float denom = max(demand, supply);
+    float bite_prob = (denom > 0.0) ? (supply / denom) : 0.0;
+
+    uint seed = i * 4129u + uint(u_frame) * 9173u;
+    float roll = a11p(seed);
+    if (roll < bite_prob) {
+        e.target_partner_timer_payload.x = 1u;  // carrier
+        // Reverse heading so the carrier heads back the way it came.
+        e.vel_energy.xyz = -e.vel_energy.xyz;
+        entities[i] = e;
+    }
+}
+"""
+
+
+SHADER_ANT_DEPOSIT = """
+// After all reads are done, lay down pheromone matching the ant's
+// CURRENT state (post SHADER_ANT_STEP):
+//   searcher (state=0) → phero_to_home (ch3)
+//   carrier  (state=1) → phero_to_food (ch2)
+//
+// This is the classic stigmergic asymmetry: ants leaving the nest
+// scent the path BACK to home; ants leaving food scent the path BACK
+// to food.  Other ants in the OPPOSITE state will follow that trail.
+//
+// Strength can be modulated by recency-of-success.  For M9 we use a
+// flat deposit rate (u_param1); M10 will scale by carry-distance.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+
+    int ch = (e.target_partner_timer_payload.x == 0u) ? 3 : 2;
+    accum_deposit(ch, vp, u_param1 * u_dt);
+}
+"""
+
+
+SHADER_ANT_PAINT = """
+// Per-voxel paint: ants in white (state-aware tint), preserves the
+// decoded food field (ch3) and lays a faint pheromone overlay.
+// Channel layout written:
+//   r (ch0) — ant paint (searchers = warm, carriers = cool-bright)
+//   g (ch1) — phero_to_food overlay (carriers' trail; visible)
+//   b (ch2) — phero_to_home overlay (searchers' trail; visible)
+//   a (ch3) — food (preserved from prior decode pass)
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;
+
+void main() {
+    uint flat_idx = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (flat_idx >= total) return;
+
+    int S = u_size;
+    int idx = int(flat_idx);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
+
+    vec4 result = imageLoad(u_grid_r, p);
+
+    // Pheromone overlays (lift from accum into g/b for visualization).
+    float pf = accum_sample(2, p);  // to_food
+    float ph = accum_sample(3, p);  // to_home
+    result.g = clamp(pf * 0.5, 0.0, 1.0);
+    result.b = clamp(ph * 0.5, 0.0, 1.0);
+
+    // Ants near this voxel via spatial hash (same pattern as termites).
+    float ant_max = 0.0;
+    ivec3 base = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
+    int half_s = S / 2;
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base + ivec3(dx, dy, dz);
+        c = ((c % u_hash_dim) + u_hash_dim) % u_hash_dim;
+        uint ci = hash_cell_index(c);
+        uint n = min(hash_count[ci], uint(u_hash_max_per_cell));
+        for (uint k = 0u; k < n; ++k) {
+            uint eid = hash_entry[ci * uint(u_hash_max_per_cell) + k];
+            Entity e = entities[eid];
+            if (!is_alive(e)) continue;
+            if (e.kind_team_role_flags.x != 1u) continue;
+
+            ivec3 center = ivec3(floor(e.pos_radius.xyz));
+            ivec3 off = p - center;
+            off.x = ((off.x % S) + S) % S; if (off.x > half_s) off.x -= S;
+            off.y = ((off.y % S) + S) % S; if (off.y > half_s) off.y -= S;
+            off.z = ((off.z % S) + S) % S; if (off.z > half_s) off.z -= S;
+
+            int rmax = int(ceil(e.pos_radius.w));
+            rmax = clamp(rmax, 0, 4);
+            if (abs(off.x) > rmax || abs(off.y) > rmax || abs(off.z) > rmax)
+                continue;
+
+            float dist = length(vec3(off));
+            if (dist > e.pos_radius.w) continue;
+            float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+            float w = max(0.0, 1.0 - dist * inv_r);
+            // Carriers paint slightly brighter.
+            if (e.target_partner_timer_payload.x != 0u) w *= 1.4;
+            ant_max = max(ant_max, w);
+        }
+    }
+
+    // Highlight the nest (a small sphere at world centre) so it's
+    // visible even when no ants are on it.
+    vec3 nest = vec3(u_world_size * 0.5);
+    vec3 dp = vec3(p) + vec3(0.5) - nest;
+    dp -= u_world_size * floor(dp / u_world_size + 0.5);
+    float nest_d = length(dp);
+    if (nest_d < 2.0) {
+        ant_max = max(ant_max, 0.8 - nest_d * 0.3);
+    }
+
+    result.r = ant_max;
+    imageStore(u_grid_w, p, result);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # CPU-side container
 # ---------------------------------------------------------------------------
 
