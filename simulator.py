@@ -31116,15 +31116,41 @@ void main() {
             f"drawtext=fontfile='{fontb}':text='{_esc(title)}':"
             f"fontcolor=white:fontsize={title_fs}:x={margin}:y={top_y}:"
             f"borderw={border_w}:bordercolor=black@0.8")
+
+        # Pre-compute right-side reservation BEFORE word-wrapping the
+        # description. The description starts at y = top_y + title_h and
+        # can wrap to several lines, so its first ~3 lines sit alongside
+        # whatever lives in the top-right corner (Score badge + live
+        # stats block). If we wrap to the full width, the long
+        # description lines run straight into / behind that right-hand
+        # text. Compute a conservative px reservation based on the
+        # widest right-hand element actually present.
+        has_static_score = (self.discovery_index >= 0 and
+                            self.discovery_index < len(self.discoveries))
+        live_stats_enabled = (
+            os.environ.get('CA_RECORDING_LIVE_STATS', '1') != '0')
+        live_fs = max(10, int(round(22 * s)))
+        right_reserve_chars = 0
+        right_reserve_fs = 0
+        if live_stats_enabled:
+            # "Voxels 1 234 567  (ratio 0.123)" ~= 32 chars at live_fs.
+            right_reserve_chars = max(right_reserve_chars, 32)
+            right_reserve_fs = max(right_reserve_fs, live_fs)
+        if has_static_score:
+            right_reserve_chars = max(right_reserve_chars, 14)
+            right_reserve_fs = max(right_reserve_fs, score_fs)
+        right_reserve_px = (
+            int(right_reserve_chars * right_reserve_fs * 0.55) + margin
+            if right_reserve_chars else 0)
+
         # Description (under title) — word-wrap so long descriptions don't
-        # run off the right edge. We don't have ffmpeg's textwrap available
-        # without re-encoding via a separate filter, so wrap in Python using
-        # a conservative average-glyph-width estimate.
+        # run off the right edge or under the top-right stats column.
         if desc:
             # DejaVu Sans average glyph width ~= 0.55 * fontsize.
             avg_glyph_px = max(4.0, desc_fs * 0.55)
-            # Reserve a small right margin equal to the left margin.
-            usable_px = max(120, w - 2 * margin)
+            # Reserve a small right margin equal to the left margin,
+            # plus the top-right stats column width.
+            usable_px = max(120, w - 2 * margin - right_reserve_px)
             max_chars = max(20, int(usable_px / avg_glyph_px))
             wrapped = textwrap.wrap(
                 desc, width=max_chars,
@@ -31150,8 +31176,6 @@ void main() {
             f"fontcolor=white:fontsize={info_fs}:x=w-tw-{margin}:y={bottom_y}:"
             f"borderw={border_w}:bordercolor=black@0.8")
         # Discovery score (top-right, if viewing a discovery)
-        has_static_score = (self.discovery_index >= 0 and
-                            self.discovery_index < len(self.discoveries))
         if has_static_score:
             score = get_field(self.discoveries[self.discovery_index], 'score', 0)
             score_str = f'Score\\: {score:.2f}'
@@ -31163,13 +31187,12 @@ void main() {
         # --- Live stats: a small dynamic block under (or in place of) the
         #     static Score line. Updated each frame via reload=1.
         live_drawtext = None
-        if os.environ.get('CA_RECORDING_LIVE_STATS', '1') != '0':
+        if live_stats_enabled:
             try:
                 fd, self._rec_live_textfile = tempfile.mkstemp(
                     suffix='.txt', prefix='ca_live_')
                 os.close(fd)
                 self._write_live_stats()  # initial content
-                live_fs = max(10, int(round(22 * s)))
                 # Sit below the static Score line if present, else at the top.
                 live_y = (top_y + max(28, int(round(40 * s)))
                           if has_static_score else top_y)
