@@ -11216,6 +11216,11 @@ uniform float u_threshold;  // visibility threshold for value normalization
 //   4 = RGBA_BLEND   (rgb=colour, density=.a)
 // Modes 2/3 keep the legacy single-channel path.
 uniform int u_vis_mode;
+// Per-channel value range, same semantics as VIEW_TEX_BUILD_SHADER:
+// rgb (or .a) values are remapped through (v - vis_lo) / (vis_hi - vis_lo)
+// and clamped to [0,1]. Default (0,1) is a no-op.
+uniform float u_vis_lo;
+uniform float u_vis_hi;
 
 // Cube vertices: 36 vertices (12 triangles, 6 faces)
 const vec3 cube_verts[36] = vec3[36](
@@ -11303,14 +11308,24 @@ void main() {
         float heat = clamp(temp / 2000.0, 0.0, 1.0);
         color = mix(color, vec3(1.0, 0.3, 0.1), heat * 0.5);
     } else {
-        if (u_vis_mode == 1) {
-            // RGB_CHANNELS: use per-voxel RGB directly (e.g. team-tinted ants).
-            // Skip the AO-darkening branch since color isn't a colormap ramp.
-            value = clamp(max(max(cell.r, cell.g), cell.b), 0.0, 1.0);
-            color = clamp(cell.rgb, 0.0, 1.0);
-        } else if (u_vis_mode == 4) {
-            value = clamp(cell.a, 0.0, 1.0);
-            color = clamp(cell.rgb, 0.0, 1.0);
+        if (u_vis_mode == 1 || u_vis_mode == 4) {
+            // Per-voxel RGB pre-baked by the simulation (team colours, R/G/B
+            // channel composites, etc.). Apply the same (vis_lo, vis_hi)
+            // remap that the volumetric raymarcher uses so voxel and ray
+            // paths show identical hues.
+            float scale = (u_vis_hi > u_vis_lo) ? (1.0 / (u_vis_hi - u_vis_lo)) : 1.0;
+            color = clamp((cell.rgb - vec3(u_vis_lo)) * scale, 0.0, 1.0);
+            // 'value' picks an alpha-style scalar used downstream by Phong
+            // brightness. RGB_CHANNELS: max channel (so a pure-green voxel
+            // still looks lit); RGBA_BLEND: explicit .a.
+            value = (u_vis_mode == 4) ? clamp(cell.a, 0.0, 1.0)
+                                      : clamp(max(max(color.r, color.g), color.b), 0.0, 1.0);
+            // Preserve the AO darkening from the legacy path: deeply
+            // embedded cells (high shade_hint) get dimmed without losing
+            // hue. Same response curve as the colormap branch below.
+            float sn = float(shade_hint) / float(__SHADE_MAX__);
+            float ao = mix(1.0, 0.35, pow(sn, 0.7));
+            color *= ao;
         } else {
             value = cell[u_channel];
             if (u_use_abs == 1) value = abs(value);
@@ -23537,6 +23552,8 @@ class Simulator:
         self._vp_u_threshold = vp['u_threshold']
         self._vp_u_vis_mode = vp.get('u_vis_mode', None)
         self._vp_u_vis_mode_frag = vp.get('u_vis_mode', None)  # same name in frag
+        self._vp_u_vis_lo = vp.get('u_vis_lo', None)
+        self._vp_u_vis_hi = vp.get('u_vis_hi', None)
         self._vp_u_volume_tex = vp['u_volume_tex']
         self._vp_u_volume_tex.value = 0  # texture unit 0
         # Empty VAO for instanced rendering (vertices come from SSBO)
@@ -23691,6 +23708,8 @@ class Simulator:
         self._vp_u_threshold = vp['u_threshold']
         self._vp_u_vis_mode = vp.get('u_vis_mode', None)
         self._vp_u_vis_mode_frag = vp.get('u_vis_mode', None)
+        self._vp_u_vis_lo = vp.get('u_vis_lo', None)
+        self._vp_u_vis_hi = vp.get('u_vis_hi', None)
         self._vp_u_volume_tex = vp['u_volume_tex']
         self._vp_u_volume_tex.value = 0
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
@@ -28931,6 +28950,10 @@ void main() {
         self._vp_u_threshold.value = effective_threshold
         if self._vp_u_vis_mode is not None:
             self._vp_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+        if self._vp_u_vis_lo is not None and self._vp_u_vis_hi is not None:
+            vlo, vhi = self.preset.get('vis_range', (0.0, 1.0))
+            self._vp_u_vis_lo.value = float(vlo)
+            self._vp_u_vis_hi.value = float(vhi)
 
         cpd = self._voxel_chunks_per_dim
 
