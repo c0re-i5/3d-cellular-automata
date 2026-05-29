@@ -9932,6 +9932,12 @@ uniform int u_is_element_ca; // 1 = element mode, 0 = standard mode
 uniform int u_max_voxels;
 uniform int u_channel;      // which channel to read (0=R, 1=G, 2=B, 3=A)
 uniform int u_use_abs;      // 1 = use abs(value) for alive test (wave mode)
+// Multi-channel vis_mode (mirrors VIEW_TEX_BUILD_SHADER):
+//   0 = DENSITY (legacy, use u_channel)
+//   1 = RGB_CHANNELS  (alive = length(rgb)/sqrt(3))
+//   4 = RGBA_BLEND    (alive = .a)
+// Modes 2/3 are treated like DENSITY (single channel is fine for cull).
+uniform int u_vis_mode;
 // Chunk bounds for multi-pass rendering (default: full grid)
 uniform ivec3 u_chunk_min;  // inclusive lower corner
 uniform ivec3 u_chunk_max;  // exclusive upper corner
@@ -9942,6 +9948,13 @@ shared float s_tile[10][10][10];
 
 float get_alive_value(vec4 c) {
     if (u_is_element_ca == 1) return c.r;
+    if (u_vis_mode == 1) {
+        // Team-coloured paint (rgb_channels): max of any channel proxies
+        // visibility well and avoids the sqrt(3) suppression of
+        // single-team voxels (red voxel has rgb=(1,0,0) -> length=1).
+        return max(max(c.r, c.g), c.b);
+    }
+    if (u_vis_mode == 4) return c.a;
     float v = c[u_channel];
     if (u_use_abs == 1) v = abs(v);
     else if (u_use_abs == 2) v = abs(v);  // signed bipolar: visibility = magnitude
@@ -11197,6 +11210,12 @@ uniform int u_is_element_ca;
 uniform int u_channel;      // which channel to read for color
 uniform int u_use_abs;      // 1 = use abs(value) for wave mode
 uniform float u_threshold;  // visibility threshold for value normalization
+// Multi-channel vis_mode (mirrors VIEW_TEX_BUILD_SHADER):
+//   0 = DENSITY (legacy: u_channel + apply_colormap in fragment)
+//   1 = RGB_CHANNELS (per-voxel rgb shown directly; e.g. ant team colors)
+//   4 = RGBA_BLEND   (rgb=colour, density=.a)
+// Modes 2/3 keep the legacy single-channel path.
+uniform int u_vis_mode;
 
 // Cube vertices: 36 vertices (12 triangles, 6 faces)
 const vec3 cube_verts[36] = vec3[36](
@@ -11232,6 +11251,8 @@ bool nb_alive(ivec3 p) {
     if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, u_dims))) return false;
     vec4 nb = texelFetch(u_volume_tex, p, 0);
     if (u_is_element_ca == 1) return int(round(nb.r)) > 0;
+    if (u_vis_mode == 1) return max(max(nb.r, nb.g), nb.b) > u_threshold;
+    if (u_vis_mode == 4) return nb.a > u_threshold;
     float v = nb[u_channel];
     if (u_use_abs == 1) v = abs(v);
     else if (u_use_abs == 2) v = abs(clamp(v, -1.0, 1.0));  // signed: alive if either sign
@@ -11282,23 +11303,33 @@ void main() {
         float heat = clamp(temp / 2000.0, 0.0, 1.0);
         color = mix(color, vec3(1.0, 0.3, 0.1), heat * 0.5);
     } else {
-        value = cell[u_channel];
-        if (u_use_abs == 1) value = abs(value);
-        else if (u_use_abs == 2) value = 0.5 + 0.5 * clamp(value, -1.0, 1.0);  // signed bipolar
-        // Normalize value to [0,1] relative to threshold
-        value = clamp((value - u_threshold) / max(1.0 - u_threshold, 0.001), 0.0, 1.0);
+        if (u_vis_mode == 1) {
+            // RGB_CHANNELS: use per-voxel RGB directly (e.g. team-tinted ants).
+            // Skip the AO-darkening branch since color isn't a colormap ramp.
+            value = clamp(max(max(cell.r, cell.g), cell.b), 0.0, 1.0);
+            color = clamp(cell.rgb, 0.0, 1.0);
+        } else if (u_vis_mode == 4) {
+            value = clamp(cell.a, 0.0, 1.0);
+            color = clamp(cell.rgb, 0.0, 1.0);
+        } else {
+            value = cell[u_channel];
+            if (u_use_abs == 1) value = abs(value);
+            else if (u_use_abs == 2) value = 0.5 + 0.5 * clamp(value, -1.0, 1.0);  // signed bipolar
+            // Normalize value to [0,1] relative to threshold
+            value = clamp((value - u_threshold) / max(1.0 - u_threshold, 0.001), 0.0, 1.0);
 
-        // For binary CAs (value ~= 1.0), use the AO-weighted shading hint
-        // (5 bits, 0..31) to give 32 smooth darkening levels instead of the
-        // previous 4. This eliminates visible posterization on iso-surfaces.
-        if (value > 0.99) {
-            float sn = float(shade_hint) / float(__SHADE_MAX__);  // shade-bit hint, normalised to [0,1]
-            // Map so isolated cells (sn ~ 0) are bright (0.85) and deeply
-            // embedded cells (sn ~ 1) are dim (0.30). The exponent shapes
-            // the response curve to emphasize edges.
-            value = mix(0.85, 0.30, pow(sn, 0.7));
+            // For binary CAs (value ~= 1.0), use the AO-weighted shading hint
+            // (5 bits, 0..31) to give 32 smooth darkening levels instead of the
+            // previous 4. This eliminates visible posterization on iso-surfaces.
+            if (value > 0.99) {
+                float sn = float(shade_hint) / float(__SHADE_MAX__);  // shade-bit hint, normalised to [0,1]
+                // Map so isolated cells (sn ~ 0) are bright (0.85) and deeply
+                // embedded cells (sn ~ 1) are dim (0.30). The exponent shapes
+                // the response curve to emphasize edges.
+                value = mix(0.85, 0.30, pow(sn, 0.7));
+            }
+            color = vec3(value);
         }
-        color = vec3(value);
     }
 
     // Cube vertex
@@ -11332,6 +11363,7 @@ uniform vec3 u_camera_pos;
 uniform float u_brightness;
 uniform int u_colormap;
 uniform int u_is_element_ca;
+uniform int u_vis_mode;  // 0=DENSITY use colormap, >0 use v_color directly
 uniform float u_alpha;  // transparency (1.0 = opaque)
 
 vec3 colormap_fire(float t) {
@@ -11369,6 +11401,9 @@ void main() {
     vec3 color;
     if (u_is_element_ca == 1) {
         color = v_color;  // element color from SSBO
+    } else if (u_vis_mode == 1 || u_vis_mode == 4) {
+        // Per-voxel rgb baked into v_color (e.g. team-tinted ants).
+        color = v_color;
     } else {
         float t = clamp(v_value, 0.0, 1.0);
         if (u_colormap == 0) color = colormap_fire(t);
@@ -23500,6 +23535,8 @@ class Simulator:
         self._vp_u_channel = vp['u_channel']
         self._vp_u_use_abs = vp['u_use_abs']
         self._vp_u_threshold = vp['u_threshold']
+        self._vp_u_vis_mode = vp.get('u_vis_mode', None)
+        self._vp_u_vis_mode_frag = vp.get('u_vis_mode', None)  # same name in frag
         self._vp_u_volume_tex = vp['u_volume_tex']
         self._vp_u_volume_tex.value = 0  # texture unit 0
         # Empty VAO for instanced rendering (vertices come from SSBO)
@@ -23652,6 +23689,8 @@ class Simulator:
         self._vp_u_channel = vp['u_channel']
         self._vp_u_use_abs = vp['u_use_abs']
         self._vp_u_threshold = vp['u_threshold']
+        self._vp_u_vis_mode = vp.get('u_vis_mode', None)
+        self._vp_u_vis_mode_frag = vp.get('u_vis_mode', None)
         self._vp_u_volume_tex = vp['u_volume_tex']
         self._vp_u_volume_tex.value = 0
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
@@ -23701,6 +23740,7 @@ class Simulator:
         self._cull_u_max_voxels = self.voxel_cull_prog['u_max_voxels']
         self._cull_u_channel = self.voxel_cull_prog['u_channel']
         self._cull_u_use_abs = self.voxel_cull_prog['u_use_abs']
+        self._cull_u_vis_mode = self.voxel_cull_prog.get('u_vis_mode', None)
         self._cull_u_chunk_min = self.voxel_cull_prog['u_chunk_min']
         self._cull_u_chunk_max = self.voxel_cull_prog['u_chunk_max']
 
@@ -23721,6 +23761,7 @@ class Simulator:
             self._cull_sp_u_max_voxels = self.voxel_cull_sparse_prog['u_max_voxels']
             self._cull_sp_u_channel = self.voxel_cull_sparse_prog['u_channel']
             self._cull_sp_u_use_abs = self.voxel_cull_sparse_prog['u_use_abs']
+            self._cull_sp_u_vis_mode = self.voxel_cull_sparse_prog.get('u_vis_mode', None)
         except Exception as e:  # noqa: BLE001  shader compile fallback
             print(f"[cull] sparse cull compile failed (falling back to dense): {e}")
             self.voxel_cull_sparse_prog = None
@@ -28888,6 +28929,8 @@ void main() {
         # palette focuses on near-critical cells).
         effective_threshold = self.voxel_threshold
         self._vp_u_threshold.value = effective_threshold
+        if self._vp_u_vis_mode is not None:
+            self._vp_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
 
         cpd = self._voxel_chunks_per_dim
 
@@ -28965,6 +29008,8 @@ void main() {
             self._cull_sp_u_max_voxels.value = self.max_voxels
             self._cull_sp_u_channel.value = cull_channel
             self._cull_sp_u_use_abs.value = cull_use_abs
+            if self._cull_sp_u_vis_mode is not None:
+                self._cull_sp_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
 
             # Bind the active-block list at binding=11 (matches shader).
             self._sparse_blocks_ssbo.bind_to_storage_buffer(11)
@@ -29002,6 +29047,8 @@ void main() {
         self._cull_u_max_voxels.value = self.max_voxels
         self._cull_u_channel.value = cull_channel
         self._cull_u_use_abs.value = cull_use_abs
+        if self._cull_u_vis_mode is not None:
+            self._cull_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
 
         # Extract frustum planes for chunk culling (only useful when cpd > 1)
         frustum_planes = self._extract_frustum_planes(vp_row_major) if cpd > 1 else None
