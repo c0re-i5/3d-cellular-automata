@@ -13880,6 +13880,186 @@ def _ant_colony_preset():
     }
 
 
+def _ant_colony_rivalry_preset():
+    """Multi-colony stigmergic foraging — 3 rival ant colonies (M10).
+
+    Three nests are placed equidistant on a circle around the world
+    centre (z = S/2 plane). Each colony has its OWN pheromone trails
+    (per-team to_food + to_home channels), so ants only follow scent
+    laid by their own teammates — no cross-team highway sharing.
+
+    Food is a SHARED resource (single food_supply / food_demand pair).
+    Whichever colony's searcher arrives at a food cell first registers
+    demand; the M9 fair-share decide pass arbitrates pickup across
+    competing teams using the same supply/demand bite-prob.
+
+    Carriers return to their OWN nest (read from
+    teams[team].spawn_pos_radius) — drop-trigger fires only there.
+
+    Accum layout (8 channels for T=3):
+      ch0           food_supply
+      ch1           food_demand
+      ch2 + 2t + 0  phero_to_food for team t
+      ch2 + 2t + 1  phero_to_home for team t
+
+    Grid channels (post-paint):
+      rgb — team-tinted ants + team-tinted nest + team-tinted trails
+      a   — food (depleting)
+
+    M10 keeps the M9 pickup machinery unchanged; only move/deposit/paint
+    are replaced with team-aware variants. M11 will add queens/workers
+    + GPU spawn from M8.
+    """
+    KIND_ANT = 1
+    N_TEAMS = 3
+    TEAM_COLORS = [
+        (1.00, 0.30, 0.30, 1.0),  # red
+        (0.30, 1.00, 0.40, 1.0),  # green
+        (0.40, 0.55, 1.00, 1.0),  # blue
+    ]
+
+    def on_init(arena, size, rng, params):
+        s = float(size)
+        # Nests on a triangle in z=S/2 plane, radius 0.22*S from centre.
+        nests = []
+        for t in range(N_TEAMS):
+            ang = 2.0 * np.pi * t / N_TEAMS + np.pi / 6.0
+            cx = s * 0.5 + s * 0.22 * float(np.cos(ang))
+            cy = s * 0.5 + s * 0.22 * float(np.sin(ang))
+            cz = s * 0.5
+            nests.append((cx, cy, cz))
+            arena.set_team(t, color=TEAM_COLORS[t],
+                           spawn_pos=(cx, cy, cz), spawn_radius=2.0)
+
+        # Total ant budget split across teams. Density: ~1 per 200
+        # voxels (lower than M9's 1/150 since 3× nests).
+        n_voxels = size ** 3
+        total_ants = min(arena.max_entities - 1,
+                         max(450, n_voxels // 200))
+        per_team = total_ants // N_TEAMS
+
+        for t in range(N_TEAMS):
+            nx, ny, nz = nests[t]
+            for _ in range(per_team):
+                ox = (rng.random() - 0.5) * 1.5
+                oy = (rng.random() - 0.5) * 1.5
+                oz = (rng.random() - 0.5) * 1.5
+                p = (nx + ox, ny + oy, nz + oz)
+                speed = 1.2 + rng.random() * 0.6
+                arena.spawn(kind=KIND_ANT, team=t, pos=p, radius=1.0,
+                            genome=(speed, 0.0, 0.0, 0.0))
+
+    def on_tick(arena, frame, params):
+        if frame % 30 != 0:
+            return
+        arena.pull_entities()
+        kinds = arena.entities['ktrf'][:, 0]
+        teams_arr = arena.entities['ktrf'][:, 1]
+        carry = arena.entities['tptp'][:, 0]
+        alive_ant = kinds == KIND_ANT
+        for t in range(N_TEAMS):
+            mask = alive_ant & (teams_arr == t)
+            n_carry = int(np.count_nonzero(mask & (carry == 1)))
+            n_total = int(np.count_nonzero(mask))
+            arena.teams[t]['saskf'][1] = n_total
+            arena.teams[t]['saskf'][2] = n_carry
+
+    # 8 aux fields: shared food + 2 per team × 3 teams.
+    aux_fields = ["food_supply", "food_demand"]
+    for t in range(N_TEAMS):
+        aux_fields.append(f"phero_to_food_t{t}")
+        aux_fields.append(f"phero_to_home_t{t}")
+
+    # One decay pass per team's pheromone channels (6 total).
+    decay_passes = []
+    for t in range(N_TEAMS):
+        decay_passes.append(
+            {"shader": f"_pfdecay_t{t}", "kind": "entity_accum_decay",
+             "writes": [], "field": f"phero_to_food_t{t}", "rate": 0.97})
+        decay_passes.append(
+            {"shader": f"_phdecay_t{t}", "kind": "entity_accum_decay",
+             "writes": [], "field": f"phero_to_home_t{t}", "rate": 0.97})
+
+    return {
+        "label": "Ant Colony Rivalry (3 teams, 3D)",
+        "shader": "noop",
+        "passes": [
+            {"shader": "_food_enc",   "kind": "entity_accum_encode", "writes": [],
+             "field": "food_supply", "src_channel": 3},
+            {"shader": "_dclear",     "kind": "entity_accum_clear",  "writes": [],
+             "field": "food_demand"},
+            *decay_passes,
+            {"shader": "_chash",      "kind": "entity_clear_hash",   "writes": []},
+            {"shader": "_bhash",      "kind": "entity_build_hash",   "writes": []},
+            # Team-aware move (own trails + own nest).
+            {"shader": "ant_move_r",        "kind": "entity_step",  "writes": []},
+            # Pickup uses shared food field — unchanged from M9.
+            {"shader": "ant_pickup_demand", "kind": "entity_step",  "writes": []},
+            {"shader": "ant_pickup_decide", "kind": "entity_step",  "writes": []},
+            {"shader": "_resolve",   "kind": "entity_accum_resolve_demand",
+             "writes": [],
+             "supply_field": "food_supply", "demand_field": "food_demand"},
+            # Team-aware deposit (own phero channels).
+            {"shader": "ant_deposit_r",     "kind": "entity_step",  "writes": []},
+            {"shader": "_food_dec",   "kind": "entity_accum_decode", "writes": ["p1"],
+             "field": "food_supply", "dst_channel": 3},
+            {"shader": "_paint",      "kind": "entity_paint",       "writes": ["p1"]},
+        ],
+        "entity_arena": {
+            "max_entities": 16384,
+            "max_teams": N_TEAMS,
+            "hash_cell": 6,
+            "aux_fields": aux_fields,
+            "accum_scale": 1024.0,
+        },
+        "entity_shaders": {
+            "ant_move_r":        entity_arena.SHADER_ANT_MOVE_RIVAL,
+            "ant_pickup_demand": entity_arena.SHADER_ANT_PICKUP_DEMAND,
+            "ant_pickup_decide": entity_arena.SHADER_ANT_PICKUP_DECIDE,
+            "ant_deposit_r":     entity_arena.SHADER_ANT_DEPOSIT_RIVAL,
+        },
+        "entity_paint_shader": entity_arena.SHADER_ANT_PAINT_RIVAL,
+        "on_init": on_init,
+        "on_tick": on_tick,
+        "params": {
+            "Wander jitter":     1.0,
+            "Pheromone deposit": 1.2,
+            "Pheromone bias":    0.8,
+            "Nest drop radius":  3.0,
+        },
+        "param_ranges": {
+            "Wander jitter":     (0.0, 3.0),
+            "Pheromone deposit": (0.0, 4.0),
+            "Pheromone bias":    (0.0, 3.0),
+            "Nest drop radius":  (1.0, 6.0),
+        },
+        "dt": 1.0,
+        "init": "ant_food",
+        "vis_channels": ["Composite (team-tinted)",
+                         "Ants only", "Trails", "Food"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "colormap": 0,
+        "render_mode": "volumetric",
+        "voxel_threshold": 0.05,
+        "boundary": "toroidal",
+        "description": (
+            "Three rival ant colonies (M10, part 2 of 3) competing "
+            "for one shared food field in 3D. Each colony has its "
+            "own pheromone trails — ants only follow scent from "
+            "their own team. Food is shared: the M9 fair-share "
+            "pickup arbitrates contention across teams. Carriers "
+            "return only to their OWN nest. Watch competing trail "
+            "networks emerge and fade as territory shifts; closer "
+            "colonies dominate nearby blobs while distant ones "
+            "occasionally lose access entirely. All deterministic."
+        ),
+        "short_description":
+            "Three rival ant colonies competing for shared food "
+            "via per-team stigmergic trails (M10 part 2 of 3).",
+    }
+
+
 RULE_PRESETS = {
     "game_of_life_3d": {
         "label": "3D Game of Life",
@@ -15959,6 +16139,7 @@ RULE_PRESETS = {
     "wolf_sheep_grass_3d": _wolf_sheep_grass_preset(),
     "wolf_sheep_grass_lv_3d": _wolf_sheep_grass_lv_preset(),
     "ant_colony_3d": _ant_colony_preset(),
+    "ant_colony_rivalry_3d": _ant_colony_rivalry_preset(),
 
     "predator_prey_lattice_3d": {
         "label": "Predator-Prey (Lattice)",

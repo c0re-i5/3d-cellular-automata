@@ -96,7 +96,12 @@ HASH_EMPTY_SLOT = 0xFFFFFFFF  # sentinel: slot is empty / available
 # max representable amount ≈ 4.2 million which is more than enough for
 # bounded-deposit rules (pheromone, food consumption, build deposits).
 DEFAULT_ACCUM_SCALE      = 1024.0
-DEFAULT_MAX_ACCUM_CHANNELS = 4
+# Upper bound on per-voxel accumulator channels. Each channel adds
+# u_size^3 uints to the SSBO (at 128^3 that's 8MB/channel) so we cap to
+# keep memory bounded. 16 is comfortably enough for the largest M10/M11
+# multi-team configurations (food + demand + 2 phero × T teams ≤ 16
+# for T ≤ 7).
+DEFAULT_MAX_ACCUM_CHANNELS = 16
 
 # Reserved kind ids:
 KIND_DEAD = 0  # slot is empty / available for reuse
@@ -2454,6 +2459,239 @@ void main() {
     }
 
     result.r = ant_max;
+    imageStore(u_grid_w, p, result);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# M10: Multi-colony ant rivalry
+# ---------------------------------------------------------------------------
+#
+# Extends the M9 stigmergic foraging to T independent colonies competing
+# for one shared food field. Each team t∈[0,T) has its own per-team
+# pheromone channels and its own nest at teams[t].spawn_pos_radius.xyz.
+#
+# Accum layout (T teams → 2 + 2*T channels):
+#   ch0                — food_supply              (shared)
+#   ch1                — food_demand              (shared)
+#   ch2 + 2*t + 0      — phero_to_food for team t (laid by team t's carriers)
+#   ch2 + 2*t + 1      — phero_to_home for team t (laid by team t's searchers)
+#
+# Pickup uses the existing SHADER_ANT_PICKUP_DEMAND / DECIDE unchanged —
+# food is a shared resource and the M9 fair-share machinery already
+# arbitrates contention correctly across all teams via the shared
+# food_demand channel.
+#
+# The team-aware shaders below replace SHADER_ANT_MOVE / DEPOSIT / PAINT
+# from M9. They read the ant's team (e.kind_team_role_flags.y) and:
+#   * Sense the team's own to_food / to_home channel (no cross-team trail
+#     following — that's the whole point of rivalry).
+#   * Pull carriers toward teams[team].spawn_pos_radius.xyz (own nest).
+#   * Trigger the carrier→searcher drop only near the OWN nest.
+#   * Deposit on the team's own phero channels.
+#   * Paint each ant in its team color; paint per-team trail clouds
+#     using each team's color so territory is visually obvious.
+
+
+SHADER_ANT_MOVE_RIVAL = """
+// Per-ant team-aware move: pick the right pheromone channels based on
+// (state, team), bias movement up the gradient, and drop at OWN nest.
+// Pickup is handled by the unchanged single-pass DEMAND/DECIDE shaders.
+float ar11(uint x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u; x = x ^ (x >> 4);
+    x *= 0x27d4eb2du; x = x ^ (x >> 15);
+    return float(x & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;  // ants only
+
+    uint team = e.kind_team_role_flags.y;
+    int  team_base = 2 + int(team) * 2;
+    int  ch_to_food = team_base + 0;
+    int  ch_to_home = team_base + 1;
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+    int S = u_size;
+
+    // Searchers (state=0) climb own to_food; carriers (state=1) climb
+    // own to_home.
+    int sense_ch = (e.target_partner_timer_payload.x == 0u)
+                   ? ch_to_food : ch_to_home;
+
+    ivec3 pe = ((vp + ivec3( 1, 0, 0)) % S + S) % S;
+    ivec3 pw = ((vp + ivec3(-1, 0, 0)) % S + S) % S;
+    ivec3 pn = ((vp + ivec3( 0, 1, 0)) % S + S) % S;
+    ivec3 ps = ((vp + ivec3( 0,-1, 0)) % S + S) % S;
+    ivec3 pu = ((vp + ivec3( 0, 0, 1)) % S + S) % S;
+    ivec3 pd = ((vp + ivec3( 0, 0,-1)) % S + S) % S;
+    float xe = accum_sample(sense_ch, pe);
+    float xw = accum_sample(sense_ch, pw);
+    float xn = accum_sample(sense_ch, pn);
+    float xs = accum_sample(sense_ch, ps);
+    float xu = accum_sample(sense_ch, pu);
+    float xd = accum_sample(sense_ch, pd);
+    vec3 grad = vec3(xe - xw, xn - xs, xu - xd);
+    float glen = length(grad);
+    vec3 bias = (glen > 1e-5) ? (grad / glen) * u_param2 : vec3(0.0);
+
+    vec3 nest = teams[team].spawn_pos_radius.xyz;
+
+    // Carriers also feel an attractive pull toward OWN nest as a
+    // bootstrap when no team trail exists yet.
+    if (e.target_partner_timer_payload.x == 1u) {
+        vec3 to_nest = nest - e.pos_radius.xyz;
+        to_nest -= u_world_size * floor(to_nest / u_world_size + 0.5);
+        float dlen = length(to_nest);
+        if (dlen > 1e-3) bias += (to_nest / dlen) * (u_param2 * 0.25);
+    }
+
+    uint seed = i * 2477u + uint(u_frame) * 8101u;
+    vec3 jitter = vec3(ar11(seed),
+                       ar11(seed + 1u),
+                       ar11(seed + 2u)) - 0.5;
+    float max_speed = max(e.genome.x, 0.01);
+    vec3 v = e.vel_energy.xyz * 0.75 + jitter * u_param0 + bias;
+    float vlen = length(v);
+    if (vlen > max_speed) v *= max_speed / vlen;
+    vec3 pos = mod(e.pos_radius.xyz + v * u_dt, u_world_size);
+
+    // Drop at OWN nest only.
+    if (e.target_partner_timer_payload.x == 1u) {
+        vec3 d = pos - nest;
+        d -= u_world_size * floor(d / u_world_size + 0.5);
+        if (length(d) < u_param3) {
+            e.target_partner_timer_payload.x = 0u;
+            v = -v;
+        }
+    }
+
+    e.pos_radius.xyz = pos;
+    e.vel_energy.xyz = v;
+    entities[i] = e;
+}
+"""
+
+
+SHADER_ANT_DEPOSIT_RIVAL = """
+// Team-aware deposit: searchers lay own to_home, carriers lay own
+// to_food. No cross-team contamination.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(u_entity_count)) return;
+    Entity e = entities[i];
+    if (!is_alive(e)) return;
+    if (e.kind_team_role_flags.x != 1u) return;
+
+    uint team = e.kind_team_role_flags.y;
+    int  team_base = 2 + int(team) * 2;
+
+    ivec3 vp = ivec3(floor(e.pos_radius.xyz));
+    vp = ((vp % u_size) + u_size) % u_size;
+
+    // searcher → own to_home (team_base+1); carrier → own to_food (team_base+0)
+    int ch = (e.target_partner_timer_payload.x == 0u)
+             ? team_base + 1 : team_base + 0;
+    accum_deposit(ch, vp, u_param1 * u_dt);
+}
+"""
+
+
+SHADER_ANT_PAINT_RIVAL = """
+// Per-voxel paint with team-colored ants + team-colored trail clouds.
+// Channels written:
+//   rgb — team-tinted ant paint (max-blend over teams) + faint trail
+//   a   — food (preserved from prior decode pass)
+//
+// Trail visualization sums each team's (to_food + to_home) scaled by
+// that team's color, so territory boundaries are visible.
+layout(rgba32f, binding=0) uniform image3D u_grid_r;
+layout(rgba32f, binding=1) uniform image3D u_grid_w;
+
+void main() {
+    uint flat_idx = gl_GlobalInvocationID.x;
+    uint total = uint(u_size) * uint(u_size) * uint(u_size);
+    if (flat_idx >= total) return;
+
+    int S = u_size;
+    int idx = int(flat_idx);
+    int z = idx / (S * S);
+    int rem = idx - z * S * S;
+    int y = rem / S;
+    int x = rem - y * S;
+    ivec3 p = ivec3(x, y, z);
+
+    vec4 result = imageLoad(u_grid_r, p);
+
+    // Team-colored trail clouds.
+    vec3 trail_rgb = vec3(0.0);
+    int T = u_team_count;
+    for (int t = 0; t < T; ++t) {
+        int base = 2 + t * 2;
+        float pf = accum_sample(base + 0, p);
+        float ph = accum_sample(base + 1, p);
+        trail_rgb += teams[uint(t)].color.rgb * (pf + ph) * 0.35;
+    }
+
+    // Team-tinted ants via spatial hash.
+    vec3 ant_rgb = vec3(0.0);
+    ivec3 base_c = ivec3(p.x / u_hash_cell, p.y / u_hash_cell, p.z / u_hash_cell);
+    int half_s = S / 2;
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        ivec3 c = base_c + ivec3(dx, dy, dz);
+        c = ((c % u_hash_dim) + u_hash_dim) % u_hash_dim;
+        uint ci = hash_cell_index(c);
+        uint n = min(hash_count[ci], uint(u_hash_max_per_cell));
+        for (uint k = 0u; k < n; ++k) {
+            uint eid = hash_entry[ci * uint(u_hash_max_per_cell) + k];
+            Entity e = entities[eid];
+            if (!is_alive(e)) continue;
+            if (e.kind_team_role_flags.x != 1u) continue;
+
+            ivec3 center = ivec3(floor(e.pos_radius.xyz));
+            ivec3 off = p - center;
+            off.x = ((off.x % S) + S) % S; if (off.x > half_s) off.x -= S;
+            off.y = ((off.y % S) + S) % S; if (off.y > half_s) off.y -= S;
+            off.z = ((off.z % S) + S) % S; if (off.z > half_s) off.z -= S;
+
+            int rmax = int(ceil(e.pos_radius.w));
+            rmax = clamp(rmax, 0, 4);
+            if (abs(off.x) > rmax || abs(off.y) > rmax || abs(off.z) > rmax)
+                continue;
+
+            float dist = length(vec3(off));
+            if (dist > e.pos_radius.w) continue;
+            float inv_r = (e.pos_radius.w > 0.001) ? 1.0 / e.pos_radius.w : 1.0;
+            float w = max(0.0, 1.0 - dist * inv_r);
+            if (e.target_partner_timer_payload.x != 0u) w *= 1.4;  // carriers brighter
+            vec3 tint = teams[uint(e.kind_team_role_flags.y)].color.rgb;
+            ant_rgb = max(ant_rgb, tint * w);
+        }
+    }
+
+    // Highlight each team's nest (small bright sphere in team color).
+    vec3 nest_rgb = vec3(0.0);
+    for (int t = 0; t < T; ++t) {
+        vec3 nest = teams[uint(t)].spawn_pos_radius.xyz;
+        vec3 dp = vec3(p) + vec3(0.5) - nest;
+        dp -= u_world_size * floor(dp / u_world_size + 0.5);
+        float nd = length(dp);
+        if (nd < 2.0) {
+            nest_rgb = max(nest_rgb,
+                           teams[uint(t)].color.rgb * (0.8 - nd * 0.3));
+        }
+    }
+
+    result.rgb = ant_rgb + nest_rgb + trail_rgb;
     imageStore(u_grid_w, p, result);
 }
 """
