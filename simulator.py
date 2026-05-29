@@ -23139,6 +23139,13 @@ class Simulator:
         self.render_mode = 0      # 0=volume, 1=iso, 2=MIP
         self.iso_threshold = 0.5
         self.colormap = self.preset.get('colormap', 0)
+        # Remember the preset's declared default colormap so we can detect
+        # when the user has explicitly overridden it via the UI. When
+        # overridden, RGB/RGBA vis modes fall back to the density+colormap
+        # path so the chosen palette (fire/neon/etc.) actually does
+        # something for presets whose vis_mode would otherwise bake its
+        # own per-channel colour.
+        self._preset_default_colormap = self.preset.get('colormap', 0)
         self.slice_pos = -1.0     # -1 = disabled
         self.slice_axis = 2
 
@@ -23946,7 +23953,16 @@ class Simulator:
         # Multi-channel TF mode + auxiliary range
         u_mode = self._view_build_prog.get('u_vis_mode', None)
         if u_mode is not None:
-            u_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+            # When the user has explicitly picked a palette different from
+            # the preset's declared default, treat RGB/RGBA vis_modes as
+            # plain DENSITY so the chosen colormap (fire/neon/etc.) is
+            # actually visible. This sacrifices baked per-channel colour
+            # (e.g. ant team colours, Gray-Scott U vs V tint) but matches
+            # user intent: they grabbed the palette dropdown for a reason.
+            effective_vis_mode = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+            if self.colormap != self._preset_default_colormap:
+                effective_vis_mode = VIS_MODE_DENSITY
+            u_mode.value = effective_vis_mode
         aux_lo, aux_hi = getattr(self, 'vis_aux_range', (0.0, 1.0))
         u_alo = self._view_build_prog.get('u_aux_lo', None)
         u_ahi = self._view_build_prog.get('u_aux_hi', None)
@@ -28948,8 +28964,14 @@ void main() {
         # palette focuses on near-critical cells).
         effective_threshold = self.voxel_threshold
         self._vp_u_threshold.value = effective_threshold
+        # When user overrides palette via UI, fall back to DENSITY so the
+        # chosen colormap (fire/neon/etc.) is honoured even for presets
+        # that declare a baked RGB/RGBA vis_mode.
+        _eff_vis_mode = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+        if self.colormap != self._preset_default_colormap:
+            _eff_vis_mode = VIS_MODE_DENSITY
         if self._vp_u_vis_mode is not None:
-            self._vp_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+            self._vp_u_vis_mode.value = _eff_vis_mode
         if self._vp_u_vis_lo is not None and self._vp_u_vis_hi is not None:
             vlo, vhi = self.preset.get('vis_range', (0.0, 1.0))
             self._vp_u_vis_lo.value = float(vlo)
@@ -29032,7 +29054,7 @@ void main() {
             self._cull_sp_u_channel.value = cull_channel
             self._cull_sp_u_use_abs.value = cull_use_abs
             if self._cull_sp_u_vis_mode is not None:
-                self._cull_sp_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+                self._cull_sp_u_vis_mode.value = _eff_vis_mode
 
             # Bind the active-block list at binding=11 (matches shader).
             self._sparse_blocks_ssbo.bind_to_storage_buffer(11)
@@ -29071,7 +29093,7 @@ void main() {
         self._cull_u_channel.value = cull_channel
         self._cull_u_use_abs.value = cull_use_abs
         if self._cull_u_vis_mode is not None:
-            self._cull_u_vis_mode.value = int(getattr(self, 'vis_mode', VIS_MODE_DENSITY))
+            self._cull_u_vis_mode.value = _eff_vis_mode
 
         # Extract frustum planes for chunk culling (only useful when cpd > 1)
         frustum_planes = self._extract_frustum_planes(vp_row_major) if cpd > 1 else None
