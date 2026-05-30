@@ -12733,11 +12733,41 @@ vec3 colormap_discrete(float t) {
     return rgb + vec3(v - cc);
 }
 """ + _NEW_COLORMAPS_GLSL + """
+// Spectral / Diverging are defined inline in the raymarch paths; the SDF
+// viewport needs its own copies (kept byte-identical to COMPUTE_RAYMARCH_SHADER
+// so all four apply_colormap sites agree -- guarded by ca_debug.colormap_parity).
+vec3 colormap_spectral(float t) {
+    float wl=380.0+t*400.0;
+    float a, b, c, d, e, f;
+    a=(wl-599.8)/37.9; b=(wl-442.0)/16.0; c=(wl-501.1)/20.4;
+    float x_bar=1.056*exp(-0.5*a*a)+0.362*exp(-0.5*b*b)-0.065*exp(-0.5*c*c);
+    d=(wl-568.8)/46.9; e=(wl-530.9)/16.3;
+    float y_bar=0.821*exp(-0.5*d*d)+0.286*exp(-0.5*e*e);
+    float p=(wl-437.0)/11.8; float q=(wl-459.0)/26.0;
+    float z_bar=1.217*exp(-0.5*p*p)+0.681*exp(-0.5*q*q);
+    vec3 rgb; rgb.r=3.2406*x_bar-1.5372*y_bar-0.4986*z_bar;
+    rgb.g=-0.9689*x_bar+1.8758*y_bar+0.0415*z_bar;
+    rgb.b=0.0557*x_bar-0.2040*y_bar+1.0570*z_bar;
+    float edge=1.0; if(wl<420.0)edge=0.3+0.7*(wl-380.0)/40.0;
+    else if(wl>700.0)edge=0.3+0.7*(780.0-wl)/80.0;
+    return clamp(rgb*edge,0.0,1.0);
+}
+vec3 colormap_diverging(float t) {
+    float u = clamp(t, 0.0, 1.0);
+    float d = (u - 0.5) * 2.0;
+    float a = abs(d);
+    vec3 cold = vec3(0.10, 0.30, 0.95);
+    vec3 warm = vec3(0.95, 0.20, 0.20);
+    vec3 hue  = (d >= 0.0) ? warm : cold;
+    return mix(vec3(0.95, 0.95, 0.95), hue, a);
+}
 vec3 apply_colormap(float t) {
     if (u_colormap ==  0) return colormap_fire(t);
     if (u_colormap ==  1) return colormap_cool(t);
     if (u_colormap ==  3) return colormap_neon(t);
     if (u_colormap ==  4) return colormap_discrete(t);
+    if (u_colormap ==  5) return colormap_spectral(t);
+    if (u_colormap ==  6) return colormap_diverging(t);
     if (u_colormap ==  7) return colormap_viridis(t);
     if (u_colormap ==  8) return colormap_magma(t);
     if (u_colormap ==  9) return colormap_plasma(t);
