@@ -1193,6 +1193,151 @@ class HeadlessRunner:
             self.measure_mode = 'continuous'
             self.alive_threshold = 0.1
             self.change_threshold = 0.05
+        elif shader == 'fcc_gray_scott':
+            # FCC Gray-Scott reaction-diffusion: U=R, V=G. The V channel
+            # carries the pattern, same as the cubic reaction_diffusion_3d.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.01
+            self.change_threshold = 0.001
+        elif shader == 'fcc_crystal':
+            # FCC phase-field solidification: phi (ch0) grows 0->1.
+            # Mirror crystal_growth — 0.3 catches the growth front.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.3
+            self.change_threshold = 0.01
+        elif shader == 'fcc_life':
+            # FCC outer-totalistic Life: binary alive/dead, like GoL.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
+        elif shader == 'fcc_excitable':
+            # FCC Greenberg-Hastings excitable medium. The medium is a
+            # dense turbulent volume (~84% non-resting), so measuring raw
+            # state saturates. The G=intensity channel is bright (>0.85)
+            # only on the excited wavefronts (~17%, matching the preset's
+            # voxel_threshold); track those as the live structure.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.85
+            self.change_threshold = 0.05
+        elif shader == 'fcc_cyclic':
+            # FCC cyclic (Greenberg) CA. Space-filling colour field, so the
+            # raw alive ratio is ~1.0 and the discrete scorer reads it as a
+            # saturated cube. The interesting structure is the colour-domain
+            # boundaries == wavefronts: measure the G=phase channel with
+            # 'phase_coherence' so "alive" = high-incoherence boundary cells.
+            self.measure_channel = 1
+            self.measure_mode = 'phase_coherence'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.02
+        elif shader == 'fcc_dla':
+            # FCC diffusion-limited aggregation: ch0 = aggregate (0/1),
+            # persistent once frozen. Discrete; activity is the slowly
+            # advancing growth front, so keep change_threshold low.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.005
+        elif shader == 'fcc_sandpile':
+            # FCC Abelian sandpile (SOC). Grain height (ch0) hovers near
+            # critical everywhere; the avalanches show as deviation from
+            # the bulk near-critical background — mirror sandpile_3d.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.1
+        elif shader in ('fcc_schnakenberg', 'fcc_brusselator'):
+            # FCC reaction-diffusion (Turing spots / oscillator). The
+            # activator U oscillates/varies across a non-zero bulk, so the
+            # cubic 'deviation 0.1' config saturates here (~99% of cells
+            # deviate from the mean -> reads as a filled cube -> quality
+            # floor -> 0 discoveries). Instead isolate the bright U-spots
+            # with a value threshold: U>2.5 is ~15% (brusselator) / ~7%
+            # (schnakenberg) of cells -- a sparse, well-scored structure
+            # matching each preset's spot vis_range.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 2.5
+            self.change_threshold = 0.05
+        elif shader == 'fcc_kuramoto':
+            # FCC Kuramoto phase oscillators. The phase field (ch0) fills
+            # the volume; the interesting structure is the synchronisation
+            # domain boundaries, so measure phase_coherence like the cubic
+            # kuramoto_3d (alive = high-incoherence boundary cells).
+            self.measure_channel = 0
+            self.measure_mode = 'phase_coherence'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.02
+        elif shader == 'fcc_ising':
+            # FCC Ising spins (ch0 = 0/1). Discrete up-spin count; below
+            # T_c the up-spins clump into a giant rhombic domain, above it
+            # they stay ~50% noise. Mirrors the cubic ising_3d branch.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
+        elif shader == 'fcc_xy_spin':
+            # FCC XY model: continuous angle field theta/(2pi) in [0,1].
+            # Vortex cores show as deviation defects from locally-uniform
+            # domains, same as the cubic xy_spin_3d branch.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.1
+            self.change_threshold = 0.005
+        elif shader == 'fcc_eden':
+            # FCC Eden aggregation: solid voxels (ch0) are persistent. Low
+            # change_threshold so the score follows the slowly advancing
+            # growth front; mirrors the cubic eden_3d branch.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.005
+        elif shader == 'fcc_forest_fire':
+            # FCC forest fire: 3 states {0, 0.5, 1.0}. Threshold 0.25
+            # catches trees+burning; mirrors the cubic forest_fire_3d branch.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.25
+            self.change_threshold = 0.1
+        elif shader == 'fcc_hodgepodge':
+            # FCC hodgepodge: state 0 = healthy background, >0 = excited.
+            # Threshold 0.05 catches the smallest nonzero integer state
+            # while excluding quantisation noise; mirrors hodgepodge_3d.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.05
+            self.change_threshold = 0.01
+        elif shader == 'fcc_fitzhugh_nagumo':
+            # FCC FitzHugh-Nagumo excitable medium. V (ch0) oscillates over
+            # roughly [-2,2] everywhere in the auto-oscillatory regime, so
+            # the 'deviation' default would mark the whole cube alive. Instead
+            # isolate the depolarised wavefront with a value threshold (V>0.8),
+            # matching the front-only voxel render: a sparse, moving shell.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.8
+            self.change_threshold = 0.05
+        elif shader == 'fcc_morphogen':
+            # FCC Gierer-Meinhardt Turing system. Activator (ch0) is sharply
+            # bimodal (bulk ~0.4, spot peaks ~4) in the tuned regime; a value
+            # threshold of 1.6 isolates the sparse spot cores (mirrors
+            # fcc_schnakenberg) rather than reading the bulk as a filled cube.
+            self.measure_channel = 0
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 1.6
+            self.change_threshold = 0.02
+        elif shader == 'fcc_prisoners_dilemma':
+            # FCC spatial Prisoner's Dilemma. Binary cooperator/defector
+            # strategy (ch0). Mirrors the cubic prisoners_dilemma_3d branch:
+            # cooperator clusters are 'alive', and the chaotic frontier keeps
+            # flipping so the change metric stays active.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
         elif is_agent_rule:
             # Agent-driven rule with a non-trivial voxel shader (e.g.
             # smugglers_3d). The grid carries sparse trails / stashes

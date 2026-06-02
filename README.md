@@ -266,21 +266,32 @@ ca_debug/               — Unified debug + data-capture + correctness-probe pac
                           audit, particle SSBO probe, per-rule validators).
 lattice.py, fcc_field.py, fcc_render.py, fcc_rule_gray_scott.py,
 fcc_viewer.py, lattice_gpu_check.py
-                        — **Work in progress / on the back burner.**
-                          Experimental face-centred-cubic (FCC) lattice
-                          substrate: dense native storage in primitive
+                        — **Experimental face-centred-cubic (FCC) lattice
+                          substrate.** Dense native storage in primitive
                           cell coordinates, 12-NN Laplacian, voxel
                           renderer with rhombohedral primitive cells. The
                           goal is denser sphere packing than the cubic
                           lattice (12 nearest neighbours instead of 6,
                           $\pi/\sqrt{18}\approx 74\%$ packing fraction
                           vs. cubic's $\pi/6\approx 52\%$) for more
-                          isotropic discrete diffusion. One rule
-                          (Gray-Scott) and a headless viewer exist as a
-                          proof of concept; not wired into the main
-                          simulator UI and not the path used by the 100+
-                          cubic-lattice presets. The pre-FCC commit is
-                          tagged `pre-fcc-transition` for rollback.
+                          isotropic discrete diffusion. These standalone
+                          files are the original headless proof of
+                          concept; the lattice has since been promoted
+                          into the main simulator, where ~19 rules have
+                          been hand-ported onto the 12-NN stencil
+                          (`fcc_` prefix in the rule dropdown) spanning
+                          reaction-diffusion (Gray-Scott, Schnakenberg,
+                          Brusselator, FitzHugh-Nagumo, Gierer-Meinhardt
+                          morphogen), excitable/oscillator media (cyclic,
+                          Kuramoto, XY-spin), statistical mechanics
+                          (Ising), growth (Eden, DLA, crystal, forest
+                          fire), and discrete rules (Life, 4-4-5,
+                          sandpile, hodgepodge, spatial Prisoner's
+                          Dilemma). They render through the in-simulator
+                          voxel path and are searchable by the headless
+                          harness like any cubic preset. The pre-FCC
+                          commit is tagged `pre-fcc-transition` for
+                          rollback.
 youtube_pipeline/       — OAuth + chunked resumable upload of `recordings/`
                           MP4s to YouTube. Reads sidecar JSON for titles,
                           descriptions, and Shorts detection. See

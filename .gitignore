@@ -80,7 +80,11 @@ batch_search.sh
 batch_elegance.sh
 batch_flagships.sh
 batch_prescreen.sh
+batch_fcc.sh
 logs/
+
+# Content exports (YouTube Studio archive downloads, etc.)
+*.zip
 
 # OS
 .DS_Store

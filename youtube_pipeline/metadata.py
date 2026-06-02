@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 REPO_URL = 'https://github.com/c0re-i5/3d-cellular-automata'
@@ -77,8 +78,10 @@ _CATEGORY_RULES: tuple[tuple[str, str], ...] = (
     ('margolus', 'Block CA'),
     ('larger_than_life', 'Life-Like CA'),
     ('445_rule', 'Life-Like CA'),
+    ('445', 'Life-Like CA'),
     ('game_of_life', 'Life-Like CA'),
     ('smoothlife', 'Life-Like CA'),
+    ('life', 'Life-Like CA'),
     ('smallworld_ca', 'Network CA'),
     ('genome_ca', 'Evolutionary CA'),
     ('causal_ca', 'Causal CA'),
@@ -97,12 +100,102 @@ _CATEGORY_RULES: tuple[tuple[str, str], ...] = (
 )
 
 
+def _normalize_rule(rule: str) -> str:
+    """Strip a lattice-variant prefix so FCC ports share the cubic rule's
+    category and hook (e.g. ``fcc_forest_fire`` -> ``forest_fire``)."""
+    if rule.startswith('fcc_'):
+        return rule[len('fcc_'):]
+    return rule
+
+
 def _category_for(rule: str) -> str:
     """Return a short human-readable category label for ``rule``."""
+    rule = _normalize_rule(rule)
     for prefix, cat in _CATEGORY_RULES:
         if rule.startswith(prefix):
             return cat
     return 'Cellular Automaton'
+
+
+# Human "hooks" for Shorts titles.  These translate the technical preset
+# name into a concrete, swipe-stopping phrase: an active verb + a
+# physical metaphor a non-specialist can picture in half a second.  The
+# searchable proper noun still lives in the science category that
+# follows the em-dash (e.g. "3D Spin System"), so we keep algorithm
+# reach while giving a human a reason to stop.
+#
+# Order matters: the first matching prefix wins (same as _CATEGORY_RULES).
+# Rules whose label is ALREADY human and high-search (Game of Life,
+# SmoothLife, Crystal, 4/4/5) are intentionally absent so their proven
+# label passes through unchanged.
+_HOOK_RULES: tuple[tuple[str, str], ...] = (
+    ('bz_', 'Chemical Spirals That Never Stop'),
+    ('hodgepodge', 'A Chemical Clock Comes Alive'),
+    ('cyclic_ca', 'Colors Chasing Each Other Forever'),
+    ('greenberg_hastings', 'Self-Healing Waves Race Around'),
+    ('gray_scott', 'Patterns That Copy Themselves'),
+    ('reaction_diffusion', 'Patterns That Copy Themselves'),
+    ('schnakenberg', 'Spots Growing Into Stripes'),
+    ('brusselator', 'A Chemical Clock Ticking in 3D'),
+    ('morphogen', 'How an Animal Gets Its Spots'),
+    ('fitzhugh', 'Heartbeat Waves Pulsing in 3D'),
+    ('xy_spin', 'A Magnet Making Up Its Mind'),
+    ('ising', 'A Magnet Making Up Its Mind'),
+    ('kuramoto', 'Thousands of Clocks Snapping Into Sync'),
+    ('flocking', 'A Swarm That Thinks as One'),
+    ('active_nematic', 'A Fluid That Stirs Itself'),
+    ('lenia', 'Digital Lifeforms Evolving'),
+    ('eden', 'A Crystal That Builds Itself'),
+    ('forest_fire', 'Fires That Never Burn Out'),
+    ('sandpile', 'The Pile That Collapses Itself'),
+    ('predator_prey', 'Hunters and Prey Locked in Balance'),
+    ('prisoners_dilemma', 'Cooperation vs Betrayal, Spreading'),
+    ('physarum', 'Slime Mold Finding the Shortest Path'),
+    ('mycelium', 'A Fungal Network Creeping Outward'),
+    ('lichen', 'Lichen Crawling Across Stone'),
+    ('sine_gordon', 'Solitons Passing Through Each Other'),
+    ('em_wave', 'Light Waves You Can Actually See'),
+    ('dirac', 'Antimatter Rippling Through Space'),
+    ('quantum_', 'A Quantum Particle Spreading Out'),
+    ('wave', 'Ripples Racing Through a 3D Lattice'),
+    ('hopfion', 'A Knot of Energy That Holds Its Shape'),
+    ('phase_separation', 'Oil and Water Pulling Apart'),
+    ('nucleation', 'Droplets Condensing Out of Nothing'),
+    ('fracture', 'Watch a Solid Shatter From Within'),
+    ('erosion', 'A Landscape Carving Itself'),
+    ('wireworld', 'Electricity Computing on a Grid'),
+    ('langton_ant', 'One Ant Builds a Highway'),
+)
+
+
+def _hook_for(rule: str) -> str:
+    """Return a human Shorts hook for ``rule``, or '' if none is defined."""
+    rule = _normalize_rule(rule)
+    for prefix, hook in _HOOK_RULES:
+        if rule.startswith(prefix):
+            return hook
+    return ''
+
+
+def _humanize_label(label: str) -> str:
+    """Clean a preset label for use in a title's hook segment.
+
+    The channel analytics showed parenthetical qualifiers (e.g.
+    "Crystal (Faceted)") correlate with lower views, so fold a trailing
+    "(Variant)" into a natural adjective prefix: "Crystal (Faceted)" ->
+    "Faceted Crystal", "Gray-Scott (coral)" -> "Coral Gray-Scott".
+    """
+    if not label:
+        return label
+    m = re.match(r'^(.*?)\s*\(([^)]+)\)\s*$', label)
+    if m:
+        base, variant = m.group(1).strip(), m.group(2).strip()
+        if base and variant:
+            # Capitalise the variant's first letter without lowercasing
+            # acronyms/Miller indices already inside it.
+            variant = variant[:1].upper() + variant[1:]
+            return f'{variant} {base}'
+    return label
 
 
 def _format_duration(seconds: float) -> str:
@@ -226,11 +319,19 @@ def build_metadata(sidecar_path: Path) -> dict:
     if title_label.startswith('Flagship: '):
         title_label = title_label[len('Flagship: '):]
     if shorts:
-        # Shorts: prioritise compact, swipeable.  Drop the hook, keep the
-        # category for context, append #Shorts for routing.
-        title = f'{title_label} — 3D {category} #Shorts'
+        # Shorts: lead with a HUMAN hook (active verb + metaphor) so a
+        # mid-scroll viewer has a reason to stop, then anchor with the
+        # science category ("3D Spin System") which carries the
+        # searchable keyword for the algorithm.  Jargon-heavy presets get
+        # a hand-written hook; presets whose label is already human and
+        # high-search (Game of Life, SmoothLife, 4/4/5, Crystal) fall
+        # back to their cleaned label.
+        hook_seg = _hook_for(rule) or _humanize_label(title_label)
+        title = f'{hook_seg} — 3D {category} #Shorts'
         if len(title) > TITLE_MAX:
-            title = f'{title_label} #Shorts'
+            title = f'{hook_seg} #Shorts'
+        if len(title) > TITLE_MAX:
+            title = f'{_humanize_label(title_label)} #Shorts'
     else:
         # Long-form: lead with the label, then a hook phrase from the
         # rule description, then the project anchor.  Falls back to a

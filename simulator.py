@@ -29,6 +29,14 @@ from imgui_bundle import imgui
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 from element_data import ELEMENT_GPU_DATA, SYMBOLS, NAMES, NUM_ELEMENTS, FLOATS_PER_ELEMENT, WALL_ID
 import entity_arena
+from lattice import FCC as _FCC_LATTICE
+# Column-major (GLSL mat3) flattenings of the FCC index->world basis and its
+# inverse. Uploaded to the voxel shader's u_lattice_M / u_lattice_M_inv when
+# rendering a preset whose `lattice` is 'fcc'. GLSL mat3 uniforms expect
+# column-major storage, so we transpose the (row-major) numpy matrices before
+# flattening (same convention as _get_view_proj's `.T.flatten()`).
+_FCC_M_COLMAJOR = tuple(float(x) for x in _FCC_LATTICE.M.T.flatten())
+_FCC_MINV_COLMAJOR = tuple(float(x) for x in _FCC_LATTICE.M_inv.T.flatten())
 
 # Schema-aware discovery field access (REQUIRED_V1 strict on v1+ entries).
 from schema import get_field
@@ -882,6 +890,1149 @@ void main() {
     float new_V = clamp(V + dV * dt_eff, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "fcc_gray_scott": """
+// Gray-Scott reaction-diffusion on the FCC (face-centred-cubic) lattice.
+// Same two coupled species as reaction_diffusion_3d (R = U substrate,
+// G = V catalyst) but the discrete Laplacian uses the 12 nearest FCC
+// neighbours of the rhombic-dodecahedron Wigner-Seitz cell instead of the
+// cubic 6/19-point stencil. The 12-NN stencil is isotropic by construction,
+// so spots/worms grow with no residual cubic-axis bias.
+//
+//   dU/dt = Du * lap(U) - U*V^2 + F*(1-U)
+//   dV/dt = Dv * lap(V) + U*V^2 - (F+k)*V
+//
+// For unit nearest-neighbour distance on a cubic-symmetric lattice,
+// sum_i d_i (outer) d_i = 4 I, so  lap(f) ~= 0.5 * (sum_nn f - 12*f).
+// The 12 index-space offsets are the FCC nearest neighbours (lattice.py):
+// 6 axial +-(1,0,0).. and 6 diagonal +-(1,-1,0).. .
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float U = self_val.r;
+    float V = self_val.g;
+
+    vec2 nn_sum = vec2(0.0);
+    for (int i = 0; i < 12; ++i) {
+        nn_sum += fetch(pos + FCC_NN[i]).rg;
+    }
+    // FCC 12-NN Laplacian, scaled by h_sq for resolution-independent
+    // continuum units (matches the cubic rule's convention).
+    vec2 lap_uv = 0.5 * (nn_sum - 12.0 * self_val.rg) * h_sq;
+    float lap_U = lap_uv.x;
+    float lap_V = lap_uv.y;
+
+    float F  = u_param0;  // feed rate
+    float k  = u_param1;  // kill rate
+    float Du = u_param2;  // U diffusion rate
+    float Dv = u_param3;  // V diffusion rate
+
+    // CFL-safe dt clamp (explicit Euler; isotropic 1/(2*Z) bound, Z=12).
+    float D_max    = max(Du, Dv);
+    float dt_limit = 0.9 / (0.5 * 12.0) / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float uvv = U * V * V;
+    float dU  = Du * lap_U - uvv + F * (1.0 - U);
+    float dV  = Dv * lap_V + uvv - (F + k) * V;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 1.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "fcc_excitable": """
+// Greenberg-Hastings excitable medium on the FCC (face-centred-cubic)
+// lattice with the 12 nearest neighbours of the rhombic-dodecahedron cell.
+// Each cell holds one of N states arranged in a cycle:
+//     0          = resting   (excitable)
+//     1          = excited   (fires this step)
+//     2 .. N-1   = refractory (recovering; cannot fire)
+// A resting cell becomes excited (state 1) the moment at least `thresh`
+// of its 12 nearest neighbours are excited. Any non-resting cell advances
+// deterministically  s -> (s+1) mod N , so it spends N-1 steps locked out
+// after firing before it can be re-excited. From random initial states
+// this self-organises into rotating scroll waves; because all 12 NN sit at
+// the same distance the wavefronts are round and free of cubic-axis bias.
+//
+//   u_param0 = N states          (refractory length = N-1)
+//   u_param1 = excitation threshold (# excited neighbours needed)
+//
+// R = raw state 0..N-1 (read by the rule). G = visual intensity: brightest
+// at the excited front, fading along the refractory tail, dark at rest.
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int N      = clamp(int(u_param0 + 0.5), 3, 24);
+    int thresh = clamp(int(u_param1 + 0.5), 1, 12);
+
+    int s = int(fetch(pos).r + 0.5);
+    s = clamp(s, 0, N - 1);
+
+    int new_s;
+    if (s == 0) {
+        int exc = 0;
+        for (int i = 0; i < 12; ++i) {
+            int ns = int(fetch(pos + FCC_NN[i]).r + 0.5);
+            if (ns == 1) exc++;
+        }
+        new_s = (exc >= thresh) ? 1 : 0;
+    } else {
+        new_s = (s + 1) % N;
+    }
+
+    float vis = (new_s == 0) ? 0.0 : (float(N - new_s) / float(N - 1));
+    imageStore(u_dst, pos, vec4(float(new_s), vis, 0.0, 0.0));
+}
+""",
+
+    "fcc_life": """
+// Outer-totalistic Life on the FCC lattice (12 nearest neighbours).
+// Each cell counts how many of its 12 rhombic-dodecahedron neighbours are
+// alive. A DEAD cell is born when that count lies in [b1, b2]; a LIVE cell
+// survives when the count lies in [s1, s2], otherwise it dies. The 12-NN
+// neighbourhood sits between 2D Life's 8 and the cubic Moore 26, which
+// makes for a rich-but-searchable rule space, and -- because every
+// neighbour is equidistant -- growth has no preferred cubic axis, so
+// clusters expand as rounded rhombic-dodecahedral blobs rather than
+// axis-aligned boxes.
+//
+//   u_param0 = birth low  (b1)   u_param1 = birth high  (b2)
+//   u_param2 = survive low (s1)  u_param3 = survive high (s2)
+//
+// R = state (0/1, read by the rule). G = neighbour density /12 for shading.
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int b1 = int(u_param0 + 0.5);
+    int b2 = int(u_param1 + 0.5);
+    int s1 = int(u_param2 + 0.5);
+    int s2 = int(u_param3 + 0.5);
+
+    float self_alive = fetch(pos).r;
+    int alive = 0;
+    for (int i = 0; i < 12; ++i) {
+        if (fetch(pos + FCC_NN[i]).r > 0.5) alive++;
+    }
+
+    float result;
+    if (self_alive > 0.5) {
+        result = (alive >= s1 && alive <= s2) ? 1.0 : 0.0;
+    } else {
+        result = (alive >= b1 && alive <= b2) ? 1.0 : 0.0;
+    }
+    float density = float(alive) * (1.0 / 12.0);
+    imageStore(u_dst, pos, vec4(result, density, 0.0, 0.0));
+}
+""",
+
+    "fcc_crystal": """
+// Solidification phase-field on the FCC lattice (12-NN isotropic Laplacian).
+//   R = phase  phi in [0,1]   (0 = liquid, 1 = solid)
+//   G = u, dimensionless supersaturation / undercooling that DRIVES
+//       freezing and is CONSUMED (latent-heat / solute rejection) as the
+//       cell solidifies, so growth is mass-limited and halts once the melt
+//       around the crystal is depleted.
+//
+//   dphi/dt = M * ( W * lap(phi) + phi(1-phi)(phi - 1/2 + lambda*u) )
+//   du/dt   = D * lap(u) - kappa * dphi/dt
+//
+// Both Laplacians use the 12 FCC nearest neighbours. Because the FCC
+// Wigner-Seitz cell IS the rhombic dodecahedron, the bare 12-NN stencil's
+// residual anisotropy favours the <110> facet family, so a single seed
+// grows into the lattice's own natural habit (rhombic-dodecahedral /
+// octahedral) -- the crystal shape is dictated by the lattice itself, with
+// no hand-coded anisotropy kernel. (Contrast the cubic crystal_growth rule,
+// which needs an explicit beta(n) facet kernel to pick a habit.)
+//
+//   u_param0 = Undercooling (lambda)   u_param1 = Diffusion (D)
+//   u_param2 = Coupling (kappa)        u_param3 = Mobility (M)
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float phi = self_val.r;
+    float u   = self_val.g;
+
+    vec2 nn = vec2(0.0);
+    for (int i = 0; i < 12; ++i) {
+        nn += fetch(pos + FCC_NN[i]).rg;
+    }
+    vec2 lap = 0.5 * (nn - 12.0 * self_val.rg) * h_sq;
+    float lap_phi = lap.x;
+    float lap_u   = lap.y;
+
+    float lambda = u_param0;
+    float D      = u_param1;
+    float kappa  = u_param2;
+    float M      = u_param3;
+
+    const float W = 1.0;  // gradient-energy / interface-width coefficient
+    float drive = phi * (1.0 - phi) * (phi - 0.5 + lambda * u);
+    float dphi  = M * (W * lap_phi + drive);
+    float du    = D * lap_u - kappa * dphi;
+
+    // CFL-safe dt clamp on the fastest diffusive channel (Z=12 bound).
+    float D_max    = max(max(D, M * W), 1e-4);
+    float dt_limit = 0.9 / (0.5 * 12.0) / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float new_phi = clamp(phi + dphi * dt_eff, 0.0, 1.0);
+    float new_u   = clamp(u   + du   * dt_eff, 0.0, 2.0);
+    imageStore(u_dst, pos, vec4(new_phi, new_u, 0.0, 0.0));
+}
+""",
+
+    "fcc_cyclic": """
+// Cyclic (Greenberg) cellular automaton on the FCC lattice -- a 3D
+// rock-paper-scissors dominance cycle over N colours. A cell in colour s is
+// eaten by its successor (s+1) mod N: it advances to (s+1) as soon as at
+// least `thresh` of its 12 nearest neighbours already hold that successor
+// colour. There is no refractory reservoir (unlike fcc_excitable) -- the
+// only dynamics is the endless chase around the colour wheel, which from a
+// random soup self-organises into interlocking 3D spiral scrolls. Because
+// all 12 neighbours are equidistant the spiral cores stay round instead of
+// pinning to cubic axes the way a 6-neighbour grid forces them to.
+//
+//   u_param0 = N colours          u_param1 = advance threshold
+//   u_param2 = neighbourhood size (how many of the 12 NN are polled, 4..12)
+//
+// R = colour 0..N-1 (read by the rule). G = phase = colour/(N-1) (hue ramp).
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int N      = clamp(int(u_param0 + 0.5), 3, 24);
+    int thresh = clamp(int(u_param1 + 0.5), 1, 12);
+    int rng    = clamp(int(u_param2 + 0.5), 4, 12);
+
+    int s   = clamp(int(fetch(pos).r + 0.5), 0, N - 1);
+    int nxt = (s + 1) % N;
+
+    int cnt = 0;
+    for (int i = 0; i < rng; ++i) {
+        int ns = clamp(int(fetch(pos + FCC_NN[i]).r + 0.5), 0, N - 1);
+        if (ns == nxt) cnt++;
+    }
+
+    int new_s = (cnt >= thresh) ? nxt : s;
+    float phase = float(new_s) / float(N - 1);
+    imageStore(u_dst, pos, vec4(float(new_s), phase, 0.0, 0.0));
+}
+""",
+
+    "fcc_dla": """
+// Diffusion-limited aggregation / dielectric-breakdown growth on the FCC
+// lattice. A continuous nutrient field u (G channel) diffuses through the
+// empty space and is slowly replenished from a uniform far-field source;
+// frozen aggregate cells (phi, R channel) hold u = 0, so the cluster acts
+// as a sink and depletes the nutrient around itself. An empty cell touching
+// the cluster solidifies stochastically with probability stick * u^eta:
+// because the nutrient is most depleted deep in the fjords and richest at
+// the exposed tips, growth concentrates on the tips -> isotropic fractal
+// DENDRITES. The eta exponent is the Niemeyer-Pietronero dielectric-
+// breakdown knob (eta=1 -> classic DLA, larger -> sparser lightning).
+// On the 12-NN FCC lattice the tips have no preferred cubic axis, so the
+// dendrite is round/coral rather than the six-armed cross a cubic grid bias
+// produces.
+//
+//   u_param0 = Diffusion   u_param1 = Feed (far-field replenish)
+//   u_param2 = Stickiness  u_param3 = Eta (tip sharpness)
+//
+// R = phi (0 empty, 1 aggregate). G = u nutrient concentration [0,1].
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float phi = self_val.r;
+    float u   = self_val.g;
+
+    // Frozen aggregate: stays solid, holds nutrient at zero (perfect sink).
+    if (phi > 0.5) {
+        imageStore(u_dst, pos, vec4(1.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float D    = u_param0;
+    float feed = u_param1;
+    float stick= u_param2;
+    float eta  = max(u_param3, 0.1);
+
+    int agg = 0;
+    float usum = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        vec4 nv = fetch(pos + FCC_NN[i]);
+        if (nv.r > 0.5) agg++;     // aggregate neighbour contributes u = 0 (sink)
+        usum += nv.g;
+    }
+
+    // Diffuse nutrient (12-NN Laplacian) then replenish toward the far-field
+    // reservoir level 1.0 so the source never fully empties.
+    float lap_u  = 0.5 * (usum - 12.0 * u) * h_sq;
+    float dt_lim = 0.9 / (0.5 * 12.0) / max(D * h_sq, 1e-8);
+    float dt_eff = min(u_dt, dt_lim);
+    float u_new  = u + D * lap_u * dt_eff;
+    u_new += feed * (1.0 - u_new) * dt_eff;
+    u_new  = clamp(u_new, 0.0, 1.0);
+
+    // Stochastic aggregation only where we touch the existing cluster.
+    float phi_new = 0.0;
+    if (agg >= 1) {
+        float p = stick * pow(u_new, eta);
+        if (hash_temporal(pos, 0) < p) {
+            phi_new = 1.0;
+            u_new   = 0.0;
+        }
+    }
+    imageStore(u_dst, pos, vec4(phi_new, u_new, 0.0, 0.0));
+}
+""",
+
+    "fcc_sandpile": """
+// Abelian sandpile (Bak-Tang-Wiesenfeld self-organised criticality) on the
+// FCC lattice. Each cell holds an integer grain count h (R channel). When a
+// cell reaches the critical height K it topples, shedding one grain to each
+// of its 12 nearest neighbours (h -= K). Toppling is applied synchronously:
+// a cell's new height is its old height, minus K if it was over-critical,
+// plus one grain for every over-critical neighbour. Grains are injected by a
+// steady drip at the centre and/or a uniform random rain; the open (clamped)
+// boundary lets grains fall off the edges, so the pile settles into the
+// classic scale-free avalanche regime. Because every cell topples to 12
+// equidistant neighbours the avalanche fronts spread as isotropic shells
+// rather than the axis-aligned diamonds a 6-neighbour grid produces.
+//
+//   u_param0 = Drip rate (centre)   u_param1 = Critical height K
+//   u_param2 = Rain probability     u_param3 = (unused)
+//
+// R = grain height. G = toppling flag (1 on the step a cell topples) -- the
+// moving avalanche front, which is what the sparse voxel view renders.
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int K = clamp(int(u_param1 + 0.5), 4, 24);
+    float Kf = float(K);
+
+    float h = fetch(pos).r;
+    int toppled = (h >= Kf) ? 1 : 0;
+
+    int income = 0;
+    for (int i = 0; i < 12; ++i) {
+        if (fetch(pos + FCC_NN[i]).r >= Kf) income++;
+    }
+
+    float h_new = h - Kf * float(toppled) + float(income);
+
+    // Driving: a steady drip at the central cell plus optional uniform rain.
+    ivec3 c = ivec3(u_size / 2);
+    if (all(equal(pos, c))) h_new += u_param0;
+    float rain = u_param2;
+    if (rain > 0.0 && hash_temporal(pos, 1) < rain) h_new += 1.0;
+
+    h_new = max(h_new, 0.0);
+    imageStore(u_dst, pos, vec4(h_new, float(toppled), 0.0, 0.0));
+}
+""",
+
+    "fcc_schnakenberg": """
+// Schnakenberg activator-substrate Turing system on the FCC lattice.
+// Same kinetics as schnakenberg_3d but the diffusion uses the 12 isotropic
+// FCC nearest neighbours instead of the cubic 19-point stencil, so the
+// Turing spots pack as a rhombic-dodecahedral foam with no axis bias.
+//   dU/dt = Du * lap(U) + a - U + U^2 * V
+//   dV/dt = Dv * lap(V) + b     - U^2 * V
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float U = self_val.r;
+    float V = self_val.g;
+
+    vec2 nn_sum = vec2(0.0);
+    for (int i = 0; i < 12; ++i) nn_sum += fetch(pos + FCC_NN[i]).rg;
+    vec2 lap_uv = 0.5 * (nn_sum - 12.0 * self_val.rg) * h_sq;
+    float lap_U = lap_uv.x;
+    float lap_V = lap_uv.y;
+
+    float a  = u_param0;
+    float b  = u_param1;
+    float Du = u_param2;
+    float Dv = u_param3;
+
+    float D_max    = max(Du, Dv);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float UUV = U * U * V;
+    float dU  = Du * lap_U + a - U + UUV;
+    float dV  = Dv * lap_V + b     - UUV;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 4.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 4.0);
+
+    imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "fcc_brusselator": """
+// Brusselator autocatalytic oscillator on the FCC lattice (12-NN Laplacian).
+// Same Hopf/Turing kinetics as brusselator_3d; the isotropic neighbourhood
+// keeps oscillating fronts and Turing spots round.
+//   dU/dt = Du * lap(U) + A - (B+1)*U + U^2 * V
+//   dV/dt = Dv * lap(V)     + B*U     - U^2 * V
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float U = self_val.r;
+    float V = self_val.g;
+
+    vec2 nn_sum = vec2(0.0);
+    for (int i = 0; i < 12; ++i) nn_sum += fetch(pos + FCC_NN[i]).rg;
+    vec2 lap_uv = 0.5 * (nn_sum - 12.0 * self_val.rg) * h_sq;
+    float lap_U = lap_uv.x;
+    float lap_V = lap_uv.y;
+
+    float A  = u_param0;
+    float B  = u_param1;
+    float Du = u_param2;
+    float Dv = u_param3;
+
+    float D_max    = max(Du, Dv);
+    float dt_limit = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float UUV = U * U * V;
+    float dU  = Du * lap_U + A - (B + 1.0) * U + UUV;
+    float dV  = Dv * lap_V     + B * U         - UUV;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 6.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 6.0);
+
+    imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "fcc_kuramoto": """
+// Kuramoto coupled phase oscillators on the FCC lattice. Each cell couples
+// to its 12 isotropic nearest neighbours (vs the cubic 26-Moore stencil),
+// so synchronisation domains and phase-singularity filaments are axis-free.
+//   R = phase / 2pi in [0,1)      G = natural frequency (adapts)
+//   B = local order parameter (coherence magnitude)
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float phase    = self_val.r;   // 0..1 representing 0..2*pi
+    float nat_freq = self_val.g;   // natural frequency (adapts)
+
+    float coupling   = u_param0;   // coupling strength K
+    float noise_amp  = u_param1;   // phase noise amplitude
+    float freq_scale = u_param2;   // natural frequency multiplier
+    float adaptation = u_param3;   // frequency adaptation rate
+
+    float phase_2pi = phase * 6.283185;
+    float coupling_sum = 0.0;
+    float cos_sum = 0.0;
+    float mean_freq = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        vec2 nb = fetch(pos + FCC_NN[i]).rg;
+        float dphi = nb.r * 6.283185 - phase_2pi;
+        coupling_sum += sin(dphi);
+        cos_sum += cos(dphi);
+        mean_freq += nb.g;
+    }
+    coupling_sum /= 12.0;
+    cos_sum /= 12.0;
+    mean_freq /= 12.0;
+
+    float coherence = sqrt(coupling_sum * coupling_sum + cos_sum * cos_sum);
+
+    float hash = hash_temporal(pos, 0);
+    float noise = (hash - 0.5) * 2.0 * noise_amp;
+
+    float d_phase = (nat_freq * freq_scale + coupling * coupling_sum + noise) * u_dt;
+    float new_phase = fract(phase + d_phase);
+
+    float new_freq = nat_freq + adaptation * coherence * (mean_freq - nat_freq) * u_dt;
+    new_freq = clamp(new_freq, -2.0, 2.0);
+
+    imageStore(u_dst, pos, vec4(new_phase, new_freq, coherence, 0.0));
+}
+""",
+
+    "fcc_ising": """
+// 3D Ising / binary-spin Metropolis dynamics on the FCC lattice (12 NN).
+// Spins in R as {0.0, 1.0} (encoding s = -1 / +1). Energy of a cell with
+// spin s and 12-NN spin sum Sn:  E = -J * s * Sn - h * s.
+//
+// The cubic version used a 2-colour (x+y+z) checkerboard for synchronous
+// detailed balance, but the FCC nearest-neighbour graph is NOT bipartite
+// (it contains triangles), so a 2-colouring fails. Per-axis parity gives an
+// 8-colouring in which no two same-colour cells are FCC neighbours (every
+// FCC offset has at least one odd component), which IS conflict-free.
+//
+// u_param0 = Temperature kT   u_param1 = External field h
+// u_param2 = J coupling       u_param3 = Update prob p
+
+float spin_at(ivec3 p) { return fetch(p).r > 0.5 ? 1.0 : -1.0; }
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float self = fetch(pos).r;
+    float s = self > 0.5 ? 1.0 : -1.0;
+
+    float Sn_all = 0.0;
+    for (int i = 0; i < 12; ++i) Sn_all += spin_at(pos + FCC_NN[i]);
+    // ch1 = signed alignment (Sn/12) remapped to [0,1]; 0.5 = disordered.
+    float align01 = (Sn_all + 12.0) * (1.0/24.0);
+
+    // 8-colouring by per-axis parity, advanced by frame.
+    int colour = (pos.x & 1) + 2 * (pos.y & 1) + 4 * (pos.z & 1);
+    if (colour != (u_frame & 7)) {
+        imageStore(u_dst, pos, vec4(self, align01, 0.0, 0.0));
+        return;
+    }
+
+    float T = max(u_param0, 1e-3);
+    float h = u_param1;
+    float J = u_param2;
+    float pflip = clamp(u_param3, 0.0, 1.0);
+
+    // dE for s -> -s:  dE = 2*s*(J*Sn + h)
+    float dE = 2.0 * s * (J * Sn_all + h);
+    float accept = dE <= 0.0 ? 1.0 : exp(-dE / T);
+
+    float r1 = hash_temporal(pos, 0);
+    float r2 = hash_temporal(pos, 1);
+
+    float new_s = s;
+    if (r1 < pflip && r2 < accept) new_s = -s;
+    float new_val = new_s > 0.0 ? 1.0 : 0.0;
+    float flipped = (new_s != s) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(new_val, align01, flipped, accept));
+}
+""",
+
+    "fcc_xy_spin": """
+// 3D classical XY model on the FCC lattice — continuous-spin magnet.
+// Each cell holds an angle theta in [0,2pi); energy with one neighbour is
+// E = -J cos(theta - theta'), summed over the 12 FCC nearest neighbours.
+// The existing 8-colouring (per-axis parity) is conflict-free on FCC too,
+// so the synchronous Metropolis sweep keeps detailed balance unchanged.
+//   ch0 = theta / 2pi.  u_param0=T  u_param1=J  u_param2=h  u_param3=sigma
+
+const float TWO_PI = 6.283185307179586;
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+float xy_theta(ivec3 p) { return fetch(p).r * TWO_PI; }
+
+float xy_local_energy(ivec3 pos, float theta, float J, float h) {
+    float E = 0.0;
+    for (int i = 0; i < 12; ++i) E -= J * cos(theta - xy_theta(pos + FCC_NN[i]));
+    E -= h * cos(theta);
+    return E;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float theta = xy_theta(pos);
+
+    int colour = (pos.x & 1) + 2 * (pos.y & 1) + 4 * (pos.z & 1);
+    if (colour != (u_frame & 7)) {
+        imageStore(u_dst, pos, vec4(theta / TWO_PI, 0.5 + 0.5 * cos(theta),
+                                     0.5 + 0.5 * sin(theta), 0.0));
+        return;
+    }
+
+    float T = max(u_param0, 1e-3);
+    float J = u_param1;
+    float h = u_param2;
+    float sigma = clamp(u_param3, 0.05, 3.14);
+
+    float r1 = hash_temporal(pos, 0);
+    float r2 = hash_temporal(pos, 1);
+
+    float dtheta = (r1 - 0.5) * 2.0 * sigma;
+    float new_theta = theta + dtheta;
+
+    float E_old = xy_local_energy(pos, theta,     J, h);
+    float E_new = xy_local_energy(pos, new_theta, J, h);
+    float dE    = E_new - E_old;
+
+    bool accept = (dE <= 0.0) || (r2 < exp(-dE / T));
+    float out_theta = accept ? new_theta : theta;
+    out_theta = mod(out_theta, TWO_PI);
+    if (out_theta < 0.0) out_theta += TWO_PI;
+
+    float dtheta_eff = accept ? abs(dtheta) : 0.0;
+    imageStore(u_dst, pos, vec4(out_theta / TWO_PI,
+                                 0.5 + 0.5 * cos(out_theta),
+                                 0.5 + 0.5 * sin(out_theta),
+                                 clamp(dtheta_eff * (1.0/3.14159265), 0.0, 1.0)));
+}
+""",
+
+    "fcc_eden": """
+// 3D Eden growth / aggregation on the FCC lattice (12 nearest neighbours).
+//
+// Channel R: 0.0 = empty, 1.0 = solid. Once filled, never emptied. Each
+// empty cell looks at its 12 rhombic-dodecahedron neighbours; if at least
+// `min_nn` of them are solid it attempts to solidify with a probability
+// that rises with the local solid count. Because all 12 neighbours are
+// equidistant, growth has NO cubic-axis bias -- the cubic Eden rule needs
+// an explicit per-axis anisotropy vector to break out of round balls,
+// whereas on FCC the only habit comes from the lattice itself. Low p with
+// min_nn = 1 gives fractal dendrites; high p with min_nn >= 2 (noise
+// reduction) gives compact rhombic-dodecahedral aggregates; the curvature
+// term smooths concavities (surface-tension-like).
+//
+//   u_param0 = Sticking probability p_base (0.02 .. 1.0)
+//   u_param1 = Min solid neighbours to grow (1 .. 6; noise reduction)
+//   u_param2 = Curvature boost (extra fill prob per neighbour beyond min)
+//   u_param3 = unused
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float self = fetch(pos).r;
+    if (self > 0.5) {
+        // Already solid: persistent.
+        imageStore(u_dst, pos, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
+
+    float p_base = clamp(u_param0, 0.0, 1.0);
+    int   min_nn = clamp(int(u_param1 + 0.5), 1, 12);
+    float curv   = clamp(u_param2, 0.0, 1.0);
+
+    int solid = 0;
+    for (int i = 0; i < 12; ++i) {
+        if (fetch(pos + FCC_NN[i]).r > 0.5) solid++;
+    }
+
+    if (solid < min_nn) {
+        imageStore(u_dst, pos, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // Fill probability rises with the local solid count beyond the gate,
+    // so concave pockets (many solid neighbours) close preferentially.
+    float p_fill = clamp(p_base + curv * float(solid - min_nn), 0.0, 1.0);
+    float r = hash_temporal(pos, 0);
+    float new_val = r < p_fill ? 1.0 : 0.0;
+    // ch1 = local fill pressure, ch2 = is_newly_grown.
+    imageStore(u_dst, pos, vec4(new_val, p_fill, new_val, 0.0));
+}
+""",
+
+    "fcc_forest_fire": """
+// 3D Drossel-Schwabl forest fire on the FCC lattice (12-NN ignition).
+//
+// 3 states (encoded in R as 0.0 / 0.5 / 1.0):
+//   0   empty   ground
+//   0.5 tree    living biomass
+//   1.0 burning currently on fire
+//
+// One time step:
+//   - burning -> empty (or a young tree with prob `immunity`)
+//   - tree    -> burning iff at least `ignite_min` of its 12 FCC
+//                neighbours are burning, OR struck by lightning (prob f)
+//   - empty   -> tree with regrowth prob p
+//
+// The 12-NN neighbourhood spreads fire isotropically (no cubic-axis fire
+// fronts). At p << 1, f << p the system self-organises to a critical state
+// with power-law fire-cluster sizes; ignite_min > 1 makes the forest
+// fire-resistant (fronts need a critical mass of burning neighbours).
+//
+//   u_param0 = p  (regrowth probability per empty cell per step)
+//   u_param1 = f  (lightning probability per tree cell per step)
+//   u_param2 = ignite_min (min burning neighbours to catch; 1 .. 4)
+//   u_param3 = immunity (0..1) fraction of trees surviving a burn
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+int ff_state(ivec3 p) {
+    float v = fetch(p).r;
+    if (v > 0.75) return 2;       // burning
+    if (v > 0.25) return 1;       // tree
+    return 0;                     // empty
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float p_grow = clamp(u_param0, 0.0, 1.0);
+    float p_lite = clamp(u_param1, 0.0, 1.0);
+    int   ig_min = clamp(int(u_param2 + 0.5), 1, 12);
+    float p_imm  = clamp(u_param3, 0.0, 1.0);
+
+    int s = ff_state(pos);
+    int new_s = s;
+
+    if (s == 2) {
+        // Burning -> ash, with a small chance of leaving a young tree.
+        new_s = (p_imm > 0.0 && hash_temporal(pos, 3) < p_imm) ? 1 : 0;
+    } else if (s == 1) {
+        int burning = 0;
+        for (int i = 0; i < 12; ++i) {
+            if (ff_state(pos + FCC_NN[i]) == 2) burning++;
+        }
+        bool ignite = burning >= ig_min;
+        if (!ignite && p_lite > 0.0 && hash_temporal(pos, 1) < p_lite) ignite = true;
+        new_s = ignite ? 2 : 1;
+    } else {
+        // Empty: regrow into a tree.
+        if (hash_temporal(pos, 2) < p_grow) new_s = 1;
+    }
+
+    float out_v = float(new_s) * 0.5;   // 0, 0.5, 1.0
+    float was_burning = (s == 2) ? 1.0 : 0.0;
+    float was_tree    = (s == 1) ? 1.0 : 0.0;
+    float just_ignite = (s == 1 && new_s == 2) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(out_v, was_burning, was_tree, just_ignite));
+}
+""",
+
+    "fcc_hodgepodge": """
+// 3D Hodgepodge machine (Gerhardt-Schuster cyclic CA, BZ-style) on the FCC
+// lattice (12 nearest neighbours instead of the cubic Moore 26).
+//
+// Each cell has an integer state in [0, N-1]:
+//   0           = "healthy" / quiescent
+//   1 .. N-2    = "infected" (infection level)
+//   N-1         = "ill" / refractory
+//
+// One FCC-neighbourhood update step:
+//   - healthy:  new state = floor(A/k1) + floor(B/k2), where A = infected
+//               neighbours, B = ill neighbours.
+//   - infected: new state = floor(sum_infected / (A+1)) + g.
+//   - ill:      reset to 0 (heal).
+//
+// Because every neighbour is equidistant, the excitable BZ-style waves
+// propagate as isotropic rhombic-dodecahedral shells / scroll rings with
+// no cubic-axis facets. Channel R stores state/(N-1) in [0,1].
+//
+//   u_param0 = N (number of states; 4 .. 256)
+//   u_param1 = g (advance increment when infected; 1 .. 8)
+//   u_param2 = k1 (healthy infection susceptibility; 1 .. 8)
+//   u_param3 = k2 (healthy ill-induced infection susceptibility; 1 .. 8)
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+int read_state(ivec3 p, int N) {
+    float v = fetch(p).r;
+    int s = int(round(v * float(N - 1)));
+    return clamp(s, 0, N - 1);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int N  = clamp(int(u_param0), 4, 256);
+    int g  = max(1, int(u_param1));
+    int k1 = max(1, int(u_param2));
+    int k2 = max(1, int(u_param3));
+
+    int s = read_state(pos, N);
+
+    int A = 0;        // count of infected neighbours
+    int B = 0;        // count of ill neighbours
+    int sum_inf = s;  // sum of "self + infected neighbours" for averaging
+
+    for (int i = 0; i < 12; ++i) {
+        int sn = read_state(pos + FCC_NN[i], N);
+        if (sn == N - 1) {
+            B += 1;
+        } else if (sn > 0) {
+            A += 1;
+            sum_inf += sn;
+        }
+    }
+
+    int new_s;
+    if (s == 0) {
+        new_s = (A / k1) + (B / k2);
+    } else if (s == N - 1) {
+        new_s = 0;  // heal
+    } else {
+        new_s = (sum_inf / (A + 1)) + g;
+    }
+    new_s = clamp(new_s, 0, N - 1);
+
+    float out_v = float(new_s) / float(max(N - 1, 1));
+    float a01 = float(A) * (1.0/12.0);
+    float b01 = float(B) * (1.0/12.0);
+    float self_v = float(s) / float(max(N - 1, 1));
+    imageStore(u_dst, pos, vec4(out_v, a01, b01, abs(out_v - self_v)));
+}
+""",
+
+    "fcc_fitzhugh_nagumo": """
+// FitzHugh-Nagumo excitable medium on the FCC lattice (12 nearest
+// neighbours). Same simplified Hodgkin-Huxley nerve-impulse kinetics as
+// fitzhugh_nagumo_3d, but only V (membrane potential) diffuses across the
+// 12 isotropic neighbours; W (slow recovery) stays local. Because every
+// neighbour is equidistant the travelling pulses, spiral waves and scroll
+// rings stay round with no cubic-axis bias.
+//
+//   dV/dt = D * lap(V) + V - V^3/3 - W
+//   dW/dt = epsilon * (V + a - b*W)
+//
+//   u_param0 = a (excitability)   u_param1 = b (recovery coupling)
+//   u_param2 = epsilon (timescale)  u_param3 = D (V diffusion)
+//
+// R = V (potential), G = W (recovery). hsv_phase maps atan2(W,V) -> hue.
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float V = self_val.r;
+    float W = self_val.g;
+
+    // FCC 12-NN Laplacian on the diffusing V channel only.
+    float nn_V = 0.0;
+    for (int i = 0; i < 12; ++i) nn_V += fetch(pos + FCC_NN[i]).r;
+    float lap_V = 0.5 * (nn_V - 12.0 * V) * h_sq;
+
+    float a       = u_param0;
+    float b       = u_param1;
+    float epsilon = u_param2;
+    float D       = u_param3;
+
+    // CFL-safe dt clamp (explicit Euler; isotropic 1/(2*Z) bound, Z=12).
+    float dt_limit = 0.9 / (0.5 * 12.0) / max(D * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float dV = D * lap_V + V - V * V * V / 3.0 - W;
+    float dW = epsilon * (V + a - b * W);
+
+    float new_V = clamp(V + dV * dt_eff, -3.0, 3.0);
+    float new_W = clamp(W + dW * dt_eff, -3.0, 3.0);
+
+    imageStore(u_dst, pos, vec4(new_V, new_W, 0.0, 0.0));
+}
+""",
+
+    "fcc_morphogen": """
+// Gierer-Meinhardt activator-inhibitor morphogenesis on the FCC lattice
+// (12-NN isotropic Laplacian). Same kinetics as morphogen_3d; the
+// equidistant neighbourhood makes the Turing spots pack as a round
+// rhombic-dodecahedral foam instead of the cubic-axis-aligned lattice of
+// spots the 19-point grid produces.
+//
+//   R = activator a, G = inhibitor h, B = tissue density rho
+//   da/dt = Da*lap(a) + react*(a^2/(h*(1+kappa a^2)) - a) + sigma_a
+//   dh/dt = Dh*lap(h) + react*(a^2 - h)
+//   drho/dt = growth*(a - 0.3)*rho + 0.002*lap(rho)
+//
+//   u_param0 = Da (activator)   u_param1 = Dh (inhibitor, the key ratio)
+//   u_param2 = reaction         u_param3 = growth
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float a   = self_val.r;  // activator
+    float h   = self_val.g;  // inhibitor
+    float rho = self_val.b;  // tissue density / growth
+
+    vec3 nn = vec3(0.0);
+    for (int i = 0; i < 12; ++i) nn += fetch(pos + FCC_NN[i]).rgb;
+    vec3 lap = 0.5 * (nn - 12.0 * self_val.rgb) * h_sq;
+    float lap_a   = lap.r;
+    float lap_h   = lap.g;
+    float lap_rho = lap.b;
+
+    float Da     = u_param0;
+    float Dh     = u_param1;
+    float react  = u_param2;
+    float growth = u_param3;
+
+    float mu_a = 1.0;
+    float mu_h = 1.0;
+    float sigma_a = 0.01;
+    float a2 = a * a;
+    float kappa = 0.1;
+    float production = a2 / (h + 0.001) / (1.0 + kappa * a2);
+    float d_a   = Da * lap_a + react * (production - mu_a * a) + sigma_a;
+    float d_h   = Dh * lap_h + react * (a2 - mu_h * h);
+    float d_rho = growth * (a - 0.3) * rho + 0.002 * lap_rho;
+
+    // CFL-safe dt clamp on the fastest diffusive channel (Z=12 bound).
+    float D_max    = max(max(Da, Dh), 0.002);
+    float dt_limit = 0.9 / (0.5 * 12.0) / max(D_max * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float new_a   = clamp(a   + d_a   * dt_eff, 0.0, 5.0);
+    float new_h   = clamp(h   + d_h   * dt_eff, 0.0, 10.0);
+    float new_rho = clamp(rho + d_rho * dt_eff, 0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_a, new_h, new_rho, 0.0));
+}
+""",
+
+    "fcc_prisoners_dilemma": """
+// Spatial Prisoner's Dilemma (Nowak-May, 1992) on the FCC lattice. Each
+// cell is a player with strategy s in {0=defector, 1=cooperator}. Every
+// round it plays one PD against each of its 12 nearest neighbours under
+// the canonical 1-parameter payoff (coop|coop=1, defect|coop=b, *|defect=0,
+// b>1 the temptation), accumulates a score, then imitates the highest-
+// scoring strategy in its 13-cell neighbourhood (self + 12 NN). The 12-NN
+// coordination sits between the 2D Moore-8 and cubic Moore-26 cases, so the
+// cooperator/defector frontier stays axis-free.
+//
+//   u_param0 = b        temptation payoff (1.0..2.5)
+//   u_param1 = mut      mutation rate (chance to flip strategy)
+//   u_param2 = tie_keep on payoff ties keep own strategy (1) or random (0)
+//   u_param3 = excl     0 = self-included neighbourhood, 1 = exclude self
+//
+// R = strategy (0/1, read by rule). G = self payoff (normalised),
+// B = local cooperator fraction, A = strategy-changed flag.
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+float pd_strat(ivec3 p) {
+    return fetch(p).r > 0.5 ? 1.0 : 0.0;
+}
+
+// Score for cell q: each cooperating neighbour pays 1 if q cooperates,
+// or b if q defects; defecting neighbours pay nothing.
+float pd_score(ivec3 q, float b) {
+    float s = pd_strat(q);
+    float total = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        float n = pd_strat(q + FCC_NN[i]);
+        if (s > 0.5 && n > 0.5) total += 1.0;
+        if (s < 0.5 && n > 0.5) total += b;
+    }
+    return total;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float b       = clamp(u_param0, 1.0, 3.0);
+    float mut     = clamp(u_param1, 0.0, 1.0);
+    int   tieKeep = int(u_param2 + 0.5);
+    int   excl    = int(u_param3 + 0.5);
+
+    float self_s     = pd_strat(pos);
+    float self_score = pd_score(pos, b);
+    float best_score = (excl == 1) ? -1.0 : self_score;
+    float best_strat = self_s;
+    float coop_neigh = 0.0;
+
+    for (int i = 0; i < 12; ++i) {
+        ivec3 q = pos + FCC_NN[i];
+        float sc = pd_score(q, b);
+        float st = pd_strat(q);
+        coop_neigh += st;
+        if (sc > best_score) {
+            best_score = sc;
+            best_strat = st;
+        } else if (sc == best_score && st != best_strat) {
+            if (tieKeep == 0 && hash_temporal(pos, 0) < 0.5) best_strat = st;
+        }
+    }
+
+    if (mut > 0.0 && hash_temporal(pos, 1) < mut) {
+        best_strat = 1.0 - best_strat;
+    }
+
+    float score01  = clamp(self_score / (b * 12.0), 0.0, 1.0);
+    float coop01   = coop_neigh * (1.0 / 12.0);
+    float changed  = (best_strat != self_s) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(best_strat, score01, coop01, changed));
 }
 """,
 
@@ -9813,8 +10964,9 @@ layout(std430, binding=6) buffer TotalCounter {
     uint totalVisibleCount;
 };
 uniform int u_reset_total;  // 1 = also reset frame-level total (first chunk only)
+uniform int u_vertex_count; // per-instance vertex count (36 cube / 72 rhombic-dodec)
 void main() {
-    vertexCount = 36u;
+    vertexCount = uint(u_vertex_count);
     instanceCount = 0u;
     firstVertex = 0u;
     baseInstance = 0u;
@@ -11291,7 +12443,16 @@ uniform int u_vis_mode;
 uniform float u_vis_lo;
 uniform float u_vis_hi;
 
-// Cube vertices: 36 vertices (12 triangles, 6 faces)
+// ── Lattice (FCC) index->world transform ──────────────────────────────
+// When u_lattice_fcc == 1, cell index coordinates are mapped to world
+// space through u_lattice_M (the FCC primitive-cell basis) so cells render
+// as sheared rhombic cells at their true isotropic positions, recentred on
+// the unit-cube centre. When u_lattice_fcc == 0 (cubic, the default) this
+// block is skipped entirely and the legacy axis-aligned mapping is used,
+// keeping cubic rules byte-for-byte unchanged.
+uniform int  u_lattice_fcc;
+uniform mat3 u_lattice_M;
+uniform mat3 u_lattice_M_inv;
 const vec3 cube_verts[36] = vec3[36](
     // -Z face
     vec3(0,0,0), vec3(1,0,0), vec3(1,1,0),  vec3(0,0,0), vec3(1,1,0), vec3(0,1,0),
@@ -11314,6 +12475,62 @@ const vec3 cube_normals[6] = vec3[6](
 // Face normal directions as ivec3 for neighbor lookup (matches cube_normals order)
 const ivec3 face_dirs[6] = ivec3[6](
     ivec3(0,0,-1), ivec3(0,0,1), ivec3(-1,0,0), ivec3(1,0,0), ivec3(0,-1,0), ivec3(0,1,0)
+);
+
+// ── Rhombic-dodecahedron geometry (FCC Wigner-Seitz / Voronoi cell) ──
+// When rendering the FCC lattice each cell is drawn as its true Voronoi
+// cell: a rhombic dodecahedron whose 12 faces are the perpendicular
+// bisectors of the 12 nearest-neighbour bonds. Adjacent cells share whole
+// faces, so the cells visibly interlock with no gaps (the actual "FCC packs
+// space perfectly" property). Canonical vertices (faces at distance sqrt(2)
+// from centre): 8 cube-type (+-1,+-1,+-1) and 6 axis-type (+-2,0,0)... .
+// In our world frame the 12 NN bonds lie along (+-1,+-1,0)-type directions,
+// so the polyhedron is axis-aligned in world space — no shear of the cell
+// shape itself, only of the lattice of cell centres.
+// 12 faces x 2 triangles x 3 verts = 72 vertices, face_id = vert_id / 6.
+const vec3 rd_verts[72] = vec3[72](
+    // face 0  n=(+1,+1,0)
+    vec3( 2,0,0), vec3( 1, 1, 1), vec3(0, 2,0),  vec3( 2,0,0), vec3(0, 2,0), vec3( 1, 1,-1),
+    // face 1  n=(-1,-1,0)
+    vec3(-2,0,0), vec3(-1,-1, 1), vec3(0,-2,0),  vec3(-2,0,0), vec3(0,-2,0), vec3(-1,-1,-1),
+    // face 2  n=(0,+1,+1)
+    vec3(0, 2,0), vec3( 1, 1, 1), vec3(0,0, 2),  vec3(0, 2,0), vec3(0,0, 2), vec3(-1, 1, 1),
+    // face 3  n=(0,-1,-1)
+    vec3(0,-2,0), vec3( 1,-1,-1), vec3(0,0,-2),  vec3(0,-2,0), vec3(0,0,-2), vec3(-1,-1,-1),
+    // face 4  n=(+1,0,+1)
+    vec3( 2,0,0), vec3( 1, 1, 1), vec3(0,0, 2),  vec3( 2,0,0), vec3(0,0, 2), vec3( 1,-1, 1),
+    // face 5  n=(-1,0,-1)
+    vec3(-2,0,0), vec3(-1, 1,-1), vec3(0,0,-2),  vec3(-2,0,0), vec3(0,0,-2), vec3(-1,-1,-1),
+    // face 6  n=(+1,0,-1)
+    vec3( 2,0,0), vec3( 1, 1,-1), vec3(0,0,-2),  vec3( 2,0,0), vec3(0,0,-2), vec3( 1,-1,-1),
+    // face 7  n=(-1,0,+1)
+    vec3(-2,0,0), vec3(-1, 1, 1), vec3(0,0, 2),  vec3(-2,0,0), vec3(0,0, 2), vec3(-1,-1, 1),
+    // face 8  n=(-1,+1,0)
+    vec3(-2,0,0), vec3(-1, 1, 1), vec3(0, 2,0),  vec3(-2,0,0), vec3(0, 2,0), vec3(-1, 1,-1),
+    // face 9  n=(+1,-1,0)
+    vec3( 2,0,0), vec3( 1,-1, 1), vec3(0,-2,0),  vec3( 2,0,0), vec3(0,-2,0), vec3( 1,-1,-1),
+    // face 10 n=(0,+1,-1)
+    vec3(0, 2,0), vec3( 1, 1,-1), vec3(0,0,-2),  vec3(0, 2,0), vec3(0,0,-2), vec3(-1, 1,-1),
+    // face 11 n=(0,-1,+1)
+    vec3(0,-2,0), vec3( 1,-1, 1), vec3(0,0, 2),  vec3(0,-2,0), vec3(0,0, 2), vec3(-1,-1, 1)
+);
+
+// Outward world-space normals for the 12 rhombic faces (unit length).
+const vec3 rd_normals[12] = vec3[12](
+    vec3( 0.70710678,  0.70710678, 0.0       ), vec3(-0.70710678, -0.70710678, 0.0       ),
+    vec3( 0.0,         0.70710678, 0.70710678 ), vec3( 0.0,       -0.70710678,-0.70710678 ),
+    vec3( 0.70710678,  0.0,        0.70710678 ), vec3(-0.70710678,  0.0,       -0.70710678 ),
+    vec3( 0.70710678,  0.0,       -0.70710678 ), vec3(-0.70710678,  0.0,        0.70710678 ),
+    vec3(-0.70710678,  0.70710678, 0.0       ), vec3( 0.70710678, -0.70710678, 0.0       ),
+    vec3( 0.0,         0.70710678,-0.70710678 ), vec3( 0.0,       -0.70710678, 0.70710678 )
+);
+
+// Index-space neighbour offset behind each rhombic face (for hidden-face
+// culling). Matches the FCC 12-NN order used by the compute stencil.
+const ivec3 rd_neighbors[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0), ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1), ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1), ivec3( 1, 0,-1), ivec3(-1, 0, 1)
 );
 
 out vec3 v_normal;
@@ -11346,9 +12563,13 @@ void main() {
                         int((pdata >>  __PB__) & __PMASK__),
                         int((pdata >> (2u * __PB__)) & __PMASK__));
 
-    // Per-face visibility: degenerate triangles for faces hidden by a neighbor
+    // Per-face visibility: degenerate triangles for faces hidden by a neighbor.
+    // Cubic cells have 6 faces (face_id 0..5); FCC rhombic-dodecahedron cells
+    // have 12 (face_id 0..11). The hidden-face test uses the neighbour behind
+    // each face — the 6 axial dirs for the cube, the 12 FCC bonds for the RD.
     int face_id = vert_id / 6;
-    if (nb_alive(ipos + face_dirs[face_id])) {
+    ivec3 cull_dir = (u_lattice_fcc == 1) ? rd_neighbors[face_id] : face_dirs[face_id];
+    if (nb_alive(ipos + cull_dir)) {
         gl_Position = vec4(0.0);
         v_normal = vec3(0.0);
         v_world_pos = vec3(0.0);
@@ -11416,15 +12637,32 @@ void main() {
         }
     }
 
-    // Cube vertex
-    vec3 local_pos = cube_verts[vert_id];
-    vec3 normal = cube_normals[face_id];
-
-    // Scale and position: map grid coords to [0,1]^3 box
+    // Cell geometry
     float cell_size = 1.0 / float(u_size);
     float shrink = 1.0 - u_voxel_gap;
-    vec3 offset = cell_pos * cell_size + cell_size * 0.5 * (1.0 - shrink);
-    vec3 world_pos = offset + local_pos * cell_size * shrink;
+    vec3 world_pos;
+    vec3 normal;
+    if (u_lattice_fcc == 1) {
+        // FCC: draw the cell's rhombic-dodecahedron Voronoi cell. The cell
+        // CENTRES form the sheared FCC lattice (centre = M * index), but the
+        // cell SHAPE is the axis-aligned RD, so neighbouring cells share whole
+        // faces and interlock with no gaps. Recentre the block on the unit
+        // cube so the existing camera framing (target ~ (0.5,0.5,0.5)) sees it.
+        vec3 center = u_lattice_M * (cell_pos - vec3(float(u_size) * 0.5)) * cell_size
+                      + vec3(0.5);
+        // Canonical RD faces sit at distance sqrt(2); scale so they sit at
+        // half the nearest-neighbour spacing (0.5 * cell_size) and apply the
+        // voxel gap via `shrink`.
+        const float RD_SCALE = 0.35355339;  // 0.5 / sqrt(2)
+        world_pos = center + rd_verts[vert_id] * (cell_size * RD_SCALE * shrink);
+        normal = rd_normals[face_id];
+    } else {
+        // Cubic: unit cube mapped into the [0,1]^3 box (legacy path, unchanged).
+        vec3 local_pos = cube_verts[vert_id];
+        normal = cube_normals[face_id];
+        vec3 offset = cell_pos * cell_size + cell_size * 0.5 * (1.0 - shrink);
+        world_pos = offset + local_pos * cell_size * shrink;
+    }
 
     gl_Position = u_view_proj * vec4(world_pos, 1.0);
     v_normal = normal;
@@ -14629,6 +15867,634 @@ RULE_PRESETS = {
         "vis_default": 1,
         "vis_abs": False,
         "vis_mode": "rgb_channels",  # R=U substrate, G=V catalyst (anti-correlated by design)
+        "boundary": "toroidal",
+    },
+
+    "fcc_gray_scott": {
+        "label": "FCC Gray-Scott (isotropic)",
+        "shader": "fcc_gray_scott",
+        # First non-cubic preset. The data is stored in the same dense 3D
+        # texture as every cubic rule; only (1) the compute stencil (12 FCC
+        # nearest neighbours) and (2) the voxel renderer's index->world basis
+        # (LATTICE_M) differ. Spots/worms grow with no cubic-axis bias.
+        "lattice": "fcc",
+        "params": {"Feed rate": 0.030, "Kill rate": 0.062,
+                   "U diffusion": 0.16, "V diffusion": 0.08},
+        "param_ranges": {"Feed rate": (0.010, 0.060), "Kill rate": (0.040, 0.072),
+                         "U diffusion": (0.05, 0.30), "V diffusion": (0.02, 0.15)},
+        "dt": 1.0,
+        "dt_range": (0.1, 2.5),
+        "init": "gray_scott",
+        "init_variants": ["gray_scott"],
+        "description": ("Gray-Scott on the face-centred-cubic lattice: 12 isotropic "
+                        "nearest neighbours (rhombic-dodecahedron cell) remove the "
+                        "cubic-axis bias of the standard grid. Cells render through "
+                        "the FCC basis as sheared rhombic voxels."),
+        "vis_channels": ["U (substrate)", "V (catalyst)"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",  # FCC currently renders via the voxel path only
+        "boundary": "toroidal",
+    },
+
+    "fcc_excitable": {
+        "label": "FCC Excitable (scroll waves)",
+        "shader": "fcc_excitable",
+        "lattice": "fcc",
+        # Greenberg-Hastings on the 12 FCC nearest neighbours. From random
+        # initial states the medium self-organises into rotating 3D scroll
+        # waves; the isotropic neighbourhood keeps the wavefronts round.
+        "params": {"N states": 6.0, "Threshold": 2.0,
+                   "unused_0": 0.0, "unused_1": 0.0},
+        "param_ranges": {"N states": (4.0, 24.0), "Threshold": (1.0, 8.0),
+                         "unused_0": (0.0, 1.0), "unused_1": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "fcc_excitable",
+        "init_variants": ["fcc_excitable"],
+        "description": ("Greenberg-Hastings excitable medium on the FCC lattice: "
+                        "resting -> excited -> refractory cells fire across the 12 "
+                        "isotropic nearest neighbours, producing axis-free 3D scroll "
+                        "waves. Only the moving wave shells (excited + refractory) "
+                        "are drawn; resting bulk is hidden."),
+        "vis_channels": ["State", "Wave intensity"],
+        "vis_default": 1,
+        "vis_abs": False,
+        # Show only the bright leading fronts (excited cells, intensity ~1.0);
+        # the dim refractory tail is hidden so the moving scroll-wave shells
+        # read clearly through the sparse voxel renderer instead of a solid mass.
+        "voxel_threshold": 0.85,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_life": {
+        "label": "FCC Life (12-neighbour)",
+        "shader": "fcc_life",
+        "lattice": "fcc",
+        # Outer-totalistic Life over the 12 FCC nearest neighbours. B4-5/S3-5
+        # is the tuned sweet spot from a headless 144-rule sweep: from a
+        # moderate fBm soup the population self-regulates to a steady ~4% fill
+        # (verified flat across 700 steps) -- a sparse, perpetually churning
+        # ecology of rhombic clusters that neither dies out nor floods the box.
+        "params": {"Birth low": 4.0, "Birth high": 5.0,
+                   "Survive low": 3.0, "Survive high": 5.0},
+        "param_ranges": {"Birth low": (1.0, 12.0), "Birth high": (1.0, 12.0),
+                         "Survive low": (1.0, 12.0), "Survive high": (1.0, 12.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "life_fbm_moderate",
+        "init_variants": ["life_fbm_moderate", "life_fbm_sparse"],
+        "description": ("Outer-totalistic Life on the face-centred-cubic lattice. "
+                        "Each cell weighs its 12 equidistant neighbours, so colonies "
+                        "grow as rounded rhombic-dodecahedral blobs with no cubic-axis "
+                        "bias instead of the boxy clusters of 26-neighbour 3D Life."),
+        "vis_channels": ["Alive", "Neighbour density"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "sparse_dispatch": True,
+        "precision": "fp32",
+    },
+
+    "fcc_crystal": {
+        "label": "FCC Crystal (natural habit)",
+        "shader": "fcc_crystal",
+        "lattice": "fcc",
+        # Phase-field solidification using the 12-NN isotropic Laplacian.
+        # Unlike the cubic crystal_growth rule (which needs an explicit
+        # beta(n) facet kernel), this crystal takes its habit straight from
+        # the FCC lattice: the rhombic-dodecahedral Wigner-Seitz cell biases
+        # growth toward the <110> family, so a single seed grows into the
+        # lattice's own natural shape. Growth is mass-limited by the finite
+        # supersaturation reservoir seeded by crystal_seed and halts on its
+        # own before reaching the wall. Coupling=0.7 is the tuned sweet spot:
+        # a headless sweep showed 0.4->fills 63%% of the box, 1.0->barely
+        # grows, 0.7->a ~9%% skeletal/hopper crystal with clear <110> facets.
+        "params": {"Undercooling": 2.5, "Diffusion": 0.6,
+                   "Coupling": 0.7, "Mobility": 3.0},
+        "param_ranges": {"Undercooling": (0.5, 4.0), "Diffusion": (0.1, 1.5),
+                         "Coupling": (0.1, 1.5), "Mobility": (0.5, 4.0)},
+        "dt": 0.1,
+        "dt_range": (0.02, 0.5),
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed"],
+        "audit_steps": 2000,
+        "description": ("Solidification phase-field on the FCC lattice: a seed grows "
+                        "into the lattice's natural rhombic-dodecahedral / octahedral "
+                        "habit driven by a consumable supersaturation field, with no "
+                        "hand-coded anisotropy -- the 12-NN stencil's own symmetry "
+                        "picks the crystal facets."),
+        "vis_channels": ["Phase", "Supersaturation"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+        "precision": "fp32",
+    },
+
+    "fcc_cyclic": {
+        "label": "FCC Cyclic (target waves)",
+        "shader": "fcc_cyclic",
+        "lattice": "fcc",
+        # N-colour rock-paper-scissors dominance cycle on the FCC NN. Tuned
+        # headlessly: with all 12 neighbours the medium either freezes
+        # (threshold>=2) or cycles in lockstep (threshold 1); polling a
+        # reduced sub-shell (Neighbourhood=4) is what lets coherent
+        # concentric target / spiral wavefronts nucleate and keep sweeping.
+        # N=6 / threshold=1 / R=4 gives the cleanest, continuously dynamic
+        # nested-ring fronts. Raise Neighbourhood toward 12 for more
+        # isotropic but increasingly turbulent waves.
+        "params": {"N colours": 6.0, "Threshold": 1.0,
+                   "Neighbourhood": 4.0, "unused_0": 0.0},
+        "param_ranges": {"N colours": (3.0, 24.0), "Threshold": (1.0, 6.0),
+                         "Neighbourhood": (4.0, 12.0), "unused_0": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "cyclic_ca",
+        "init_variants": ["cyclic_ca"],
+        "description": ("Cyclic (Greenberg-Hastings) CA on the face-centred-cubic "
+                        "lattice: a 3D rock-paper-scissors colour cycle whose "
+                        "wavefronts self-organise into nested concentric target and "
+                        "spiral waves. It fills the volume, so the rhombic-"
+                        "dodecahedron surface reveals the wave fronts as banded "
+                        "rings; the Neighbourhood knob trades pattern coherence "
+                        "against isotropy."),
+        "vis_channels": ["Colour", "Phase"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "voxel_threshold": 0.0,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_dla": {
+        "label": "FCC DLA (isotropic dendrite)",
+        "shader": "fcc_dla",
+        "lattice": "fcc",
+        # Diffusion-limited / dielectric-breakdown aggregation. Feed and
+        # Stickiness are the growth knobs; Eta (the Niemeyer-Pietronero
+        # exponent) controls how dendritic vs compact the cluster is.
+        # Tuned headlessly: sticking must be RARE (so nutrient depletion has
+        # time to shield the fjords) for a ramified fractal rather than a
+        # compact Eden blob -> Stickiness 0.022 / Eta 4.5 / Feed 0.006.
+        "params": {"Diffusion": 1.0, "Feed": 0.006,
+                   "Stickiness": 0.022, "Eta": 4.5},
+        "param_ranges": {"Diffusion": (0.2, 1.5), "Feed": (0.0, 0.2),
+                         "Stickiness": (0.005, 0.5), "Eta": (1.0, 6.0)},
+        "dt": 0.5,
+        "dt_range": (0.1, 1.0),
+        "init": "fcc_dla",
+        "init_variants": ["fcc_dla"],
+        "audit_steps": 2000,
+        "description": ("Diffusion-limited aggregation on the FCC lattice: a single "
+                        "seed grows a stochastic fractal dendrite as it consumes a "
+                        "diffusing nutrient field. Nutrient depletion shields the "
+                        "fjords so growth runs to the tips; the 12-NN lattice keeps "
+                        "the branches isotropic (coral, not a six-armed cross)."),
+        "vis_channels": ["Aggregate", "Nutrient"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_sandpile": {
+        "label": "FCC Sandpile (SOC avalanches)",
+        "shader": "fcc_sandpile",
+        "lattice": "fcc",
+        # Abelian (Bak-Tang-Wiesenfeld) sandpile, critical height K=12 (one
+        # per FCC neighbour). Tuned headlessly: a single central drip just
+        # piles up faster than a cell can shed, so driving is instead a faint
+        # uniform RAIN (prob 0.004/cell/step). The pile self-organises to
+        # criticality and sheds scale-free avalanches that dissipate off the
+        # open boundary (toppling fraction plateaus ~0.07 = SOC steady state).
+        "params": {"Drip rate": 0.0, "Critical K": 12.0,
+                   "Rain prob": 0.004, "unused_0": 0.0},
+        "param_ranges": {"Drip rate": (0.0, 64.0), "Critical K": (6.0, 20.0),
+                         "Rain prob": (0.0, 0.02), "unused_0": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "fcc_sandpile",
+        "init_variants": ["fcc_sandpile"],
+        "description": ("Abelian sandpile (self-organised criticality) on the FCC "
+                        "lattice: cells topple a grain to each of their 12 neighbours "
+                        "at the critical height, so a steady central drip sheds "
+                        "scale-free avalanches as isotropic shells instead of the "
+                        "axis-aligned diamonds of a 6-neighbour grid."),
+        "vis_channels": ["Height", "Toppling"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+        "precision": "fp32",
+    },
+
+    "fcc_schnakenberg": {
+        "label": "FCC Schnakenberg (Turing spots)",
+        "shader": "fcc_schnakenberg",
+        "lattice": "fcc",
+        # Activator-substrate Turing system on the 12 FCC nearest neighbours.
+        # The isotropic stencil lets the V-spots pack as a rhombic-
+        # dodecahedral foam instead of the cubic-axis lattice of spots the
+        # 19-point grid produces. Same kinetics/params as schnakenberg_3d.
+        "params": {"a": 0.1, "b": 0.9, "Du": 0.05, "Dv": 1.0},
+        "param_ranges": {"a": (0.02, 0.3), "b": (0.3, 1.5),
+                         "Du": (0.01, 0.3), "Dv": (0.3, 3.0)},
+        "dt": 0.5,
+        "dt_range": (0.1, 2.0),
+        "init": "schnakenberg",
+        "init_variants": ["schnakenberg"],
+        "description": ("Schnakenberg activator-substrate Turing system on the "
+                        "face-centred-cubic lattice: V-activator spots self-organise "
+                        "into an isotropic rhombic-dodecahedral packing with no "
+                        "cubic-axis bias."),
+        "vis_channels": ["U (substrate)", "V (activator)"],
+        # Show the activator U: its spots spike to ~1.6-2.0 over a uniform
+        # U*~1 bulk, so a value-level voxel_threshold of 1.6 culls the bulk
+        # and leaves only the Turing spots (~14% of cells). (V instead sits
+        # near its fixed point ~0.9 everywhere, so thresholding V renders a
+        # solid blob.)
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_range": (1.0, 2.0),
+        "voxel_threshold": 1.6,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_brusselator": {
+        "label": "FCC Brusselator (autocatalytic)",
+        "shader": "fcc_brusselator",
+        "lattice": "fcc",
+        # Prigogine autocatalytic oscillator with Hopf + Turing regimes on the
+        # 12 FCC nearest neighbours. U-peaks render as isotropic spots.
+        "params": {"A": 1.0, "B": 3.0, "Du": 2.0, "Dv": 8.0},
+        # Narrowed vs the cubic brusselator_3d: the Turing/Hopf instability is
+        # a small island (needs B above the diffusion-driven threshold and
+        # Dv >> Du), so the cubic's wide ranges almost never sample an active
+        # regime under random MAP-Elites search. These bounds keep most draws
+        # inside the pattern-forming window so the rule is actually discoverable.
+        "param_ranges": {"A": (0.6, 1.6), "B": (2.2, 5.0),
+                         "Du": (1.0, 4.0), "Dv": (5.0, 14.0)},
+        "dt": 0.05,
+        "dt_range": (0.02, 0.08),
+        "init": "brusselator",
+        "init_variants": ["brusselator"],
+        "description": ("Brusselator on the face-centred-cubic lattice: autocatalytic "
+                        "U-peaks form isotropic 3D Turing spots / oscillating fronts "
+                        "without the cubic-axis alignment of the standard grid."),
+        "vis_channels": ["U", "V"],
+        "vis_default": 0,
+        "vis_abs": False,
+        # U bulk sits near the well-mixed mean ~1 with isolated peaks at 3-5;
+        # a value-level voxel_threshold of 2.5 culls the bulk so only the
+        # autocatalyst spots draw.
+        "vis_range": (2.5, 5.0),
+        "voxel_threshold": 2.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_fitzhugh_nagumo": {
+        "label": "FCC FitzHugh-Nagumo (scroll waves)",
+        "shader": "fcc_fitzhugh_nagumo",
+        "lattice": "fcc",
+        # Excitable membrane on the 12 FCC nearest neighbours (only V
+        # diffuses). Same auto-oscillatory regime as fitzhugh_nagumo_3d:
+        # the V*~-0.2 equilibrium sits on the unstable branch of the cubic
+        # nullcline (Hopf-crossed), so every voxel is a limit-cycle
+        # oscillator and the medium sustains scroll waves forever from any
+        # phase-varied seed. The isotropic 12-NN stencil keeps the rotating
+        # wavefronts round with no cubic-axis bias.
+        "params": {"a": 0.1, "b": 0.5, "ε": 0.10, "D": 1.0},
+        "param_ranges": {"a": (0.0, 1.5), "b": (0.1, 2.0),
+                         "ε": (0.005, 0.5), "D": (0.1, 4.0)},
+        "dt": 0.2,
+        "dt_range": (0.05, 0.5),
+        "init": "fitzhugh_nagumo",
+        "init_variants": ["fitzhugh_nagumo"],
+        "description": ("FitzHugh-Nagumo excitable medium on the face-centred-cubic "
+                        "lattice: auto-oscillatory nerve-impulse kinetics whose only "
+                        "the depolarised wavefronts are drawn, sweeping the box as "
+                        "axis-free 3D scroll waves over a hidden resting bulk."),
+        "vis_channels": ["V (potential)", "W (recovery)"],
+        # Show only the depolarised wavefront: in the oscillatory regime V
+        # swings roughly [-2, +2] everywhere, so a value-level threshold of
+        # 0.8 lights the cells currently excited (V>0.8) and hides the
+        # resting/refractory bulk, leaving moving scroll-wave shells (mirror
+        # of the fcc_excitable front-only rendering).
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_range": (0.0, 2.0),
+        "voxel_threshold": 0.8,
+        "render_mode": "voxel",
+        # Mirror (Neumann zero-flux) BC: scroll filaments survive on a closed
+        # domain because the wavefront cannot wrap and annihilate against its
+        # own refractory wake (the toroidal failure mode that quenched the
+        # cube to uniform rest on small boxes).
+        "boundary": "mirror",
+        "precision": "fp32",
+    },
+
+    "fcc_morphogen": {
+        "label": "FCC Morphogen (Turing spots)",
+        "shader": "fcc_morphogen",
+        "lattice": "fcc",
+        # Gierer-Meinhardt activator-inhibitor system on the 12 FCC nearest
+        # neighbours (all three fields diffuse). High inhibitor diffusion
+        # (Dh/Da large) gives isolated activator peaks; the isotropic stencil
+        # packs them as a rhombic-dodecahedral spot foam rather than the
+        # cubic-axis lattice of spots the 19-point grid produces.
+        # Tuned to a sharply bimodal regime: the activator bulk sits low
+        # (~0.4) while Turing peaks spike to ~4, so a value threshold of 1.6
+        # leaves only the isolated spot cores (~14% of cells) instead of a
+        # near-uniform blob. Low growth keeps the spots from coarsening into
+        # a space-filling mass over time.
+        "params": {"Da (activator)": 0.008, "Dh (inhibitor)": 8.0,
+                   "Reaction": 0.08, "Growth": 0.01},
+        "param_ranges": {"Da (activator)": (0.001, 2.0), "Dh (inhibitor)": (0.1, 50.0),
+                         "Reaction": (0.005, 0.5), "Growth": (0.002, 0.3)},
+        "dt": 0.1,
+        "dt_range": (0.02, 0.5),
+        "init": "morphogen_hotspots",
+        "init_variants": ["morphogen_hotspots", "morphogen"],
+        "description": ("Gierer-Meinhardt morphogenesis on the face-centred-cubic "
+                        "lattice: an activator-inhibitor pair self-organises into a "
+                        "regular 3D Turing spot packing -- the same mechanism that "
+                        "lays out an animal's spots -- with no cubic-axis alignment."),
+        "vis_channels": ["Activator", "Inhibitor", "Tissue density"],
+        # Activator is sharply bimodal (bulk ~0.4, spot peaks ~4); a value
+        # threshold of 1.6 culls the bulk and lights only the spot cores so
+        # the regular 3D spot packing reads clearly.
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_range": (0.6, 4.0),
+        "voxel_threshold": 1.6,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_prisoners_dilemma": {
+        "label": "FCC Prisoner's Dilemma",
+        "shader": "fcc_prisoners_dilemma",
+        "lattice": "fcc",
+        # Nowak-May spatial PD on the 12 FCC nearest neighbours. Each round
+        # every cell scores against its 12 neighbours under the (1, b, 0, 0)
+        # payoff and imitates the best-scoring strategy in its 13-cell
+        # neighbourhood. The 12-NN coordination sits between the 2D Moore-8
+        # (critical b~1.85) and cubic Moore-26 (critical b~1.65) cases, so the
+        # chaotic cooperator/defector coexistence regime sits around b~1.75;
+        # the frontier stays axis-free instead of aligning to the grid axes.
+        "params": {"Temptation b": 1.75, "Mutation": 0.001,
+                   "Tie keep": 1.0, "Exclude self": 0.0},
+        "param_ranges": {"Temptation b": (1.0, 2.5), "Mutation": (0.0, 0.05),
+                         "Tie keep": (0.0, 1.0), "Exclude self": (0.0, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "pd_random",
+        "init_variants": ["pd_random", "pd_invading"],
+        "description": ("Spatial Prisoner's Dilemma on the face-centred-cubic "
+                        "lattice: cooperators and defectors compete for territory "
+                        "across the 12 isotropic neighbours, and cooperation "
+                        "survives greedy invasion as a spatio-temporally chaotic, "
+                        "axis-free frontier. Only the cooperator clusters are drawn."),
+        "vis_channels": ["Strategy", "Score", "Coop fraction", "Changed"],
+        # Strategy channel is 0 (defect) / 1 (coop); threshold 0.5 draws only
+        # the cooperator clusters against a hidden defector sea.
+        "vis_default": 0,
+        "vis_abs": False,
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_kuramoto": {
+        "label": "FCC Kuramoto Oscillators",
+        "shader": "fcc_kuramoto",
+        "lattice": "fcc",
+        # Coupled phase oscillators on the 12 FCC nearest neighbours. The
+        # isotropic coupling makes synchronisation domains and phase-
+        # singularity filaments axis-free. Same params as kuramoto_3d.
+        "params": {"Coupling K": 0.5, "Noise": 0.02,
+                   "Freq scale": 0.1, "Adaptation": 0.5},
+        "param_ranges": {"Coupling K": (0.01, 1.5), "Noise": (0.01, 0.8),
+                         "Freq scale": (0.05, 2.0), "Adaptation": (0.0, 3.0)},
+        "dt": 0.1,
+        "dt_range": (0.02, 0.3),
+        "init": "kuramoto_clusters",
+        "init_variants": ["kuramoto_clusters"],
+        "description": ("Kuramoto coupled oscillators on the face-centred-cubic "
+                        "lattice: adaptive frequencies and 12-neighbour isotropic "
+                        "coupling produce axis-free synchronisation domains and "
+                        "chimera states. The phase field fills the volume, so the "
+                        "rhombic-dodecahedron surface bands by phase."),
+        "vis_channels": ["Phase", "Frequency", "Coherence"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "hsv_phase",  # ch0 phase -> hue
+        "voxel_threshold": 0.0,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_ising": {
+        "label": "FCC Ising / Spin Glass",
+        "shader": "fcc_ising",
+        "lattice": "fcc",
+        # Metropolis spin dynamics on the 12 FCC nearest neighbours. NOTE the
+        # FCC NN graph is non-bipartite (it has triangles), so the cubic
+        # 2-colour (x+y+z) checkerboard fails; the shader instead uses an
+        # 8-colouring by per-axis parity, which is conflict-free on FCC.
+        # Mean-field T_c rises with coordination (z=12 vs 6), so the
+        # interesting window sits higher than the cubic ~4.51.
+        "params": {"Temperature": 9.0, "Field h": 0.0,
+                   "J coupling": 1.0, "Update prob": 1.0},
+        "param_ranges": {"Temperature": (1.0, 16.0), "Field h": (-2.0, 2.0),
+                         "J coupling": (-2.0, 2.0), "Update prob": (0.1, 1.0)},
+        "dt": 1.0,
+        "init": "random_spins",
+        "init_variants": ["random_spins"],
+        "description": ("3D Ising model with Metropolis dynamics on the face-centred-"
+                        "cubic lattice. The 12-coordinated NN graph is non-bipartite, "
+                        "so updates use an 8-colour per-axis-parity sweep instead of "
+                        "the cubic red-black checkerboard. Higher coordination raises "
+                        "T_c; below it the system magnetises into rhombic-"
+                        "dodecahedral domains."),
+        "vis_channels": ["Spin", "Alignment", "Flipped", "Accept"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_xy_spin": {
+        "label": "FCC XY Spin Model",
+        "shader": "fcc_xy_spin",
+        "lattice": "fcc",
+        # Continuous-spin classical magnet on the 12 FCC nearest neighbours.
+        # The 8-colour (per-axis parity) Metropolis sweep is already conflict-
+        # free on FCC, so it carries over unchanged. Higher coordination
+        # raises the ordering temperature above the cubic ~2.2.
+        "params": {"Temperature": 4.0, "J coupling": 1.0,
+                   "Field h": 0.0, "Proposal s": 1.0},
+        "param_ranges": {"Temperature": (0.1, 9.0), "J coupling": (-2.0, 2.0),
+                         "Field h": (-1.0, 1.0), "Proposal s": (0.1, 3.14)},
+        "dt": 1.0,
+        "init": "xy_random",
+        "init_variants": ["xy_random", "xy_aligned"],
+        "description": ("Classical XY magnet on the face-centred-cubic lattice: each "
+                        "cell holds an angle theta coupled to its 12 isotropic "
+                        "neighbours via -J cos(theta-theta'). Vortex lines (1D "
+                        "defects) become long-lived below the ordering temperature, "
+                        "with no cubic-axis pinning."),
+        "vis_channels": ["theta/2pi", "half+half cos", "half+half sin", "|dtheta|/pi"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        # Disordered angle field is uniform over [0,1] -> voxel mode would draw
+        # every cell. Show only the upper-third domain so vortex lines stand out.
+        "voxel_threshold": 0.7,
+        "vis_range": (0.5, 1.0),
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_445": {
+        "label": "FCC 4/4/5 Crystal",
+        "shader": "fcc_life",
+        "lattice": "fcc",
+        # The cubic 4/4/5 grows diamond crystals from a 26-neighbour count
+        # of 4 (~15% density). On the 12-NN FCC lattice the equivalent
+        # growth band sits at a count of 2-3; B3/S3-4 grows a faceted
+        # rhombic-dodecahedral crystal from a centred seed cluster, with no
+        # cubic-axis bias (the cubic rule's diamonds are an artefact of the
+        # axis-aligned Moore box).
+        "params": {"Birth min": 3, "Birth max": 3, "Survive min": 3, "Survive max": 4},
+        "param_ranges": {"Birth min": (2, 6), "Birth max": (2, 7),
+                         "Survive min": (2, 6), "Survive max": (2, 8)},
+        "dt": 1.0,
+        "init": "game_of_life_centered",
+        "init_variants": ["game_of_life_centered", "life_fbm_sparse"],
+        "description": ("Strict outer-totalistic Life on the FCC lattice: a centred "
+                        "seed cluster grows outward into faceted rhombic-dodecahedral "
+                        "crystals. The 12-NN count band selects a growth habit set by "
+                        "the lattice itself rather than by an axis-aligned box."),
+        "vis_channels": ["Alive", "Neighbour density", "unused"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "sparse_dispatch": True,
+    },
+
+    "fcc_eden": {
+        "label": "FCC Eden Growth (isotropic)",
+        "shader": "fcc_eden",
+        "lattice": "fcc",
+        # Probabilistic surface aggregation on 12 equidistant neighbours.
+        # Sticking p near 1 with Min neighbours >= 2 grows compact rhombic-
+        # dodecahedral balls; low p with Min neighbours = 1 gives fractal
+        # dendrites. Curvature boost smooths concavities (surface tension).
+        # No per-axis bias is needed -- the lattice provides the only habit.
+        # Default p is kept low (0.12) so a single centre seed grows a
+        # visible faceted rhombic-dodecahedral crystal mid-flight rather
+        # than filling the box (Eden growth is irreversible/monotonic).
+        "params": {"Sticking p": 0.12, "Min neighbours": 1.0,
+                   "Curvature": 0.0, "unused_0": 0.0},
+        "param_ranges": {"Sticking p": (0.01, 0.5), "Min neighbours": (1.0, 6.0),
+                         "Curvature": (0.0, 0.5), "unused_0": (0.0, 1.0)},
+        "dt": 1.0,
+        "init": "eden_seeds",
+        "init_variants": ["eden_seeds", "eden_scattered"],
+        "description": ("Probabilistic surface aggregation on the FCC lattice. High "
+                        "sticking with a 2+ neighbour gate grows compact rhombic-"
+                        "dodecahedral aggregates; low sticking gives fractal "
+                        "dendrites. Solid voxels are persistent (irreversible), and "
+                        "growth is isotropic with no cubic-axis needles."),
+        "vis_channels": ["Solid", "Growth pressure", "Newly grown"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+
+    "fcc_forest_fire": {
+        "label": "FCC Forest Fire (Drossel-Schwabl)",
+        "shader": "fcc_forest_fire",
+        "lattice": "fcc",
+        # Canonical SOC model on 12 isotropic neighbours: empty / tree /
+        # burning. Trees regrow with prob p, lightning ignites with f << p,
+        # and fire spreads to any tree with >= Ignite min burning neighbours.
+        # Small f/p self-organises to power-law fire clusters; the 12-NN
+        # spread keeps fire fronts spherical rather than axis-faceted.
+        "params": {"Regrowth p": 0.02, "Lightning f": 0.0001,
+                   "Ignite min": 1.0, "Immunity": 0.0},
+        "param_ranges": {"Regrowth p": (0.0001, 0.05),
+                         "Lightning f": (0.0, 0.0005),
+                         "Ignite min": (1.0, 4.0), "Immunity": (0.0, 0.3)},
+        "dt": 1.0,
+        "init": "forest_dense",
+        "init_variants": ["forest_dense", "forest_burning_seed"],
+        "description": ("Self-organised-criticality forest fire on the FCC lattice: "
+                        "trees regrow with prob p, lightning ignites with f << p, and "
+                        "fire spreads isotropically across the 12 nearest neighbours. "
+                        "Small f/p gives power-law fire-cluster sizes; the Ignite-min "
+                        "knob makes the forest fire-resistant."),
+        "vis_channels": ["State", "Was burning", "Was tree", "Just ignited"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "vis_range": (0.25, 1.0),
+        "voxel_threshold": 0.25,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_hodgepodge": {
+        "label": "FCC Hodgepodge (BZ machine)",
+        "shader": "fcc_hodgepodge",
+        "lattice": "fcc",
+        # Gerhardt-Schuster cyclic CA on 12 neighbours: healthy -> infected
+        # (sublevels) -> ill -> healthy. The excitable medium self-organises
+        # into BZ-style spirals and target waves; on FCC the wavefronts are
+        # isotropic rhombic-dodecahedral shells / scroll rings. The state
+        # field fills the volume, so threshold to the excited/ill bands to
+        # reveal the wave fronts.
+        "params": {"States N": 100.0, "Increment g": 25.0,
+                   "k1 healthy": 2.0, "k2 ill": 3.0},
+        "param_ranges": {"States N": (16.0, 256.0), "Increment g": (1.0, 60.0),
+                         "k1 healthy": (1.0, 8.0), "k2 ill": (1.0, 8.0)},
+        "dt": 1.0,
+        "init": "hodgepodge_random",
+        "init_variants": ["hodgepodge_random"],
+        "description": ("Gerhardt-Schuster cyclic CA on the FCC lattice: each cell "
+                        "cycles healthy -> infected -> ill -> healthy under a 12-NN "
+                        "infection rule, producing self-organising spirals and target "
+                        "waves like the Belousov-Zhabotinsky reaction in pure integer "
+                        "arithmetic, with isotropic (non-faceted) wavefronts."),
+        "vis_channels": ["State", "Infected/12", "Ill/12", "|delta|"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "density",
+        "vis_range": (0.78, 1.0),
+        "voxel_threshold": 0.8,
+        "render_mode": "voxel",
         "boundary": "toroidal",
     },
 
@@ -18179,6 +20045,44 @@ def init_cyclic_ca(size, rng):
     states = rng.randint(0, N, (size, size, size)).astype(np.float32)
     data[:, :, :, 0] = states
     data[:, :, :, 1] = states / float(N)
+    return data
+
+def init_fcc_excitable(size, rng):
+    """Greenberg-Hastings excitable seed: uniform-random cyclic states so the
+    medium immediately breaks into rotating 3D scroll waves rather than
+    settling to rest. N_INIT matches the preset's default 'N states' so the
+    initial distribution is uniform across the cycle (the cyclic_ca init,
+    which spans 0..13, would pile most cells into the deep-refractory tail
+    once clamped to a small N and the medium would just quiesce).
+
+    R = state 0..N_INIT-1 (read by the rule). G = normalised wave intensity.
+    """
+    N_INIT = 6
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    states = rng.randint(0, N_INIT, (size, size, size)).astype(np.float32)
+    data[:, :, :, 0] = states
+    vis = np.where(states > 0.5, (N_INIT - states) / float(N_INIT - 1), 0.0)
+    data[:, :, :, 1] = vis.astype(np.float32)
+    return data
+
+def init_fcc_dla(size, rng):
+    """DLA seed: a single solid aggregate cell at the centre (R=phi=1) in a
+    box otherwise full of nutrient (G=u=1, R=0). The dendrite grows outward
+    from the seed as the surrounding nutrient is consumed."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 1] = 1.0  # u nutrient everywhere
+    c = size // 2
+    data[c, c, c, 0] = 1.0  # phi seed
+    data[c, c, c, 1] = 0.0  # seed holds no nutrient
+    return data
+
+def init_fcc_sandpile(size, rng):
+    """Sandpile seed: a uniformly random sub-critical pile (heights 0..11)
+    so the first drips immediately trigger system-spanning avalanches and the
+    pile relaxes onto the self-organised-critical attractor. G (toppling
+    flag) starts at zero."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = rng.randint(0, 12, (size, size, size)).astype(np.float32)
     return data
 
 def init_wave_pulse(size, rng):
@@ -21827,6 +23731,9 @@ INIT_FUNCS = {
     'fitzhugh_nagumo': init_fitzhugh_nagumo,
     'brusselator': init_brusselator,
     'cyclic_ca': init_cyclic_ca,
+    'fcc_excitable': init_fcc_excitable,
+    'fcc_dla': init_fcc_dla,
+    'fcc_sandpile': init_fcc_sandpile,
     'predator_prey': init_predator_prey,
     'kuramoto': init_kuramoto,
     'bz_reaction': init_bz_reaction,
@@ -23350,6 +25257,9 @@ class Simulator:
 
         # Rendering mode: 'volumetric' or 'voxel'
         self.renderer_mode = self.preset.get('render_mode', 'volumetric')
+        # Storage lattice: 'cubic' (default) or 'fcc'. FCC presets render via
+        # the voxel path with the lattice basis applied (see _render_voxels).
+        self.lattice = self.preset.get('lattice', 'cubic')
         self.boundary_mode = _BOUNDARY_NAME_TO_MODE.get(
             self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
@@ -23487,6 +25397,8 @@ class Simulator:
         self._rec_auto_stop_options = [
             ('Manual stop', 0.0),
             ('10 seconds',  10.0),
+            ('15 seconds',  15.0),
+            ('20 seconds',  20.0),
             ('30 seconds',  30.0),
             ('60 seconds',  60.0),
             ('2 minutes',   120.0),
@@ -23762,6 +25674,10 @@ class Simulator:
         self._vp_u_vis_hi = vp.get('u_vis_hi', None)
         self._vp_u_volume_tex = vp['u_volume_tex']
         self._vp_u_volume_tex.value = 0  # texture unit 0
+        # FCC lattice transform uniforms (absent/stripped on cubic-only builds).
+        self._vp_u_lattice_fcc = vp.get('u_lattice_fcc', None)
+        self._vp_u_lattice_M = vp.get('u_lattice_M', None)
+        self._vp_u_lattice_M_inv = vp.get('u_lattice_M_inv', None)
         # Empty VAO for instanced rendering (vertices come from SSBO)
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
 
@@ -23918,6 +25834,9 @@ class Simulator:
         self._vp_u_vis_hi = vp.get('u_vis_hi', None)
         self._vp_u_volume_tex = vp['u_volume_tex']
         self._vp_u_volume_tex.value = 0
+        self._vp_u_lattice_fcc = vp.get('u_lattice_fcc', None)
+        self._vp_u_lattice_M = vp.get('u_lattice_M', None)
+        self._vp_u_lattice_M_inv = vp.get('u_lattice_M_inv', None)
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
 
     def _voxel_pack_inject(self, src: str) -> str:
@@ -23995,6 +25914,8 @@ class Simulator:
         if not hasattr(self, '_indirect_reset_prog'):
             self._indirect_reset_prog = self.ctx.compute_shader(INDIRECT_RESET_SHADER)
             self._indirect_reset_u_reset_total = self._indirect_reset_prog['u_reset_total']
+            self._indirect_reset_u_vertex_count = self._indirect_reset_prog.get(
+                'u_vertex_count', None)
 
     def _init_compute_ray_uniforms(self):
         """Cache uniform references for the compute raymarcher."""
@@ -27046,6 +28967,7 @@ class Simulator:
         self.vis_mode = _vis_mode_to_int(self.preset.get('vis_mode', 'density'))
         self.vis_aux_range = tuple(self.preset.get('vis_aux_range', (0.0, 1.0)))
         self.renderer_mode = self.preset.get('render_mode', 'volumetric')
+        self.lattice = self.preset.get('lattice', 'cubic')
         self.boundary_mode = _BOUNDARY_NAME_TO_MODE.get(
             self.preset.get('boundary', 'toroidal'), 0)
         self.is_element_ca = self.preset.get('is_element_ca', False)
@@ -27064,7 +28986,7 @@ class Simulator:
         shader = self.preset['shader']
         if self.is_element_ca:
             self.voxel_threshold = 0.5
-        elif shader == 'reaction_diffusion_3d':
+        elif shader in ('reaction_diffusion_3d', 'fcc_gray_scott'):
             self.voxel_threshold = 0.01
         elif shader == 'wave_3d':
             self.voxel_threshold = 0.005
@@ -27409,7 +29331,7 @@ void main() {
         vis_abs = self.preset.get('vis_abs', False)
         if shader == 'game_of_life_3d':
             return ("exposed", "buried", "surface neighbor count")
-        elif shader == 'reaction_diffusion_3d':
+        elif shader in ('reaction_diffusion_3d', 'fcc_gray_scott'):
             ch = self.vis_channels[self.vis_channel] if hasattr(self, 'vis_channel') else 'V'
             if 'U' in ch:
                 return ("depleted", "saturated", "substrate concentration")
@@ -28613,7 +30535,7 @@ void main() {
         is_elem = preset.get('is_element_ca', False)
         if is_elem:
             channel, mode, threshold, change_thr = 0, 3, 0.5, 0.5
-        elif shader == 'reaction_diffusion_3d':
+        elif shader in ('reaction_diffusion_3d', 'fcc_gray_scott'):
             channel, mode, threshold, change_thr = 1, 1, 0.01, 0.001
         elif shader == 'wave_3d':
             channel, mode, threshold, change_thr = 0, 2, 0.005, 0.001
@@ -29217,6 +31139,24 @@ void main() {
             vlo, vhi = self.preset.get('vis_range', (0.0, 1.0))
             self._vp_u_vis_lo.value = float(vlo)
             self._vp_u_vis_hi.value = float(vhi)
+
+        # ── Lattice transform (FCC presets render through LATTICE_M) ──
+        # Set every frame, before the cull fast-path early-return, so a
+        # cached-cull redraw still carries the correct basis. Cubic presets
+        # upload u_lattice_fcc=0 and the shader uses the legacy mapping.
+        is_fcc = getattr(self, 'lattice', 'cubic') == 'fcc'
+        if self._vp_u_lattice_fcc is not None:
+            self._vp_u_lattice_fcc.value = 1 if is_fcc else 0
+        if is_fcc and self._vp_u_lattice_M is not None:
+            self._vp_u_lattice_M.value = _FCC_M_COLMAJOR
+            if self._vp_u_lattice_M_inv is not None:
+                self._vp_u_lattice_M_inv.value = _FCC_MINV_COLMAJOR
+        # Per-instance vertex count: 36 for the cube, 72 for the FCC rhombic
+        # dodecahedron. Written into the draw-indirect command by the GPU-side
+        # reset shader. MUST be set every frame (uniform defaults to 0 -> no
+        # geometry would be drawn).
+        if getattr(self, '_indirect_reset_u_vertex_count', None) is not None:
+            self._indirect_reset_u_vertex_count.value = 72 if is_fcc else 36
 
         cpd = self._voxel_chunks_per_dim
 
@@ -30344,18 +32284,29 @@ void main() {
 
             if self._rec_capture_mode == 'per_step':
                 imgui.set_next_item_width(120)
-                spf_changed, new_spf = imgui.slider_float(
-                    "Steps/frame", float(self._rec_steps_per_frame),
-                    0.1, 10.0, '%.2f',
-                    flags=imgui.SliderFlags_.logarithmic)
+                # Discrete option list so the sub-1 slow-motion rates
+                # (0.25, 0.5) stay selectable alongside the integer
+                # time-lapse rates. The slider runs over the option index
+                # but displays the mapped multiplier as its overlay text
+                # (the format string has no %-specifier, so imgui prints it
+                # verbatim instead of the raw index).
+                spf_opts = (0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)
+                cur_idx = min(
+                    range(len(spf_opts)),
+                    key=lambda i: abs(spf_opts[i] - self._rec_steps_per_frame))
+                spf_changed, new_idx = imgui.slider_int(
+                    "Steps/frame", cur_idx, 0, len(spf_opts) - 1,
+                    f"{spf_opts[cur_idx]:g}x")
                 if spf_changed:
-                    self._rec_steps_per_frame = max(0.1, float(new_spf))
+                    self._rec_steps_per_frame = float(spf_opts[int(new_idx)])
                 if imgui.is_item_hovered():
                     imgui.set_tooltip(
                         "How many sim steps per video frame.\n"
-                        "  1.0  = 1 step → 1 frame (default)\n"
-                        "  >1   = time-lapse (e.g. 4.0 = 4× speed)\n"
-                        "  <1   = slow-motion (e.g. 0.5 = 2× slow)")
+                        "  0.25 = 0.25 step/frame -> 4x slow-motion\n"
+                        "  0.5  = 0.5 step/frame  -> 2x slow-motion\n"
+                        "  1    = 1 step -> 1 frame (default)\n"
+                        "  2    = 2x speed time-lapse\n"
+                        "  3+   = 3x speed, and so on.")
 
             # Auto-stop target
             stop_labels = [s[0] for s in self._rec_auto_stop_options]
