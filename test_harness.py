@@ -2853,6 +2853,7 @@ def cmd_audit(ctx, args):
     print("─" * 90)
 
     results = []
+    broken_names = []
     for name in RULE_PRESETS:
         # Skip presets that have no autonomous dynamics (interactive-only
         # sandboxes that start empty and require user paint input). These
@@ -2901,6 +2902,9 @@ def cmd_audit(ctx, args):
         elif result['score'] < 0.3:
             status = "WEAK"
 
+        if result['has_nan'] or result['has_inf']:
+            broken_names.append(name)
+
         print(f"{name:<25} {result['score']:5.2f} "
               f"{result['final_alive']:7.3f} "
               f"{result['final_activity']:6.3f} "
@@ -2914,6 +2918,14 @@ def cmd_audit(ctx, args):
     weak = sum(1 for r in results if 0.1 <= r['score'] < 0.3)
     bad = sum(1 for r in results if r['score'] < 0.1)
     print(f"Summary: {good} good, {weak} weak, {bad} dead/broken out of {len(results)}")
+
+    # Genuinely broken presets (non-finite fields) are correctness bugs, not
+    # subjective "dead/weak" scores. Surface them as a non-zero exit so the
+    # audit can fail CI / scripts. We deliberately do NOT fail on low scores:
+    # some presets are quiet-but-valid and would produce false alarms.
+    if broken_names:
+        print(f"BROKEN (NaN/Inf): {len(broken_names)} -> {', '.join(broken_names)}")
+    return len(broken_names)
 
 
 def cmd_test(ctx, args):
@@ -4436,9 +4448,11 @@ def main():
 
     window, ctx = create_headless_context()
 
+    exit_code = 0
     try:
         if args.command == 'audit':
-            cmd_audit(ctx, args)
+            broken = cmd_audit(ctx, args)
+            exit_code = 1 if broken else 0
         elif args.command == 'test':
             cmd_test(ctx, args)
         elif args.command == 'sweep':
@@ -4453,7 +4467,8 @@ def main():
             cmd_save_target(ctx, args)
     finally:
         destroy_context(window)
+    return exit_code
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
