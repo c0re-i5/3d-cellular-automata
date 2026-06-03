@@ -183,6 +183,7 @@ The test harness runs GPU parameter sweeps without a window, scoring each trial 
 
 ```bash
 python test_harness.py                       # single headless run
+python test_harness.py audit                 # walk every preset; exits non-zero if any produces NaN/Inf
 ```
 
 ### Correctness Probes
@@ -221,7 +222,10 @@ Each probe accepts `--rules <comma-separated>` to scope to a single preset, and 
 ## Architecture
 
 ```
-simulator.py            — Main simulator: GLSL shaders, rendering, UI (~31 000 lines)
+simulator.py            — Main simulator: rendering, UI, rule presets (~32 500 lines)
+shaders/                — GLSL compute/vertex/fragment sources extracted from
+                          simulator.py (one .glsl per shader constant),
+                          loaded byte-for-byte at import via `_load_glsl`
 element_data.py         — Periodic table data for the Element Chemistry rule
 entity_arena.py         — GPU substrate for typed voxel-resident agents
                           (predator/prey, wandering teams) with spatial-hash
@@ -305,7 +309,7 @@ reddit_pipeline/        — PRAW link-submission of uploaded videos to a
 > recordings, and personal batch-search shell scripts are also gitignored
 > and not part of the repository.
 
-All compute shaders are embedded in `simulator.py` as GLSL source strings, compiled at runtime via moderngl. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
+All compute shaders live as GLSL source in the `shaders/` directory (one file per shader constant), loaded byte-for-byte at import and compiled at runtime via moderngl. A few fragment shaders that are composed from multiple pieces (e.g. the shared colormap block) remain inline in `simulator.py`. The rendering pipeline uses a separate ray marching fragment shader with emission-absorption volume integration.
 
 ### Compute Shader Design
 

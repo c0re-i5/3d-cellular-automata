@@ -21,6 +21,7 @@ Usage:
 
 import sys, math, time, argparse, json, os, re, random, subprocess, shutil, tempfile, textwrap, threading
 import queue as _queue
+import contextlib
 import numpy as np
 import glfw
 import moderngl
@@ -282,272 +283,23 @@ def _anisotropize_glsl(src: str) -> str:
 
     return src
 
+def _load_glsl(_name):
+    """Load a GLSL shader source extracted to shaders/<name>.
+
+    Returns the file contents byte-for-byte (no normalisation) so the
+    loaded string is identical to the literal it replaced.
+    """
+    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      'shaders', _name)
+    with open(_p, 'r', encoding='utf-8', newline='') as _f:
+        return _f.read()
+
+
 # ── Shader sources ────────────────────────────────────────────────────
 
 # Compute shader: 3D CA step
 # Uses rgba32f textures (4 floats per cell) for multi-field support
-COMPUTE_HEADER = """
-#version 430
-layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
-
-layout(rgba32f, binding=0) uniform image3D u_src;
-layout(rgba32f, binding=1) uniform image3D u_dst;
-
-// `u_size` is declared early because the optional deposit() helper
-// below needs it for SSBO indexing.  All other CA uniforms follow
-// the deposit block.
-uniform int u_size;
-
-// ── Optional particle→field deposit channel ────────────────────────
-// When the active preset enables deposit (any non-zero deposit_strength
-// or trail_strength), the simulator compiles every CA pass with
-// DEPOSIT_ENABLED=1 and binds an r32f image at unit 12 holding the
-// per-voxel sum of particle splats from this step.  CA shaders that
-// want to react to particles call `deposit(pos)` and add the result
-// (scaled by `u_deposit_strength`) into a chosen channel.  Shaders
-// that ignore deposit pay zero cost — `deposit()` returns 0 and the
-// optimiser deletes the load+multiply.
-#ifndef DEPOSIT_ENABLED
-#define DEPOSIT_ENABLED 0
-#endif
-uniform float u_deposit_strength;     // always declared; 0 when no deposit
-uniform int   u_deposit_channel;      // informational; shader picks where
-#if DEPOSIT_ENABLED
-// SSBO instead of image: image units are limited to 8 on this driver,
-// so we use SSBO binding 15 (the image namespace was full).  Atomic
-// float adds on SSBOs are provided by GL_NV_shader_atomic_float in the
-// particle shader; the CA shader only reads.
-layout(std430, binding = 15) readonly buffer DepositBuf { float data[]; } u_deposit_buf;
-float deposit(ivec3 p) {
-    // Use u_dims (W,H,D) for correct linear indexing on non-cubic grids.
-    // u_dims is injected by _compile_compute alongside u_size.
-    int idx = (p.z * u_dims.y + p.y) * u_dims.x + p.x;
-    return u_deposit_buf.data[idx];
-}
-#else
-float deposit(ivec3 p) { return 0.0; }
-#endif
-
-uniform float u_dt;
-uniform float u_param0;
-uniform float u_param1;
-uniform float u_param2;
-uniform float u_param3;
-uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (Dirichlet, zero outside), 2 = mirror (Neumann, zero-flux)
-uniform int u_frame;     // step counter for temporal noise
-
-// ── Viewport pose (used by procedural "viewport" kind shaders, e.g. fractal
-// zoom-throughs). For ordinary CA shaders these are bound but ignored.
-// u_origin = world-space point at the centre of the cube
-// u_zoom   = half-width of the cube in world units (cube spans u_origin ± u_zoom)
-uniform vec3  u_origin;
-uniform float u_zoom;
-
-// ── Auxiliary uniforms for multi-fractal viewport shaders ─────────
-// u_aux3   = generic vec3 slot (e.g. Julia c-vector)
-// u_aux_a  = generic float (e.g. Mandelbox scale, Menger fold count)
-// u_aux_b  = generic float (e.g. Mandelbox min radius)
-// All three are bound from the named preset params 'Julia cx/cy/cz',
-// 'Box scale', 'Folds', 'Min radius' when present. Optimised out of
-// shaders that don't reference them.
-uniform vec3  u_aux3;
-uniform float u_aux_a;
-uniform float u_aux_b;
-
-// ── Grid-spacing scale factors ──────────────────────────────────────
-// PDE rules use discrete Laplacians on a grid with voxel spacing h = REF/size
-// (in "reference" units — physical domain is fixed at REF_SIZE, independent
-// of grid resolution). The continuous Laplacian is
-//     ∇²U ≈ (sum_neighbors - 6*center) / h²
-// so rules MULTIPLY the raw stencil by h_sq to obtain ∇²U. That makes h_sq
-// equal to 1/h² = (size/REF)², not h² itself — the variable name refers to
-// "the factor we multiply by", not "h squared" literally.
-// At REF_SIZE both definitions collapse to 1, which is why this bug went
-// unnoticed for a long time (presets were tuned at REF_SIZE=128).
-// h_inv = size/REF for scaling radii and gradients (physical length → voxels).
-const float REF_SIZE = 128.0;
-float h_inv = float(u_size) / REF_SIZE;                 // multiply radii by this
-float h_sq  = h_inv * h_inv;                            // multiply Laplacians by this (= 1/h²)
-
-vec4 fetch(ivec3 p) {
-    if (u_boundary == 1) {
-        // Clamped (Dirichlet): out-of-bounds returns zero
-        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
-            return vec4(0.0);
-        return imageLoad(u_src, p);
-    }
-    if (u_boundary == 2) {
-        // Mirror (Neumann zero-flux): reflect index across boundary.
-        // Preserves conservation laws for diffusion/reaction-diffusion PDEs.
-        // Equivalent to the boundary cell having a phantom neighbor equal to itself.
-        p = clamp(p, ivec3(0), ivec3(u_size - 1));
-        return imageLoad(u_src, p);
-    }
-    // Toroidal: wrap around
-    p = (p + u_size) % u_size;
-    return imageLoad(u_src, p);
-}
-
-// Reciprocal of UINT32_MAX — multiplying is ~2x faster than dividing on GPU.
-// Used to normalise Wang-hashed uint seeds to [0,1).
-const float INV_U32_MAX = 1.0 / 4294967295.0;
-
-// Temporal hash: changes every frame (unlike position-only fract(sin(...)))
-// Uses Wang hash on (pos + frame) for high-quality pseudo-random numbers
-float hash_temporal(ivec3 p, int channel) {
-    uint seed = uint(p.x * 73856093) ^ uint(p.y * 19349663) ^ uint(p.z * 83492791)
-              ^ uint(u_frame * 2654435761u) ^ uint(channel * 668265263u);
-    seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
-    seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
-    seed = seed ^ (seed >> 16u);
-    return float(seed) * INV_U32_MAX;
-}
-
-// Quenched (frozen) hash: depends on position only — same value every frame.
-// Use this for representing material heterogeneities like crystal lattice
-// defects, dopant atoms, or surface impurities that don't move with time.
-// Different `channel` values give independent random fields.
-float hash_static(ivec3 p, int channel) {
-    uint seed = uint(p.x * 73856093) ^ uint(p.y * 19349663) ^ uint(p.z * 83492791)
-              ^ uint(channel * 2246822519u);
-    seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
-    seed = (seed ^ (seed >> 16u)) * 0x45d9f3bu;
-    seed = seed ^ (seed >> 16u);
-    return float(seed) * INV_U32_MAX;
-}
-
-// SMOOTH VALUE NOISE on a unit-spaced lattice (8-corner trilinear interp,
-// smoothstep blend). Output ~uniform [0,1]. Building block for fbm3.
-float value_noise3(vec3 p, int channel) {
-    vec3 pf = floor(p);
-    vec3 t  = p - pf;
-    t = t * t * (3.0 - 2.0 * t);  // C1-continuous smoothstep blend
-    ivec3 i = ivec3(pf);
-    float c000 = hash_static(i + ivec3(0,0,0), channel);
-    float c100 = hash_static(i + ivec3(1,0,0), channel);
-    float c010 = hash_static(i + ivec3(0,1,0), channel);
-    float c110 = hash_static(i + ivec3(1,1,0), channel);
-    float c001 = hash_static(i + ivec3(0,0,1), channel);
-    float c101 = hash_static(i + ivec3(1,0,1), channel);
-    float c011 = hash_static(i + ivec3(0,1,1), channel);
-    float c111 = hash_static(i + ivec3(1,1,1), channel);
-    float x00 = mix(c000, c100, t.x);
-    float x10 = mix(c010, c110, t.x);
-    float x01 = mix(c001, c101, t.x);
-    float x11 = mix(c011, c111, t.x);
-    float y0  = mix(x00, x10, t.y);
-    float y1  = mix(x01, x11, t.y);
-    return mix(y0, y1, t.z);
-}
-
-// FRACTIONAL BROWNIAN MOTION (3D, octave sum of value noise).
-//
-// fbm3(p, base_period, octaves, channel)
-//   base_period: lattice cells per period at the LOWEST frequency octave
-//                (octave 0 has wavelength ~ base_period cells)
-//   octaves:    number of doublings; each octave halves wavelength and amp
-//   channel:    seed offset; each octave gets channel + i*17 internally
-//
-// Output normalised to ~[0,1] (centred at ~0.5). The point of this over
-// raw white noise: pattern-forming PDEs on a uniform grid can only resolve
-// instabilities at one characteristic wavelength (the linear M-S/Turing
-// length), which collapses emergent shapes to a single scale (sphere,
-// octahedron, hex). Forcing with multi-octave noise injects
-// perturbations at several wavelengths simultaneously so branches can
-// have sub-branches "for free", giving a fractal envelope rather than a
-// clean smooth one.
-float fbm3(vec3 p, float base_period, int octaves, int channel) {
-    float amp  = 0.5;
-    float freq = 1.0 / max(base_period, 1e-3);
-    float sum  = 0.0;
-    float norm = 0.0;
-    for (int i = 0; i < octaves; ++i) {
-        sum  += amp * value_noise3(p * freq, channel + i * 17);
-        norm += amp;
-        amp  *= 0.5;
-        freq *= 2.0;
-    }
-    return sum / max(norm, 1e-6);
-}
-
-// TEMPORAL FBM: same as fbm3 but the lowest octave drifts in time, so the
-// noise field evolves rather than being frozen. Each octave is given an
-// independent time offset so they don't all march together (which would
-// look like uniform translation rather than evolution). The drift speed
-// per octave scales with the octave's frequency so finer detail flickers
-// faster than coarse structure -- matches the way real diffusive noise
-// has a power-law temporal spectrum.
-float fbm3_temporal(vec3 p, float base_period, int octaves, int channel) {
-    float amp  = 0.5;
-    float freq = 1.0 / max(base_period, 1e-3);
-    float sum  = 0.0;
-    float norm = 0.0;
-    float t    = float(u_frame) * 0.05;
-    for (int i = 0; i < octaves; ++i) {
-        // Per-octave time offset along an octave-specific axis so the
-        // "wind direction" varies between scales (more organic motion).
-        vec3 drift = vec3(float((i * 13) % 7), float((i * 19) % 5),
-                          float((i * 23) % 11)) * t;
-        sum  += amp * value_noise3(p * freq + drift, channel + i * 17);
-        norm += amp;
-        amp  *= 0.5;
-        freq *= 2.0;
-    }
-    return sum / max(norm, 1e-6);
-}
-
-// ── Isotropic 19-point compact Laplacian (Patra-Karttunen / Mehrstellen) ──
-//
-// Standard 6-point stencil:   ∇²f ≈ (Σ_face f - 6f₀) / h²
-//   Leading error:   (h²/12) · Σ_i ∂⁴f/∂xᵢ⁴   ← axis-aligned, anisotropic
-//
-// 19-point compact (this function):
-//   ∇²f ≈ (⅓ Σ_face f + ⅙ Σ_edge f - 4f₀) / h²
-//   Leading error:   (h²/12) · ∇²(∇²f)        ← rotationally symmetric, isotropic
-//
-// Visible consequence: BZ spirals stop being square-ish, Cahn-Hilliard
-// droplets become spherical, wavefronts radiate evenly in all directions.
-// Cost is ~3× memory traffic vs the 6-point fetch (18 vs 6 fetches).
-// Coefficient sanity: 6·(1/3) + 12·(1/6) − 4 = 0 (constants give zero).
-//
-// Returns the per-component Laplacian (multiplied by h_sq so it equals ∇²f
-// in continuum units, matching the 6-point convention used elsewhere).
-vec4 lap19_v4(ivec3 pos, vec4 self_val) {
-    vec4 face = fetch(pos + ivec3( 1, 0, 0)) + fetch(pos + ivec3(-1, 0, 0))
-              + fetch(pos + ivec3( 0, 1, 0)) + fetch(pos + ivec3( 0,-1, 0))
-              + fetch(pos + ivec3( 0, 0, 1)) + fetch(pos + ivec3( 0, 0,-1));
-    vec4 edge = fetch(pos + ivec3( 1, 1, 0)) + fetch(pos + ivec3( 1,-1, 0))
-              + fetch(pos + ivec3(-1, 1, 0)) + fetch(pos + ivec3(-1,-1, 0))
-              + fetch(pos + ivec3( 1, 0, 1)) + fetch(pos + ivec3( 1, 0,-1))
-              + fetch(pos + ivec3(-1, 0, 1)) + fetch(pos + ivec3(-1, 0,-1))
-              + fetch(pos + ivec3( 0, 1, 1)) + fetch(pos + ivec3( 0, 1,-1))
-              + fetch(pos + ivec3( 0,-1, 1)) + fetch(pos + ivec3( 0,-1,-1));
-    return ((1.0/3.0) * face + (1.0/6.0) * edge - 4.0 * self_val) * h_sq;
-}
-
-// Trilinear interpolation: fetch at fractional position (for semi-Lagrangian advection)
-vec4 fetch_interp(vec3 p) {
-    vec3 pf = floor(p);
-    vec3 frac_p = p - pf;
-    ivec3 p0 = ivec3(pf);
-
-    // Eight corners of the cube
-    vec4 c000 = fetch(p0);
-    vec4 c100 = fetch(p0 + ivec3(1,0,0));
-    vec4 c010 = fetch(p0 + ivec3(0,1,0));
-    vec4 c110 = fetch(p0 + ivec3(1,1,0));
-    vec4 c001 = fetch(p0 + ivec3(0,0,1));
-    vec4 c101 = fetch(p0 + ivec3(1,0,1));
-    vec4 c011 = fetch(p0 + ivec3(0,1,1));
-    vec4 c111 = fetch(p0 + ivec3(1,1,1));
-
-    // Trilinear blend
-    float fx = frac_p.x, fy = frac_p.y, fz = frac_p.z;
-    vec4 i0 = mix(mix(c000, c100, fx), mix(c010, c110, fx), fy);
-    vec4 i1 = mix(mix(c001, c101, fx), mix(c011, c111, fx), fy);
-    return mix(i0, i1, fz);
-}
-"""
+COMPUTE_HEADER = _load_glsl("COMPUTE_HEADER.glsl")
 
 # Different CA rule kernels
 CA_RULES = {
@@ -9975,307 +9727,9 @@ void main() {
 
 # ── Element CA: separate compute header with SSBO for element properties ──
 
-ELEMENT_COMPUTE_HEADER = """
-#version 430
-layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+ELEMENT_COMPUTE_HEADER = _load_glsl("ELEMENT_COMPUTE_HEADER.glsl")
 
-layout(rgba32f, binding=0) uniform image3D u_src;
-layout(rgba32f, binding=1) uniform image3D u_dst;
-
-// Element property table: 120 elements x 16 floats each (0=vacuum, 1-118=elements, 119=wall)
-// Layout per element:
-//   [0] atomic_number  [1] mass      [2] electronegativity  [3] valence_electrons
-//   [4] melting_point  [5] boiling_pt [6] density           [7] thermal_cond
-//   [8] color_r        [9] color_g    [10] color_b          [11] phase_at_25C
-//   [12] group         [13] period    [14] category_id      [15] reserved
-layout(std430, binding=2) buffer ElementTable {
-    float elements[];  // 120 * 16 floats
-};
-
-uniform int u_size;
-uniform float u_dt;
-uniform float u_param0;  // ambient temperature
-uniform float u_param1;  // gravity strength
-uniform float u_param2;  // reaction rate multiplier
-uniform float u_param3;  // unused
-uniform int u_boundary;  // 0 = toroidal (wrap), 1 = clamped (Dirichlet, zero outside), 2 = mirror (Neumann)
-
-// Cell channels:
-// R = element ID (0=vacuum, 1-118=element), encoded as float
-// G = temperature (°C)
-// B = phase (0=solid, 1=liquid, 2=gas)
-// A = velocity_y (for gravity/buoyancy)
-
-vec4 fetch(ivec3 p) {
-    if (u_boundary == 1) {
-        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
-            return vec4(0.0);
-        return imageLoad(u_src, p);
-    }
-    if (u_boundary == 2) {
-        // Mirror (Neumann zero-flux): treat the wall as identical to its inner neighbor.
-        p = clamp(p, ivec3(0), ivec3(u_size - 1));
-        return imageLoad(u_src, p);
-    }
-    p = (p + u_size) % u_size;
-    return imageLoad(u_src, p);
-}
-
-// Get element property by atomic number and property index
-float elem_prop(int z, int prop) {
-    if (z < 0 || z > 118) return 0.0;
-    return elements[z * 16 + prop];
-}
-
-float get_mass(int z)       { return elem_prop(z, 1); }
-float get_eneg(int z)       { return elem_prop(z, 2); }
-float get_valence(int z)    { return elem_prop(z, 3); }
-float get_mp(int z)         { return elem_prop(z, 4); }
-float get_bp(int z)         { return elem_prop(z, 5); }
-float get_density(int z)    { return elem_prop(z, 6); }
-float get_thermal(int z)    { return elem_prop(z, 7); }
-float get_category(int z)   { return elem_prop(z, 14); }
-
-// Determine phase from temperature and element properties
-float compute_phase(int z, float temp) {
-    float mp = get_mp(z);
-    float bp = get_bp(z);
-    if (temp < mp) return 0.0;       // solid
-    if (temp < bp) return 1.0;       // liquid
-    return 2.0;                       // gas
-}
-"""
-
-ELEMENT_CA_RULE = """
-// Multi-element CA with real physical properties
-// Movement uses matched thresholds: a cell vacates itself at the same threshold
-// that a vacuum cell uses to accept an incoming atom, preventing duplication/loss.
-void main() {
-    ivec3 pos = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
-
-    vec4 self_val = fetch(pos);
-    int self_id = int(round(self_val.r));
-    float self_temp = self_val.g;
-    float self_phase = self_val.b;
-    float self_vy = self_val.a;
-
-    // Wall element (id=119): indestructible, no physics, just stay put
-    if (self_id == 119) {
-        imageStore(u_dst, pos, self_val);
-        return;
-    }
-
-    // Movement threshold — must be the same for sender and receiver
-    const float MOVE_THRESHOLD = 0.3;
-
-    // Vacuum stays vacuum (but can be filled by moving atoms)
-    if (self_id == 0) {
-        // Check if a neighbor wants to move here (gravity, buoyancy, diffusion)
-
-        // Liquid/solid falling from above?
-        vec4 above = fetch(pos + ivec3(0, 1, 0));
-        int above_id = int(round(above.r));
-        float above_phase = above.b;
-        float above_vy = above.a;
-        if (above_id > 0 && above_phase < 1.5 && above_vy < -MOVE_THRESHOLD) {
-            imageStore(u_dst, pos, vec4(float(above_id), above.g, above_phase, above_vy * 0.8));
-            return;
-        }
-
-        // Gas rising from below?
-        vec4 below = fetch(pos + ivec3(0, -1, 0));
-        int below_id = int(round(below.r));
-        float below_phase = below.b;
-        float below_vy = below.a;
-        if (below_id > 0 && below_phase > 1.5 && below_vy > MOVE_THRESHOLD) {
-            imageStore(u_dst, pos, vec4(float(below_id), below.g, below_phase, below_vy * 0.8));
-            return;
-        }
-
-        // Liquid spreading sideways: check 4 horizontal neighbors for liquid wanting to spread
-        for (int axis = 0; axis < 3; axis += 2) {  // X and Z axes only
-            for (int dir = -1; dir <= 1; dir += 2) {
-                ivec3 offset = ivec3(0);
-                offset[axis] = dir;
-                vec4 nb = fetch(pos + offset);
-                int nb_id = int(round(nb.r));
-                if (nb_id > 0 && nb.b > 0.5 && nb.b < 1.5) {
-                    // Liquid neighbor — check if there's liquid above it (hydrostatic pressure)
-                    vec4 nb_above = fetch(pos + offset + ivec3(0, 1, 0));
-                    if (int(round(nb_above.r)) > 0) {
-                        float hash = fract(sin(float(pos.x * 374761 + pos.y * 668265 + pos.z * 928114 + axis * 13) * 0.0001) * 43758.5453);
-                        if (hash < 0.2 * u_dt) {
-                            imageStore(u_dst, pos, vec4(float(nb_id), nb.g, nb.b, 0.0));
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Gas diffusion: check all 6 neighbors for gas-phase atoms
-        for (int axis = 0; axis < 3; axis++) {
-            for (int dir = -1; dir <= 1; dir += 2) {
-                ivec3 offset = ivec3(0);
-                offset[axis] = dir;
-                vec4 nb = fetch(pos + offset);
-                int nb_id = int(round(nb.r));
-                if (nb_id > 0 && nb.b > 1.5) {
-                    float mass = get_mass(nb_id);
-                    float diffuse_rate = 1.0 / max(sqrt(mass), 1.0);
-                    float hash = fract(sin(float(pos.x * 374761 + pos.y * 668265 + pos.z * 928114 + axis * 13) * 0.0001) * 43758.5453);
-                    if (hash < diffuse_rate * u_dt * 0.3) {
-                        imageStore(u_dst, pos, vec4(float(nb_id), nb.g, nb.b, 0.0));
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Stay vacuum, but conduct ambient temperature
-        float ambient = u_param0;
-        imageStore(u_dst, pos, vec4(0.0, mix(self_temp, ambient, 0.1 * u_dt), 0.0, 0.0));
-        return;
-    }
-
-    // Non-vacuum cell: apply physics
-
-    // 1. Thermal conduction — average temperature with neighbors, weighted by thermal conductivity
-    float temp_sum = 0.0;
-    float weight_sum = 0.0;
-    for (int axis = 0; axis < 3; axis++) {
-        for (int dir = -1; dir <= 1; dir += 2) {
-            ivec3 offset = ivec3(0);
-            offset[axis] = dir;
-            vec4 nb = fetch(pos + offset);
-            int nb_id = int(round(nb.r));
-            float k_self = get_thermal(self_id);
-            float k_nb = nb_id > 0 ? get_thermal(nb_id) : 0.01;
-            float k_avg = (k_self + k_nb) * 0.5;
-            // Normalize conductivity to reasonable rate
-            float rate = k_avg * 0.001;
-            temp_sum += nb.g * rate;
-            weight_sum += rate;
-        }
-    }
-    float new_temp = self_temp;
-    if (weight_sum > 0.0) {
-        new_temp = mix(self_temp, temp_sum / weight_sum, min(u_dt * 0.5, 0.4));
-    }
-
-    // 2. Phase transitions
-    float new_phase = compute_phase(self_id, new_temp);
-
-    // 3. Gravity and movement
-    float new_vy = self_vy;
-    float density = get_density(self_id);
-    float gravity = u_param1;
-
-    if (new_phase > 0.5) {
-        // Liquid or gas: affected by gravity/buoyancy
-        if (new_phase > 1.5) {
-            // Gas: buoyancy upward
-            new_vy += gravity * 0.5 * u_dt;
-        } else {
-            // Liquid: falls with gravity
-            new_vy -= gravity * density * 0.1 * u_dt;
-        }
-        new_vy = clamp(new_vy, -5.0, 5.0);
-        new_vy *= (1.0 - 0.1 * u_dt); // drag
-
-        // Liquid falling: vacate if destination (below) is vacuum
-        vec4 below = fetch(pos + ivec3(0, -1, 0));
-        int below_id = int(round(below.r));
-        if (new_vy < -MOVE_THRESHOLD && below_id == 0 && new_phase < 1.5) {
-            imageStore(u_dst, pos, vec4(0.0, new_temp, 0.0, 0.0));
-            return;
-        }
-
-        // Gas rising: vacate if destination (above) is vacuum
-        vec4 above = fetch(pos + ivec3(0, 1, 0));
-        int above_id = int(round(above.r));
-        if (new_vy > MOVE_THRESHOLD && above_id == 0 && new_phase > 1.5) {
-            imageStore(u_dst, pos, vec4(0.0, new_temp, 0.0, 0.0));
-            return;
-        }
-
-        // Liquid spreading: vacate sideways if pressured from above
-        if (new_phase > 0.5 && new_phase < 1.5) {
-            vec4 my_above = fetch(pos + ivec3(0, 1, 0));
-            if (int(round(my_above.r)) > 0) {
-                // Under pressure — try to spread sideways into vacuum
-                for (int axis = 0; axis < 3; axis += 2) {
-                    for (int dir = -1; dir <= 1; dir += 2) {
-                        ivec3 offset = ivec3(0);
-                        offset[axis] = dir;
-                        vec4 side = fetch(pos + offset);
-                        if (int(round(side.r)) == 0) {
-                            float hash = fract(sin(float(pos.x * 571 + pos.y * 887 + pos.z * 233 + axis * 17) * 0.0001) * 43758.5453);
-                            if (hash < 0.2 * u_dt) {
-                                imageStore(u_dst, pos, vec4(0.0, new_temp, 0.0, 0.0));
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        new_vy = 0.0; // Solids don't move
-    }
-
-    // 4. Chemical reactions with neighbors
-    float react_mult = u_param2;
-    for (int axis = 0; axis < 3; axis++) {
-        for (int dir = -1; dir <= 1; dir += 2) {
-            ivec3 offset = ivec3(0);
-            offset[axis] = dir;
-            vec4 nb = fetch(pos + offset);
-            int nb_id = int(round(nb.r));
-            if (nb_id == 0 || nb_id == self_id) continue;
-
-            // Electronegativity difference drives reaction probability
-            float en_self = get_eneg(self_id);
-            float en_nb = get_eneg(nb_id);
-            float en_diff = abs(en_self - en_nb);
-
-            // Higher EN difference = more likely to react
-            // Also need sufficient temperature (activation energy ~ mass-weighted)
-            float activation = (get_mass(self_id) + get_mass(nb_id)) * 2.0;
-            if (en_diff > 0.8 && new_temp > activation * 0.1) {
-                float hash = fract(sin(float(pos.x * 127 + pos.y * 311 + pos.z * 523 + axis * 7) * 0.0001) * 43758.5453);
-                float react_prob = en_diff * 0.02 * react_mult * u_dt;
-                if (hash < react_prob) {
-                    // Reaction! Release energy (exothermic if large EN diff)
-                    float energy = en_diff * 200.0;
-                    new_temp += energy;
-                    // Switch phase (reaction heat may cause phase change)
-                    new_phase = compute_phase(self_id, new_temp);
-                }
-            }
-        }
-    }
-
-    // 5. Radiative cooling toward ambient temperature.
-    // Without this the chemical reactions deposit en_diff*200 K per
-    // event with no sink, so temperature accumulates indefinitely and
-    // pegs at the 10000 K cap (audit: max=10000 forever). Newton's
-    // law of cooling with a small linear coefficient lets the system
-    // dissipate accumulated reaction heat to the environment, plus a
-    // quadratic term provides extra cooling at the high end so
-    // blackbody-hot cells return to manageable temperatures.
-    float T_amb = u_param0;  // ambient temperature slider
-    float dT = new_temp - T_amb;
-    new_temp -= 0.05 * dT * u_dt;             // linear (~Newton)
-    if (dT > 0.0) {
-        new_temp -= 1e-5 * dT * dT * u_dt;    // quadratic boost at high T
-    }
-
-    new_temp = clamp(new_temp, -273.15, 10000.0);
-    imageStore(u_dst, pos, vec4(float(self_id), new_temp, new_phase, new_vy));
-}
-"""
+ELEMENT_CA_RULE = _load_glsl("ELEMENT_CA_RULE.glsl")
 
 
 # ── Agent CA: separate compute header with SSBO for mobile agents ─────────
@@ -10295,47 +9749,7 @@ void main() {
 # Direction encoding (matches AGENT_DIRS in the host code):
 #   0=+X  1=-X  2=+Y  3=-Y  4=+Z  5=-Z
 
-AGENT_COMPUTE_HEADER = """
-#version 430
-layout(local_size_x=64, local_size_y=1, local_size_z=1) in;
-
-// Voxel grid bound IN PLACE: same texture on both image units, agents
-// read-modify-write the cells they visit.
-layout(rgba32f, binding=0) uniform image3D u_grid_r;
-layout(rgba32f, binding=1) uniform image3D u_grid_w;
-
-struct Agent {
-    ivec4 pos_dir;   // .xyz = pos, .w = dir id (0..5)
-    ivec4 state;     // reserved per-rule
-};
-layout(std430, binding=8) buffer AgentBuf {
-    Agent agents[];
-};
-
-uniform int u_size;
-uniform float u_dt;
-uniform int u_boundary;
-uniform int u_frame;
-uniform int u_pass;
-uniform float u_param0;
-uniform float u_param1;
-uniform float u_param2;
-uniform float u_param3;
-
-// 6 axis-aligned direction vectors. Order MUST match AGENT_DIRS in host.
-// Interleaved so consecutive entries are PERPENDICULAR (each +1 step is a
-// 90° turn around some axis, never a 180° axis flip). Opposites are
-// always 3 apart, so dir^3 (XOR with bit 0b11... actually +3 mod 6) is
-// the reverse direction.
-const ivec3 DIR[6] = ivec3[6](
-    ivec3( 1, 0, 0), ivec3( 0, 1, 0), ivec3( 0, 0, 1),
-    ivec3(-1, 0, 0), ivec3( 0,-1, 0), ivec3( 0, 0,-1)
-);
-
-ivec3 wrap_pos(ivec3 p) {
-    return ((p % u_size) + u_size) % u_size;
-}
-"""
+AGENT_COMPUTE_HEADER = _load_glsl("AGENT_COMPUTE_HEADER.glsl")
 
 
 AGENT_RULES = {
@@ -10951,29 +10365,7 @@ void main() {
 # ── Voxel rendering shaders ──────────────────────────────────────────
 
 # GPU-side indirect buffer reset (avoids CPU->GPU write per chunk)
-INDIRECT_RESET_SHADER = """
-#version 430
-layout(local_size_x=1) in;
-layout(std430, binding=4) buffer DrawIndirect {
-    uint vertexCount;
-    uint instanceCount;
-    uint firstVertex;
-    uint baseInstance;
-};
-layout(std430, binding=6) buffer TotalCounter {
-    uint totalVisibleCount;
-};
-uniform int u_reset_total;  // 1 = also reset frame-level total (first chunk only)
-uniform int u_vertex_count; // per-instance vertex count (36 cube / 72 rhombic-dodec)
-void main() {
-    vertexCount = uint(u_vertex_count);
-    instanceCount = 0u;
-    firstVertex = 0u;
-    baseInstance = 0u;
-    if (u_reset_total == 1)
-        totalVisibleCount = 0u;
-}
-"""
+INDIRECT_RESET_SHADER = _load_glsl("INDIRECT_RESET_SHADER.glsl")
 
 # ── Block-sparse compute dispatch shaders ────────────────────────────
 #
@@ -11005,106 +10397,13 @@ void main() {
 # uses bs=4) are auto-disabled from sparse dispatch — they're already
 # fast enough and the workgroup/block mismatch would complicate things.
 
-SPARSE_OCC_SHADER = """
-#version 430
-// One workgroup per 8³ block; 512 threads each fetch ONE voxel and
-// OR the result into shared memory. Replaces a previous serial
-// 512-iter per-thread loop that ran ~100× slower at 384³ due to
-// fully sequential texelFetch chains within each warp.
-layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
-uniform sampler3D u_volume;
-uniform int u_size;       // voxel grid edge
-layout(r8ui, binding=0) uniform restrict writeonly uimage3D u_occ_out;
-shared uint s_occ;
-void main() {
-    if (gl_LocalInvocationIndex == 0u) s_occ = 0u;
-    barrier();
+SPARSE_OCC_SHADER = _load_glsl("SPARSE_OCC_SHADER.glsl")
 
-    ivec3 b = ivec3(gl_WorkGroupID);
-    ivec3 p = b * 8 + ivec3(gl_LocalInvocationID);
-    if (all(lessThan(p, ivec3(u_size)))) {
-        // ANY channel != 0 counts as occupied (covers multi-field rules).
-        vec4 v = texelFetch(u_volume, p, 0);
-        if (any(notEqual(v, vec4(0.0)))) {
-            atomicOr(s_occ, 1u);
-        }
-    }
-    barrier();
-    if (gl_LocalInvocationIndex == 0u) {
-        imageStore(u_occ_out, b, uvec4(s_occ, 0u, 0u, 0u));
-    }
-}
-"""
+SPARSE_DILATE_SHADER = _load_glsl("SPARSE_DILATE_SHADER.glsl")
 
-SPARSE_DILATE_SHADER = """
-#version 430
-layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
-uniform int u_occ_dim;
-uniform int u_boundary;   // 0 = clamp, 1 = wrap (toroidal)
-layout(r8ui, binding=0) uniform restrict readonly  uimage3D u_occ_in;
-layout(r8ui, binding=1) uniform restrict writeonly uimage3D u_active_out;
+SPARSE_COMPACT_SHADER = _load_glsl("SPARSE_COMPACT_SHADER.glsl")
 
-uint sample_block(ivec3 b) {
-    if (u_boundary == 1) {
-        b = ((b % u_occ_dim) + u_occ_dim) % u_occ_dim;
-    } else {
-        if (any(lessThan(b, ivec3(0))) || any(greaterThanEqual(b, ivec3(u_occ_dim))))
-            return 0u;
-    }
-    return imageLoad(u_occ_in, b).r;
-}
-void main() {
-    ivec3 b = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(b, ivec3(u_occ_dim)))) return;
-    uint a = sample_block(b);
-    // 6-neighbour face dilation (axis-aligned, 1 block = 8 voxels)
-    a |= sample_block(b + ivec3(-1, 0, 0));
-    a |= sample_block(b + ivec3( 1, 0, 0));
-    a |= sample_block(b + ivec3( 0,-1, 0));
-    a |= sample_block(b + ivec3( 0, 1, 0));
-    a |= sample_block(b + ivec3( 0, 0,-1));
-    a |= sample_block(b + ivec3( 0, 0, 1));
-    imageStore(u_active_out, b, uvec4(a, 0u, 0u, 0u));
-}
-"""
-
-SPARSE_COMPACT_SHADER = """
-#version 430
-layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
-uniform int u_occ_dim;
-layout(r8ui, binding=0) uniform restrict readonly uimage3D u_active_in;
-// Slot 0..2 = (groupCountX, 1, 1); compact list lives in a separate SSBO.
-layout(std430, binding=10) buffer SparseIndirect {
-    uint sparse_groups_x;
-    uint sparse_groups_y;
-    uint sparse_groups_z;
-};
-layout(std430, binding=11) buffer SparseBlocks {
-    uvec4 sparse_blocks[];   // .xyz = block coord, .w unused (16-byte aligned)
-};
-void main() {
-    ivec3 b = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(b, ivec3(u_occ_dim)))) return;
-    if (imageLoad(u_active_in, b).r == 0u) return;
-    uint slot = atomicAdd(sparse_groups_x, 1u);
-    sparse_blocks[slot] = uvec4(uint(b.x), uint(b.y), uint(b.z), 0u);
-}
-"""
-
-SPARSE_INDIRECT_RESET_SHADER = """
-#version 430
-layout(local_size_x=1) in;
-layout(std430, binding=10) buffer SparseIndirect {
-    uint sparse_groups_x;
-    uint sparse_groups_y;
-    uint sparse_groups_z;
-};
-void main() {
-    sparse_groups_x = 0u;
-    sparse_groups_y = 1u;
-    sparse_groups_z = 1u;
-}
-"""
+SPARSE_INDIRECT_RESET_SHADER = _load_glsl("SPARSE_INDIRECT_RESET_SHADER.glsl")
 
 # Compute shader: extract visible voxel positions into an SSBO
 # A voxel is "visible" if it's alive/non-vacuum AND has at least one dead/vacuum neighbor
@@ -11115,192 +10414,7 @@ void main() {
 # Note: prior layout used 10/10/10/2 (1024³ max, only 4 shading levels). The
 # 5-bit shading field gives 32 levels, eliminating visible posterization on
 # voxel iso-surfaces. The simulator maxes at 512³ grids so 9 bits suffice.
-VOXEL_CULL_SHADER = """
-#version 430
-layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
-
-#ifdef SPARSE_DISPATCH
-// Brick-list cull: one workgroup per ACTIVE 8³ block, fetched from
-// _sparse_blocks_ssbo. Skips traversal of empty / fully-buried regions
-// entirely — dense fields with sparse surfaces win the most.
-layout(std430, binding=11) readonly buffer ActiveBlocks {
-    uvec4 sparse_blocks[];
-};
-#endif
-
-// Read-only sampler for texture-cache-friendly access (vs imageLoad)
-uniform sampler3D u_volume_tex;
-
-layout(std430, binding=3) buffer VoxelBuffer {
-    uint voxels[];   // 1 uint per voxel (position only, 4 bytes)
-};
-
-layout(std430, binding=4) buffer DrawIndirect {
-    uint vertexCount;      // = 36 (set by CPU)
-    uint instanceCount;    // written by this shader via atomicAdd
-    uint firstVertex;      // = 0 (set by CPU)
-    uint baseInstance;     // = 0 (set by CPU)
-};
-
-layout(std430, binding=6) buffer TotalCounter {
-    uint totalVisibleCount;  // accumulates across all chunks (reset once per frame)
-};
-
-uniform int u_size;
-uniform ivec3 u_dims;       // (W, H, D) — per-axis grid bounds
-uniform float u_threshold;  // visibility threshold for non-element CAs
-uniform int u_is_element_ca; // 1 = element mode, 0 = standard mode
-uniform int u_max_voxels;
-uniform int u_channel;      // which channel to read (0=R, 1=G, 2=B, 3=A)
-uniform int u_use_abs;      // 1 = use abs(value) for alive test (wave mode)
-// Multi-channel vis_mode (mirrors VIEW_TEX_BUILD_SHADER):
-//   0 = DENSITY (legacy, use u_channel)
-//   1 = RGB_CHANNELS  (alive = length(rgb)/sqrt(3))
-//   4 = RGBA_BLEND    (alive = .a)
-// Modes 2/3 are treated like DENSITY (single channel is fine for cull).
-uniform int u_vis_mode;
-// Chunk bounds for multi-pass rendering (default: full grid)
-uniform ivec3 u_chunk_min;  // inclusive lower corner
-uniform ivec3 u_chunk_max;  // exclusive upper corner
-
-// Shared memory tile: 10x10x10 halo around the 8x8x8 workgroup.
-// Only stores the scalar alive-test value (1 float per cell).
-shared float s_tile[10][10][10];
-
-float get_alive_value(vec4 c) {
-    if (u_is_element_ca == 1) return c.r;
-    if (u_vis_mode == 1) {
-        // Team-coloured paint (rgb_channels): max of any channel proxies
-        // visibility well and avoids the sqrt(3) suppression of
-        // single-team voxels (red voxel has rgb=(1,0,0) -> length=1).
-        return max(max(c.r, c.g), c.b);
-    }
-    if (u_vis_mode == 4) return c.a;
-    float v = c[u_channel];
-    if (u_use_abs == 1) v = abs(v);
-    else if (u_use_abs == 2) v = abs(v);  // signed bipolar: visibility = magnitude
-    return v;
-}
-
-// Fetch alive-test value, returning 0.0 (dead) for out-of-bounds cells.
-// This prevents boundary cells from falsely seeing themselves as neighbors.
-float fetch_alive(ivec3 gp) {
-    if (any(lessThan(gp, ivec3(0))) || any(greaterThanEqual(gp, u_dims)))
-        return 0.0;
-    return get_alive_value(texelFetch(u_volume_tex, gp, 0));
-}
-
-bool is_alive(float v) {
-    if (u_is_element_ca == 1) return int(round(v)) > 0;
-    return v > u_threshold;
-}
-
-void main() {
-    ivec3 chunk_size = u_chunk_max - u_chunk_min;
-    ivec3 local = ivec3(gl_LocalInvocationID);
-#ifdef SPARSE_DISPATCH
-    // Each workgroup handles one active 8³ block from the compact list.
-    uvec4 b = sparse_blocks[gl_WorkGroupID.x];
-    ivec3 wg_origin = ivec3(b.xyz) * 8;
-#else
-    ivec3 wg_origin = ivec3(gl_WorkGroupID) * 8 + u_chunk_min;
-#endif
-
-    // ── Load 10x10x10 shared memory tile (8³ core + 1-cell halo) ──
-    // Each thread in the 8³ workgroup loads its own cell at offset +1
-    {
-        ivec3 gp = wg_origin + local;
-        s_tile[local.z + 1][local.y + 1][local.x + 1] = fetch_alive(gp);
-    }
-
-    // Halo: threads on the faces of the 8³ block load boundary cells.
-    // Uses fetch_alive() which returns 0.0 for out-of-bounds positions.
-    // X-axis halo (left/right)
-    if (local.x == 0) {
-        s_tile[local.z + 1][local.y + 1][0] =
-            fetch_alive(wg_origin + ivec3(-1, local.y, local.z));
-    }
-    if (local.x == 7) {
-        s_tile[local.z + 1][local.y + 1][9] =
-            fetch_alive(wg_origin + ivec3(8, local.y, local.z));
-    }
-    // Y-axis halo (bottom/top)
-    if (local.y == 0) {
-        s_tile[local.z + 1][0][local.x + 1] =
-            fetch_alive(wg_origin + ivec3(local.x, -1, local.z));
-    }
-    if (local.y == 7) {
-        s_tile[local.z + 1][9][local.x + 1] =
-            fetch_alive(wg_origin + ivec3(local.x, 8, local.z));
-    }
-    // Z-axis halo (front/back)
-    if (local.z == 0) {
-        s_tile[0][local.y + 1][local.x + 1] =
-            fetch_alive(wg_origin + ivec3(local.x, local.y, -1));
-    }
-    if (local.z == 7) {
-        s_tile[9][local.y + 1][local.x + 1] =
-            fetch_alive(wg_origin + ivec3(local.x, local.y, 8));
-    }
-
-    barrier();
-    memoryBarrierShared();
-
-    // ── Surface cull using shared memory ──
-    ivec3 pos = wg_origin + local;
-#ifndef SPARSE_DISPATCH
-    if (any(greaterThanEqual(pos, u_chunk_max))) return;
-#endif
-    if (any(greaterThanEqual(pos, u_dims))) return;
-
-    // Read own cell from shared memory (offset +1 for halo)
-    ivec3 s = local + 1;  // shared memory coords
-    float myVal = s_tile[s.z][s.y][s.x];
-    if (!is_alive(myVal)) return;
-
-    // Check 6 neighbors from shared memory — no global reads
-    int solid_neighbors = 0;
-    if (is_alive(s_tile[s.z][s.y][s.x - 1])) solid_neighbors++;  // -X
-    if (is_alive(s_tile[s.z][s.y][s.x + 1])) solid_neighbors++;  // +X
-    if (is_alive(s_tile[s.z][s.y - 1][s.x])) solid_neighbors++;  // -Y
-    if (is_alive(s_tile[s.z][s.y + 1][s.x])) solid_neighbors++;  // +Y
-    if (is_alive(s_tile[s.z - 1][s.y][s.x])) solid_neighbors++;  // -Z
-    if (is_alive(s_tile[s.z + 1][s.y][s.x])) solid_neighbors++;  // +Z
-    if (solid_neighbors >= 6) return;  // fully buried, skip
-
-    // Compute a richer surface-darkening hint: 0..6 raw face-neighbor count
-    // mapped to 0..30 so it fits in a 5-bit field with smooth steps. We oversample
-    // the corner contributions by also weighting the 12 edge neighbors (each
-    // counted as 0.5) and 8 corner neighbors (each as 0.25). This produces
-    // ambient-occlusion-like shading without any extra global memory traffic
-    // (everything lives in s_tile which is already populated for the surface cull).
-    int aoc = solid_neighbors * 4;  // face neighbors weighted x4 (range 0..24)
-    // Edge (12) and corner (8) contributions for AO darkening
-    if (is_alive(s_tile[s.z][s.y - 1][s.x - 1])) aoc++;
-    if (is_alive(s_tile[s.z][s.y - 1][s.x + 1])) aoc++;
-    if (is_alive(s_tile[s.z][s.y + 1][s.x - 1])) aoc++;
-    if (is_alive(s_tile[s.z][s.y + 1][s.x + 1])) aoc++;
-    if (is_alive(s_tile[s.z - 1][s.y][s.x - 1])) aoc++;
-    if (is_alive(s_tile[s.z - 1][s.y][s.x + 1])) aoc++;
-    if (is_alive(s_tile[s.z + 1][s.y][s.x - 1])) aoc++;
-    if (is_alive(s_tile[s.z + 1][s.y][s.x + 1])) aoc++;
-    // Cap the AO score in the shade-bit field range
-    uint shade_hint = uint(min(aoc, int(__SHADE_MAX__)));
-
-    // Append position only (1 uint = 4 bytes per voxel)
-    atomicAdd(totalVisibleCount, 1u);  // frame-level total (not reset per chunk)
-    uint idx = atomicAdd(instanceCount, 1u);
-    if (idx >= uint(u_max_voxels)) return;
-
-    // Pack: __PB__ bits per axis (xyz) + __SB__-bit shading.
-    // Substituted at compile time based on max(W,H,D): 9/5 for size<=512,
-    // 10/2 for size<=1024 (loses smooth AO levels but supports 1024^3).
-    voxels[idx] = (uint(pos.x) & __PMASK__)
-                | ((uint(pos.y) & __PMASK__) << __PB__)
-                | ((uint(pos.z) & __PMASK__) << (2u * __PB__))
-                | ((shade_hint  & __SMASK__) << (3u * __PB__));
-}
-"""
+VOXEL_CULL_SHADER = _load_glsl("VOXEL_CULL_SHADER.glsl")
 
 # ── Min/max range reduction over the _mm_tex mipmap ───────────────
 # Async-friendly replacement for a synchronous _mm_tex.read() that was
@@ -11316,164 +10430,14 @@ void main() {
 # in _mm_tex come from a view-tex that is either raw, abs(), or signed
 # remapped to [0,1], so we range-shift by adding +10 to guarantee
 # non-negative IEEE-comparable values, then subtract back on readback.
-RANGE_REDUCE_SHADER = """
-#version 430
-layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
-
-uniform sampler3D u_minmax;   // RG16F: per-block (min, max) of view tex
-uniform int u_dim;            // mipmap dimension along each axis
-
-layout(std430, binding=0) buffer RangeBuf {
-    uint range_min_bits;  // float bits of (min + 10.0)
-    uint range_max_bits;  // float bits of (max + 10.0)
-};
-
-shared float s_lo[64];
-shared float s_hi[64];
-
-void main() {
-    ivec3 p = ivec3(gl_GlobalInvocationID);
-    uint lid = gl_LocalInvocationIndex;
-    float lo =  1e10;
-    float hi = -1e10;
-    if (all(lessThan(p, ivec3(u_dim)))) {
-        vec2 mm = texelFetch(u_minmax, p, 0).rg;
-        lo = mm.r;
-        hi = mm.g;
-    }
-    s_lo[lid] = lo;
-    s_hi[lid] = hi;
-    barrier();
-    // Tree reduction in shared memory (64 -> 1)
-    for (uint stride = 32u; stride > 0u; stride >>= 1) {
-        if (lid < stride) {
-            s_lo[lid] = min(s_lo[lid], s_lo[lid + stride]);
-            s_hi[lid] = max(s_hi[lid], s_hi[lid + stride]);
-        }
-        barrier();
-    }
-    if (lid == 0u) {
-        // Float-as-uint atomic min/max via +10 bias to keep IEEE bits
-        // monotonic even for negative inputs (range is [-10, +Inf)).
-        atomicMin(range_min_bits, floatBitsToUint(s_lo[0] + 10.0));
-        atomicMax(range_max_bits, floatBitsToUint(s_hi[0] + 10.0));
-    }
-}
-"""
+RANGE_REDUCE_SHADER = _load_glsl("RANGE_REDUCE_SHADER.glsl")
 
 # ── GPU-side metrics reduction shader ─────────────────────────────
 # Computes alive_count, change_count, surface_count, nan_count using
 # workgroup-local shared-memory reduction, then one global atomicAdd
 # per counter per workgroup.  This avoids millions of global atomics
 # that can hang Nouveau/Mesa at large grid sizes.
-METRICS_REDUCE_SHADER = """
-#version 430
-layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
-
-layout(rgba32f, binding=0) readonly uniform image3D u_current;
-layout(rgba32f, binding=1) readonly uniform image3D u_prev;
-
-layout(std430, binding=5) buffer Metrics {
-    uint alive_count;
-    uint change_count;
-    uint surface_count;
-    uint nan_count;
-};
-
-uniform int u_size;
-uniform float u_threshold;
-uniform int u_channel;
-uniform int u_mode;        // 0=discrete, 1=continuous, 2=wave, 3=element
-uniform float u_change_thr;
-uniform int u_has_prev;    // 0 = no previous snapshot, skip activity
-uniform int u_boundary;    // 0 = toroidal, 1 = clamped (Dirichlet), 2 = mirror (Neumann)
-
-shared uint s_alive;
-shared uint s_change;
-shared uint s_surface;
-shared uint s_nan;
-
-bool is_alive(vec4 cell) {
-    float v = cell[u_channel];
-    if (u_mode == 3) return abs(v) > 0.5 && abs(v - 119.0) > 0.5;
-    if (u_mode == 2) return abs(v) > u_threshold;
-    return v > u_threshold;
-}
-
-vec4 safe_load(ivec3 p) {
-    if (u_boundary == 1) {
-        // Clamped: out-of-bounds reads as dead (zero)
-        if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, ivec3(u_size))))
-            return vec4(0.0);
-        return imageLoad(u_current, p);
-    } else if (u_boundary == 2) {
-        // Mirror: out-of-bounds reflects to its inner neighbor (zero-flux).
-        return imageLoad(u_current, clamp(p, ivec3(0), ivec3(u_size - 1)));
-    } else {
-        // Toroidal: wrap
-        return imageLoad(u_current, (p + ivec3(u_size)) % ivec3(u_size));
-    }
-}
-
-void main() {
-    uint lid = gl_LocalInvocationIndex;
-
-    // Clear shared counters (one thread per workgroup)
-    if (lid == 0u) {
-        s_alive = 0u; s_change = 0u; s_surface = 0u; s_nan = 0u;
-    }
-    barrier();
-
-    ivec3 pos = ivec3(gl_GlobalInvocationID);
-    if (all(lessThan(pos, ivec3(u_size)))) {
-        vec4 cur = imageLoad(u_current, pos);
-        float val = cur[u_channel];
-
-        // NaN / Inf check
-        if (isnan(val) || isinf(val)) {
-            atomicAdd(s_nan, 1u);
-        } else {
-            bool alive = is_alive(cur);
-
-            if (alive) {
-                atomicAdd(s_alive, 1u);
-
-                // Surface check: alive cell with < 6 alive von-Neumann neighbours
-                int solid = 0;
-                if (is_alive(safe_load(pos + ivec3(-1, 0, 0)))) solid++;
-                if (is_alive(safe_load(pos + ivec3( 1, 0, 0)))) solid++;
-                if (is_alive(safe_load(pos + ivec3( 0,-1, 0)))) solid++;
-                if (is_alive(safe_load(pos + ivec3( 0, 1, 0)))) solid++;
-                if (is_alive(safe_load(pos + ivec3( 0, 0,-1)))) solid++;
-                if (is_alive(safe_load(pos + ivec3( 0, 0, 1)))) solid++;
-                if (solid < 6) atomicAdd(s_surface, 1u);
-            }
-
-            // Activity: compare with previous snapshot
-            if (u_has_prev != 0) {
-                vec4 prv = imageLoad(u_prev, pos);
-                float prev_val = prv[u_channel];
-                float diff = abs(val - prev_val);
-                bool changed = diff > u_change_thr;
-                if (u_mode == 3) {
-                    float temp_diff = abs(cur[1] - prv[1]);
-                    changed = changed || temp_diff > 1.0;
-                }
-                if (changed) atomicAdd(s_change, 1u);
-            }
-        }
-    }
-
-    // Flush workgroup totals to global memory (one atomic per counter)
-    barrier();
-    if (lid == 0u) {
-        if (s_alive > 0u)   atomicAdd(alive_count, s_alive);
-        if (s_change > 0u)  atomicAdd(change_count, s_change);
-        if (s_surface > 0u) atomicAdd(surface_count, s_surface);
-        if (s_nan > 0u)     atomicAdd(nan_count, s_nan);
-    }
-}
-"""
+METRICS_REDUCE_SHADER = _load_glsl("METRICS_REDUCE_SHADER.glsl")
 
 # ─────────────────────────────────────────────────────────────────────
 # DEBUG STATS SHADER — comprehensive single-pass instrumentation
@@ -11517,212 +10481,7 @@ void main() {
 # "stale by one frame" histogram bounds are perfectly fine for live
 # visualization -- the alternative (two dispatches) would double the
 # debug-mode cost with no perceptual win.
-DEBUG_STATS_SHADER = """
-#version 430
-layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
-
-layout(rgba32f, binding=0) readonly uniform image3D u_grid;
-
-layout(std430, binding=7) buffer DebugStats {
-    uint finite_count[4];
-    uint nan_count[4];
-    uint inf_count[4];
-    uint min_bits[4];
-    uint max_bits[4];
-    uint sum_fp[4];
-    uint sumsq_fp[4];
-    uint active_count;
-    uint bbox_min[3];
-    uint bbox_max[3];
-    uint com_sum[3];
-    uint rg_sum;
-    uint boundary_count;
-    uint hist[4 * 64];
-};
-
-uniform int   u_size;
-uniform int   u_active_channel;   // which channel defines "active"
-uniform float u_active_threshold; // active iff value > threshold (or |v|>thr in mode==2)
-uniform int   u_active_mode;      // 0=>thr, 1=>thr, 2=>abs(thr), 3=>element-id
-uniform int   u_boundary_shell;   // shell thickness (default 4)
-uniform float u_hist_min[4];      // previous frame's min per channel
-uniform float u_hist_max[4];      // previous frame's max per channel
-uniform float u_norm_n;           // 1.0 / total_cells
-
-// Encoded constants (must match Python decoder)
-#define BIAS      1.0e6
-#define SCALE_S   1.0e6
-#define SCALE_Q   1.0e3
-
-// Workgroup-shared accumulators -- one atomic per workgroup per metric.
-// (Atomic-bombing the global SSBO from every thread would be ~5-50x
-//  slower at 256³ on real hardware.)
-shared uint s_finite[4];
-shared uint s_nan[4];
-shared uint s_inf[4];
-shared uint s_min_bits[4];
-shared uint s_max_bits[4];
-shared int  s_sum_int[4];     // signed local sum, fixed-point
-shared uint s_sumsq[4];       // unsigned local sum-of-squares, fixed-point
-shared uint s_active;
-shared uint s_bbox_min[3];
-shared uint s_bbox_max[3];
-shared uint s_com[3];
-shared uint s_rg;
-shared uint s_boundary;
-
-bool is_active(vec4 cell) {
-    float v = cell[u_active_channel];
-    if (u_active_mode == 3) return abs(v) > 0.5 && abs(v - 119.0) > 0.5;
-    if (u_active_mode == 2) return abs(v) > u_active_threshold;
-    return v > u_active_threshold;
-}
-
-void main() {
-    uint lid = gl_LocalInvocationIndex;
-
-    // ── Init shared memory (1 thread per slot) ───────────────────────
-    if (lid < 4u) {
-        s_finite[lid] = 0u;
-        s_nan[lid] = 0u;
-        s_inf[lid] = 0u;
-        // Min sentinel: a huge positive biased value (~floatBitsToUint(1e30),
-        // a large positive uint). atomicMin against any real biased data
-        // (BIAS ± v, a normal positive float bit-pattern ≪ 1e30 bits)
-        // replaces the sentinel with the real value.
-        s_min_bits[lid] = floatBitsToUint(BIAS + 1.0e30);
-        // Max sentinel: 0u, the smallest possible uint. atomicMax against any
-        // real biased data (positive uint, since BIAS keeps things > 0) wins.
-        // CRITICAL: do NOT use floatBitsToUint(BIAS - 1e30); that float is
-        // negative, which sets the sign bit and produces a HUGE uint that
-        // beats every real datum in atomicMax (the bug that pinned max to
-        // −1e30 in the first JSON dump).
-        s_max_bits[lid] = 0u;
-        s_sum_int[lid] = 0;
-        s_sumsq[lid] = 0u;
-    }
-    if (lid < 3u) {
-        s_bbox_min[lid] = uint(u_size);   // start large (= no active yet)
-        s_bbox_max[lid] = 0u;             // start small
-        s_com[lid] = 0u;
-    }
-    if (lid == 0u) {
-        s_active = 0u; s_rg = 0u; s_boundary = 0u;
-    }
-    barrier();
-
-    ivec3 pos = ivec3(gl_GlobalInvocationID);
-    bool in_grid = all(lessThan(pos, ivec3(u_size)));
-
-    if (in_grid) {
-        vec4 cur = imageLoad(u_grid, pos);
-
-        // ── Per-channel scalar stats ────────────────────────────────
-        for (int c = 0; c < 4; c++) {
-            float v = cur[c];
-            if (isnan(v)) {
-                atomicAdd(s_nan[c], 1u);
-                continue;
-            }
-            if (isinf(v)) {
-                atomicAdd(s_inf[c], 1u);
-                continue;
-            }
-            atomicAdd(s_finite[c], 1u);
-            // Keep per-cell accumulation UN-normalized so small values
-            // don't truncate to zero (the bug that pinned ch0_mean=0 at
-            // size>=128). Workgroup local sum is bounded by
-            //   512 * |v|_max * SCALE_S  ~ 5.12e8  -> fits int32.
-            // We normalize by u_norm_n only at flush-to-global time.
-            int s_int = int(v * SCALE_S);
-            // sum-of-squares is non-negative; 512 * v²_max * SCALE_Q
-            // ~ 5e5..5e8 depending on rule -> fits uint32.
-            uint sq_uint = uint(v * v * SCALE_Q);
-            atomicAdd(s_sum_int[c], s_int);
-            atomicAdd(s_sumsq[c], sq_uint);
-            // Min/max via float-bits + bias for atomicMin/Max ordering.
-            uint biased_bits = floatBitsToUint(v + BIAS);
-            atomicMin(s_min_bits[c], biased_bits);
-            atomicMax(s_max_bits[c], biased_bits);
-
-            // Histogram. Use previous frame's range so we have stable bins.
-            float lo = u_hist_min[c];
-            float hi = u_hist_max[c];
-            float span = max(hi - lo, 1.0e-12);
-            int bin = int(clamp((v - lo) / span * 64.0, 0.0, 63.0));
-            atomicAdd(hist[c * 64 + bin], 1u);
-        }
-
-        // ── Active-mask spatial stats ───────────────────────────────
-        if (is_active(cur)) {
-            atomicAdd(s_active, 1u);
-            atomicMin(s_bbox_min[0], uint(pos.x));
-            atomicMin(s_bbox_min[1], uint(pos.y));
-            atomicMin(s_bbox_min[2], uint(pos.z));
-            atomicMax(s_bbox_max[0], uint(pos.x));
-            atomicMax(s_bbox_max[1], uint(pos.y));
-            atomicMax(s_bbox_max[2], uint(pos.z));
-            atomicAdd(s_com[0], uint(pos.x));
-            atomicAdd(s_com[1], uint(pos.y));
-            atomicAdd(s_com[2], uint(pos.z));
-            // Radius-of-gyration accumulator: sum of |p - center|² where
-            // center = size/2. Stored as fixed-point: divide by size² so
-            // the per-cell contribution is in [0, 0.75] before scaling.
-            vec3 d = vec3(pos) - vec3(u_size) * 0.5;
-            float r2_norm = dot(d, d) / float(u_size * u_size);
-            atomicAdd(s_rg, uint(r2_norm * 1024.0));
-            // Boundary shell: count active cells within u_boundary_shell
-            // of any face.
-            int sh = u_boundary_shell;
-            if (pos.x < sh || pos.x >= u_size - sh ||
-                pos.y < sh || pos.y >= u_size - sh ||
-                pos.z < sh || pos.z >= u_size - sh) {
-                atomicAdd(s_boundary, 1u);
-            }
-        }
-    }
-
-    barrier();
-
-    // ── Flush workgroup totals to global SSBO (one atomic each) ─────
-    if (lid < 4u) {
-        if (s_finite[lid] > 0u) atomicAdd(finite_count[lid], s_finite[lid]);
-        if (s_nan[lid]    > 0u) atomicAdd(nan_count[lid],    s_nan[lid]);
-        if (s_inf[lid]    > 0u) atomicAdd(inf_count[lid],    s_inf[lid]);
-        // Min/max: ONLY flush when this workgroup actually saw finite data.
-        // Otherwise the sentinels (huge-uint for min, 0 for max) would
-        // corrupt the global running min/max via the atomic ops.
-        if (s_finite[lid] > 0u) {
-            atomicMin(min_bits[lid], s_min_bits[lid]);
-            atomicMax(max_bits[lid], s_max_bits[lid]);
-        }
-        // Normalize workgroup totals by 1/N on flush. Each global-atomic
-        // contribution is tiny per workgroup but sums correctly across
-        // the whole grid. Signed->uint reinterpret preserves the bit
-        // pattern so Python's int32 view decodes negatives properly.
-        // CRITICAL: use round-to-nearest-even, not truncation. At huge
-        // grids (512³) per-workgroup normalized values can be <1 and
-        // `int(x)` would systematically truncate them to 0, losing the
-        // entire signal.
-        float sum_norm_f   = float(s_sum_int[lid]) * u_norm_n;
-        float sumsq_norm_f = float(s_sumsq[lid])   * u_norm_n;
-        int  ws_sum_norm   = int(floor(sum_norm_f + sign(sum_norm_f) * 0.5));
-        uint ws_sumsq_norm = uint(sumsq_norm_f + 0.5);
-        if (ws_sum_norm  != 0)  atomicAdd(sum_fp[lid],   uint(ws_sum_norm));
-        if (ws_sumsq_norm > 0u) atomicAdd(sumsq_fp[lid], ws_sumsq_norm);
-    }
-    if (lid < 3u) {
-        atomicMin(bbox_min[lid], s_bbox_min[lid]);
-        atomicMax(bbox_max[lid], s_bbox_max[lid]);
-        if (s_com[lid] > 0u) atomicAdd(com_sum[lid], s_com[lid]);
-    }
-    if (lid == 0u) {
-        if (s_active > 0u)   atomicAdd(active_count,   s_active);
-        if (s_rg > 0u)       atomicAdd(rg_sum,         s_rg);
-        if (s_boundary > 0u) atomicAdd(boundary_count, s_boundary);
-    }
-}
-"""
+DEBUG_STATS_SHADER = _load_glsl("DEBUG_STATS_SHADER.glsl")
 
 # ─── GPU PARTICLE LAYER ────────────────────────────────────────────────
 # Each particle is 8 floats / 32 bytes:
@@ -11739,403 +10498,14 @@ void main() {
 #   'gradient_neg_r' — same but pushes UP-gradient (away from sources)
 #   'curl_rgb'     — curl of the RGB vector field; gives swirly motion
 #                    around vorticity tubes (great for aurora/ink).
-PARTICLE_UPDATE_COMPUTE = """
-#version 430
-#extension GL_NV_shader_atomic_float : enable
-layout(local_size_x = 64) in;
-
-layout(std430, binding = 9) buffer Particles { vec4 data[]; } P;
-// Particle i occupies P.data[2*i + 0] = (pos, life)
-//                      P.data[2*i + 1] = (vel, mass)
-
-#ifndef NN_HID
-#define NN_HID 0
-#endif
-#ifndef NN_SHARED
-#define NN_SHARED 0
-#endif
-
-#ifndef DEPOSIT_ENABLED
-#define DEPOSIT_ENABLED 0
-#endif
-
-#if DEPOSIT_ENABLED
-// Each particle does an atomic float add into the (newly cleared)
-// deposit SSBO at its post-update voxel.  Requires
-// GL_NV_shader_atomic_float — fp32 atomics on SSBOs are NVIDIA-only,
-// but every target device for this simulator (GeForce/Quadro from
-// Maxwell onward) supports them.  We use an SSBO instead of an image
-// because the driver only exposes 8 image units, all of which are
-// already taken by field src/dst/extras bindings.
-layout(std430, binding = 15) coherent buffer DepositBuf { float data[]; } u_deposit_buf;
-uniform float u_deposit_amount;       // mass added per particle per step
-uniform int   u_deposit_radius;       // 0 = single voxel, 1 = 3³ cube splat
-uniform ivec3 u_dep_dims;             // (W,H,D) — needed for correct linear
-                                      // indexing on non-cubic grids; u_size
-                                      // is the back-compat scalar max(W,H,D).
-#endif
-
-#if NN_HID > 0
-// Per-agent brain weight stride (floats):
-//   W1: 6 * NN_HID, b1: NN_HID, W2: NN_HID * 3, b2: 3
-//   total = 10 * NN_HID + 3
-#define NN_STRIDE (10 * NN_HID + 3)
-layout(std430, binding = 13) readonly buffer Brains { float w[]; } B;
-#endif
-
-uniform sampler3D u_field_tex;
-uniform int   u_size;
-uniform int   u_count;
-uniform int   u_force_mode;   // 0=none, 1=velocity_rgb, 2=grad_r, 3=grad_neg_r, 4=curl_rgb, 5=nn_brain
-uniform float u_force_scale;
-uniform float u_dt;
-uniform float u_drag;         // 0..1 fraction of velocity removed per step
-uniform float u_life_decay;   // amount subtracted from life each step
-uniform int   u_respawn;      // 0/1
-uniform uint  u_frame;        // for respawn RNG
-uniform vec3  u_spawn_min;
-uniform vec3  u_spawn_max;
-uniform float u_spawn_speed;  // initial random speed magnitude on respawn
-
-// ── Particle Lenia (force mode 6) parameters ──────────────────────
-// All dimensions are in cell units.  Matches Mordvintsev et al. 2022
-// ("Particle Lenia and the Energy-Based Behaviour of Pattern
-// Formation"): each particle feels a kernel-summed potential U from
-// its neighbours and moves down the energy E(x) = R(x) - G(U(x)),
-// where R is short-range repulsion and G is the bell-shaped growth
-// function from standard Lenia.  Self-organising clusters, gliders,
-// and metastable structures emerge from pure pairwise dynamics — no
-// background field required.
-uniform float u_pl_mu_k;     // kernel centre radius
-uniform float u_pl_sigma_k;  // kernel ring thickness
-uniform float u_pl_mu_g;     // growth-function centre (target U)
-uniform float u_pl_sigma_g;  // growth-function width
-uniform float u_pl_c_rep;    // repulsion strength
-uniform float u_pl_r_rep;    // repulsion cutoff radius
-
-float fs = float(u_size);
-
-vec4 sampleField(vec3 p) {
-    vec3 uv = (p + 0.5) / fs;
-    return texture(u_field_tex, uv);
-}
-
-vec3 gradient_r(vec3 p) {
-    float h = 1.0;
-    float xp = sampleField(p + vec3(h,0,0)).r;
-    float xm = sampleField(p - vec3(h,0,0)).r;
-    float yp = sampleField(p + vec3(0,h,0)).r;
-    float ym = sampleField(p - vec3(0,h,0)).r;
-    float zp = sampleField(p + vec3(0,0,h)).r;
-    float zm = sampleField(p - vec3(0,0,h)).r;
-    return 0.5 * vec3(xp - xm, yp - ym, zp - zm);
-}
-
-vec3 curl_rgb(vec3 p) {
-    float h = 1.0;
-    vec3 xp = sampleField(p + vec3(h,0,0)).rgb;
-    vec3 xm = sampleField(p - vec3(h,0,0)).rgb;
-    vec3 yp = sampleField(p + vec3(0,h,0)).rgb;
-    vec3 ym = sampleField(p - vec3(0,h,0)).rgb;
-    vec3 zp = sampleField(p + vec3(0,0,h)).rgb;
-    vec3 zm = sampleField(p - vec3(0,0,h)).rgb;
-    vec3 dFdx = 0.5 * (xp - xm);
-    vec3 dFdy = 0.5 * (yp - ym);
-    vec3 dFdz = 0.5 * (zp - zm);
-    return vec3(dFdy.z - dFdz.y, dFdz.x - dFdx.z, dFdx.y - dFdy.x);
-}
-
-#if NN_HID > 0
-// Tiny MLP forward pass: 6 inputs → NN_HID hidden (tanh) → 3 outputs (tanh).
-// `agent_id` selects per-agent weights (or 0 if NN_SHARED).
-vec3 nn_eval(uint agent_id, vec3 grad, vec3 vel) {
-    uint base = (NN_SHARED != 0) ? 0u : agent_id * uint(NN_STRIDE);
-    float in_vec[6];
-    in_vec[0] = grad.x; in_vec[1] = grad.y; in_vec[2] = grad.z;
-    in_vec[3] = vel.x;  in_vec[4] = vel.y;  in_vec[5] = vel.z;
-    float hid[NN_HID];
-    // Layer 1: hid[h] = tanh(b1[h] + sum_i W1[i,h] * in[i])
-    uint w1_base = base;                   // W1: 6 × NN_HID, row-major (i*H + h)
-    uint b1_base = base + 6u * uint(NN_HID);
-    for (int h = 0; h < NN_HID; ++h) {
-        float s = B.w[b1_base + uint(h)];
-        for (int i = 0; i < 6; ++i) {
-            s += B.w[w1_base + uint(i) * uint(NN_HID) + uint(h)] * in_vec[i];
-        }
-        hid[h] = tanh(s);
-    }
-    // Layer 2: out[o] = tanh(b2[o] + sum_h W2[h,o] * hid[h])
-    uint w2_base = b1_base + uint(NN_HID); // W2: NN_HID × 3, (h*3 + o)
-    uint b2_base = w2_base + uint(NN_HID) * 3u;
-    vec3 outv;
-    for (int o = 0; o < 3; ++o) {
-        float s = B.w[b2_base + uint(o)];
-        for (int h = 0; h < NN_HID; ++h) {
-            s += B.w[w2_base + uint(h) * 3u + uint(o)] * hid[h];
-        }
-        outv[o] = tanh(s);
-    }
-    return outv;
-}
-#endif
-
-// Cheap hash → uniform [0,1) in 3 components.
-vec3 hash3(uint i, uint salt) {
-    uint h = i * 1664525u + salt * 1013904223u;
-    h ^= (h >> 16); h *= 0x85ebca6bu;
-    h ^= (h >> 13); h *= 0xc2b2ae35u;
-    h ^= (h >> 16);
-    uint h2 = h * 1597334677u + 0x9e3779b9u;
-    uint h3 = h2 * 1597334677u + 0x9e3779b9u;
-    return vec3(float(h & 0xffffffu), float(h2 & 0xffffffu),
-                float(h3 & 0xffffffu)) / 16777215.0;
-}
-
-void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(u_count)) return;
-
-    vec4 a = P.data[2u * i + 0u];   // pos.xyz, life
-    vec4 b = P.data[2u * i + 1u];   // vel.xyz, mass
-    vec3 pos = a.xyz;
-    vec3 vel = b.xyz;
-    float life = a.w;
-
-    if (life <= 0.0) {
-        if (u_respawn != 0) {
-            vec3 r = hash3(i, u_frame);
-            pos = mix(u_spawn_min, u_spawn_max, r);
-            vec3 r2 = hash3(i, u_frame + 17u) - 0.5;
-            vel = u_spawn_speed * r2;
-            life = 1.0 + hash3(i, u_frame + 31u).x;
-        } else {
-            // dead and not respawning — write back unchanged
-            P.data[2u * i + 0u] = vec4(pos, life);
-            P.data[2u * i + 1u] = vec4(vel, b.w);
-            return;
-        }
-    }
-
-    // ── Force from field ──
-    vec3 force = vec3(0.0);
-    if (u_force_mode == 1) {
-        vec3 v = sampleField(pos).rgb - 0.5;
-        force = u_force_scale * v;
-    } else if (u_force_mode == 2) {
-        force = u_force_scale * gradient_r(pos);
-    } else if (u_force_mode == 3) {
-        force = -u_force_scale * gradient_r(pos);
-    } else if (u_force_mode == 4) {
-        force = u_force_scale * curl_rgb(pos);
-    }
-#if NN_HID > 0
-    else if (u_force_mode == 5) {
-        // NN brain: inputs = (gradient_r, vel) → outputs = steering force.
-        vec3 g = gradient_r(pos);
-        vec3 act = nn_eval(i, g, vel);
-        force = u_force_scale * act;
-    }
-#endif
-    else if (u_force_mode == 6) {
-        // ── Particle Lenia (Mordvintsev et al., 2022) ──
-        // Two N² passes over neighbours: pass 1 sums U at this point,
-        // pass 2 sums ∇U and ∇R for the force.  Toroidal min-image
-        // distances keep the dynamics consistent with the wrapped
-        // particle positions.  Cutoffs prune work outside the kernel
-        // and repulsion supports.
-        float mu_k    = u_pl_mu_k;
-        float sigma_k = max(u_pl_sigma_k, 0.001);
-        float mu_g    = u_pl_mu_g;
-        float sigma_g = max(u_pl_sigma_g, 0.001);
-        float c_rep   = u_pl_c_rep;
-        float r_rep   = max(u_pl_r_rep, 0.001);
-        float k_cut   = mu_k + 4.0 * sigma_k;
-        float k_cut2  = k_cut * k_cut;
-        float r_rep2  = r_rep * r_rep;
-
-        // Pass 1: kernel-summed potential at this particle.
-        float U = 0.0;
-        for (uint j = 0u; j < uint(u_count); ++j) {
-            if (j == i) continue;
-            vec3 pj = P.data[2u * j + 0u].xyz;
-            vec3 d = pos - pj;
-            // Toroidal min-image displacement (matches mod(pos,fs) wrap).
-            d -= fs * round(d / fs);
-            float r2 = dot(d, d);
-            if (r2 > k_cut2) continue;
-            float r = sqrt(r2);
-            float z = (r - mu_k) / sigma_k;
-            U += exp(-0.5 * z * z);
-        }
-
-        // G(U) and dG/dU:  G(U) = exp(-½ z²),  z = (U-μ_g)/σ_g
-        //                 G'(U) = -G·z/σ_g
-        float zg     = (U - mu_g) / sigma_g;
-        float G_at   = exp(-0.5 * zg * zg);
-        float Gprime = -G_at * zg / sigma_g;
-
-        // Pass 2: ∇U (kernel) and ∇R (repulsion) at this particle.
-        // ∂K(r)/∂x_i = -K·z/(σ_k·r) · d        with d = x_i - x_j
-        // ∂R(r)/∂x_i = -2·c_rep·(1 - r/r_rep)/(r_rep·r) · d   for r<r_rep
-        vec3 grad_U = vec3(0.0);
-        vec3 grad_R = vec3(0.0);
-        for (uint j = 0u; j < uint(u_count); ++j) {
-            if (j == i) continue;
-            vec3 pj = P.data[2u * j + 0u].xyz;
-            vec3 d = pos - pj;
-            d -= fs * round(d / fs);
-            float r2 = dot(d, d);
-            if (r2 > k_cut2 && r2 > r_rep2) continue;
-            float r = sqrt(max(r2, 1e-8));
-            if (r2 <= k_cut2) {
-                float z = (r - mu_k) / sigma_k;
-                float K = exp(-0.5 * z * z);
-                grad_U += -K * z / (sigma_k * r) * d;
-            }
-            if (r < r_rep) {
-                float t = 1.0 - r / r_rep;
-                grad_R += -2.0 * c_rep * t / (r_rep * r) * d;
-            }
-        }
-
-        // F = -∇E = -(∇R - G'·∇U) = G'·∇U - ∇R
-        force = u_force_scale * (Gprime * grad_U - grad_R);
-    }
-
-    // Semi-implicit Euler with linear drag.
-    vel = vel * (1.0 - u_drag) + force * u_dt;
-    pos = pos + vel * u_dt;
-    life -= u_life_decay;
-
-    // Wrap (periodic) — keeps particles on screen for visual continuity.
-    pos = mod(pos, fs);
-
-    P.data[2u * i + 0u] = vec4(pos, life);
-    P.data[2u * i + 1u] = vec4(vel, b.w);
-
-#if DEPOSIT_ENABLED
-    // Splat into the deposit field at the particle's new voxel.  We
-    // round-to-nearest rather than floor so a particle at the centre
-    // of a voxel deposits into that voxel (not the one to its lower
-    // corner).  The deposit texture is cleared every step before this
-    // pass, so we accumulate "this step's worth" only — no temporal
-    // smearing here (the CA shader can integrate over time if it wants
-    // a persistent trail).  Atomic add tolerates the rare race where
-    // two particles land in the same voxel; without atomics we'd lose
-    // ~N²/V deposits per step at high particle density.
-    if (life > 0.0 && u_deposit_amount != 0.0) {
-        ivec3 dp = ivec3(floor(pos + 0.5));
-        dp = clamp(dp, ivec3(0), u_dep_dims - ivec3(1));
-        if (u_deposit_radius == 0) {
-            int idx = (dp.z * u_dep_dims.y + dp.y) * u_dep_dims.x + dp.x;
-            atomicAdd(u_deposit_buf.data[idx], u_deposit_amount);
-        } else {
-            // 3³ Gaussian-ish splat with weights 1, 1/2, 1/4 by Chebyshev
-            // distance.  Total energy ≈ 1 + 6·½ + 12·¼ + 8·¼ = 9 — caller
-            // should scale u_deposit_amount accordingly if they want unit
-            // total mass per particle.
-            for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-                ivec3 q = clamp(dp + ivec3(dx, dy, dz),
-                                ivec3(0), u_dep_dims - ivec3(1));
-                int cheby = max(max(abs(dx), abs(dy)), abs(dz));
-                float w = (cheby == 0) ? 1.0 : (cheby == 1 ? 0.5 : 0.25);
-                int idx = (q.z * u_dep_dims.y + q.y) * u_dep_dims.x + q.x;
-                atomicAdd(u_deposit_buf.data[idx], u_deposit_amount * w);
-            }
-        }
-    }
-#endif
-}
-"""
+PARTICLE_UPDATE_COMPUTE = _load_glsl("PARTICLE_UPDATE_COMPUTE.glsl")
 
 # Particle render: instanced screen-aligned billboard (a 6-vertex quad)
 # rebuilt in the vertex shader from gl_VertexID. Radius and color come
 # from uniforms / per-particle attributes.
-PARTICLE_VERTEX_SHADER = """
-#version 430
+PARTICLE_VERTEX_SHADER = _load_glsl("PARTICLE_VERTEX_SHADER.glsl")
 
-layout(std430, binding = 9) readonly buffer Particles { vec4 data[]; } P;
-
-uniform mat4  u_view_proj;
-uniform vec3  u_camera_pos;
-uniform vec3  u_camera_right;
-uniform vec3  u_camera_up;
-uniform float u_size_world;     // particle radius in cell units
-uniform vec3  u_world_per_cell; // box_dims/size — grid cell → world coord
-uniform int   u_color_mode;     // 0=fixed, 1=speed, 2=lifetime, 3=position
-uniform vec3  u_color_fixed;
-uniform float u_speed_scale;
-
-out vec2  v_uv;        // [-1..1]² for the quad
-out vec3  v_color;
-out float v_life;
-
-void main() {
-    uint pid = uint(gl_VertexID) / 6u;
-    uint vid = uint(gl_VertexID) % 6u;
-    vec4 a = P.data[2u * pid + 0u];
-    vec4 b = P.data[2u * pid + 1u];
-    vec3 pos = a.xyz;
-    float life = a.w;
-    vec3 vel = b.xyz;
-
-    // 6-vertex quad: two tris covering [-1,1]²
-    vec2 corners[6] = vec2[6](
-        vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2(-1.0,  1.0),
-        vec2( 1.0, -1.0), vec2( 1.0,  1.0), vec2(-1.0,  1.0)
-    );
-    vec2 c = corners[vid];
-
-    // Hide dead particles by collapsing them to a point off-screen.
-    float vis = step(0.001, life);
-    // Particle pos is in grid cell coords [0..size]; convert to world
-    // coords [0..box_dims] before the view-projection transform.
-    vec3 wp_center = pos * u_world_per_cell;
-    float scl = (u_world_per_cell.x + u_world_per_cell.y + u_world_per_cell.z) / 3.0;
-    vec3 world_pos = wp_center + (u_camera_right * c.x + u_camera_up * c.y) * u_size_world * scl;
-    world_pos = mix(vec3(-1e6), world_pos, vis);
-
-    gl_Position = u_view_proj * vec4(world_pos, 1.0);
-    v_uv = c;
-    v_life = life;
-
-    vec3 col;
-    if (u_color_mode == 1) {
-        float s = length(vel) * u_speed_scale;
-        col = mix(vec3(0.1, 0.3, 0.9), vec3(1.0, 0.7, 0.1), clamp(s, 0.0, 1.0));
-    } else if (u_color_mode == 2) {
-        float t = clamp(life, 0.0, 1.0);
-        col = mix(vec3(1.0, 0.2, 0.1), vec3(0.6, 0.9, 1.0), t);
-    } else if (u_color_mode == 3) {
-        col = vec3(0.5) + 0.5 * sin(pos * 0.3 + vec3(0.0, 2.0, 4.0));
-    } else {
-        col = u_color_fixed;
-    }
-    v_color = col;
-}
-"""
-
-PARTICLE_FRAGMENT_SHADER = """
-#version 430
-in vec2 v_uv;
-in vec3 v_color;
-in float v_life;
-out vec4 fragColor;
-
-uniform float u_alpha;
-
-void main() {
-    float r2 = dot(v_uv, v_uv);
-    if (r2 > 1.0) discard;
-    // Soft Gaussian-ish falloff (exp(-3r²) is fine and cheap).
-    float fall = exp(-3.0 * r2);
-    float a = u_alpha * fall * clamp(v_life, 0.0, 1.0);
-    // Pre-multiplied additive: (rgb*a, a)
-    fragColor = vec4(v_color * a, a);
-}
-"""
+PARTICLE_FRAGMENT_SHADER = _load_glsl("PARTICLE_FRAGMENT_SHADER.glsl")
 
 # ─── VECTOR-FIELD GLYPH RENDERER ──────────────────────────────────────
 # Renders the field as a sparse 3D grid of oriented line segments
@@ -12146,87 +10516,7 @@ void main() {
 # Vertex layout: 2 vertices per glyph drawn as GL_LINES. The vertex
 # shader synthesises the (x,y,z) grid coord from gl_VertexID/2 and
 # samples the field there.
-GLYPH_LINE_VERTEX_SHADER = """
-#version 430
-uniform sampler3D u_field_tex;
-uniform mat4  u_view_proj;
-uniform int   u_size;
-uniform vec3  u_world_per_cell; // box_dims/size — grid cell → world coord
-uniform ivec3 u_grid_dim;     // glyphs along each axis
-uniform vec3  u_origin;       // grid origin in cell coords
-uniform vec3  u_step;         // spacing in cell coords
-uniform float u_scale;        // length of unit vector in grid cells
-uniform int   u_source;       // 0 = rgb directly, 1 = grad of R, 2 = curl of rgb
-uniform float u_threshold;    // skip glyphs with |v| below this (avoids forest of noise)
-uniform float u_mag_scale;    // scale factor when colouring by magnitude
-
-out vec3 v_color;
-out float v_alpha;
-
-float fs;
-
-vec4 sampleField(vec3 p) {
-    p = clamp(p, vec3(0.0), vec3(fs - 1.0));
-    return texture(u_field_tex, (p + 0.5) / fs);
-}
-
-vec3 grad_r(vec3 p) {
-    float h = 1.0;
-    return 0.5 * vec3(
-        sampleField(p + vec3(h,0,0)).r - sampleField(p - vec3(h,0,0)).r,
-        sampleField(p + vec3(0,h,0)).r - sampleField(p - vec3(0,h,0)).r,
-        sampleField(p + vec3(0,0,h)).r - sampleField(p - vec3(0,0,h)).r);
-}
-
-vec3 curl_rgb(vec3 p) {
-    float h = 1.0;
-    vec3 xp = sampleField(p + vec3(h,0,0)).rgb;
-    vec3 xm = sampleField(p - vec3(h,0,0)).rgb;
-    vec3 yp = sampleField(p + vec3(0,h,0)).rgb;
-    vec3 ym = sampleField(p - vec3(0,h,0)).rgb;
-    vec3 zp = sampleField(p + vec3(0,0,h)).rgb;
-    vec3 zm = sampleField(p - vec3(0,0,h)).rgb;
-    vec3 dFdx = 0.5 * (xp - xm);
-    vec3 dFdy = 0.5 * (yp - ym);
-    vec3 dFdz = 0.5 * (zp - zm);
-    return vec3(dFdy.z - dFdz.y, dFdz.x - dFdx.z, dFdx.y - dFdy.x);
-}
-
-void main() {
-    fs = float(u_size);
-    int gid = gl_VertexID / 2;
-    int tip = gl_VertexID & 1;
-    int gx = gid % u_grid_dim.x;
-    int gy = (gid / u_grid_dim.x) % u_grid_dim.y;
-    int gz = gid / (u_grid_dim.x * u_grid_dim.y);
-    vec3 base = u_origin + vec3(gx, gy, gz) * u_step;
-
-    vec3 v;
-    if (u_source == 1)      v = grad_r(base);
-    else if (u_source == 2) v = curl_rgb(base);
-    else                    v = sampleField(base).rgb - 0.5;
-
-    float mag = length(v);
-    vec3 dir = mag > 1e-5 ? v / mag : vec3(0.0);
-    vec3 pos = base + dir * (mag * u_scale * float(tip));
-
-    // Cull below-threshold glyphs by collapsing them to a point off-screen.
-    float vis = step(u_threshold, mag);
-    pos = mix(vec3(-1e6), pos, vis);
-
-    // Convert from grid cell coords [0..size] to world coords [0..box_dims].
-    pos = pos * u_world_per_cell;
-
-    gl_Position = u_view_proj * vec4(pos, 1.0);
-
-    // Colour: cool→hot mapped from magnitude. Tips brighter than bases.
-    float t = clamp(mag * u_mag_scale, 0.0, 1.0);
-    vec3 c_low  = vec3(0.15, 0.4, 0.95);
-    vec3 c_high = vec3(1.0, 0.75, 0.15);
-    v_color = mix(c_low, c_high, t);
-    v_alpha = mix(0.45, 0.95, float(tip));   // tip vertex more opaque
-}
-"""
+GLYPH_LINE_VERTEX_SHADER = _load_glsl("GLYPH_LINE_VERTEX_SHADER.glsl")
 
 GLYPH_LINE_FRAGMENT_SHADER = """
 #version 430
@@ -12256,421 +10546,15 @@ void main() {
 # Worst-case vertex budget caps the buffer; cells that overflow are
 # silently skipped (atomic compare guard). Default cap = 2 M verts
 # = 64 MB, comfortably handles 96³ filled densely.
-MC_COMPUTE_SHADER = """
-#version 430
-layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+MC_COMPUTE_SHADER = _load_glsl("MC_COMPUTE_SHADER.glsl")
 
-uniform sampler3D u_field_tex;
-uniform int   u_size;
-uniform int   u_channel;     // 0=R, 1=G, 2=B, 3=A
-uniform int   u_use_abs;
-uniform float u_iso;
-uniform int   u_max_verts;
+MC_VERTEX_SHADER = _load_glsl("MC_VERTEX_SHADER.glsl")
 
-// Vertex output: vec4 pos, vec4 normal — 32 B per vertex.
-layout(std430, binding=10) buffer MCVerts { vec4 verts[]; } V;
-layout(std430, binding=11) buffer MCCounter { uint vert_count; uint pad[3]; } C;
-
-// Triangulation LUT (256 cases × 16 entries, -1 = end).
-layout(std430, binding=12) readonly buffer MCTriTable { int tri_table[]; } T;
-
-float fs;
-
-float sampleScalar(ivec3 p) {
-    p = clamp(p, ivec3(0), ivec3(u_size - 1));
-    vec4 v = texelFetch(u_field_tex, p, 0);
-    float s;
-    if (u_channel == 0) s = v.r;
-    else if (u_channel == 1) s = v.g;
-    else if (u_channel == 2) s = v.b;
-    else s = v.a;
-    if (u_use_abs != 0) s = abs(s);
-    return s;
-}
-
-vec3 vertexInterp(vec3 p1, vec3 p2, float v1, float v2) {
-    float denom = v2 - v1;
-    if (abs(denom) < 1e-6) return 0.5 * (p1 + p2);
-    float t = clamp((u_iso - v1) / denom, 0.0, 1.0);
-    return mix(p1, p2, t);
-}
-
-void main() {
-    fs = float(u_size);
-    ivec3 cell = ivec3(gl_GlobalInvocationID);
-    if (cell.x >= u_size - 1 || cell.y >= u_size - 1 || cell.z >= u_size - 1) return;
-
-    // 8 corners (Lorensen ordering: 0..7 = (0,0,0),(1,0,0),(1,1,0),(0,1,0),
-    //                                       (0,0,1),(1,0,1),(1,1,1),(0,1,1))
-    ivec3 ofs[8] = ivec3[8](
-        ivec3(0,0,0), ivec3(1,0,0), ivec3(1,1,0), ivec3(0,1,0),
-        ivec3(0,0,1), ivec3(1,0,1), ivec3(1,1,1), ivec3(0,1,1)
-    );
-    float val[8];
-    vec3  pos[8];
-    int caseIndex = 0;
-    for (int i = 0; i < 8; ++i) {
-        ivec3 p = cell + ofs[i];
-        val[i] = sampleScalar(p);
-        pos[i] = vec3(p);
-        if (val[i] >= u_iso) caseIndex |= (1 << i);
-    }
-    if (caseIndex == 0 || caseIndex == 255) return;
-
-    // 12 edges, each connects two corners (Lorensen edge ordering).
-    int e_a[12] = int[12](0,1,2,3,4,5,6,7,0,1,2,3);
-    int e_b[12] = int[12](1,2,3,0,5,6,7,4,4,5,6,7);
-
-    // Pre-interpolate the up to 12 active edge vertices.
-    vec3 edge_v[12];
-    for (int e = 0; e < 12; ++e) {
-        int a = e_a[e]; int b = e_b[e];
-        // Cheap to just always compute; tri table picks the ones we need.
-        edge_v[e] = vertexInterp(pos[a], pos[b], val[a], val[b]);
-    }
-
-    int base = caseIndex * 16;
-    for (int t = 0; t < 16; t += 3) {
-        int e0 = T.tri_table[base + t];
-        if (e0 < 0) break;
-        int e1 = T.tri_table[base + t + 1];
-        int e2 = T.tri_table[base + t + 2];
-        vec3 a = edge_v[e0];
-        vec3 b = edge_v[e1];
-        vec3 c = edge_v[e2];
-        vec3 n = cross(b - a, c - a);
-        float nlen = length(n);
-        if (nlen < 1e-8) continue;
-        n /= nlen;
-
-        uint vid = atomicAdd(C.vert_count, 3u);
-        if (vid + 3u > uint(u_max_verts)) return;
-        V.verts[2u*vid    ] = vec4(a, val[0]);
-        V.verts[2u*vid + 1u] = vec4(n, 0.0);
-        V.verts[2u*(vid+1u)    ] = vec4(b, val[0]);
-        V.verts[2u*(vid+1u) + 1u] = vec4(n, 0.0);
-        V.verts[2u*(vid+2u)    ] = vec4(c, val[0]);
-        V.verts[2u*(vid+2u) + 1u] = vec4(n, 0.0);
-    }
-}
-"""
-
-MC_VERTEX_SHADER = """
-#version 430
-layout(std430, binding=10) readonly buffer MCVerts { vec4 verts[]; } V;
-
-uniform mat4 u_view_proj;
-uniform vec3 u_camera_pos;
-uniform vec3 u_world_per_cell; // box_dims/size — grid cell → world coord
-
-out vec3 v_normal;
-out vec3 v_world;
-
-void main() {
-    uint i = uint(gl_VertexID);
-    vec3 p = V.verts[2u * i].xyz * u_world_per_cell;
-    vec3 n = V.verts[2u * i + 1u].xyz;
-    gl_Position = u_view_proj * vec4(p, 1.0);
-    v_normal = n;
-    v_world = p;
-}
-"""
-
-MC_FRAGMENT_SHADER = """
-#version 430
-in vec3 v_normal;
-in vec3 v_world;
-out vec4 fragColor;
-
-uniform vec3  u_camera_pos;
-uniform vec3  u_color;
-uniform float u_alpha;
-uniform int   u_double_sided;
-uniform int   u_size;
-
-void main() {
-    vec3 N = normalize(v_normal);
-    vec3 L = normalize(u_camera_pos - v_world);   // headlight
-    float cosNL = dot(N, L);
-    if (u_double_sided != 0) cosNL = abs(cosNL);
-    else                     cosNL = max(cosNL, 0.0);
-    // Hemispheric ambient (sky/ground tint) + Lambert.
-    vec3 sky    = vec3(0.55, 0.62, 0.75);
-    vec3 ground = vec3(0.12, 0.10, 0.08);
-    float h = 0.5 + 0.5 * N.y;
-    vec3 ambient = mix(ground, sky, h) * 0.35;
-    vec3 col = u_color * (ambient + cosNL * 0.85);
-    // Distance-based subtle desaturation
-    float d = length(u_camera_pos - v_world) / float(u_size);
-    col = mix(col, vec3(dot(col, vec3(0.299, 0.587, 0.114))), clamp(d * 0.05, 0.0, 0.3));
-    fragColor = vec4(col, u_alpha);
-}
-"""
+MC_FRAGMENT_SHADER = _load_glsl("MC_FRAGMENT_SHADER.glsl")
 
 
 # Vertex shader: instanced cube rendering
-VOXEL_VERTEX_SHADER = """
-#version 430
-
-// Per-instance data from packed SSBO (1 uint per voxel — position only)
-layout(std430, binding=3) buffer VoxelBuffer {
-    uint voxels[];
-};
-
-// Element property table (for element CA color lookup)
-layout(std430, binding=2) buffer ElementTable {
-    float elements[];  // 120 * 16 floats
-};
-
-uniform sampler3D u_volume_tex;  // 3D volume texture for color sampling
-uniform int u_size;
-uniform ivec3 u_dims;            // (W, H, D) — per-axis bounds for nb_alive
-uniform mat4 u_view_proj;
-uniform float u_voxel_gap;  // gap between voxels (0 = touching, 0.1 = 10% gap)
-uniform int u_is_element_ca;
-uniform int u_channel;      // which channel to read for color
-uniform int u_use_abs;      // 1 = use abs(value) for wave mode
-uniform float u_threshold;  // visibility threshold for value normalization
-// Multi-channel vis_mode (mirrors VIEW_TEX_BUILD_SHADER):
-//   0 = DENSITY (legacy: u_channel + apply_colormap in fragment)
-//   1 = RGB_CHANNELS (per-voxel rgb shown directly; e.g. ant team colors)
-//   4 = RGBA_BLEND   (rgb=colour, density=.a)
-// Modes 2/3 keep the legacy single-channel path.
-uniform int u_vis_mode;
-// Per-channel value range, same semantics as VIEW_TEX_BUILD_SHADER:
-// rgb (or .a) values are remapped through (v - vis_lo) / (vis_hi - vis_lo)
-// and clamped to [0,1]. Default (0,1) is a no-op.
-uniform float u_vis_lo;
-uniform float u_vis_hi;
-
-// ── Lattice (FCC) index->world transform ──────────────────────────────
-// When u_lattice_fcc == 1, cell index coordinates are mapped to world
-// space through u_lattice_M (the FCC primitive-cell basis) so cells render
-// as sheared rhombic cells at their true isotropic positions, recentred on
-// the unit-cube centre. When u_lattice_fcc == 0 (cubic, the default) this
-// block is skipped entirely and the legacy axis-aligned mapping is used,
-// keeping cubic rules byte-for-byte unchanged.
-uniform int  u_lattice_fcc;
-uniform mat3 u_lattice_M;
-uniform mat3 u_lattice_M_inv;
-const vec3 cube_verts[36] = vec3[36](
-    // -Z face
-    vec3(0,0,0), vec3(1,0,0), vec3(1,1,0),  vec3(0,0,0), vec3(1,1,0), vec3(0,1,0),
-    // +Z face
-    vec3(0,0,1), vec3(1,1,1), vec3(1,0,1),  vec3(0,0,1), vec3(0,1,1), vec3(1,1,1),
-    // -X face
-    vec3(0,0,0), vec3(0,1,0), vec3(0,1,1),  vec3(0,0,0), vec3(0,1,1), vec3(0,0,1),
-    // +X face
-    vec3(1,0,0), vec3(1,1,1), vec3(1,1,0),  vec3(1,0,0), vec3(1,0,1), vec3(1,1,1),
-    // -Y face
-    vec3(0,0,0), vec3(0,0,1), vec3(1,0,1),  vec3(0,0,0), vec3(1,0,1), vec3(1,0,0),
-    // +Y face
-    vec3(0,1,0), vec3(1,1,0), vec3(1,1,1),  vec3(0,1,0), vec3(1,1,1), vec3(0,1,1)
-);
-
-const vec3 cube_normals[6] = vec3[6](
-    vec3(0,0,-1), vec3(0,0,1), vec3(-1,0,0), vec3(1,0,0), vec3(0,-1,0), vec3(0,1,0)
-);
-
-// Face normal directions as ivec3 for neighbor lookup (matches cube_normals order)
-const ivec3 face_dirs[6] = ivec3[6](
-    ivec3(0,0,-1), ivec3(0,0,1), ivec3(-1,0,0), ivec3(1,0,0), ivec3(0,-1,0), ivec3(0,1,0)
-);
-
-// ── Rhombic-dodecahedron geometry (FCC Wigner-Seitz / Voronoi cell) ──
-// When rendering the FCC lattice each cell is drawn as its true Voronoi
-// cell: a rhombic dodecahedron whose 12 faces are the perpendicular
-// bisectors of the 12 nearest-neighbour bonds. Adjacent cells share whole
-// faces, so the cells visibly interlock with no gaps (the actual "FCC packs
-// space perfectly" property). Canonical vertices (faces at distance sqrt(2)
-// from centre): 8 cube-type (+-1,+-1,+-1) and 6 axis-type (+-2,0,0)... .
-// In our world frame the 12 NN bonds lie along (+-1,+-1,0)-type directions,
-// so the polyhedron is axis-aligned in world space — no shear of the cell
-// shape itself, only of the lattice of cell centres.
-// 12 faces x 2 triangles x 3 verts = 72 vertices, face_id = vert_id / 6.
-const vec3 rd_verts[72] = vec3[72](
-    // face 0  n=(+1,+1,0)
-    vec3( 2,0,0), vec3( 1, 1, 1), vec3(0, 2,0),  vec3( 2,0,0), vec3(0, 2,0), vec3( 1, 1,-1),
-    // face 1  n=(-1,-1,0)
-    vec3(-2,0,0), vec3(-1,-1, 1), vec3(0,-2,0),  vec3(-2,0,0), vec3(0,-2,0), vec3(-1,-1,-1),
-    // face 2  n=(0,+1,+1)
-    vec3(0, 2,0), vec3( 1, 1, 1), vec3(0,0, 2),  vec3(0, 2,0), vec3(0,0, 2), vec3(-1, 1, 1),
-    // face 3  n=(0,-1,-1)
-    vec3(0,-2,0), vec3( 1,-1,-1), vec3(0,0,-2),  vec3(0,-2,0), vec3(0,0,-2), vec3(-1,-1,-1),
-    // face 4  n=(+1,0,+1)
-    vec3( 2,0,0), vec3( 1, 1, 1), vec3(0,0, 2),  vec3( 2,0,0), vec3(0,0, 2), vec3( 1,-1, 1),
-    // face 5  n=(-1,0,-1)
-    vec3(-2,0,0), vec3(-1, 1,-1), vec3(0,0,-2),  vec3(-2,0,0), vec3(0,0,-2), vec3(-1,-1,-1),
-    // face 6  n=(+1,0,-1)
-    vec3( 2,0,0), vec3( 1, 1,-1), vec3(0,0,-2),  vec3( 2,0,0), vec3(0,0,-2), vec3( 1,-1,-1),
-    // face 7  n=(-1,0,+1)
-    vec3(-2,0,0), vec3(-1, 1, 1), vec3(0,0, 2),  vec3(-2,0,0), vec3(0,0, 2), vec3(-1,-1, 1),
-    // face 8  n=(-1,+1,0)
-    vec3(-2,0,0), vec3(-1, 1, 1), vec3(0, 2,0),  vec3(-2,0,0), vec3(0, 2,0), vec3(-1, 1,-1),
-    // face 9  n=(+1,-1,0)
-    vec3( 2,0,0), vec3( 1,-1, 1), vec3(0,-2,0),  vec3( 2,0,0), vec3(0,-2,0), vec3( 1,-1,-1),
-    // face 10 n=(0,+1,-1)
-    vec3(0, 2,0), vec3( 1, 1,-1), vec3(0,0,-2),  vec3(0, 2,0), vec3(0,0,-2), vec3(-1, 1,-1),
-    // face 11 n=(0,-1,+1)
-    vec3(0,-2,0), vec3( 1,-1, 1), vec3(0,0, 2),  vec3(0,-2,0), vec3(0,0, 2), vec3(-1,-1, 1)
-);
-
-// Outward world-space normals for the 12 rhombic faces (unit length).
-const vec3 rd_normals[12] = vec3[12](
-    vec3( 0.70710678,  0.70710678, 0.0       ), vec3(-0.70710678, -0.70710678, 0.0       ),
-    vec3( 0.0,         0.70710678, 0.70710678 ), vec3( 0.0,       -0.70710678,-0.70710678 ),
-    vec3( 0.70710678,  0.0,        0.70710678 ), vec3(-0.70710678,  0.0,       -0.70710678 ),
-    vec3( 0.70710678,  0.0,       -0.70710678 ), vec3(-0.70710678,  0.0,        0.70710678 ),
-    vec3(-0.70710678,  0.70710678, 0.0       ), vec3( 0.70710678, -0.70710678, 0.0       ),
-    vec3( 0.0,         0.70710678,-0.70710678 ), vec3( 0.0,       -0.70710678, 0.70710678 )
-);
-
-// Index-space neighbour offset behind each rhombic face (for hidden-face
-// culling). Matches the FCC 12-NN order used by the compute stencil.
-const ivec3 rd_neighbors[12] = ivec3[12](
-    ivec3( 1, 0, 0), ivec3(-1, 0, 0), ivec3( 0, 1, 0), ivec3( 0,-1, 0),
-    ivec3( 0, 0, 1), ivec3( 0, 0,-1), ivec3( 1,-1, 0), ivec3(-1, 1, 0),
-    ivec3( 0, 1,-1), ivec3( 0,-1, 1), ivec3( 1, 0,-1), ivec3(-1, 0, 1)
-);
-
-out vec3 v_normal;
-out vec3 v_world_pos;
-out vec3 v_color;
-out float v_value;
-
-bool nb_alive(ivec3 p) {
-    if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, u_dims))) return false;
-    vec4 nb = texelFetch(u_volume_tex, p, 0);
-    if (u_is_element_ca == 1) return int(round(nb.r)) > 0;
-    if (u_vis_mode == 1) return max(max(nb.r, nb.g), nb.b) > u_threshold;
-    if (u_vis_mode == 4) return nb.a > u_threshold;
-    float v = nb[u_channel];
-    if (u_use_abs == 1) v = abs(v);
-    else if (u_use_abs == 2) v = abs(clamp(v, -1.0, 1.0));  // signed: alive if either sign
-    return v > u_threshold;
-}
-
-void main() {
-    int instance_id = gl_InstanceID;
-    int vert_id = gl_VertexID;
-
-    // Unpack position from 1 uint (4 bytes) — __PB__ bits per axis + __SB__-bit shading
-    uint pdata = voxels[instance_id];
-    uint shade_hint = (pdata >> (3u * __PB__)) & __SMASK__;
-
-    // Sample color from 3D texture at this voxel's grid coordinate (exact texel)
-    ivec3 ipos = ivec3(int(pdata & __PMASK__),
-                        int((pdata >>  __PB__) & __PMASK__),
-                        int((pdata >> (2u * __PB__)) & __PMASK__));
-
-    // Per-face visibility: degenerate triangles for faces hidden by a neighbor.
-    // Cubic cells have 6 faces (face_id 0..5); FCC rhombic-dodecahedron cells
-    // have 12 (face_id 0..11). The hidden-face test uses the neighbour behind
-    // each face — the 6 axial dirs for the cube, the 12 FCC bonds for the RD.
-    int face_id = vert_id / 6;
-    ivec3 cull_dir = (u_lattice_fcc == 1) ? rd_neighbors[face_id] : face_dirs[face_id];
-    if (nb_alive(ipos + cull_dir)) {
-        gl_Position = vec4(0.0);
-        v_normal = vec3(0.0);
-        v_world_pos = vec3(0.0);
-        v_color = vec3(0.0);
-        v_value = 0.0;
-        return;
-    }
-
-    vec3 cell_pos = vec3(ipos);
-    vec4 cell = texelFetch(u_volume_tex, ipos, 0);
-
-    float value;
-    vec3 color;
-
-    if (u_is_element_ca == 1) {
-        int z = int(round(cell.r));
-        value = cell.r;
-        // Color from element table
-        color = vec3(
-            elements[z * 16 + 8],
-            elements[z * 16 + 9],
-            elements[z * 16 + 10]
-        );
-        // Tint by temperature
-        float temp = cell.g;
-        float heat = clamp(temp / 2000.0, 0.0, 1.0);
-        color = mix(color, vec3(1.0, 0.3, 0.1), heat * 0.5);
-    } else {
-        if (u_vis_mode == 1 || u_vis_mode == 4) {
-            // Per-voxel RGB pre-baked by the simulation (team colours, R/G/B
-            // channel composites, etc.). Apply the same (vis_lo, vis_hi)
-            // remap that the volumetric raymarcher uses so voxel and ray
-            // paths show identical hues.
-            float scale = (u_vis_hi > u_vis_lo) ? (1.0 / (u_vis_hi - u_vis_lo)) : 1.0;
-            color = clamp((cell.rgb - vec3(u_vis_lo)) * scale, 0.0, 1.0);
-            // 'value' picks an alpha-style scalar used downstream by Phong
-            // brightness. RGB_CHANNELS: max channel (so a pure-green voxel
-            // still looks lit); RGBA_BLEND: explicit .a.
-            value = (u_vis_mode == 4) ? clamp(cell.a, 0.0, 1.0)
-                                      : clamp(max(max(color.r, color.g), color.b), 0.0, 1.0);
-            // Preserve the AO darkening from the legacy path: deeply
-            // embedded cells (high shade_hint) get dimmed without losing
-            // hue. Same response curve as the colormap branch below.
-            float sn = float(shade_hint) / float(__SHADE_MAX__);
-            float ao = mix(1.0, 0.35, pow(sn, 0.7));
-            color *= ao;
-        } else {
-            value = cell[u_channel];
-            if (u_use_abs == 1) value = abs(value);
-            else if (u_use_abs == 2) value = 0.5 + 0.5 * clamp(value, -1.0, 1.0);  // signed bipolar
-            // Normalize value to [0,1] relative to threshold
-            value = clamp((value - u_threshold) / max(1.0 - u_threshold, 0.001), 0.0, 1.0);
-
-            // For binary CAs (value ~= 1.0), use the AO-weighted shading hint
-            // (5 bits, 0..31) to give 32 smooth darkening levels instead of the
-            // previous 4. This eliminates visible posterization on iso-surfaces.
-            if (value > 0.99) {
-                float sn = float(shade_hint) / float(__SHADE_MAX__);  // shade-bit hint, normalised to [0,1]
-                // Map so isolated cells (sn ~ 0) are bright (0.85) and deeply
-                // embedded cells (sn ~ 1) are dim (0.30). The exponent shapes
-                // the response curve to emphasize edges.
-                value = mix(0.85, 0.30, pow(sn, 0.7));
-            }
-            color = vec3(value);
-        }
-    }
-
-    // Cell geometry
-    float cell_size = 1.0 / float(u_size);
-    float shrink = 1.0 - u_voxel_gap;
-    vec3 world_pos;
-    vec3 normal;
-    if (u_lattice_fcc == 1) {
-        // FCC: draw the cell's rhombic-dodecahedron Voronoi cell. The cell
-        // CENTRES form the sheared FCC lattice (centre = M * index), but the
-        // cell SHAPE is the axis-aligned RD, so neighbouring cells share whole
-        // faces and interlock with no gaps. Recentre the block on the unit
-        // cube so the existing camera framing (target ~ (0.5,0.5,0.5)) sees it.
-        vec3 center = u_lattice_M * (cell_pos - vec3(float(u_size) * 0.5)) * cell_size
-                      + vec3(0.5);
-        // Canonical RD faces sit at distance sqrt(2); scale so they sit at
-        // half the nearest-neighbour spacing (0.5 * cell_size) and apply the
-        // voxel gap via `shrink`.
-        const float RD_SCALE = 0.35355339;  // 0.5 / sqrt(2)
-        world_pos = center + rd_verts[vert_id] * (cell_size * RD_SCALE * shrink);
-        normal = rd_normals[face_id];
-    } else {
-        // Cubic: unit cube mapped into the [0,1]^3 box (legacy path, unchanged).
-        vec3 local_pos = cube_verts[vert_id];
-        normal = cube_normals[face_id];
-        vec3 offset = cell_pos * cell_size + cell_size * 0.5 * (1.0 - shrink);
-        world_pos = offset + local_pos * cell_size * shrink;
-    }
-
-    gl_Position = u_view_proj * vec4(world_pos, 1.0);
-    v_normal = normal;
-    v_world_pos = world_pos;
-    v_color = color;
-    v_value = value;
-}
-"""
+VOXEL_VERTEX_SHADER = _load_glsl("VOXEL_VERTEX_SHADER.glsl")
 
 # ── Additional perceptually-uniform / aesthetic colormaps ────────────
 # Shared across all four shader sites (voxel fragment, raymarcher
@@ -12855,45 +10739,7 @@ void main() {
 # so the full accel rebuild (view + occupancy + minmax) costs
 # 2 GB + 256 MB instead of the prior 2 × 2 GB. Roughly halves the
 # per-sim-step accel bandwidth at large grids.
-ACCEL_FUSED_SHADER = """
-#version 430
-layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
-
-uniform sampler3D u_view;    // R16F (channel/abs already applied)
-uniform int u_size;          // full grid dimension
-uniform int u_block_size;    // block edge length (e.g. 4 or 8)
-uniform float u_threshold;   // alive threshold for occupancy
-
-layout(r8ui, binding=0) writeonly uniform uimage3D u_occupancy;
-layout(rg16f, binding=1) writeonly uniform image3D u_minmax;
-
-void main() {
-    ivec3 block = ivec3(gl_GlobalInvocationID);
-    int occ_size = (u_size + u_block_size - 1) / u_block_size;
-    if (any(greaterThanEqual(block, ivec3(occ_size)))) return;
-
-    ivec3 base = block * u_block_size;
-    bool found = false;
-    float lo =  1e10;
-    float hi = -1e10;
-
-    for (int dz = 0; dz < u_block_size; dz++) {
-        for (int dy = 0; dy < u_block_size; dy++) {
-            for (int dx = 0; dx < u_block_size; dx++) {
-                ivec3 pos = base + ivec3(dx, dy, dz);
-                if (any(greaterThanEqual(pos, ivec3(u_size)))) continue;
-                float v = texelFetch(u_view, pos, 0).r;
-                if (v > u_threshold) found = true;
-                lo = min(lo, v);
-                hi = max(hi, v);
-            }
-        }
-    }
-
-    imageStore(u_occupancy, block, uvec4(found ? 1u : 0u, 0u, 0u, 0u));
-    imageStore(u_minmax,    block, vec4(lo, hi, 0.0, 0.0));
-}
-"""
+ACCEL_FUSED_SHADER = _load_glsl("ACCEL_FUSED_SHADER.glsl")
 
 # ── Reduced-precision view texture builder ──────────────────────────
 # Bakes the per-voxel visualization scalar (channel select + abs / signed
@@ -12903,111 +10749,7 @@ void main() {
 # For a 512³ grid: 256 MB R16F vs 2 × 512 MB RGBA32F ping-pong.
 # R16F (vs R8) keeps values outside [0,1] intact with ~3-decimal precision,
 # which is plenty for colormaps and iso thresholds.
-VIEW_TEX_BUILD_SHADER = """
-#version 430
-layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
-
-// RGBA16F view texture:
-//   .r       = scalar density used for occupancy/min-max accel + iso/MIP
-//   .gba     = pre-mapped colour (or zero when u_vis_mode==0)
-// Downstream raymarchers read .r for density and (when u_use_baked_color
-// is set) .gba directly as the per-voxel colour, bypassing apply_colormap.
-layout(rgba16f, binding=0) writeonly uniform image3D u_view;
-uniform sampler3D u_volume;
-uniform int u_size;
-uniform int u_channel;     // primary channel for density (legacy)
-uniform int u_use_abs;     // 0=raw, 1=abs, 2=signed→[0,1]
-// Optional value-range remap so rules whose channel range exceeds [0,1]
-// (e.g. sandpile grain count 0..12) don't render as a fully-opaque
-// "ghost cube". After the abs/sign step we map (v - lo)/(hi - lo) and
-// clamp to [0,1]. Default lo=0, hi=1 is a no-op (legacy behaviour).
-uniform float u_vis_lo;
-uniform float u_vis_hi;
-// Multi-channel transfer-function mode:
-//   0 = DENSITY      (legacy: only u_channel; .gba=0; raymarcher uses apply_colormap)
-//   1 = RGB_CHANNELS (R=ch0, G=ch1, B=ch2; density=length / sqrt(3))
-//   2 = HSV_PHASE    (hue=atan2(ch1,ch0)/2π, sat=1, val=length(ch0,ch1); density=val)
-//   3 = BIPOLAR      (signed ch0 → diverging blue/white/red; density=|ch0|)
-//   4 = RGBA_BLEND   (R=ch0,G=ch1,B=ch2; density=ch3)
-uniform int u_vis_mode;
-// Per-mode auxiliary range used for normalising vector magnitudes / phase values
-// (defaults set from preset; falls back to (vis_lo, vis_hi) when not specified).
-uniform float u_aux_lo;
-uniform float u_aux_hi;
-
-vec3 hsv2rgb(vec3 c) {
-    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
-    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}
-
-vec3 diverging_bwr(float d) {
-    // d in [-1, 1] -> blue (cold) ↔ white ↔ red (warm)
-    float a = clamp(abs(d), 0.0, 1.0);
-    vec3 cold = vec3(0.10, 0.30, 0.95);
-    vec3 warm = vec3(0.95, 0.20, 0.20);
-    vec3 hue  = (d >= 0.0) ? warm : cold;
-    return mix(vec3(0.95, 0.95, 0.95), hue, a);
-}
-
-void main() {
-    ivec3 p = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(p, ivec3(u_size)))) return;
-    vec4 raw = texelFetch(u_volume, p, 0);
-
-    float density = 0.0;
-    vec3  colour  = vec3(0.0);
-    float scale = (u_vis_hi > u_vis_lo) ? (1.0 / (u_vis_hi - u_vis_lo)) : 1.0;
-    float aux_scale = (u_aux_hi > u_aux_lo) ? (1.0 / (u_aux_hi - u_aux_lo)) : 1.0;
-
-    if (u_vis_mode == 1) {
-        // RGB_CHANNELS: each channel mapped through (vis_lo, vis_hi)
-        vec3 rgb = clamp((raw.rgb - vec3(u_vis_lo)) * scale, 0.0, 1.0);
-        density = clamp(length(rgb) * (1.0 / 1.7320508), 0.0, 1.0);
-        colour  = rgb;
-    } else if (u_vis_mode == 2) {
-        // HSV_PHASE: (ch0, ch1) treated as a 2-vector
-        float a = raw.r, b = raw.g;
-        float mag = length(vec2(a, b));
-        // Inverted aux range (lo > hi) flips amplitude→opacity so that
-        // *defect cores* (low |A| in an oscillator otherwise saturated
-        // at |A|≈1) render bright and the bulk vanishes — essential
-        // for CGLE/BZ where the spiral filaments live at |A|<<1.
-        float val;
-        if (u_aux_hi >= u_aux_lo) {
-            val = clamp((mag - u_aux_lo) * aux_scale, 0.0, 1.0);
-        } else {
-            float inv_scale = 1.0 / (u_aux_lo - u_aux_hi);
-            val = clamp(1.0 - (mag - u_aux_hi) * inv_scale, 0.0, 1.0);
-        }
-        float hue = atan(b, a) / 6.2831853 + 0.5;  // wrap to [0,1]
-        colour  = hsv2rgb(vec3(hue, 1.0, val));
-        density = val;
-    } else if (u_vis_mode == 3) {
-        // BIPOLAR: signed ch0
-        float v = raw[u_channel];
-        float d = clamp(v * aux_scale, -1.0, 1.0);   // aux_lo unused; aux_hi normalises
-        if (u_aux_hi <= u_aux_lo) d = clamp(v, -1.0, 1.0);
-        density = abs(d);
-        colour  = diverging_bwr(d);
-    } else if (u_vis_mode == 4) {
-        // RGBA_BLEND: explicit per-channel colour, density from ch3
-        vec3 rgb = clamp((raw.rgb - vec3(u_vis_lo)) * scale, 0.0, 1.0);
-        density  = clamp((raw.a - u_aux_lo) * aux_scale, 0.0, 1.0);
-        colour   = rgb;
-    } else {
-        // 0 = DENSITY (legacy single-channel, colormap applied in raymarcher)
-        float v = raw[u_channel];
-        if (u_use_abs == 1)      v = abs(v);
-        else if (u_use_abs == 2) v = v * 0.5 + 0.5;
-        v = clamp((v - u_vis_lo) * scale, 0.0, 1.0);
-        density = v;
-        colour  = vec3(0.0);  // raymarcher will recolour via apply_colormap
-    }
-
-    imageStore(u_view, p, vec4(density, colour));
-}
-"""
+VIEW_TEX_BUILD_SHADER = _load_glsl("VIEW_TEX_BUILD_SHADER.glsl")
 
 # ── Half-resolution bilateral upsample shader ────────────────────────
 # Upsamples a half-res volume render to full res using edge-aware bilateral filter
@@ -13021,62 +10763,7 @@ void main() {
 }
 """
 
-UPSAMPLE_FRAGMENT_SHADER = """
-#version 430
-in vec2 v_uv;
-out vec4 fragColor;
-
-uniform sampler2D u_half_res;    // half-resolution volume render
-uniform vec2 u_texel_size;       // 1.0 / half_res_dimensions
-
-void main() {
-    // Joint bilateral upsample (5-tap: center + 4 diagonal neighbors at the
-    // adjacent half-res texel centers).
-    //
-    // PRIOR BUG: the 4 corner samples used offsets of ±0.5 * u_texel_size,
-    // which sample BETWEEN half-res texels. With LINEAR filtering enabled
-    // those reads collapse to bilinear-interpolated values that already
-    // include the center, so the bilateral weights had nothing distinct to
-    // compare against — the filter degenerated to a plain box blur.
-    //
-    // The correct neighbor offset on the half-res grid is ±1.0 texel.
-    vec2 uv = v_uv;
-    vec4 center = texture(u_half_res, uv);
-
-    vec4 s00 = texture(u_half_res, uv + vec2(-1.0, -1.0) * u_texel_size);
-    vec4 s10 = texture(u_half_res, uv + vec2( 1.0, -1.0) * u_texel_size);
-    vec4 s01 = texture(u_half_res, uv + vec2(-1.0,  1.0) * u_texel_size);
-    vec4 s11 = texture(u_half_res, uv + vec2( 1.0,  1.0) * u_texel_size);
-
-    // Range (color) sigma: how perceptually different a sample must be before
-    // its weight collapses. 0.08 keeps the filter sharp on iso-surfaces while
-    // still smoothing within smooth gradients.
-    const float sigma_color = 0.08;
-    const float inv_2sig2   = 1.0 / (2.0 * sigma_color * sigma_color);
-
-    // Squared color distance from center (Euclidean in linear RGB).
-    vec3 d00 = s00.rgb - center.rgb;
-    vec3 d10 = s10.rgb - center.rgb;
-    vec3 d01 = s01.rgb - center.rgb;
-    vec3 d11 = s11.rgb - center.rgb;
-
-    float w00 = exp(-dot(d00, d00) * inv_2sig2);
-    float w10 = exp(-dot(d10, d10) * inv_2sig2);
-    float w01 = exp(-dot(d01, d01) * inv_2sig2);
-    float w11 = exp(-dot(d11, d11) * inv_2sig2);
-    // Center always carries a weight of 1 — guarantees a nonzero denominator
-    // and keeps the result anchored on the original sample.
-    float w_sum = 1.0 + w00 + w10 + w01 + w11;
-
-    vec3 result = (center.rgb
-                 + s00.rgb * w00
-                 + s10.rgb * w10
-                 + s01.rgb * w01
-                 + s11.rgb * w11) / w_sum;
-
-    fragColor = vec4(result, 1.0);
-}
-"""
+UPSAMPLE_FRAGMENT_SHADER = _load_glsl("UPSAMPLE_FRAGMENT_SHADER.glsl")
 
 # ── Compute-shader raymarcher ────────────────────────────────────────
 # Alternative to the fragment shader: raymarches in a compute shader,
@@ -25390,6 +23077,16 @@ class Simulator:
         self._rec_capture_mode = 'per_step'
         self._rec_steps_per_frame = 1.0   # >1 = time-lapse, <1 = slow-mo
         self._rec_step_accum = 0.0        # fractional step counter
+        # Per-frame CPU sub-timings for the recording path (render/dma/
+        # readback/queue), populated by _record_frame and drained by the
+        # main loop into the perf section history. See _draw_perf_overlay.
+        self._rec_sub = {}
+        # GPU timer-query state (opt-in via the F12 overlay). Maps a label
+        # to a small async ring [queryA, queryB, idx, pending] so elapsed
+        # GPU time is read one frame late, never stalling the pipeline.
+        # Default OFF: timer queries are a diagnostic, not always-on.
+        self._gpu_timing_enabled = False
+        self._gpu_timer_ring = {}
         # Auto-stop the recording after this many seconds of OUTPUT
         # video (i.e. _rec_frame_count >= duration * fps).  0 = manual
         # stop only.
@@ -31853,6 +29550,52 @@ void main() {
         # End-of-stream: leave replay flag on so we don't reset _replay_idx,
         # but no more events will be applied.
 
+    @contextlib.contextmanager
+    def _gpu_time(self, label, sec):
+        """Async GPU timer query around a section of GPU work.
+
+        Wraps the body in a GL_TIME_ELAPSED query. To avoid stalling the
+        pipeline waiting for the result, we keep two query objects per
+        label and read back the PREVIOUS frame's result (one-frame lag,
+        same trick as the recording PBOs). Elapsed GPU time lands in
+        sec['gpu.<label>'] in seconds. Fully defensive: any driver/API
+        hiccup disables GPU timing for the rest of the run rather than
+        crashing the render loop. Must NOT be nested (only one
+        GL_TIME_ELAPSED query may be active at a time).
+        """
+        if not getattr(self, '_gpu_timing_enabled', False):
+            yield
+            return
+        ring = self._gpu_timer_ring.get(label)
+        if ring is None:
+            try:
+                ring = [self.ctx.query(time=True), self.ctx.query(time=True), 0, False]
+                self._gpu_timer_ring[label] = ring
+            except Exception:
+                self._gpu_timing_enabled = False
+                yield
+                return
+        q = ring[ring[2]]
+        try:
+            q.__enter__()
+        except Exception:
+            self._gpu_timing_enabled = False
+            yield
+            return
+        try:
+            yield
+        finally:
+            cur = ring[2]
+            prev = 1 - cur
+            try:
+                q.__exit__(None, None, None)
+                if ring[3]:  # a previous-frame result is ready
+                    sec[f'gpu.{label}'] = ring[prev].elapsed / 1e9
+            except Exception:
+                self._gpu_timing_enabled = False
+            ring[3] = True
+            ring[2] = prev
+
     def _draw_perf_overlay(self, history):
         """Tiny always-on-top window showing per-section frame timings.
         Toggle with F12. Helps localize stutter to a specific stage of
@@ -31872,10 +29615,11 @@ void main() {
         if not getattr(self, '_show_perf_overlay', False) or len(history) < 5:
             return
         # Aggregate stats over the rolling window
-        # Base sections + every render.* sub-section seen in the history.
-        base_keys = ('poll', 'step', 'score', 'render', 'ui', 'swap', 'total')
+        # Base sections + every render.*/rec.*/gpu.* sub-section seen in
+        # the history, plus the 'record' total when recording.
+        base_keys = ('poll', 'step', 'score', 'render', 'record', 'ui', 'swap', 'total')
         sub_keys = sorted({k for sec in history for k in sec
-                            if k.startswith('render.')})
+                           if k.startswith(('render.', 'rec.', 'gpu.'))})
         keys = base_keys + tuple(sub_keys)
         worst = {k: 0.0 for k in keys}
         worst_frame_idx = {k: -1 for k in keys}
@@ -31902,6 +29646,8 @@ void main() {
         imgui.text(f"{'section':<18} {'mean':>7} {'worst':>7} {'frame':>6}")
         imgui.separator()
         for k in keys:
+            if counts[k] == 0:
+                continue  # section not present in this window (e.g. not recording)
             ms_mean = mean[k] * 1000
             ms_worst = worst[k] * 1000
             # Highlight any section whose worst is >2x its mean — that's
@@ -31912,11 +29658,24 @@ void main() {
             # render.* sub-keys get dimmed slightly to read as children of render
             if k.startswith('render.') and not spiky:
                 color = (0.75, 0.85, 1.0, 1.0)
+            elif k.startswith('rec.') and not spiky:
+                color = (1.0, 0.85, 0.6, 1.0)  # amber children of 'record'
+            elif k.startswith('gpu.') and not spiky:
+                color = (0.7, 1.0, 0.75, 1.0)  # green = GPU timer-query rows
             imgui.text_colored(imgui.ImVec4(*color),
                 f"{k:<18} {ms_mean:>6.2f}m {ms_worst:>6.2f}m {worst_frame_idx[k]:>6d}")
         imgui.separator()
         imgui.text_colored(imgui.ImVec4(0.7, 0.7, 0.7, 1.0),
             "red = worst > 2x mean (likely stutter)")
+        changed, val = imgui.checkbox("GPU timer queries (gpu.*)",
+                                      getattr(self, '_gpu_timing_enabled', False))
+        if changed:
+            self._gpu_timing_enabled = val
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Measure GPU-side time for step/render via GL_TIME_ELAPSED.\n"
+                "Splits GPU-compute from CPU/readback stalls. Read one frame\n"
+                "late so it never stalls the pipeline. Off by default.")
         if imgui.button("Save perf log JSON"):
             self._save_perf_log(list(history))
         imgui.same_line()
@@ -33503,11 +31262,25 @@ void main() {
         DMA) and hands them to the writer thread. Net effect: one frame of
         added end-to-end latency, ~3-6 ms/frame saved on the main thread.
         """
-        if not self._recording or not self._rec_process:
+        if not self._recording:
+            return
+        # Normally we need a live ffmpeg process. The benchmark sets
+        # _rec_dryrun to exercise the real render + PBO readback cost
+        # (the expensive part) without spawning an encoder or writing a
+        # file — the bytes are simply dropped.
+        if not self._rec_process and not getattr(self, '_rec_dryrun', False):
             return
 
+        # Per-frame CPU sub-timings, accumulated across however many times
+        # _record_frame runs this loop iteration (slow-mo emits N frames).
+        # The main loop reads + resets self._rec_sub.
+        sub = self._rec_sub
+
         # Render scene to recording FBO.
-        self._render_to_rec_fbo()
+        _t = time.perf_counter()
+        with self._gpu_time('rec.render', sub):
+            self._render_to_rec_fbo()
+        sub['rec.render'] = sub.get('rec.render', 0.0) + (time.perf_counter() - _t)
 
         cur = self._rec_pbo_idx
         prev = 1 - cur
@@ -33515,28 +31288,39 @@ void main() {
         # Issue async DMA: GPU copies the FBO contents into the current PBO.
         # This call returns immediately on the driver side; the actual copy
         # happens in parallel with whatever we do next.
+        _t = time.perf_counter()
         self._rec_fbo.read_into(self._rec_pbo[cur], components=3)
+        sub['rec.dma'] = sub.get('rec.dma', 0.0) + (time.perf_counter() - _t)
 
         # If we have a pending read from the previous frame, retrieve it now.
         # By this point the DMA is one frame old and almost certainly done,
         # so .read() returns without blocking.
         if self._rec_pbo_pending:
+            _t = time.perf_counter()
             data = self._rec_pbo[prev].read()
-            try:
-                self._rec_write_queue.put_nowait(data)
+            sub['rec.readback'] = sub.get('rec.readback', 0.0) + (time.perf_counter() - _t)
+            if self._rec_process is None:
+                # Dry-run benchmark: real render+readback already paid;
+                # drop the bytes instead of piping to ffmpeg.
                 self._rec_frame_count += 1
-            except _queue.Full:
-                # ffmpeg is falling behind — surface the loss so users notice
-                # before checking the MP4. Throttle the log so a sustained
-                # backlog doesn't spam stderr.
-                self._rec_dropped_frames += 1
-                if self._rec_dropped_frames % 30 == 1:
-                    sys.stderr.write(
-                        f"[recording] dropped {self._rec_dropped_frames} frame(s); "
-                        f"ffmpeg writer queue is saturated\n")
-                    self._rec_msg = (
-                        f"WARN: dropped {self._rec_dropped_frames} frame(s)")
-                    self._rec_msg_time = time.time()
+            else:
+                try:
+                    _t = time.perf_counter()
+                    self._rec_write_queue.put_nowait(data)
+                    sub['rec.queue'] = sub.get('rec.queue', 0.0) + (time.perf_counter() - _t)
+                    self._rec_frame_count += 1
+                except _queue.Full:
+                    # ffmpeg is falling behind — surface the loss so users
+                    # notice before checking the MP4. Throttle the log so a
+                    # sustained backlog doesn't spam stderr.
+                    self._rec_dropped_frames += 1
+                    if self._rec_dropped_frames % 30 == 1:
+                        sys.stderr.write(
+                            f"[recording] dropped {self._rec_dropped_frames} frame(s); "
+                            f"ffmpeg writer queue is saturated\n")
+                        self._rec_msg = (
+                            f"WARN: dropped {self._rec_dropped_frames} frame(s)")
+                        self._rec_msg_time = time.time()
 
         self._rec_pbo_pending = True
         self._rec_pbo_idx = prev  # swap for next frame
@@ -33706,18 +31490,19 @@ void main() {
                             self._last_step_time = now
 
                     if should_step:
-                        for _ in range(self.sim_speed):
-                            if self._replay_active:
-                                self._drain_replay_events()
-                            self._step_sim()
-                            # Debug stats: throttled GPU dispatch per step
-                            self._dispatch_debug_stats()
-                            # Per-step recording: tick the step accumulator
-                            # so the post-render capture block can pull off
-                            # however many video frames are owed.
-                            if (self._recording
-                                    and self._rec_capture_mode == 'per_step'):
-                                self._rec_step_accum += 1.0
+                        with self._gpu_time('step', sec):
+                            for _ in range(self.sim_speed):
+                                if self._replay_active:
+                                    self._drain_replay_events()
+                                self._step_sim()
+                                # Debug stats: throttled GPU dispatch per step
+                                self._dispatch_debug_stats()
+                                # Per-step recording: tick the step accumulator
+                                # so the post-render capture block can pull off
+                                # however many video frames are owed.
+                                if (self._recording
+                                        and self._rec_capture_mode == 'per_step'):
+                                    self._rec_step_accum += 1.0
 
                         # Live scoring (periodic GPU reduction — no full readback)
                         self._score_frame += 1
@@ -33745,7 +31530,8 @@ void main() {
                     self._restore_scene_snapshot()
                     sec['render_skipped'] = True
                 else:
-                    self._render()
+                    with self._gpu_time('render', sec):
+                        self._render()
                     t_snap = time.perf_counter()
                     self._snapshot_scene()
                     sec['render.snapshot'] = time.perf_counter() - t_snap
@@ -33767,6 +31553,8 @@ void main() {
                 #              sim steps; consume the accumulator until
                 #              it goes below 1 frame's worth.
                 if self._recording:
+                    t_record_start = time.perf_counter()
+                    self._rec_sub.clear()
                     if self._rec_capture_mode == 'realtime':
                         self._record_frame()
                         self._rec_check_autostop()
@@ -33801,6 +31589,15 @@ void main() {
                                 self.cam_theta -= 2.0 * math.pi
                             elif self.cam_theta < -math.pi:
                                 self.cam_theta += 2.0 * math.pi
+
+                    # Drain the per-frame recording sub-timings (render/
+                    # dma/readback/queue) into the section dict and record
+                    # the total wall-clock spent in the capture path. This
+                    # is the cost the F12 overlay was previously blind to:
+                    # it lived in the gap between 'render' and 'ui'.
+                    for k, v in self._rec_sub.items():
+                        sec[k] = v
+                    sec['record'] = time.perf_counter() - t_record_start
 
                 # Render UI
                 t_ui_start = time.perf_counter()
@@ -34187,7 +31984,9 @@ def run_audit(rule, sizes, steps, seed=None, sample_interval=5, warmup=0,
 
 
 def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
-                            renderers='auto', seed=None):
+                            renderers='auto', seed=None, record=False,
+                            gpu_timing=False, half_res=False,
+                            compute_ray=False):
     """Cycle through N random 3D rule presets, run each for `frames_per_rule`
     frames in a visible GLFW window, and dump a combined JSON report to
     perf_runs/benchmark_<timestamp>.json.
@@ -34199,6 +31998,12 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
     `renderers` is a comma-separated list of renderer modes to test
     (voxel, volumetric, slice, auto). 'auto' uses each rule's default.
     Multiple modes multiply the run length.
+
+    `record` exercises the recording path (a second render to the rec FBO
+    at recording resolution + PBO readback) via a dry-run that drops the
+    bytes instead of spawning ffmpeg, so `record`/`rec.*` sections appear
+    in the report. `gpu_timing` adds GL_TIME_ELAPSED `gpu.*` rows for the
+    step/render/rec.render sections.
     """
     import os, random as _rnd
     rng = _rnd.Random(seed if seed is not None else int(time.time()))
@@ -34248,6 +32053,14 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
     sim._show_perf_overlay = False  # we capture frames directly, no overlay
     sim.target_sps = 0  # unlimited (one step per frame)
     sim.paused = False
+    sim._gpu_timing_enabled = bool(gpu_timing)
+    # Render-acceleration A/B toggles. Both paths already exist in the
+    # renderer but ship default-off; the benchmark flips them so the
+    # gpu.render timer can quantify the win on volumetric rules.
+    #   half_res    -> _render_volume renders at half res + upsample
+    #   compute_ray -> _render_volume_compute (shared-mem compute raymarch)
+    sim._use_half_res = bool(half_res)
+    sim._use_compute_ray = bool(compute_ray)
     glfw.swap_interval(0)  # disable vsync — we want raw render time
 
     per_rule = []
@@ -34261,6 +32074,10 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
                 if rmode is not None:
                     sim.renderer_mode = rmode
                 sim._reset()
+                # Re-assert render-accel toggles (defensive — _change_rule /
+                # _reset may reset renderer state on some presets).
+                sim._use_half_res = bool(half_res)
+                sim._use_compute_ray = bool(compute_ray)
             except Exception as e:  # noqa: BLE001  rule change failure, keep current rule
                 print(f"[bench]   skipped: change_rule failed: {e!r}", flush=True)
                 continue
@@ -34270,47 +32087,82 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
             from collections import deque
             section_history = deque(maxlen=frames_per_rule)
             t_rule_start = time.time()
-            for fi in range(warmup_frames + frames_per_rule):
-                if glfw.window_should_close(sim.window):
-                    print("[bench]   window closed early — aborting", flush=True)
-                    break
-                t0 = time.perf_counter()
-                sec = {}
-                glfw.poll_events()
-                sim.imgui_renderer.process_inputs()
-                sec['poll'] = time.perf_counter() - t0
+            if record:
+                # Dry-run recording: build the rec FBO/PBOs and flag the
+                # capture path so _record_frame renders to the rec FBO and
+                # reads it back, but drops the bytes (no ffmpeg).
+                sim._rec_dryrun = True
+                sim._recording = True
+                sim._rec_capture_mode = 'realtime'
+                sim._rec_frame_count = 0
+                sim._rec_pbo_pending = False
+                sim._init_rec_fbo()
+            rule_aborted = False
+            try:
+                for fi in range(warmup_frames + frames_per_rule):
+                    if glfw.window_should_close(sim.window):
+                        print("[bench]   window closed early — aborting", flush=True)
+                        break
+                    t0 = time.perf_counter()
+                    sec = {}
+                    glfw.poll_events()
+                    sim.imgui_renderer.process_inputs()
+                    sec['poll'] = time.perf_counter() - t0
 
-                fb_w, fb_h = glfw.get_framebuffer_size(sim.window)
-                if fb_w > 0 and fb_h > 0:
-                    sim.width, sim.height = fb_w, fb_h
-                    sim.ctx.viewport = (0, 0, fb_w, fb_h)
+                    fb_w, fb_h = glfw.get_framebuffer_size(sim.window)
+                    if fb_w > 0 and fb_h > 0:
+                        sim.width, sim.height = fb_w, fb_h
+                        sim.ctx.viewport = (0, 0, fb_w, fb_h)
 
-                t_step = time.perf_counter()
-                sim._step_sim()
-                sec['step'] = time.perf_counter() - t_step
+                    t_step = time.perf_counter()
+                    with sim._gpu_time('step', sec):
+                        sim._step_sim()
+                    sec['step'] = time.perf_counter() - t_step
 
-                t_render = time.perf_counter()
-                sim._render()
-                sub = getattr(sim, '_render_sub', None)
-                if sub:
-                    for k, v in sub.items():
-                        if not k.startswith('_'):
-                            sec[f'render.{k}'] = v
-                sec['render'] = time.perf_counter() - t_render
+                    t_render = time.perf_counter()
+                    with sim._gpu_time('render', sec):
+                        sim._render()
+                    sub = getattr(sim, '_render_sub', None)
+                    if sub:
+                        for k, v in sub.items():
+                            if not k.startswith('_'):
+                                sec[f'render.{k}'] = v
+                    sec['render'] = time.perf_counter() - t_render
 
-                t_swap = time.perf_counter()
-                glfw.swap_buffers(sim.window)
-                sec['swap'] = time.perf_counter() - t_swap
-                sec['total'] = time.perf_counter() - t0
+                    if record:
+                        sim._rec_sub.clear()
+                        t_rec = time.perf_counter()
+                        sim._record_frame()
+                        for k, v in sim._rec_sub.items():
+                            sec[k] = v
+                        sec['record'] = time.perf_counter() - t_rec
 
-                if fi >= warmup_frames:
-                    section_history.append(sec)
+                    t_swap = time.perf_counter()
+                    glfw.swap_buffers(sim.window)
+                    sec['swap'] = time.perf_counter() - t_swap
+                    sec['total'] = time.perf_counter() - t0
+
+                    if fi >= warmup_frames:
+                        section_history.append(sec)
+            except Exception as e:  # noqa: BLE001  one rule failing must not
+                # abort the whole sweep — skip it, keep prior rules' data and
+                # still write the report. (e.g. ant_colony_lifecycle_3d raises
+                # a GLError at 384 from a pre-existing agent-buffer bug.)
+                rule_aborted = True
+                print(f"[bench]   ERROR in '{label}': {e!r} — skipping rule",
+                      flush=True)
+            finally:
+                if record:
+                    sim._recording = False
+                    sim._rec_dryrun = False
+                    sim._rec_pbo_pending = False
 
             rule_dt = time.time() - t_rule_start
             # Per-rule summary
             hist = list(section_history)
             if not hist:
-                print(f"[bench]   no frames captured", flush=True)
+                if not rule_aborted:
+                    print(f"[bench]   no frames captured", flush=True)
                 continue
             mean_total = sum(s['total'] for s in hist) / len(hist) * 1000
             mean_render = sum(s['render'] for s in hist) / len(hist) * 1000
@@ -34362,6 +32214,10 @@ def run_renderer_benchmark(size, n_rules, frames_per_rule, warmup_frames,
         'frames_per_rule': frames_per_rule,
         'warmup_frames': warmup_frames,
         'renderers_arg': renderers,
+        'record': bool(record),
+        'gpu_timing': bool(gpu_timing),
+        'half_res': bool(half_res),
+        'compute_ray': bool(compute_ray),
         'seed': seed,
         'gl_renderer': sim.ctx.info.get('GL_RENDERER', '?'),
         'gl_vendor': sim.ctx.info.get('GL_VENDOR', '?'),
@@ -34478,6 +32334,25 @@ def main():
                         help='Comma-separated renderer modes to test '
                              '(voxel,volumetric,slice,auto). "auto" uses '
                              'each rule\'s default. (default: auto)')
+    parser.add_argument('--benchmark-record', action='store_true',
+                        help='Exercise the recording path during the '
+                             'benchmark (second render to the rec FBO at '
+                             'recording resolution + PBO readback) via a '
+                             'dry-run that drops bytes instead of spawning '
+                             'ffmpeg. Adds record/rec.* sections.')
+    parser.add_argument('--benchmark-gpu-timing', action='store_true',
+                        help='Add GL_TIME_ELAPSED gpu.* rows (step/render/'
+                             'rec.render) to the benchmark to separate '
+                             'GPU-compute time from CPU/readback stalls.')
+    parser.add_argument('--benchmark-half-res', action='store_true',
+                        help='Render the volume at half resolution + '
+                             'upsample (_use_half_res) during the benchmark '
+                             'so gpu.render quantifies the speedup.')
+    parser.add_argument('--benchmark-compute-ray', action='store_true',
+                        help='Use the shared-memory compute raymarcher '
+                             '(_use_compute_ray) for volumetric rules during '
+                             'the benchmark to A/B it against the fragment '
+                             'raymarcher.')
     parser.add_argument('--seed', type=int, default=None,
                         help='Override seed before reset (applies to audit '
                              'and non-audit runs)')
@@ -34512,6 +32387,10 @@ def main():
             warmup_frames=args.benchmark_warmup,
             renderers=args.benchmark_renderers,
             seed=args.seed,
+            record=args.benchmark_record,
+            gpu_timing=args.benchmark_gpu_timing,
+            half_res=args.benchmark_half_res,
+            compute_ray=args.benchmark_compute_ray,
         )
         try:
             glfw.terminate()
