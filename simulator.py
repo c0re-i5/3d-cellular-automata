@@ -645,6 +645,65 @@ void main() {
 }
 """,
 
+    "flow_turing_3d": """
+// Differential-flow Gray-Scott -- flow-distributed structures (FDS).
+// Same two-species Gray-Scott kinetics as reaction_diffusion_3d, but the
+// catalyst V is advected uniformly along +x while the substrate U stays put.
+// This "differential flow" between the two species is the Rovinsky-Menzinger
+// differential-flow instability (DIFI, 1992): once the flow exceeds a small
+// threshold the static Turing labyrinth is replaced by PERPETUAL travelling
+// wave trains -- stripes that are continuously born upstream and swept
+// downstream, never freezing. Flow = 0 recovers the ordinary static
+// Gray-Scott pattern exactly (this shader reduces to reaction_diffusion_3d).
+//
+//   dU/dt = Du lap(U) - U V^2 + F(1-U)
+//   dV/dt = Dv lap(V) + U V^2 - (F+k)V  -  phi dV/dx      (phi = flow speed)
+//
+//   u_param0 = Feed F   u_param1 = Kill k
+//   u_param2 = Flow phi (V advection speed, +x)   u_param3 = Dv (V diffusion)
+// Du is fixed at 0.16 (the worm/labyrinth operating point).
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float U = self_val.r;
+    float V = self_val.g;
+
+    vec4 lap_v4 = lap19_v4(pos, self_val);
+    float lap_U = lap_v4.r;
+    float lap_V = lap_v4.g;
+
+    float F    = u_param0;        // feed rate
+    float k    = u_param1;        // kill rate
+    float flow = max(u_param2, 0.0);  // differential flow speed (V drifts +x)
+    float Dv   = u_param3;        // V diffusion
+    float Du   = 0.16;            // fixed substrate diffusion (worm regime)
+
+    // First-order upwind for the +x advection of V (donor is the -x cell).
+    float V_xm = fetch(pos - ivec3(1, 0, 0)).g;
+    float adv_V = -flow * (V - V_xm) * h_inv;   // -phi dV/dx, upwind (phi>=0)
+
+    // CFL-safe dt: satisfy BOTH the diffusion limit (D dt h^2 <= 1/6) and the
+    // advection Courant limit (phi dt h_inv <= 0.9) so the wave train stays
+    // stable at any grid resolution.
+    float D_max     = max(Du, Dv);
+    float dt_diff   = 0.9 / 6.0 / max(D_max * h_sq, 1e-8);
+    float dt_adv    = 0.9 / max(flow * h_inv, 1e-8);
+    float dt_eff    = min(u_dt, min(dt_diff, dt_adv));
+
+    float uvv = U * V * V;
+    float dU  = Du * lap_U - uvv + F * (1.0 - U);
+    float dV  = Dv * lap_V + uvv - (F + k) * V + adv_V;
+
+    float new_U = clamp(U + dU * dt_eff, 0.0, 1.0);
+    float new_V = clamp(V + dV * dt_eff, 0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
     "fcc_gray_scott": """
 // Gray-Scott reaction-diffusion on the FCC (face-centred-cubic) lattice.
 // Same two coupled species as reaction_diffusion_3d (R = U substrate,
@@ -706,6 +765,268 @@ void main() {
     float new_V = clamp(V + dV * dt_eff, 0.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_U, new_V, 0.0, 0.0));
+}
+""",
+
+    "fcc_particle_life": """
+// Multi-species "Particle Life" as a CONTINUUM FIELD on the FCC lattice.
+//
+// Instead of discrete agents, each of 5 "colours" is a density field. The
+// "rule" is a 5x5 force matrix A: A[i][j] is how strongly colour i is
+// attracted to (>0) or repelled by (<0) colour j at mid-range. A is built
+// deterministically from an integer seed (u_param0), so every seed is a new
+// universe -- this is the search genome (analogous to Clusters / Tom Mohr's
+// random force matrix, lifted into 3D on the isotropic FCC lattice).
+//
+// Per step, for each colour i we (1) sum a NON-RECIPROCAL force from the
+// matrix over the FCC neighbourhood -- a universal short-range repulsion plus
+// a matrix-weighted mid-range attraction -- to get a velocity, then (2) move
+// the density with a CONSERVATIVE upwind finite-volume flux across the 12 FCC
+// faces. Because A is asymmetric (A[i][j] != A[j][i]), red can chase green
+// while green flees red: the velocity field keeps curling, so structures
+// travel and reorganise forever (alive) instead of relaxing into static blobs
+// (which a symmetric gradient model does). The face flux is computed
+// identically from both neighbouring cells, so mass per colour is *exactly*
+// conserved -- no colour can run away and fog the box (the failure mode of a
+// semi-Lagrangian backtrace, which duplicates mass under convergent flow).
+//
+// Texture layout (renderer reads only the primary texture, so the primary
+// holds a COMPOSITE display colour and the real state lives in aux fields):
+//   u_dst   (main)  = vec4(display.rgb, total_density)   -> vis 'rgba_blend'
+//   u_src2/u_dst2   = densities of colours 0,1,2,3       (field2, bind 2/3)
+//   u_src3/u_dst3   = density  of colour 4 in .r         (extra0, bind 4/5)
+//
+//   u_param0 = matrix seed (cast to int)
+//   u_param1 = repulsion radius fraction beta  (hard-core size, 0..1 of rmax)
+//   u_param2 = interaction radius rmax         (in nearest-neighbour units)
+//   u_param3 = force -> velocity scale (advection speed; higher = livelier)
+
+layout(rgba32f, binding=2) uniform image3D u_src2;   // colours 0..3 (read)
+layout(rgba32f, binding=3) uniform image3D u_dst2;   // colours 0..3 (write)
+layout(rgba32f, binding=4) uniform image3D u_src3;   // colour 4 in .r (read)
+layout(rgba32f, binding=5) uniform image3D u_dst3;   // colour 4 in .r (write)
+
+// FCC index -> world basis, scaled so nearest-neighbour distance = 1.
+// Columns are the FCC primitive vectors a1,a2,a3; world = BASIS * vec3(index).
+// Only used to measure isotropic world-space neighbour distances for the
+// interaction kernels (no inverse needed: transport is a gather of fluxes,
+// not a backtrace).
+const float PL_S = 0.70710678;  // 1/sqrt(2)
+
+// One uint hash -> [0,1). Used to synthesise the force-matrix entries from
+// the integer seed (two-input PCG-style mix).
+float pl_hash(int a, int b) {
+    uint s = uint(a) * 747796405u + uint(b) * 2891336453u + 0x9E3779B9u;
+    s ^= s >> 16u; s *= 0x7feb352du;
+    s ^= s >> 15u; s *= 0x846ca68bu;
+    s ^= s >> 16u;
+    return float(s) * INV_U32_MAX;
+}
+
+// Read colour `ci` (0..4) at an integer cell with toroidal wrap.
+float pl_colorAt(ivec3 p, int ci) {
+    ivec3 w = (p + ivec3(u_size) * 4) % ivec3(u_size);
+    if (ci < 4) return imageLoad(u_src2, w)[ci];
+    return imageLoad(u_src3, w).r;
+}
+
+// Per-colour force-velocity at integer cell `c`. Sums the (asymmetric)
+// Particle-Life force over the isotropic FCC neighbourhood: a universal
+// short-range repulsion (rn < beta) keeps bodies from collapsing, plus a
+// matrix-weighted mid-range attraction (rn >= beta) that pulls colour i
+// toward / away from each colour j. Because the SAME function is evaluated
+// at a cell and at each of its 12 neighbours, the face velocities used by
+// the transport below are identical from both sides -> exactly conservative.
+void pl_velocity(ivec3 c, mat3 BASIS, float A[25], float beta, float rmax,
+                 int R, out vec3 vel[5]) {
+    for (int i = 0; i < 5; ++i) vel[i] = vec3(0.0);
+    for (int dz = -R; dz <= R; ++dz)
+    for (int dy = -R; dy <= R; ++dy)
+    for (int dx = -R; dx <= R; ++dx) {
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        vec3 wo = BASIS * vec3(dx, dy, dz);      // world-space offset
+        float r = length(wo);
+        if (r > rmax) continue;
+        vec3 dir = wo / r;                       // unit vector toward neighbour
+        float rn = r / rmax;                     // normalised 0..1
+        float att = (rn >= beta) ? (1.0 - rn) : 0.0;       // mid-range attract
+        float rep = (rn < beta) ? (1.0 - rn / beta) : 0.0; // short-range repel
+        ivec3 w = (c + ivec3(dx, dy, dz) + ivec3(u_size) * 4) % ivec3(u_size);
+        vec4 nb = imageLoad(u_src2, w);
+        float ne2 = imageLoad(u_src3, w).r;
+        float nd[5];
+        nd[0] = nb.x; nd[1] = nb.y; nd[2] = nb.z; nd[3] = nb.w; nd[4] = ne2;
+        float Tn = nd[0] + nd[1] + nd[2] + nd[3] + nd[4];
+        for (int i = 0; i < 5; ++i) {
+            float coeff = 0.0;
+            for (int j = 0; j < 5; ++j) coeff += A[i * 5 + j] * nd[j];
+            float fmag = att * coeff - 3.0 * rep * Tn;   // attract - hard-core
+            vel[i] += dir * fmag;
+        }
+    }
+}
+
+// ── Workgroup-shared velocity cache ─────────────────────────────
+// pl_velocity (a neighbourhood sum per cell) is the expensive part, and the
+// conservative flux needs the velocity of all 12 face neighbours -- naively
+// that re-evaluates every cell's velocity ~13x (once as a centre, 12x as a
+// neighbour of its neighbours). Instead each thread computes its OWN velocity
+// once and publishes it here; the flux reads neighbours straight from the 8^3
+// tile. Only neighbours outside the tile (or wrapped at the grid edge) get
+// recomputed, so ~13x evaluations collapse to ~2.5x. 8^3 cells * 5 vec3 =
+// 30 KB, comfortably under the 48 KB shared-memory budget.
+shared float pl_vs[8 * 8 * 8 * 15];
+
+void pl_storeVel(int lidx, vec3 v[5]) {
+    int b = lidx * 15;
+    for (int i = 0; i < 5; ++i) {
+        pl_vs[b + i * 3 + 0] = v[i].x;
+        pl_vs[b + i * 3 + 1] = v[i].y;
+        pl_vs[b + i * 3 + 2] = v[i].z;
+    }
+}
+
+vec3 pl_loadVel(int lidx, int i) {
+    int b = lidx * 15 + i * 3;
+    return vec3(pl_vs[b], pl_vs[b + 1], pl_vs[b + 2]);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    ivec3 lid = ivec3(gl_LocalInvocationID);
+    int   lidx = (lid.z * 8 + lid.y) * 8 + lid.x;
+
+    // ── Force matrix A (row-major 5x5) from the integer seed ───────────
+    int seed = int(u_param0 + 0.5);
+    float A[25];
+    for (int k = 0; k < 25; ++k) A[k] = pl_hash(seed, k) * 2.0 - 1.0;
+    // Mild diagonal self-attraction so each colour holds together as a
+    // coherent travelling body. Too much freezes everything into static
+    // blobs; the random asymmetric off-diagonal is what drives the motion.
+    for (int d = 0; d < 5; ++d) A[d * 5 + d] += 0.35;
+
+    float beta  = clamp(u_param1, 0.05, 0.9);   // hard-core radius fraction
+    float rmax  = clamp(u_param2, 1.3, 4.0);    // interaction radius (NN units)
+    float speed = u_param3;                     // force -> velocity scale
+
+    mat3 BASIS = mat3(vec3(0.0, PL_S, PL_S),
+                      vec3(PL_S, 0.0, PL_S),
+                      vec3(PL_S, PL_S, 0.0));
+
+    // Force window covering the world-space interaction radius rmax (one
+    // integer step ~ 1/sqrt(2) of a diagonal), kept tight (2..3).
+    int R = clamp(int(rmax * PL_S + 1.0), 2, 3);
+
+    // Compute THIS cell's velocity once and publish it to the shared tile.
+    // ALL 512 threads (including any past the grid edge in a partial tile)
+    // must reach the barrier, so this runs before the validity return.
+    vec3 vc[5];
+    pl_velocity(pos, BASIS, A, beta, rmax, R, vc);
+    pl_storeVel(lidx, vc);
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    // Own density.
+    float cd[5];
+    cd[0] = pl_colorAt(pos, 0); cd[1] = pl_colorAt(pos, 1);
+    cd[2] = pl_colorAt(pos, 2); cd[3] = pl_colorAt(pos, 3);
+    cd[4] = pl_colorAt(pos, 4);
+
+    // The 12 FCC nearest-neighbour integer steps (rhombic-dodecahedron faces).
+    const ivec3 NB12[12] = ivec3[12](
+        ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+        ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+        ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+        ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+        ivec3( 1, 0,-1), ivec3(-1, 0, 1),
+        ivec3( 0, 1,-1), ivec3( 0,-1, 1));
+
+    // ── Conservative upwind finite-volume advection (the liveness key) ──
+    // For each of the 12 faces we form the shared face velocity
+    // 0.5*(v_centre + v_neighbour).dhat and move mass UPWIND -- taken from
+    // whichever side the flow leaves. Both cells compute the identical face
+    // flux, so total mass per colour is *exactly* conserved: no semi-
+    // Lagrangian duplication, so the box can never fog over or let one colour
+    // eat all the mass (the failure mode of the backtrace scheme). Upwind is
+    // positivity-preserving, so densities stay bounded with no clamp. The
+    // matrix is asymmetric, so the velocity field keeps curling -- bodies
+    // chase, snake and reorganise forever instead of relaxing into blobs.
+    float net[5];
+    for (int i = 0; i < 5; ++i) net[i] = 0.0;
+    const float DIFF = 0.05;     // diffusion strength (caps density spikes)
+
+    for (int f = 0; f < 12; ++f) {
+        ivec3 d = NB12[f];
+        vec3 wo = BASIS * vec3(d);
+        float r = length(wo);
+        vec3 dhat = wo / r;                       // unit face normal (toward nb)
+        ivec3 nc = pos + d;
+        float nd[5];
+        nd[0] = pl_colorAt(nc, 0); nd[1] = pl_colorAt(nc, 1);
+        nd[2] = pl_colorAt(nc, 2); nd[3] = pl_colorAt(nc, 3);
+        nd[4] = pl_colorAt(nc, 4);
+
+        // Neighbour velocity: read from the shared tile when the neighbour
+        // lives in this workgroup and did NOT wrap toroidally; otherwise
+        // recompute it from global memory (tile-boundary cells only).
+        vec3 vn[5];
+        ivec3 lp = lid + d;
+        if (all(greaterThanEqual(lp, ivec3(0))) && all(lessThan(lp, ivec3(8)))
+                && all(greaterThanEqual(nc, ivec3(0)))
+                && all(lessThan(nc, ivec3(u_size)))) {
+            int nlidx = (lp.z * 8 + lp.y) * 8 + lp.x;
+            for (int i = 0; i < 5; ++i) vn[i] = pl_loadVel(nlidx, i);
+        } else {
+            pl_velocity(nc, BASIS, A, beta, rmax, R, vn);
+        }
+        for (int i = 0; i < 5; ++i) {
+            float vface = 0.5 * dot(vc[i] + vn[i], dhat) * speed;
+            vface = clamp(vface, -0.5, 0.5);          // CFL half-cell per face
+            float F = (vface > 0.0) ? cd[i] * vface : nd[i] * vface;
+            net[i] -= F;            // vface>0 leaves the centre toward neighbour
+            // Conservative diffusion (symmetric face flux) caps the density:
+            // pure attraction would collapse a colour into a near-delta spike
+            // (mass-conserving but density -> infinity). A little diffusion
+            // bounds the peaks and keeps bodies soft/round without breaking
+            // conservation -- the field analogue of a finite particle size.
+            net[i] += DIFF * (nd[i] - cd[i]);
+        }
+    }
+
+    // Explicit conservative update, normalised by the 12 faces so the scheme
+    // stays CFL-stable (positivity-preserving upwind -> bounded, no clamp).
+    float newd[5];
+    for (int i = 0; i < 5; ++i) {
+        newd[i] = max(cd[i] + (u_dt / 12.0) * net[i], 0.0);
+    }
+
+    // ── Display colour: dominant-species hue (winner-take-most) ────────
+    // An additive blend of all five densities averages overlapping colours
+    // into a muddy grey that hides any segregation. Instead we weight each
+    // hue by density^3 and normalise, so each voxel takes the hue of its
+    // locally dominant colour -- domains read as clean, distinct colours
+    // while the total density drives brightness / the render threshold.
+    vec3 HUE[5] = vec3[5](
+        vec3(1.0, 0.20, 0.20),   // red
+        vec3(0.25, 1.0, 0.30),   // green
+        vec3(0.25, 0.50, 1.0),   // blue
+        vec3(1.0, 0.85, 0.15),   // yellow
+        vec3(1.0, 0.30, 1.0));   // magenta
+    vec3 chue = vec3(0.0);
+    float wsum = 0.0;
+    float total = 0.0;
+    for (int i = 0; i < 5; ++i) {
+        float w = newd[i] * newd[i] * newd[i];   // emphasise the dominant colour
+        chue += HUE[i] * w;
+        wsum += w;
+        total += newd[i];
+    }
+    vec3 disp = (wsum > 0.0) ? clamp(chue / wsum, 0.0, 1.0) : vec3(0.0);
+
+    imageStore(u_dst,  pos, vec4(disp, total));
+    imageStore(u_dst2, pos, vec4(newd[0], newd[1], newd[2], newd[3]));
+    imageStore(u_dst3, pos, vec4(newd[4], 0.0, 0.0, 0.0));
 }
 """,
 
@@ -1290,6 +1611,92 @@ void main() {
 }
 """,
 
+    "active_ising_3d": """
+// Active Ising model -- hydrodynamic (mean-field) form, Solon & Tailleur 2013/2015.
+// Self-propelled spins carry a polarity that biases their motion along +-x:
+// up-spins drift +x, down-spins drift -x. The local ferromagnetic alignment
+// (Ising reaction) competes with diffusion/noise. Above the flocking
+// transition the equilibrium "frozen domains" of the passive Ising model are
+// replaced by PERPETUAL TRAVELLING BANDS -- dense, ordered sheets that march
+// through a dilute disordered gas (the active liquid-gas coexistence).
+//
+// State is carried as the two sub-populations so transport is exactly
+// conservative AND positivity-preserving (donor-cell upwind):
+//   R = rho+  (up-spin density, drifts +x)   G = rho-  (down-spin, drifts -x)
+//   B = rho = rho+ + rho-  (total density, display)   A = m = rho+ - rho-
+// Continuum limit reproduces  d rho/dt = D lap rho - v d/dx m  and
+//   d m/dt = D lap m - v d/dx rho + F(rho,m), with the mean-field flip
+//   F = 2 m (beta rho - 1) - 2 beta m^3/rho exchanging rho+ <-> rho- locally.
+// Total density is conserved exactly (every upwind out-flux is a neighbour's
+// in-flux; diffusion stencil is symmetric; the reaction only swaps rho+/rho-).
+// v = 0 recovers passive Ising/Allen-Cahn relaxation that coarsens and freezes.
+//
+//   u_param0 = Drive v   u_param1 = Diffusion D
+//   u_param2 = Alignment beta   u_param3 = Noise
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4  self_val = fetch(pos);
+    float rp = self_val.r;   // rho+  (drifts +x)
+    float rm = self_val.g;   // rho-  (drifts -x)
+
+    // Frozen spatial operators (neighbours are last frame).
+    vec4  lap = lap19_v4(pos, self_val);
+    float lap_rp = lap.r;
+    float lap_rm = lap.g;
+    float rp_xm = fetch(pos - ivec3(1, 0, 0)).r;   // upwind donor for +x drift
+    float rm_xp = fetch(pos + ivec3(1, 0, 0)).g;   // upwind donor for -x drift
+
+    float v     = max(u_param0, 0.0);
+    float D     = max(u_param1, 0.0);
+    float beta  = u_param2;
+    float noise = u_param3;
+
+    // Conservative donor-cell upwind advection over the full step (frozen
+    // self + neighbour). Courant clamped <1 keeps it positive and stable;
+    // spread across the substeps below so the totals are exactly these deltas.
+    float c = clamp(v * u_dt * h_inv, 0.0, 0.9);
+    float adv_rp = c * (rp_xm - rp);
+    float adv_rm = c * (rm_xp - rm);
+
+    float rho0     = rp + rm;
+    float gain_max = 2.0 * abs(beta) * max(rho0, 1.0) + 6.0 * abs(beta);
+    float dt_diff  = 0.9 / 6.0 / max(D * h_sq, 1e-8);
+    float dt_react = 0.5 / max(gain_max, 1e-8);
+    int   nsub     = clamp(int(ceil(u_dt / min(dt_diff, dt_react))), 1, 16);
+    float dt_sub   = u_dt / float(nsub);
+    float adv_rp_s = adv_rp / float(nsub);
+    float adv_rm_s = adv_rm / float(nsub);
+
+    for (int i = 0; i < nsub; ++i) {
+        // transport: advection fraction + frozen-neighbour diffusion
+        rp += adv_rp_s + dt_sub * D * lap_rp;
+        rm += adv_rm_s + dt_sub * D * lap_rm;
+        rp  = max(rp, 0.0);
+        rm  = max(rm, 0.0);
+        // local ferromagnetic flip: exchange rho+ <-> rho- (conserves rho)
+        float rho  = rp + rm;
+        float m    = rp - rm;
+        float gain = beta * rho - 1.0;
+        float react = 2.0 * m * gain - 2.0 * beta * m * m * m / max(rho, 1e-3);
+        float new_m = clamp(m + react * dt_sub, -rho, rho);
+        rp = 0.5 * (rho + new_m);
+        rm = 0.5 * (rho - new_m);
+    }
+
+    // Small fluctuating field keeps the disordered gas live and seeds bands.
+    float rho_f = rp + rm;
+    float m_f   = clamp((rp - rm) + (hash_temporal(pos, 0) - 0.5) * noise * u_dt,
+                        -rho_f, rho_f);
+    rp = 0.5 * (rho_f + m_f);
+    rm = 0.5 * (rho_f - m_f);
+
+    imageStore(u_dst, pos, vec4(rp, rm, rho_f, m_f));
+}
+""",
+
     "fcc_xy_spin": """
 // 3D classical XY model on the FCC lattice — continuous-spin magnet.
 // Each cell holds an angle theta in [0,2pi); energy with one neighbour is
@@ -1788,6 +2195,180 @@ void main() {
 }
 """,
 
+    "fcc_bz_spiral_waves": """
+// Belousov-Zhabotinsky / Complex Ginzburg-Landau (CGLE) on the FCC
+// (face-centred-cubic) lattice. Same complex-amplitude oscillator as
+// bz_3d (R = Re(A), G = Im(A)) but the Laplacian uses the 12 nearest FCC
+// neighbours of the rhombic-dodecahedron cell instead of the cubic
+// 6/19-point stencil, so the rotating spiral / scroll wavefronts stay
+// round with no residual cubic-axis bias.
+//
+//   dA/dt = mu*A + (1+i*alpha)*D*lap(A) - (1+i*beta)*|A|^2*A
+//
+//   u_param0 = alpha (dispersion / linear cross-diffusion)
+//   u_param1 = beta  (nonlinear frequency shift)
+//   u_param2 = D     (diffusion coefficient)
+//   u_param3 = mu    (growth / bifurcation parameter, ~1)
+//
+// B channel stores |A| (amplitude); defect cores where |A| -> 0 trace the
+// 1-D scroll filaments. The voxel renderer thresholds Re(A) to draw only
+// the advancing spiral crests over a hidden oscillating bulk.
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_val = fetch(pos);
+    float u = self_val.r;  // Re(A)
+    float v = self_val.g;  // Im(A)
+
+    vec2 nn_sum = vec2(0.0);
+    for (int i = 0; i < 12; ++i) {
+        nn_sum += fetch(pos + FCC_NN[i]).rg;
+    }
+    // FCC 12-NN Laplacian (isotropic), scaled by h_sq for continuum units.
+    vec2 lap_uv = 0.5 * (nn_sum - 12.0 * self_val.rg) * h_sq;
+    float lap_u = lap_uv.x;
+    float lap_v = lap_uv.y;
+
+    float alpha = u_param0;  // dispersion (linear cross-diffusion)
+    float beta  = u_param1;  // nonlinear frequency shift
+    float D     = u_param2;  // diffusion coefficient
+    float mu    = u_param3;  // growth rate (bifurcation parameter, usually ~1)
+
+    // CFL-safe dt clamp (explicit Euler; isotropic 1/(2*Z) bound, Z=12).
+    // Cross-diffusion magnitude is D*sqrt(1+alpha^2); bound conservatively
+    // with D*(1+|alpha|). The clamp only ever reduces dt below the preset.
+    float D_eff    = D * (1.0 + abs(alpha));
+    float dt_limit = 0.9 / (0.5 * 12.0) / max(D_eff * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    float rho2 = u * u + v * v;
+
+    // CGLE reaction: linear growth + cubic saturation (verbatim from bz_3d).
+    float du_react = mu * u - (u - beta * v) * rho2;
+    float dv_react = mu * v - (v + beta * u) * rho2;
+
+    // Diffusion: cross-coupled due to dispersion alpha.
+    float du_diff = D * (lap_u - alpha * lap_v);
+    float dv_diff = D * (alpha * lap_u + lap_v);
+
+    float new_u = u + (du_react + du_diff) * dt_eff;
+    float new_v = v + (dv_react + dv_diff) * dt_eff;
+
+    // B channel = amplitude |A| (defect cores -> 0 trace scroll filaments).
+    float amp = length(vec2(new_u, new_v));
+    imageStore(u_dst, pos, vec4(new_u, new_v, amp, 0.0));
+}
+""",
+
+    "fcc_lichen": """
+// Lichen / coral three-species competition on the FCC (face-centred-cubic)
+// lattice. Same rock-paper-scissors ecology as lichen_3d:
+//     R = species A (pioneer)   G = species B (competitor)
+//     B = resource              A = species C (nomad)
+// but every field's Laplacian uses the 12 nearest FCC neighbours of the
+// rhombic-dodecahedron cell instead of the cubic 19-point stencil, so the
+// territorial boundaries curve freely with no cubic-axis alignment.
+//
+//   u_param0 = growth rate multiplier
+//   u_param1 = competition strength
+//   u_param2 = resource regeneration rate
+//   u_param3 = diffusion (spread rate)
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    float a   = self_data.r;  // species A (pioneer)
+    float b   = self_data.g;  // species B (competitor)
+    float res = self_data.b;  // resource
+    float c   = self_data.a;  // species C (nomad)
+
+    float growth_mult = u_param0;
+    float competition = u_param1;
+    float regen       = u_param2;
+    float diffusion   = u_param3;
+
+    // FCC 12-NN Laplacian over all four channels (isotropic).
+    vec4 nn_sum = vec4(0.0);
+    for (int i = 0; i < 12; ++i) {
+        nn_sum += fetch(pos + FCC_NN[i]);
+    }
+    vec4 lap_v4 = 0.5 * (nn_sum - 12.0 * self_data) * h_sq;
+    float lap_a = lap_v4.r;
+    float lap_b = lap_v4.g;
+    float lap_r = lap_v4.b;
+    float lap_c = lap_v4.a;
+
+    float total_bio = a + b + c;
+    float space = max(0.0, 1.0 - total_bio);
+
+    // CFL-safe dt clamp (species C diffuses fastest at 2.0*diffusion).
+    float dt_limit = 0.9 / (0.5 * 12.0) / max(2.0 * diffusion * h_sq, 1e-8);
+    float dt_eff   = min(u_dt, dt_limit);
+
+    // Three-way rock-paper-scissors: B>A, C>B, A>C (coefficients verbatim
+    // from lichen_3d, balanced so all three species coexist as a mosaic).
+    float grow_a = growth_mult * 1.6 * a * res * space;
+    float die_a  = a * (competition * (b * 1.5 + c * 0.3) + 0.015);  // vulnerable to B
+
+    float grow_b = growth_mult * 1.4 * b * res * space;
+    float die_b  = b * (competition * (c * 1.5 + a * 0.2) + 0.015);  // C dominates B
+
+    float grow_c = growth_mult * 1.5 * c * res * space;
+    float die_c  = c * (competition * (a * 1.5 + b * 0.2) + 0.015);  // A dominates C
+
+    float new_a = a + (grow_a - die_a) * dt_eff + diffusion * lap_a * dt_eff;
+    float new_b = b + (grow_b - die_b) * dt_eff + diffusion * 0.5 * lap_b * dt_eff;
+    float new_c = c + (grow_c - die_c) * dt_eff + diffusion * 2.0 * lap_c * dt_eff;
+
+    // Resource: regenerates, consumed equally by all three species.
+    float consumption = (a + b + c) * growth_mult;
+    float new_res = res + regen * (1.0 - res) * dt_eff
+                    - consumption * res * dt_eff
+                    + diffusion * 0.3 * lap_r * dt_eff;
+
+    // Noise for symmetry breaking.
+    float hash = hash_temporal(pos, 0);
+    new_a += (hash - 0.5) * 0.001 * dt_eff;
+
+    new_a   = clamp(new_a, 0.0, 1.0);
+    new_b   = clamp(new_b, 0.0, 1.0);
+    new_c   = clamp(new_c, 0.0, 1.0);
+    new_res = clamp(new_res, 0.0, 1.0);
+
+    // Enforce carrying capacity.
+    float new_total = new_a + new_b + new_c;
+    if (new_total > 1.0) {
+        new_a /= new_total;
+        new_b /= new_total;
+        new_c /= new_total;
+    }
+
+    imageStore(u_dst, pos, vec4(new_a, new_b, new_res, new_c));
+}
+""",
+
     "schnakenberg_3d": """
 // 3D Schnakenberg Reaction-Diffusion — the canonical "two-species
 // activator-substrate" Turing system that produces clean spotty/striped
@@ -2075,6 +2656,84 @@ void main() {
     new_v = clamp(new_v, -100.0, 100.0);
 
     imageStore(u_dst, pos, vec4(new_u, new_v, 0.0, 0.0));
+}
+""",
+
+    "directional_solidification_3d": """
+// Directional solidification (Bridgman pulling) -- a phase field in a
+// TRAVELLING thermal field. A cold/hot temperature wave is pulled through
+// the box at velocity Vp along +x; the solid-liquid front tracks the moving
+// isotherm, so the supercooled melt solidifies on the LEADING (cold) edge
+// while the solid superheated on the TRAILING (hot) edge melts back. The
+// net result is a band of solid -- broken into a cellular/dendritic array by
+// a quenched lateral instability -- that SCROLLS through the box forever
+// instead of freezing. Vp = 0 recovers a static striped equilibrium.
+//
+// This is deliberately a SEPARATE, self-contained phase field (NOT the
+// crystal_growth shader): it carries no solute field and applies no solute
+// back-reaction onto the growth kinetics, sidestepping the constitutional-
+// undercooling geometric-bias trap. The cellular instability is supplied by
+// a frozen per-(y,z)-column threshold offset, which is bias-free.
+//
+//   R = phi (0 liquid, 1 solid)   G = thermal field T (for display)
+//   u_param0 = Pull velocity Vp (cells/frame, +x)
+//   u_param1 = Mobility M (front speed)   u_param2 = Gradient G (undercooling)
+//   u_param3 = Cell strength (lateral instability -> dendrite spacing)
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4  self_val = fetch(pos);
+    float phi = self_val.r;
+
+    float lap_phi = lap19_v4(pos, self_val).r;
+
+    // interface gradient (for gating the cellular noise to the front only)
+    float gx = (fetch(pos + ivec3(1,0,0)).r - fetch(pos - ivec3(1,0,0)).r) * 0.5 * h_inv;
+    float gy = (fetch(pos + ivec3(0,1,0)).r - fetch(pos - ivec3(0,1,0)).r) * 0.5 * h_inv;
+    float gz = (fetch(pos + ivec3(0,0,1)).r - fetch(pos - ivec3(0,0,1)).r) * 0.5 * h_inv;
+    float grad_mag = sqrt(gx*gx + gy*gy + gz*gz + 1e-8);
+
+    float Vp   = u_param0;          // pull velocity (cells/frame)
+    float M    = max(u_param1, 0.0);// mobility
+    float G    = u_param2;          // thermal contrast / undercooling depth
+    float cell = u_param3;          // lateral instability strength
+
+    // Travelling thermal wave: cold (T>0 -> solid favoured) regions march +x.
+    const float TWO_PI = 6.28318530718;
+    const float NB = 2.0;                       // bands across the box
+    float Lx = float(u_size);
+    float t  = float(u_frame);
+    float ph = TWO_PI * NB * (float(pos.x) - Vp * t) / Lx;
+    float Tdrive = cos(ph);
+
+    // Quenched per-column threshold offset breaks the planar front into a
+    // cellular/dendritic array (bias-free: depends only on y,z, never on the
+    // growth geometry, so it can't fake a crystallographic anisotropy).
+    float lateral = hash_static(ivec3(7, pos.y, pos.z), 5) - 0.5;
+    float Teff = Tdrive + cell * lateral;
+
+    // Allen-Cahn phase field: isotropic surface tension + double-well driving
+    // tilted by the local (travelling) undercooling. Drive < 0 in hot regions
+    // melts solid back, which is what lets the band travel rather than fill.
+    const float EPS2 = 1.5;                       // interface width^2 (h^2 units)
+    float drive = phi * (1.0 - phi) * (phi - 0.5 + G * Teff);
+    float dphi  = M * (EPS2 * lap_phi + drive);
+
+    // small temporal flutter at the front seeds side-branching / liveliness
+    float flut = (hash_temporal(pos, 1) - 0.5);
+    dphi += M * 0.15 * cell * flut * smoothstep(0.02, 0.25, grad_mag);
+
+    // CFL: explicit Euler stable for the diffusion-like term and the local
+    // reaction term separately; advance the smaller stable step.
+    float dt_diff  = 0.9 / 6.0 / max(M * EPS2 * h_sq, 1e-8);
+    float dt_react = 0.5 / max(M * (abs(G) + 1.0), 1e-8);
+    float dt_eff   = min(u_dt, min(dt_diff, dt_react));
+
+    float new_phi = clamp(phi + dphi * dt_eff, 0.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_phi, 0.5 + 0.5 * Tdrive, 0.0, 0.0));
 }
 """,
 
@@ -2593,30 +3252,40 @@ void main() {
     // audit (scripts/audit_crystals.py) showed gets erased at saturation.
     float driving = phi * (1.0 - phi) * (phi - 0.5 + 6.0 * undercooling * u_field);
 
-    // CONSTITUTIONAL UNDERCOOLING (currently disabled)
+    // CONSTITUTIONAL UNDERCOOLING (bias-free gradient coupling)
     // Real impurities depress the local liquidus T_liq = T_eq - m*c, which
-    // in principle triggers Mullins-Sekerka instability via solute
-    // pile-up at the front. We tried `driving -= m*(c - c_inf)*phi*(1-phi)`
-    // but it has a hidden geometric bias on a 6-cell stencil: cells at
-    // convex CORNERS see more liquid neighbours, so solute diffuses away
-    // faster -> lower local c -> smaller penalty -> fastest growth at
-    // <111>. That accidental cube-corner coupling masquerades as an
-    // octahedral kinetic anisotropy and:
-    //   - makes the dendritic kernel's intended 6-axis K4 morphology
-    //     decay into an octahedron with bumps;
-    //   - washes out the snowflake's 6-fold basal arms (wrong symmetry);
-    //   - has no effect on cube/octahedral (already aligned with bias);
-    //   - actually helps the compact and morphology blends.
-    // The right formulation is a gradient coupling
+    // triggers the Mullins-Sekerka instability via solute pile-up at the
+    // front. The naive form `driving -= m*(c - c_inf)*phi*(1-phi)` (now
+    // removed) had a hidden geometric bias on a 6-cell stencil: convex
+    // CORNERS see more liquid neighbours, so solute diffuses away faster
+    // -> lower local c -> smaller penalty -> fastest growth at <111>. That
+    // accidental cube-corner coupling masqueraded as an octahedral kinetic
+    // anisotropy, decaying the dendritic K4 morphology into a bumpy
+    // octahedron and washing out the snowflake's 6-fold basal arms.
+    //
+    // The correct formulation is the GRADIENT coupling
     //     driving -= m * (n . grad(c)) * phi*(1-phi)
-    // which is zero at uniform c regardless of geometry and only
-    // activates where solute genuinely piles up against the front. That
-    // requires a 6-stencil grad(c) read and reuses the interface normal
-    // we already have. Punted until the visual baseline is back; the
-    // solute field below still updates correctly and can be visualised.
-    // float c_inf = 1.0;
-    // float m_liquidus = 0.05;
-    // driving -= m_liquidus * (c_local - c_inf) * phi * (1.0 - phi);
+    // which is exactly zero at uniform c regardless of cell geometry, and
+    // only fires where solute genuinely piles up AGAINST the front. n is
+    // the interface normal grad(phi)/|grad(phi)| (points liquid->solid);
+    // the solute pile-up has grad(c) along +n at the front, so n.grad(c)>0
+    // there and the penalty slows accumulated regions while a tip poking
+    // into fresh low-c melt (thinner boundary layer, smaller gradient)
+    // outruns its flanks -> genuine constitutional branching.
+    //
+    // GATED per shape_mode: only the modes whose physics actually want a
+    // diffusion instability get a non-zero m_liquidus. The faceted modes
+    // (octahedral/cubic/snowflake/hopper) are driven by singular kinetic
+    // anisotropy, not diffusion, and get m_liquidus=0 so their symmetry is
+    // provably untouched by this term.
+    float m_liquidus = 0.0;
+    if      (shape_mode == 3) m_liquidus = 0.25;  // dendritic: constitutional side-branching
+    else if (shape_mode == 0) m_liquidus = 0.15;  // compact:   gentle cellular instability
+    else if (shape_mode == 6) m_liquidus = 0.20;  // morphology: emergent cell/dendrite regime
+    if (m_liquidus > 0.0) {
+        vec3 grad_c = vec3(c_xp - c_xm, c_yp - c_ym, c_zp - c_zm) * 0.5 * h_inv;
+        driving -= m_liquidus * dot(n, grad_c) * phi * (1.0 - phi);
+    }
 
     // GIBBS-THOMSON CURVATURE UNDERCOOLING
     // The melting point of a curved interface is depressed by an amount
@@ -2708,55 +3377,63 @@ void main() {
     float growth_rate = (shape_mode == 3) ? 0.06 : 0.2;
     float dphi;
     if (shape_mode == 3) {
-        // DENDRITIC: keep the operator strictly isotropic (mass
-        // conservation respects the u_field reservoir) and source ALL
-        // anisotropy + side-branching from beta varying across the
-        // front. Six attempts at lateral-instability operators
-        // (anti-diffusive lap_eff, additive qnoise driving, multiplicative
-        // qnoise driving) all either failed to produce arms or filled
-        // the box past the mass cap. Conclusion: at this grid scale
-        // the M-S instability is not numerically resolvable; the
-        // visible "branching" must come from the K4 kernel + a STRONG
-        // multi-scale defect modulation of beta (see defect_amp block
-        // above). The u^2 axial-tip amplifier remains because it gives
-        // arm tips the boost they need to outpace lateral fill-in.
+        // DENDRITIC -- screening-driven (harmonic-measure) branching.
         //
-        // FACET-FRONT SUPPRESSION via curvature gating.
+        // History: earlier attempts kept a value-coupled Allen-Cahn front
+        // (velocity ~ undercooling*u) and tried to coax arms out of it
+        // with kinetic anisotropy, a u^2 tip amplifier, and curvature
+        // flat-front damping. Every one of those produced a convex Wulff
+        // OCTAHEDRON that then filled the box, because a value-coupled
+        // front advances EVERYWHERE u>0 -- the concave gaps between arms
+        // grow too, just slightly slower, so they always fill in. No
+        // amount of anisotropy makes a value-coupled front concave.
         //
-        // Two complementary curvature-dependent modulations:
+        // The fix is to change the GROWTH LAW, not tune the old one.
+        // Real diffusion-limited solidification is FLUX-driven: the
+        // interface velocity is set by the gradient of the diffusion
+        // field it consumes, v ~ |grad u|^eta (the harmonic measure /
+        // Niemeyer-Pietronero law behind DLA, lightning, and the
+        // dielectric_breakdown rule in this file). Combined with the
+        // screened u field built below (a sustained far-field source at
+        // the walls + a sink inside the solid), |grad u| is steep on
+        // exposed tips and ~0 in the shaded re-entrant pockets, so the
+        // gaps see ZERO growth and survive -- the front goes concave and
+        // branches instead of filling the box. The cubic kernel b2 then
+        // biases the flux growth onto the <100> axes so the result is a
+        // coherent 6-arm dendrite rather than an isotropic DLA tangle.
         //
-        // 1. TIP BOOST: an extra u^2 forcing that fires only at sharp
-        //    convex tips (kappa_signed << 0). The mild base term gives
-        //    arms slow steady extension; the bonus makes tips outrun
-        //    lateral fill.
-        //
-        // 2. FLAT-FRONT DAMP: the bulk `driving` term is multiplied by
-        //    a curvature-aware factor that approaches 1 at sharp tips
-        //    and shrinks to ~0.35 on flat sections of the front. This
-        //    is the OPPOSITE of Gibbs-Thomson capillarity: instead of
-        //    penalizing convex tips (which stabilizes a smooth front),
-        //    we penalize flat sections to let dendrites pull ahead.
-        //    Without this, the entire interface advances at nearly the
-        //    same rate and tips never gain visible lead.
-        //
-        // The curvature measure kappa_signed = lap_phi / |grad phi| is
-        // negative at convex outward tips, ~0 on flat sections, and
-        // positive in concave gaps between arms. We map -kappa_signed
-        // through smoothstep to get a tip-ness indicator in [0,1].
+        // NOTE on the resolution wall: branched morphology is a small-
+        // scale feature. As the crystal grows, lateral fill eventually
+        // coarsens the arms back toward a pointed octahedron (the
+        // Mullins-Sekerka tip radius cannot stay resolved on a 144^3
+        // grid). The branchy window (convex-hull solidity ~0.6-0.75,
+        // clear cross-arms) spans roughly the first ~12k steps; the dt
+        // and Diffusion sliders trade growth speed for how long the
+        // branched phase lasts (slower / coarser = branchier longer).
         float kappa_signed = lap_phi / max(grad_mag, 0.5);
         float gate3 = phi * (1.0 - phi);
-        float fuel3 = max(u_field, 0.0);
         float tip_ness = smoothstep(0.15, 0.6, -kappa_signed);
-        // Flat-front damping: factor in [0.35, 1.0] gating the bulk
-        // driving. flat=1 -> 0.35, tip=1 -> 1.0. Only acts at the
-        // diffuse interface (gate3>0); bulk relaxation is unaffected.
-        float drive_factor = mix(1.0, mix(0.35, 1.0, tip_ness), gate3 * 4.0);
-        drive_factor = clamp(drive_factor, 0.35, 1.0);
-        float drive_d = driving * drive_factor;
-        // Mild base amplifier (keeps arms growing); large bonus only
-        // at sharp tips so they accelerate past the damped flat front.
-        drive_d += gate3 * fuel3 * fuel3 * (8.0 + 24.0 * tip_ness);
-        dphi = (lap_phi + b2 * drive_d * 30.0) * growth_rate;
+        vec3 grad_u = vec3(nxp.g - nxm.g,
+                           nyp.g - nym.g,
+                           nzp.g - nzm.g) * 0.5 * h_inv;
+        float flux = length(grad_u);
+        // Soft-thresholded harmonic measure. Normalising the flux keeps
+        // the growth law scale-stable (no magic gain to retune) while the
+        // quartic sharpening (eta ~ 4, the lightning end of the DLA
+        // spectrum) makes a protruding tip GROW FASTER THAN IT SCREENS,
+        // the positive feedback that turns a smooth convex front into
+        // discrete branches.
+        float fhat = flux / (flux + 0.02);        // ~1 steep tip, ~0 flat/shaded
+        float harm = fhat * fhat * fhat * fhat;
+        float drive_d = gate3 * harm * 3.5;
+        // Convex tips keep the lead over their flanks so arms stay
+        // needle-like; flanks (tip_ness~0) get only a fraction.
+        drive_d *= (0.2 + 0.8 * tip_ness);
+        // Capillary term sets the tip radius and melts back the small
+        // internal pockets that would otherwise riddle the crystal with
+        // trapped-liquid porosity; kept low enough that it does not round
+        // the external arms away during the branchy growth window.
+        dphi = (0.15 * lap_phi + b2 * drive_d) * growth_rate;
     } else {
         dphi = (lap_phi + b2 * driving * 30.0) * growth_rate;
     }
@@ -2813,6 +3490,40 @@ void main() {
 
     new_u = clamp(new_u, -1.0, 2.0);
 
+    // DENDRITIC (mode 3) SCREENING FIELD. The finite-reservoir design
+    // above gives a convex Wulff blob because the whole front depletes
+    // u together -- there is no tip-vs-gap contrast. Real diffusion
+    // dendrites branch because the diffusion field is SCREENED: deep
+    // re-entrant pockets between arms are starved while exposed tips sit
+    // in fresh melt. We recreate that with two Dirichlet-style anchors
+    // that give u a Laplace structure (the same harmonic-measure
+    // screening the dielectric_breakdown / DLA rule uses, but coupled
+    // through the phase field instead of replacing it):
+    //
+    //   (1) FAR-FIELD SOURCE: feed u toward a sustained undercooling at
+    //       the walls so a steady boundary layer wraps the crystal
+    //       instead of the reservoir emptying globally.
+    //   (2) SOLID SINK: pin u toward ~0 inside established solid (latent
+    //       heat keeps the frozen interior warm -> no local
+    //       supersaturation). THIS is the ingredient the old
+    //       boundary-feed attempts lacked: between a warm solid (u~0)
+    //       and a cold far field (u~u_far) the harmonic field has its
+    //       steepest gradient on protruding tips and is nearly flat in
+    //       the shaded pockets, so the u^2 tip amplifier grows tips far
+    //       faster than gaps and the gaps survive -> branching. Without
+    //       the sink the wall just feeds the whole front uniformly and
+    //       the box fills (the documented failure mode).
+    if (shape_mode == 3) {
+        if (pos.x == 0 || pos.x == u_size-1 ||
+            pos.y == 0 || pos.y == u_size-1 ||
+            pos.z == 0 || pos.z == u_size-1) {
+            new_u = mix(new_u, 0.3, 0.2 * u_dt);  // sustained far-field undercooling
+        }
+        float solid_w = smoothstep(0.55, 0.9, new_phi);
+        new_u = mix(new_u, 0.0, solid_w * 0.85);  // solid acts as a strong heat sink
+        new_u = clamp(new_u, -1.0, 2.0);
+    }
+
     // SOLUTE TRAPPING BANDS ("growth striations")
     // Real crystals trap impurity-rich melt as visible internal bands when
     // the growth-front velocity exceeds the solute diffusion rate. The
@@ -2831,12 +3542,18 @@ void main() {
     float trapped_new = trapped;
     bool just_solidified = (phi <= 0.5 && new_phi > 0.5);
     if (just_solidified) {
-        // Front velocity proxy: how much phi changed this step (always
-        // positive when crossing 0.5 from below). Multiply by the local
-        // supersaturation (the impurity reservoir actually available to
-        // be trapped) and stretch into a visible 0..1 band-amplitude.
+        // Velocity-dependent SOLUTE TRAPPING (Aziz model, simplified).
+        // At low front velocity the solid takes only k_eff*c_liquid (strong
+        // segregation -> dark band); as the front speeds up it traps
+        // progressively more of the local melt composition, k_eff -> 1.
+        // c_local is the ACTUAL solute pile-up ahead of this cell (a live
+        // field now that field2 ping-pongs), so a cell that freezes into a
+        // boundary-layer pile-up locks in a bright coring band while a cell
+        // that grew into depleted melt stays dark. This is genuine
+        // microsegregation / oscillatory growth zoning, not a thermal proxy.
         float velocity = max(dphi, 0.0);
-        trapped_new = clamp(velocity * (0.5 + u_field) * 0.4, 0.0, 1.0);
+        float k_eff = mix(0.2, 1.0, clamp(velocity * 12.0, 0.0, 1.0));  // 0.2 == k_partition below
+        trapped_new = clamp(k_eff * c_local * 0.8, 0.0, 1.0);
 
         // TWIN NUCLEATION
         // Real crystals occasionally form twin boundaries at the moment
@@ -2864,6 +3581,12 @@ void main() {
         }
     }
 
+    // If a cell re-melts (or was never solid), its growth-history record
+    // dissolves back into the liquid -- keep the trapped channel exactly
+    // zero everywhere outside the current solid so the coring view can be
+    // thresholded directly without ghost voxels in the melt.
+    if (new_phi < 0.5) trapped_new = 0.0;
+
     imageStore(u_dst, pos, vec4(new_phi, new_u, new_orient, trapped_new));
 
     // SOLUTE CONCENTRATION UPDATE (second physics field)
@@ -2888,10 +3611,10 @@ void main() {
     // liquid neighbours to fan out into) ends up with LESS solute at its
     // tip than a flat region (only one liquid neighbour ahead). That
     // spatial difference is what drives the morphological instability.
-    float D_c = 0.25;                                  // solute diffusivity (slower than thermal but fast enough to spread)
+    float D_c = 0.06;                                  // solute diffusivity (slow -> thin, steep boundary layer that the gradient coupling can resolve)
     float c_diffusivity = D_c * (1.0 - 0.95 * phi);    // suppressed in solid
     float dc = c_diffusivity * lap_c;
-    float k_partition = 0.3;                           // distribution coefficient
+    float k_partition = 0.2;                            // distribution coefficient (more rejection -> taller pile-up)
     float dphi_pos = max(new_phi - phi, 0.0);          // only solidification rejects (melting reabsorbs)
     if (dphi_pos > 0.0) {
         // Interface-gated source: the rejected (1-k)*c is added at the
@@ -3326,9 +4049,19 @@ void main() {
     sum_inner /= max(w_inner, 1.0);
     sum_outer /= max(w_outer, 1.0);
 
-    float pot_a = sum_inner.r + cross * (sum_outer.g + sum_outer.b) * 0.5;
-    float pot_b = sum_inner.g + cross * (sum_outer.b + sum_outer.r) * 0.5;
-    float pot_c = sum_inner.b + cross * (sum_outer.r + sum_outer.g) * 0.5;
+    // NON-RECIPROCAL cyclic cross-channel coupling (the "liveness key",
+    // lifted from fcc_particle_life). Each channel is DRAWN to one
+    // neighbour's outer ring and REPELLED by the other, in a cycle:
+    //   A <- (+B, -C)    B <- (+C, -A)    C <- (+A, -B)
+    // Because A's effect on B is not matched by B's effect on A
+    // (cross*+g for A vs cross*-r for B), the three channels perpetually
+    // chase one another -- the potential field keeps shifting, so
+    // structures travel and reorganise instead of relaxing into static
+    // multi-colour blobs (the failure mode of the old symmetric g+b
+    // coupling). cross still sets the strength; cross=0 -> decoupled.
+    float pot_a = sum_inner.r + cross * (sum_outer.g - sum_outer.b) * 0.5;
+    float pot_b = sum_inner.g + cross * (sum_outer.b - sum_outer.r) * 0.5;
+    float pot_c = sum_inner.b + cross * (sum_outer.r - sum_outer.g) * 0.5;
 
     float mu_offset = 0.1 * cross;
     float ga_z = (pot_a - mu) / sigma;
@@ -3385,8 +4118,23 @@ void main() {
     float mu       = u_param0;
     float sigma    = max(u_param1, 0.001);
     float radius   = u_param2;
-    float ring_pos = clamp(u_param3, 0.1, 0.9);
-    if (ring_pos < 0.05) ring_pos = 0.5;
+    float kshape   = clamp(u_param3, 0.0, 1.0);
+
+    // MULTI-SHELL KERNEL.  The original Flow Lenia used a single symmetric
+    // Gaussian ring -> a symmetric blob is the only attractor (a stationary
+    // sphere).  Here the kernel is a sum of up to three concentric shells:
+    //   inner  at r=0.25, height h0
+    //   middle at r=0.50, height 1
+    //   outer  at r=0.80, height h2
+    // `kshape` (u_param3) fades the inner & outer shells in:
+    //   kshape=0  -> single middle ring   (original blob behaviour)
+    //   kshape=1  -> three equal shells   (competing radii break the
+    //                spherical symmetry -> layered, buckling, splitting
+    //                creatures instead of a featureless ball).
+    const float PR0 = 0.25, PR1 = 0.50, PR2 = 0.80;
+    const float KW  = 0.12;          // shell thickness (normalized radius)
+    float h0 = kshape;
+    float h2 = kshape;
 
     int R = clamp(int(round(radius * h_inv)), 3, MAX_R);
     float fR = float(R);
@@ -3402,8 +4150,12 @@ void main() {
         float dist = sqrt(dist2);
         if (dist > fR + 0.5) continue;
         float r_norm = dist / fR;
-        float kring  = (r_norm - ring_pos) / 0.15;
-        float kernel = exp(-0.5 * kring * kring);
+        float k0 = (r_norm - PR0) / KW;
+        float k1 = (r_norm - PR1) / KW;
+        float k2 = (r_norm - PR2) / KW;
+        float kernel = h0 * exp(-0.5 * k0 * k0)
+                     +      exp(-0.5 * k1 * k1)
+                     + h2 * exp(-0.5 * k2 * k2);
         float v = fetch(pos + ivec3(dx, dy, dz)).r;
         weighted_sum += v * kernel;
         weight_total += kernel;
@@ -3418,17 +4170,34 @@ void main() {
 """,
 
     "flow_lenia_advect": """
-// Flow Lenia — Pass 2 of 2: semi-Lagrangian transport of mass along ∇G.
+// Flow Lenia -- Pass 2 of 2: CONSERVATIVE UPWIND FINITE-VOLUME transport
+// of mass along the velocity field v = alpha * grad(G).
 //
-// Reads pair 2 channel R (growth field G from pass 1) at ±1 in each
-// axis to form ∇G via central differences, then backtraces the mass
-// field A by v = α · ∇G to find where each cell's *new* mass came
-// from in the *current* mass field.  Trilinear interpolation makes
-// the operator effectively conservative.
+// The original Flow Lenia (and this rule's first version) used a
+// semi-Lagrangian backtrace + trilinear interpolation.  That is only
+// "effectively" conservative: trilinear sampling both DIFFUSES and (with
+// the clamp(0,1) and the 0.005 death floor on top) silently DESTROYS and
+// DUPLICATES mass.  Total int(A) drifts -- which defeats the entire
+// purpose of Flow Lenia ("Mass Conservation for the Study of Virtual
+// Creatures").
 //
-// Velocity is clamped to ½ cell per step (CFL condition for stable
-// trilinear advection — beyond this the backtrace overshoots and
-// mass "tunnels" through structure, destroying coherence).
+// This version transports mass with a flux-form upwind scheme across the
+// 6 cubic faces.  For each face between cell c and neighbour n the normal
+// velocity is the SHARED average  uf = 0.5*(v_c + v_n).n_hat  (CFL-clamped
+// to +-0.5 cell).  Upwind picks the donor cell; the flux F leaving c
+// through that face is EXACTLY the flux entering n through the same face,
+// because both cells evaluate the identical uf (with opposite normal) and
+// the identical donor.  Hence sum over the grid of A is conserved to
+// floating-point round-off -- no clamp, no death floor.
+//
+// v_c and v_n are both reconstructed from pass 1's growth field G (stored
+// in pair 2), so no velocity needs to be cached: grad(G) is read straight
+// from the texture at the cell and at each neighbour.
+//
+// A light conservative diffusion (DIFF) is added per face to cap the
+// density spikes that pure attraction toward the growth band would
+// otherwise build up (mass-conserving: each pair exchanges a symmetric
+// amount).  Without it a creature can collapse to a near-delta spike.
 
 layout(rgba32f, binding=2) uniform image3D u_src2;
 layout(rgba32f, binding=3) uniform image3D u_dst2;
@@ -3447,48 +4216,83 @@ vec4 fetch2(ivec3 p) {
     return imageLoad(u_src2, p);
 }
 
+// grad(G) via central differences on pass 1's growth field.
+vec3 fl_gradG(ivec3 p) {
+    float gxp = fetch2(p + ivec3( 1, 0, 0)).r;
+    float gxm = fetch2(p + ivec3(-1, 0, 0)).r;
+    float gyp = fetch2(p + ivec3( 0, 1, 0)).r;
+    float gym = fetch2(p + ivec3( 0,-1, 0)).r;
+    float gzp = fetch2(p + ivec3( 0, 0, 1)).r;
+    float gzm = fetch2(p + ivec3( 0, 0,-1)).r;
+    return 0.5 * vec3(gxp - gxm, gyp - gym, gzp - gzm);
+}
+
+// Transport velocity.  The first term  alpha * grad(G)  is ordinary Flow
+// Lenia (mass climbs the growth potential -> relaxes to a static sphere).
+// The second term  swirl * (grad(G) x axis)  adds a ROTATIONAL component
+// perpendicular to the gradient: circulation around the axis.  Because it
+// is not the gradient of any potential it never reaches equilibrium, so
+// the creature keeps spinning / shearing instead of freezing -- the same
+// "non-reciprocal force -> perpetual motion" trick used in Particle Life.
+// Conservation is unaffected: the upwind flux conserves mass for ANY
+// velocity field.
+vec3 fl_velocity(ivec3 p, float alpha, float swirl) {
+    vec3 g = fl_gradG(p);
+    return alpha * g + swirl * cross(g, vec3(0.0, 0.0, 1.0));
+}
+
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
     float alpha = u_param0;  // Flow strength
+    float swirl = u_param1;  // Rotational (curl) strength
 
-    // ∇G via central differences on pass 1's growth field.
-    float Gxp = fetch2(pos + ivec3( 1, 0, 0)).r;
-    float Gxm = fetch2(pos + ivec3(-1, 0, 0)).r;
-    float Gyp = fetch2(pos + ivec3( 0, 1, 0)).r;
-    float Gym = fetch2(pos + ivec3( 0,-1, 0)).r;
-    float Gzp = fetch2(pos + ivec3( 0, 0, 1)).r;
-    float Gzm = fetch2(pos + ivec3( 0, 0,-1)).r;
+    const ivec3 DIRS[6] = ivec3[6](
+        ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+        ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+        ivec3( 0, 0, 1), ivec3( 0, 0,-1));
 
-    vec3 grad = 0.5 * vec3(Gxp - Gxm, Gyp - Gym, Gzp - Gzm);
+    // A small conservative diffusion keeps the creature's density bounded
+    // near 1 (without it, mass slowly over-concentrates into a bright core,
+    // max creeping to 2-3).  In 3D a single symmetric ring kernel yields a
+    // stationary breathing creature at every parameter setting, so there is
+    // no translational motion to damp -- this purely stabilises the render.
+    const float DIFF = 0.03;
 
-    // Mass flows TOWARD higher growth: v = α · ∇G.  Sign matters —
-    // negating this collapses blobs to nothing as mass flees the
-    // growth band.
-    vec3 vel = alpha * grad;
+    float A_c = fetch(pos).r;
+    vec3  v_c = fl_velocity(pos, alpha, swirl);
 
-    // CFL clamp: |v · dt| ≤ 0.5 cell.  Beyond this the semi-Lagrangian
-    // backtrace can skip over fine structure (mass "tunneling") and
-    // the conservation guarantee weakens visibly.
-    float vmax_per_step = 0.5;
-    float disp = length(vel) * u_dt;
-    if (disp > vmax_per_step) vel *= (vmax_per_step / disp);
+    float net = 0.0;
+    for (int k = 0; k < 6; k++) {
+        ivec3 d  = DIRS[k];
+        ivec3 nc = pos + d;
+        float A_n = fetch(nc).r;
+        vec3  v_n = fl_velocity(nc, alpha, swirl);
 
-    // Backtrace: where did this cell's mass come from last frame?
-    vec3 src_pos = vec3(pos) - vel * u_dt;
-    float A_new = fetch_interp(src_pos).r;
+        // Normal velocity on the shared face (CFL-clamped to +-0.5 cell).
+        float uf = 0.5 * dot(v_c + v_n, vec3(d));
+        uf = clamp(uf, -0.5, 0.5);
 
-    A_new = clamp(A_new, 0.0, 1.0);
-    if (A_new < 0.005) A_new = 0.0;  // matches lenia_3d's death floor
+        // Upwind donor flux: positive uf carries A_c out, negative pulls
+        // A_n in.  Both cells compute an identical magnitude => conservative.
+        float F = uf > 0.0 ? A_c * uf : A_n * uf;
+        net -= F;
+
+        // Symmetric (conservative) diffusion.
+        net += DIFF * (A_n - A_c);
+    }
+
+    // Positivity-preserving update.  NO clamp(0,1) and NO death floor --
+    // those would break exact mass conservation.
+    float A_new = max(A_c + (u_dt / 6.0) * net, 0.0);
 
     // Carry potential & growth from p2 for vis (channels 1, 2);
-    // channel 3 is |Δ| against the unadvected source for activity vis.
-    float U     = fetch2(pos).g;
-    float G     = fetch2(pos).r;
-    float A_old = fetch(pos).r;
+    // channel 3 is |delta| against the previous mass for activity vis.
+    float U = fetch2(pos).g;
+    float G = fetch2(pos).r;
 
-    imageStore(u_dst, pos, vec4(A_new, U, 0.5 + 0.5 * G, abs(A_new - A_old)));
+    imageStore(u_dst, pos, vec4(A_new, U, 0.5 + 0.5 * G, abs(A_new - A_c)));
 }
 """,
 
@@ -4293,12 +5097,32 @@ void main() {
     spd = length(new_vel);
     if (spd > v0 * 1.5) new_vel *= (v0 * 1.5) / spd;
 
-    // Density transport: semi-Lagrangian advection of ρ + diffusion.
-    vec3 back  = vec3(pos) - vel * u_dt;
-    float adv  = fetch_interp(back).r;
+    // Density transport: CONSERVATIVE upwind finite-volume advection of
+    // boid density (replaces the old semi-Lagrangian backtrace, which
+    // DUPLICATED mass under the convergent cohesion flow and then lost
+    // the excess to clamp(0,1) -- boid count was not conserved). Across
+    // each of the 6 faces the donor-cell density is moved by the face
+    // Courant number c = 0.5*(v_c + v_n).n_hat * dt (CFL-clamped to
+    // +-0.5). Both cells of a face see c with opposite sign and the SAME
+    // donor cell, so total density is EXACTLY conserved. CFL here is tiny
+    // (|v| <= v0*1.5 = 0.75, dt = 0.1 => peak face Courant ~0.075) so
+    // upwind is stable AND far less diffusive than trilinear -> sharper,
+    // properly-dense flocks instead of a smeared occupancy haze.
+    float outflow = 0.0;
+    for (int axis = 0; axis < 3; axis++) {
+        for (int s = -1; s <= 1; s += 2) {
+            ivec3 d = ivec3(0); d[axis] = s;
+            vec4 nb = fetch(pos + d);
+            float c = clamp(0.5 * (vel[axis] + nb.gba[axis]) * float(s) * u_dt,
+                            -0.5, 0.5);
+            // c > 0 => density flows OUT of this cell (donor = self);
+            // c < 0 => density flows IN from the neighbour (donor = nb).
+            outflow += (c > 0.0) ? (rho * c) : (nb.r * c);
+        }
+    }
     float lap  = (sum_rho - 26.0 * rho) / 26.0;
-    float new_rho = adv + diffusion * lap * u_dt;
-    new_rho = clamp(new_rho, 0.0, 1.0);
+    // Positivity floor only -- the conservative flux needs no upper clamp.
+    float new_rho = max(rho - outflow + diffusion * lap * u_dt, 0.0);
 
     imageStore(u_dst, pos, vec4(new_rho, new_vel));
 }
@@ -4500,6 +5324,94 @@ void main() {
     new_c = clamp(new_c, -1.0, 1.0);
 
     imageStore(u_dst, pos, vec4(new_c, new_mu, 0.0, 0.0));
+}
+""",
+
+    "active_phase_sep_3d": """
+// Non-reciprocal (active) Cahn-Hilliard phase separation.
+//
+// TWO conserved order parameters demix simultaneously:
+//   R = phi1, G = mu1 (chemical potential of phi1)
+//   B = phi2, A = mu2 (chemical potential of phi2)
+//
+// Each field follows conservative Cahn-Hilliard dynamics
+//   d phi_i/dt = M * lap(mu_i),  mu_i = phi_i^3 - phi_i - eps2*lap(phi_i)
+// so BOTH masses int(phi_i) are conserved (the Laplacian of a
+// conservative stencil sums to zero on a torus).
+//
+// THE LIVENESS KEY (the same non-reciprocal coupling lifted from
+// fcc_particle_life, here in the Saha / Agudo-Canalejo / Golestanian
+// 2020 "scalar active matter" form): a NON-RECIPROCAL cross-coupling
+// enters the two chemical potentials with OPPOSITE sign --
+//   mu1 += +chi * phi2    (phi1 is ATTRACTED to phi2)
+//   mu2 += -chi * phi1    (phi2 is REPELLED by phi1)
+// so phi1 chases phi2 while phi2 flees phi1.  Because the coupling is
+// antisymmetric the free energy is non-integrable -- there is no global
+// minimum to relax into -- so ordinary spinodal coarsening (which
+// freezes into a static sponge) is replaced by PERPETUAL travelling and
+// chasing demixing waves.  chi = 0 recovers two independent, static
+// Cahn-Hilliard fields.
+//
+// u_param0 = mobility M
+// u_param1 = epsilon^2   (interface width)
+// u_param2 = chi         (non-reciprocal coupling; the liveness key)
+// u_param3 = noise       (thermal nucleation)
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 self_data = fetch(pos);
+    float c1 = self_data.r;   // phi1
+    float c2 = self_data.b;   // phi2
+
+    // 19-point isotropic Laplacian of all four channels at once.
+    // lap.r=lap(phi1)  lap.g=lap(mu1)  lap.b=lap(phi2)  lap.a=lap(mu2)
+    vec4 lap_v4 = lap19_v4(pos, self_data);
+    float lap_c1  = lap_v4.r;
+    float lap_mu1 = lap_v4.g;
+    float lap_c2  = lap_v4.b;
+    float lap_mu2 = lap_v4.a;
+
+    float mobility  = u_param0;
+    float eps2      = u_param1;
+    float chi       = u_param2;
+    float noise_str = u_param3;
+
+    // Same explicit-Euler stability guards as cahn_hilliard: floor eps2 so
+    // the Nyquist (checkerboard) mode is damped, ceiling it so the lagged
+    // biharmonic cannot blow up on fine grids, then sub-step the biharmonic.
+    float eps2_floor = 1.0 / (8.0 * h_sq);
+    float eps2_eff = max(eps2, eps2_floor);
+    float eps2_ceiling = 0.025 / max(mobility * u_dt * h_sq * h_sq, 1e-6);
+    eps2_eff = min(eps2_eff, max(eps2_floor, eps2_ceiling));
+
+    float dt_max = 0.5 / (72.0 * max(mobility, 1e-6) * eps2_eff * h_sq * h_sq);
+    int substeps = int(ceil(u_dt / dt_max));
+    substeps = clamp(substeps, 1, 8);
+    float dt_sub = u_dt / float(substeps);
+
+    float new_c1  = c1;
+    float new_c2  = c2;
+    float new_mu1 = self_data.g;
+    float new_mu2 = self_data.a;
+    for (int s = 0; s < substeps; s++) {
+        // Non-reciprocal chemical potentials (opposite-sign coupling).
+        new_mu1 = (new_c1 * new_c1 * new_c1 - new_c1) - eps2_eff * lap_c1 + chi * new_c2;
+        new_mu2 = (new_c2 * new_c2 * new_c2 - new_c2) - eps2_eff * lap_c2 - chi * new_c1;
+        // Conservative transport from the previous frame's mu Laplacian.
+        new_c1 = new_c1 + mobility * lap_mu1 * dt_sub;
+        new_c2 = new_c2 + mobility * lap_mu2 * dt_sub;
+    }
+
+    // Thermal noise (decorrelated between the two fields).
+    new_c1 += (hash_temporal(pos, 0) - 0.5) * noise_str * u_dt;
+    new_c2 += (hash_temporal(pos, 1) - 0.5) * noise_str * u_dt;
+
+    new_c1 = clamp(new_c1, -1.0, 1.0);
+    new_c2 = clamp(new_c2, -1.0, 1.0);
+
+    imageStore(u_dst, pos, vec4(new_c1, new_mu1, new_c2, new_mu2));
 }
 """,
 
@@ -6021,12 +6933,26 @@ void main() {
                        + visc * lap_v * u_dt
                        + expand * from_centre * 0.01 * u_dt;
 
-    // Mass transport: semi-Lagrangian advection of ρ + flux divergence.
-    vec3 back     = vec3(pos) - vel * u_dt;
-    float adv_rho = sample_p1(back).r;
-    float div_v   = 0.5 * ((xp.g - xm.g) + (yp.b - ym.b) + (zp.a - zm.a));
-    float new_rho = adv_rho - rho * div_v * u_dt;
-    new_rho = clamp(new_rho, 0.001, 10.0);
+    // Mass transport: CONSERVATIVE upwind finite-volume advection of rho
+    // (replaces the old semi-Lagrangian backtrace + first-order div-v
+    // correction). The backtrace DUPLICATED mass under the strongly
+    // convergent gravitational-collapse flow, and the old clamp's 0.001
+    // floor injected spurious mass into every void cell -- both fatal for a
+    // self-gravitating sim where total mass IS the Poisson source term.
+    // CFL is tiny (|v|<=3, dt=0.05 => peak face Courant ~0.15), so the
+    // upwind flux is accurate. Both cells of a face evaluate the SAME donor
+    // with opposite-sign Courant => EXACT mass conservation.
+    vec4 nbf[6];
+    nbf[0] = xp; nbf[1] = xm; nbf[2] = yp; nbf[3] = ym; nbf[4] = zp; nbf[5] = zm;
+    float outflow = 0.0;
+    for (int i = 0; i < 6; i++) {
+        int axis = i / 2;
+        float sgn = 1.0 - 2.0 * float(i % 2);   // +1 toward p-face, -1 toward m-face
+        float vface = vel[axis] + nbf[i].gba[axis];
+        float c = clamp(0.5 * vface * sgn * u_dt, -0.5, 0.5);
+        outflow += (c > 0.0) ? (rho * c) : (nbf[i].r * c);
+    }
+    float new_rho = max(rho - outflow, 0.0);
 
     // ── Optional particle→field coupling ───────────────────────────
     // When deposit is active, dust particles add their mass directly
@@ -6035,8 +6961,8 @@ void main() {
     // the loop:  particles ride ∇Φ → particles deposit ρ → Φ updates →
     // particles ride the new ∇Φ.  This is what turns "dust drifting on
     // a frozen galaxy" into "dust collapsing under its own gravity".
-    new_rho = clamp(new_rho + u_deposit_strength * deposit(pos),
-                    0.001, 10.0);
+    new_rho = max(new_rho + u_deposit_strength * deposit(pos), 0.0);
+    new_rho = min(new_rho, 6000.0);   // safety ceiling against runaway collapse
 
     // Velocity speed cap (keeps CFL bounded under runaway collapse).
     float spd = length(new_vel);
@@ -13585,6 +14511,142 @@ RULE_PRESETS = {
         "boundary": "toroidal",
     },
 
+    "fcc_gray_scott_worms": {
+        "label": "FCC Gray-Scott (worms)",
+        "shader": "fcc_gray_scott",
+        "lattice": "fcc",
+        # Worm/labyrinth regime of the FCC Gray-Scott rule: higher feed and
+        # kill than the default spot regime push the system into branching
+        # stripe filaments. Reuses the fcc_gray_scott compute shader; only the
+        # Feed/Kill operating point changes. The 12-NN isotropic stencil lets
+        # the worms wander in any direction instead of snapping to cubic axes.
+        "params": {"Feed rate": 0.046, "Kill rate": 0.063,
+                   "U diffusion": 0.16, "V diffusion": 0.08},
+        "param_ranges": {"Feed rate": (0.030, 0.060), "Kill rate": (0.050, 0.072),
+                         "U diffusion": (0.05, 0.30), "V diffusion": (0.02, 0.15)},
+        "dt": 1.0,
+        "dt_range": (0.1, 2.5),
+        "init": "gray_scott",
+        "init_variants": ["gray_scott"],
+        "description": ("Gray-Scott worm regime on the face-centred-cubic lattice: "
+                        "labyrinthine stripe filaments branch and wander through the "
+                        "12 isotropic nearest neighbours with no cubic-axis bias."),
+        "vis_channels": ["U (substrate)", "V (catalyst)"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
+    "fcc_particle_life": {
+        "label": "FCC Particle Life (5-colour)",
+        "shader": "fcc_particle_life",
+        "lattice": "fcc",
+        # Continuum multi-species "Particle Life" on the isotropic FCC lattice.
+        # Five colour density fields interact through a 5x5 force matrix that is
+        # synthesised in-shader from an integer seed -- every seed is a distinct
+        # universe, which makes the seed the discovery-search genome. The state
+        # lives in two auxiliary textures (field2 = colours 0-3, extra0 = colour
+        # 4); the primary texture carries a composite display colour so all five
+        # species are visible at once through the voxel renderer.
+        "extra_fields": 2,
+        "field2_init": "plife_rand",
+        "field_inits": ["plife_rand", "plife_rand_r"],
+        "passes": [
+            {"shader": "fcc_particle_life", "kind": "voxel",
+             "writes": ["p1", "p2", "p3"]},
+        ],
+        "params": {"Matrix seed": 1.0, "Repel radius": 0.30,
+                   "Interaction radius": 2.8, "Speed": 0.45},
+        "param_ranges": {"Matrix seed": (1.0, 9999.0),
+                         "Repel radius": (0.05, 0.80),
+                         "Interaction radius": (1.3, 4.0),
+                         "Speed": (0.05, 1.20)},
+        "dt": 1.0,
+        "dt_range": (0.1, 2.0),
+        "init": "blank",          # primary texture is display-only (rebuilt each step)
+        "init_variants": ["blank"],
+        "description": ("Multi-species Particle Life as a continuum field on the "
+                        "face-centred-cubic lattice. Five colour densities push and "
+                        "pull each other through a 5x5 force matrix built from a seed "
+                        "(each seed = a new universe). Each colour drifts up the "
+                        "matrix-weighted affinity gradient and down the crowding "
+                        "gradient via mass-conserving flux, so blobs, shells, "
+                        "membranes and chasing clusters condense out of empty space "
+                        "with no cubic-axis bias."),
+        "vis_channels": ["Composite (5 colours)"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",   # primary rgb = composite colour, a = total density
+        "render_mode": "voxel",
+        "voxel_threshold": 0.32,
+        "boundary": "toroidal",
+    },
+
+    "fcc_bz_spiral_waves": {
+        "label": "FCC BZ Spiral Waves",
+        "shader": "fcc_bz_spiral_waves",
+        "lattice": "fcc",
+        # CGLE oscillator on the 12 FCC nearest neighbours (same Benjamin-Feir
+        # stable regime as bz_spiral_waves). Every voxel is a limit-cycle
+        # oscillator of radius |A|~1; the isotropic stencil keeps the rotating
+        # spiral / scroll wavefronts round. Re(A) swings [-1,+1] everywhere, so
+        # a value threshold of ~0.45 lights only the advancing wave crests and
+        # hides the oscillating bulk, leaving clean rotating shells (mirror of
+        # the fcc_fitzhugh_nagumo front-only rendering).
+        "params": {"Alpha (dispersion)": 0.5, "Beta (nonlinear)": -1.0,
+                   "Diffusion": 0.4, "Growth (mu)": 1.0},
+        "param_ranges": {"Alpha (dispersion)": (0.05, 1.5), "Beta (nonlinear)": (-2.5, 0.0),
+                         "Diffusion": (0.05, 1.5), "Growth (mu)": (0.3, 2.5)},
+        "dt": 0.05,
+        "dt_range": (0.01, 0.15),
+        "init": "bz_spiral_seed",
+        "init_variants": ["bz_spiral_seed", "bz_reaction"],
+        "description": ("Belousov-Zhabotinsky CGLE oscillator on the face-centred-cubic "
+                        "lattice: rotating 3D spiral and scroll waves whose wavefronts "
+                        "stay round across the 12 isotropic nearest neighbours. Only the "
+                        "advancing wave crests are drawn over a hidden oscillating bulk."),
+        "vis_channels": ["Re(A)", "Im(A)", "Amplitude"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_range": (0.0, 1.0),
+        "voxel_threshold": 0.45,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_lichen": {
+        "label": "FCC Lichen Competition",
+        "shader": "fcc_lichen",
+        "lattice": "fcc",
+        # Three-species rock-paper-scissors competition on the 12 FCC nearest
+        # neighbours. Pioneer / competitor / nomad carve out a territorial
+        # mosaic whose boundaries curve freely instead of aligning to the cubic
+        # axes. R/G/B map to species A / species B / resource so the colour mix
+        # reads as a living patchwork; cells below 0.25 total biomass are culled
+        # so the mosaic boundaries read instead of a solid cube.
+        "params": {"Growth": 1.0, "Competition": 1.0, "Regen": 0.3, "Diffusion": 0.1},
+        "param_ranges": {"Growth": (0.1, 3.0), "Competition": (0.5, 8.0),
+                         "Regen": (0.01, 1.0), "Diffusion": (0.01, 0.5)},
+        "dt": 0.1,
+        "dt_range": (0.03, 0.15),
+        "init": "lichen_dense",
+        "init_variants": ["lichen_dense"],
+        "description": ("Three species compete for space on the face-centred-cubic "
+                        "lattice -- pioneer, competitor and nomad lock into a "
+                        "rock-paper-scissors cycle and tile the box with an axis-free "
+                        "territorial mosaic."),
+        "vis_channels": ["Species A", "Species B", "Resource", "Species C"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "voxel_threshold": 0.25,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+    },
+
     "fcc_excitable": {
         "label": "FCC Excitable (scroll waves)",
         "shader": "fcc_excitable",
@@ -14028,6 +15090,33 @@ RULE_PRESETS = {
         "boundary": "toroidal",
     },
 
+    "active_ising": {
+        "label": "Active Ising (Flocking Bands)",
+        "shader": "active_ising_3d",
+        # Solon-Tailleur active Ising in its hydrodynamic form: self-propelled
+        # spins (up drifts +x, down drifts -x) with ferromagnetic alignment.
+        # Above the flocking transition the passive Ising's frozen domains are
+        # replaced by perpetual travelling bands -- dense ordered sheets that
+        # march through a dilute disordered gas. Density is conserved; the
+        # magnetization is not (spins flip). Drive=0 recovers passive coarsening.
+        "params": {"Drive": 1.5, "Diffusion": 1.0, "Alignment": 1.6, "Noise": 0.02},
+        "param_ranges": {"Drive": (0.0, 4.0), "Diffusion": (0.2, 3.0),
+                         "Alignment": (0.5, 3.0), "Noise": (0.0, 0.1)},
+        "dt": 0.1, "dt_range": (0.02, 0.2),
+        "init": "active_ising",
+        "description": ("Active (self-propelled) Ising model in its hydrodynamic "
+                        "form (Solon & Tailleur). Up-spins drift +x, down-spins -x, "
+                        "while ferromagnetic alignment competes with noise. Above "
+                        "the flocking transition the static domains of the ordinary "
+                        "Ising model become perpetual travelling bands -- dense "
+                        "ordered sheets marching through a dilute disordered gas. "
+                        "Density is conserved exactly; Drive=0 recovers passive "
+                        "coarsening."),
+        "vis_channels": ["rho+", "rho-", "Density", "Magnetization"],
+        "vis_default": 3, "vis_abs": False, "vis_mode": "bipolar",
+        "render_mode": "volumetric", "boundary": "toroidal",
+    },
+
     "fcc_xy_spin": {
         "label": "FCC XY Spin Model",
         "shader": "fcc_xy_spin",
@@ -14199,6 +15288,29 @@ RULE_PRESETS = {
         # 'gray_scott') — INIT_DEAD per ca_debug.triage.
         "init_variants": ["gray_scott"],
         "description": "Gray-Scott worm regime — labyrinthine stripe patterns.",
+        "vis_channels": ["U (substrate)", "V (catalyst)"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "boundary": "toroidal",
+    },
+    "flow_turing": {
+        "label": "Flow Turing (Drifting Waves)",
+        "shader": "flow_turing_3d",
+        "params": {"Feed rate": 0.046, "Kill rate": 0.063,
+                   "Flow": 1.2, "V diffusion": 0.04},
+        "param_ranges": {"Feed rate": (0.030, 0.060), "Kill rate": (0.050, 0.072),
+                         "Flow": (0.0, 3.0), "V diffusion": (0.01, 0.08)},
+        "dt": 0.5,
+        "dt_range": (0.1, 2.5),
+        "init": "gray_scott",
+        "init_variants": ["gray_scott"],
+        "description": ("Differential-flow Gray-Scott: the catalyst V is swept along "
+                        "+x while the substrate U stays put. This differential-flow "
+                        "instability (Rovinsky-Menzinger) turns the frozen Turing "
+                        "labyrinth into perpetual travelling wave trains — stripes born "
+                        "upstream and carried downstream forever. Flow=0 recovers the "
+                        "ordinary static Gray-Scott worms."),
         "vis_channels": ["U (substrate)", "V (catalyst)"],
         "vis_default": 1,
         "vis_abs": False,
@@ -14411,43 +15523,43 @@ RULE_PRESETS = {
     "crystal_dendritic": {
         "label": "Crystal (Dendritic)",
         "shader": "crystal_growth",
-        # Mode 3 = canonical Karma-Rappel WEAK anisotropy kernel:
-        #   beta = 1 + eps * aniso,  aniso = (4*K4 - 4/3) * 0.375 in [0,1]
-        # peaks at <100>. The DEFAULT eps=2.5 (rather than the textbook
-        # eps~0.05) is required because at our 64-128^3 grid scale the
-        # diffusion-driven Mullins-Sekerka instability has too few cells
-        # per unstable wavelength to amplify; we lean instead on the
-        # KINETIC anisotropy to do the symmetry breaking. With eps=2.5
-        # and dt~0.025 a 6-arm cross is clearly visible by step ~500
-        # (af~0.05), with bbox/equiv-sphere ratio ~1.7 -- i.e. the
-        # crystal is 70% wider along the <100> axes than an isotropic
-        # blob of the same volume. This was tuned from interactive
-        # GUI-debug saves at U~0.5 / A~2.5 / dt~0.025 that produced
-        # visibly star-shaped morphology.
+        # Mode 3 = SCREENING-DRIVEN (harmonic-measure) dendrite. Growth
+        # velocity ~ |grad u|^4 on a screened supersaturation field (far-
+        # field source at the walls + sink inside the solid), so the
+        # concave gaps between arms are starved and survive instead of
+        # filling in. The cubic kernel (Anisotropy strength = eps) biases
+        # the flux growth onto the <100> axes -> a coherent axis-aligned
+        # 6-arm dendrite rather than an isotropic DLA tangle.
         #
-        # Lower eps (0.5-1.0) gives a more textbook-correct kinetic
-        # weight relative to diffusion but the resulting transient
-        # spikes get smeared by lateral fill-in too quickly to see in
-        # the GUI. Higher eps (>=4) overdrives the kernel and produces
-        # a clean octahedron with no branching texture. eps=2.5 is the
-        # sweet spot for visual clarity at our grid sizes.
-        "params": {"Undercooling": 0.5, "Diffusion": 0.02, "Anisotropy strength": 2.5, "Shape": 3},
-        "param_ranges": {"Undercooling": (0.2, 1.0), "Diffusion": (0.005, 0.05),
-                         "Anisotropy strength": (0.5, 6.0), "Shape": (3, 3)},
+        # Diffusion (D) sets the SCREENING / branch spacing: lower D ->
+        # finer, sharper arms that coarsen sooner; higher D -> coarser,
+        # longer-lived branches (but too high, ~0.4+, traps internal
+        # porosity). 0.12 grows a clearly branched star -- convex-hull
+        # solidity ~0.45 (about half the hull is open inter-arm gaps),
+        # axis reach ~2x the diagonal reach -- that spans the whole first
+        # ~10k-step window before lateral fill coarsens it.
+        #
+        # Anisotropy strength scales the per-step velocity, so raising it
+        # past ~6 pushes the front into the kinetic (fast/smooth) regime
+        # where it fills as a pointed octahedron; 2.5 sits in the
+        # diffusion-limited branching regime. dt is the speed knob: lower
+        # dt keeps the branched phase visible longer (slower Peclet).
+        "params": {"Undercooling": 0.5, "Diffusion": 0.12, "Anisotropy strength": 2.5, "Shape": 3},
+        "param_ranges": {"Undercooling": (0.2, 1.0), "Diffusion": (0.04, 0.3),
+                         "Anisotropy strength": (1.0, 6.0), "Shape": (3, 3)},
         "dt": 0.025,
         "dt_range": (0.005, 0.05),
-        # Larger default grid: arms are ~25 cells long at peak, so 144^3
-        # gives them enough resolution to read as branches under the
-        # voxel/volumetric renderer. 96^3 collapses them visually.
+        # Larger default grid: the branched star needs enough cells per
+        # arm to read under the voxel renderer; 144^3 keeps the cross
+        # arms and re-entrant gaps resolvable through the branchy window.
         "default_size": 144,
         "init": "crystal_seed",
         "init_variants": ["crystal_seed", "crystal_multi_seed"],
-        # Dendritic growth is faster than the near-isotropic
-        # crystal_growth preset (eps=2.5 anisotropy drives 6 fast tip
-        # arms) but still needs ~1500 steps for the arms to become
-        # measurable in audit terms.
-        "audit_steps": 1500,
-        "description": "Dendritic crystal — Mullins-Sekerka tip-splitting produces 6 axis-aligned branching arms.",
+        # Screening-limited growth is slow on purpose (that is what keeps
+        # the Peclet number low enough to branch); the branched phase
+        # spans several thousand steps before lateral fill coarsens it.
+        "audit_steps": 8000,
+        "description": "Dendritic crystal — flux-driven (harmonic-measure) screening starves the gaps between arms, growing a branched <100> dendrite instead of a blob.",
         "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
         "vis_default": 0,
         "vis_abs": False,
@@ -14556,6 +15668,74 @@ RULE_PRESETS = {
         "vis_abs": False,
         "render_mode": "voxel",
         "boundary": "clamped",
+    },
+    "crystal_coring": {
+        "label": "Crystal (Coring / Zoning)",
+        "shader": "crystal_growth",
+        # Mode 0 (compact) but VIEWED through the trapped-solute (A) channel
+        # instead of phase, so the default render is the frozen chemical
+        # record rather than the solid envelope.
+        #
+        # As the front sweeps outward it rejects solute into the melt
+        # (partition coefficient k < 1); the velocity-dependent
+        # solute-trapping law snapshots the local melt composition into
+        # each cell at the instant it crosses phi=0.5. The fast initial
+        # burst out of the seed traps a solute-rich BRIGHT CORE; the
+        # decelerating front then locks in progressively leaner shells,
+        # with radial streaks wherever a twin boundary re-seeds growth.
+        # The result is the concentric chemical ZONING / CORING seen in
+        # real mineral crystals (plagioclase, garnet, agate) and the
+        # microsegregation of cast alloys -- a genuine read-out of the
+        # now-live solute field, not a decorative texture.
+        #
+        # Mild undercooling + generous diffusion keeps the front smooth so
+        # the zoning reads as clean shells rather than dendritic noise.
+        "params": {"Undercooling": 0.6, "Diffusion": 0.22, "Anisotropy strength": 0.05, "Shape": 0},
+        "param_ranges": {"Undercooling": (0.2, 1.5), "Diffusion": (0.10, 0.5),
+                         "Anisotropy strength": (0.0, 0.25), "Shape": (0, 0)},
+        "dt": 0.02,
+        "dt_range": (0.005, 0.08),
+        "init": "crystal_seed",
+        "init_variants": ["crystal_seed", "crystal_multi_seed"],
+        # Coring only becomes legible once a few thousand steps of growth
+        # have laid down distinct shells (same slow near-isotropic front as
+        # crystal_growth).
+        "audit_steps": 3000,
+        "description": "Crystal coring — the trapped-solute view reveals concentric chemical zoning frozen in as the growth front sweeps outward.",
+        "vis_channels": ["Phase φ", "Supersaturation", "Orientation", "Trapped solute"],
+        "vis_default": 3,
+        "vis_range": (0.0, 1.0),
+        "voxel_threshold": 0.1,
+        "vis_abs": False,
+        "render_mode": "voxel",
+        "boundary": "clamped",
+    },
+    "directional_solidification": {
+        "label": "Directional Solidification (Scrolling Dendrites)",
+        "shader": "directional_solidification_3d",
+        # A phase field pulled through a TRAVELLING thermal gradient
+        # (Bridgman growth). The cold isotherm marches along +x at the pull
+        # velocity; melt solidifies on its leading edge and the solid melts
+        # back on the trailing (now-hot) edge, so a cellular/dendritic band
+        # scrolls forever instead of freezing. Pull=0 -> static stripes.
+        "params": {"Pull velocity": 0.05, "Mobility": 2.0,
+                   "Gradient": 1.4, "Cell strength": 1.0},
+        "param_ranges": {"Pull velocity": (0.0, 0.3), "Mobility": (0.5, 4.0),
+                         "Gradient": (0.3, 2.0), "Cell strength": (0.0, 1.2)},
+        "dt": 0.5,
+        "dt_range": (0.1, 1.0),
+        "init": "directional_solidification",
+        "description": ("Directional (Bridgman) solidification: a cold thermal "
+                        "front is pulled through the supercooled melt at a fixed "
+                        "velocity. Dendritic cells nucleate on the advancing front "
+                        "and the whole array scrolls perpetually — solid grows "
+                        "upstream and melts back downstream. Pull velocity = 0 "
+                        "recovers a frozen static striped equilibrium."),
+        "vis_channels": ["Phase φ", "Thermal field"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "boundary": "toroidal",
     },
     "crystal_dla": {
         "label": "Crystal (DLA / Lightning)",
@@ -14668,27 +15848,28 @@ RULE_PRESETS = {
         "shader": "flow_lenia_advect",  # nominal "main" shader; passes overrides
         "passes": [
             {"shader": "flow_lenia_potential", "writes": ["p2"], "kind": "voxel",
-             "param_names": ["Growth center", "Growth width", "Kernel radius", "Ring position"]},
+             "param_names": ["Growth center", "Growth width", "Kernel radius", "Kernel shape"]},
             {"shader": "flow_lenia_advect", "writes": ["p1"], "kind": "voxel",
-             "param_names": ["Flow strength", "Growth width", "Kernel radius", "Ring position"]},
+             "param_names": ["Flow strength", "Swirl", "Kernel radius", "Kernel shape"]},
         ],
         # extra_fields=1 enables pair 2 (tex_a2/tex_b2) for storing the
         # intermediate growth/potential fields between passes.
         "extra_fields": 1,
-        "params": {"Growth center": 0.15, "Growth width": 0.030,
-                   "Kernel radius": 4.0, "Ring position": 0.5,
-                   "Flow strength": 0.6},
+        "params": {"Growth center": 0.18, "Growth width": 0.035,
+                   "Kernel radius": 4.0, "Kernel shape": 1.0,
+                   "Flow strength": 1.2, "Swirl": 1.0},
         "param_ranges": {"Growth center": (0.02, 0.40), "Growth width": (0.005, 0.10),
-                         "Kernel radius": (2.0, 6.0), "Ring position": (0.2, 0.8),
-                         "Flow strength": (0.0, 3.0)},
-        # Semi-Lagrangian advection is unconditionally stable, so we can
-        # take much larger steps than standard Lenia's 0.05.  The internal
-        # CFL clamp (½ cell per step) caps actual displacement.
+                         "Kernel radius": (2.0, 6.0), "Kernel shape": (0.0, 1.0),
+                         "Flow strength": (0.0, 3.0), "Swirl": (0.0, 3.0)},
+        # Conservative upwind finite-volume advection is positivity-
+        # preserving and exactly mass-conserving; the internal CFL clamp
+        # (1/2 cell per step on each face) caps the displacement so larger
+        # steps than standard Lenia's 0.05 stay stable.
         "dt": 0.10,
         "dt_range": (0.02, 0.30),
         "init": "lenia_fbm",
         "init_variants": ["lenia_fbm", "lenia"],
-        "description": "Mass-conserving Lenia (Plantec 2022) — solid creatures that flow, collide, merge, and split without evaporating.",
+        "description": "Mass-conserving Lenia (exact, upwind FV) -- a structured cell-like creature; Kernel shape morphs blob->shells, Swirl shears the surface into wound filaments.",
         "vis_channels": ["Mass", "Potential U", "Growth G", "|Δ|"],
         "vis_default": 0,
         "vis_abs": False,
@@ -15093,6 +16274,23 @@ RULE_PRESETS = {
         "vis_channels": ["Order param", "Chemical potential"],
         "vis_default": 0,
         "vis_abs": False,
+        "render_mode": "volumetric",
+        "boundary": "toroidal",
+    },
+    "active_phase_separation": {
+        "label": "Active Phase Separation",
+        "shader": "active_phase_sep_3d",
+        "params": {"Mobility": 0.5, "Epsilon²": 0.2, "Coupling": 0.6, "Noise": 0.02},
+        "param_ranges": {"Mobility": (0.1, 2.0), "Epsilon²": (0.05, 1.0),
+                         "Coupling": (0.0, 2.0), "Noise": (0.0, 0.1)},
+        "dt": 0.05,
+        "dt_range": (0.01, 0.1),
+        "init": "active_phase_sep",
+        "description": "Non-reciprocal (active) Cahn-Hilliard — two conserved phases chase each other (phi1 pursues phi2, phi2 flees phi1), turning static spinodal coarsening into perpetual travelling demixing waves.",
+        "vis_channels": ["Phase 1", "Chem pot 1", "Phase 2", "Chem pot 2"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "bipolar",  # signed order params ∈ [-1,1]
         "render_mode": "volumetric",
         "boundary": "toroidal",
     },
@@ -18166,6 +19364,65 @@ def init_nucleation(size, rng):
     base = 0.4  # metastable, near shallow "+" well
     data[:, :, :, 0] = (base + _canonical_noise(size, rng, -0.1, 0.1)).astype(np.float32)
     return data
+
+
+def init_active_phase_sep(size, rng):
+    """Non-reciprocal Cahn-Hilliard: two independent order parameters, each
+    near zero with small perturbations (a double spinodal quench). phi1 is
+    in R, phi2 in B; the chemical-potential channels (G, A) start at zero."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = _canonical_noise(size, rng, -0.05, 0.05)  # phi1
+    data[:, :, :, 2] = _canonical_noise(size, rng, -0.05, 0.05)  # phi2 (rng advanced → decorrelated)
+    return data
+
+
+def init_active_ising(size, rng):
+    """Active Ising: a dilute disordered gas (low density, m~0) seeded with a
+    few dense, fully-ordered planar slabs perpendicular to the drift axis (x).
+    In the flocking/coexistence regime these slabs sharpen into travelling
+    bands that march through the gas; the gas continually feeds them, so the
+    motion is perpetual. State carried as sub-populations rho+ (R), rho- (G),
+    with density (B) and magnetization (A) mirrored for display."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    rho_gas = 0.6  # disordered gas just below the ordering threshold (beta*rho<1)
+    rho = rho_gas + _canonical_noise(size, rng, -0.03, 0.03)
+    m = _canonical_noise(size, rng, -0.03, 0.03)  # rng advanced -> decorrelated
+    # A couple of dense ordered bands (slabs perpendicular to the drift axis).
+    # The shader drifts along pos.x, which maps to numpy axis 2 on read-back,
+    # so the slab profile must vary along axis 2 to translate visibly.
+    xs = np.arange(size, dtype=np.float32)
+    width = max(2.0, size / 16.0)
+    for centre in (size * 0.33, size * 0.66):
+        slab = np.exp(-0.5 * ((xs - centre) / width) ** 2)  # along drift axis
+        prof = slab[None, None, :]                          # (1,1,x) broadcast
+        rho = rho + 1.2 * prof
+        m = m + 1.2 * prof                                  # ordered (up) band
+    m = np.clip(m, -rho, rho)
+    data[:, :, :, 0] = 0.5 * (rho + m)   # rho+
+    data[:, :, :, 1] = 0.5 * (rho - m)   # rho-
+    data[:, :, :, 2] = rho               # density (display)
+    data[:, :, :, 3] = m                 # magnetization (display)
+    return data
+
+
+def init_directional_solidification(size, rng):
+    """Directional solidification: seed the solid bands at the cold troughs of
+    the t=0 thermal wave (cos along the pull axis x = numpy axis 2) so the
+    scrolling cellular array is populated from the first frame. A little
+    lateral noise keeps the front from starting perfectly planar."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    xs = np.arange(size, dtype=np.float32)
+    nb = 2.0  # bands across the box (must match NB in the shader)
+    wave = np.cos(2.0 * np.pi * nb * xs / size)        # cold where wave > 0
+    phi_x = np.clip(wave, 0.0, 1.0)                    # solid in the cold half
+    phi = np.broadcast_to(phi_x[None, None, :], (size, size, size)).copy()
+    phi = phi + _canonical_noise(size, rng, -0.05, 0.05)  # break planar front
+    phi = np.clip(phi, 0.0, 1.0)
+    data[:, :, :, 0] = phi
+    data[:, :, :, 1] = 0.5 + 0.5 * np.broadcast_to(
+        wave[None, None, :], (size, size, size))
+    return data
+
 
 def init_erosion_terrain(size, rng):
     """Erosion: solid terrain block with water source at top."""
@@ -21434,6 +22691,9 @@ INIT_FUNCS = {
     'metal_layers': init_metal_layers,
     'phase_separation': init_phase_separation,
     'nucleation': init_nucleation,
+    'active_phase_sep': init_active_phase_sep,
+    'active_ising': init_active_ising,
+    'directional_solidification': init_directional_solidification,
     'erosion_terrain': init_erosion_terrain,
     'mycelium': init_mycelium,
     'em_wave': init_em_wave,
@@ -23146,6 +24406,16 @@ class Simulator:
         self._rec_live_last_write = 0.0
         self._rec_live_update_interval = 0.1
         self._rec_dropped_frames = 0
+        # Background music: when enabled, a randomly-chosen royalty-free
+        # track from youtube_pipeline/audio/ is muxed into the finished
+        # recording (after ffmpeg closes), clipped to the video's exact
+        # length with a short fade in/out. Done as a post-process so the
+        # live frame-pipe encoder is left untouched.
+        self._rec_add_music = False
+        self._rec_audio_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'youtube_pipeline', 'audio')
+        self._rec_music_thread = None
 
         # Quick-access element palette
         self.palette_elements = [
@@ -24141,7 +25411,15 @@ class Simulator:
         self._pass_specs = []
         for entry in raw_passes:
             if isinstance(entry, str):
-                spec = {"shader": entry, "writes": ("p1",), "kind": "voxel"}
+                # crystal_growth is a single-pass rule that nonetheless writes
+                # the solute field (pair 2) every step via imageStore(u_dst2).
+                # It MUST declare p2 in its writes-set so ping2 flips in
+                # lockstep; otherwise fetch2 keeps reading the pristine initial
+                # field2 and the solute concentration can never accumulate
+                # across steps (the constitutional-undercooling coupling then
+                # sees a flat c and does nothing).
+                writes = ("p1", "p2") if entry == 'crystal_growth' else ("p1",)
+                spec = {"shader": entry, "writes": writes, "kind": "voxel"}
             else:
                 # Preserve all keys from the preset spec (channel, src_channel,
                 # dst_channel, rate, etc. are consumed by accum/scratch passes).
@@ -24408,6 +25686,34 @@ class Simulator:
             rng = np.random.default_rng(getattr(self, 'seed', None) or 0)
             mask = rng.random((self.size, self.size, self.size), dtype=np.float32) < 0.05
             arr[..., 0] = mask.astype(np.float32)
+            return arr
+        if init_name in ('plife_rand', 'plife_rand_r'):
+            # Large-domain seed for fcc_particle_life. 'plife_rand' fills the
+            # 4 channels (colours 0..3); 'plife_rand_r' fills only the R
+            # channel (colour 4). Per-cell white noise barely coarsens under
+            # the mass-conserving dynamics (Cahn-Hilliard is slow), so the
+            # field would stay a frozen salt-and-pepper mix. Instead we seed
+            # LOW-FREQUENCY blobs: smooth a coarse random field up to full
+            # resolution and keep its upper tail, giving each colour a few
+            # big rounded domains in mostly-empty space that the force matrix
+            # then grows, wets, engulfs or chases.
+            from scipy.ndimage import gaussian_filter
+            base = (getattr(self, 'seed', None) or 0)
+            offset = 0 if init_name == 'plife_rand' else 101
+            rng = np.random.default_rng(base + offset)
+            nch = 4 if init_name == 'plife_rand' else 1
+            s = self.size
+            sigma = max(2.0, s / 16.0)   # domain length scale ~ a few cells
+            for c in range(nch):
+                noise = rng.standard_normal((s, s, s)).astype(np.float32)
+                fld = gaussian_filter(noise, sigma=sigma, mode='wrap')
+                fld -= fld.mean()
+                std = fld.std()
+                if std > 1e-6:
+                    fld /= std
+                # Keep only the upper tail -> sparse, large, rounded domains.
+                amp = np.clip((fld - 0.9) / 1.6, 0.0, 1.0)
+                arr[..., c] = (0.4 + 0.6 * amp) * (amp > 0.0)
             return arr
         if init_name in ('euler_blast_pair2',
                          'euler_shocktube_pair2',
@@ -30000,6 +31306,30 @@ void main() {
                     "recordings/upload_queue/ where the YouTube pipeline\n"
                     "will pick it up. Otherwise records to recordings/.")
 
+            # Background-music toggle. Greyed out when the audio folder has
+            # no usable tracks so the option can't silently do nothing.
+            imgui.same_line()
+            _has_tracks = bool(self._list_audio_tracks())
+            if not _has_tracks:
+                self._rec_add_music = False
+            imgui.begin_disabled(not _has_tracks)
+            changed, self._rec_add_music = imgui.checkbox(
+                "Add music", self._rec_add_music)
+            imgui.end_disabled()
+            if imgui.is_item_hovered():
+                if _has_tracks:
+                    imgui.set_tooltip(
+                        "After recording stops, mux a random royalty-free\n"
+                        "track from youtube_pipeline/audio/ into the video,\n"
+                        "clipped to its exact length with a fade in/out.\n"
+                        "Runs in the background; the silent mp4 is saved\n"
+                        "first, then replaced once the audio is merged.")
+                else:
+                    imgui.set_tooltip(
+                        "No audio tracks found.\n"
+                        "Drop .mp3/.wav/.flac files into\n"
+                        "youtube_pipeline/audio/ to enable.")
+
             # Resolution selector
             res_labels = [r[0] for r in self._rec_resolutions]
             imgui.set_next_item_width(180)
@@ -31206,10 +32536,32 @@ void main() {
                     duration_s=float(duration))
             except Exception: pass  # noqa: BLE001  optional recorder, never fatal
 
+        # Optional background music: pick a track now (so the sidecar can
+        # credit it) and mux it in on a background thread once the silent
+        # mp4 is finalised. The exact playback length is frames/fps, not
+        # wall-clock, so the clip lines up with the video precisely.
+        music_credit = None
+        if self._rec_add_music and self._rec_frame_count > 0:
+            tracks = self._list_audio_tracks()
+            if not tracks:
+                self._rec_msg = ("WARN: 'Add music' on but no tracks in "
+                                 "youtube_pipeline/audio/")
+                self._rec_msg_time = time.time()
+            elif os.path.exists(self._rec_filename):
+                track = random.choice(tracks)
+                music_credit = self._parse_track_credit(track)
+                video_dur = (self._rec_frame_count / self._rec_fps
+                             if self._rec_fps else 0.0)
+                self._rec_music_thread = threading.Thread(
+                    target=self._mux_music_into_recording,
+                    args=(self._rec_filename, track, video_dur),
+                    daemon=True)
+                self._rec_music_thread.start()
+
         # Sidecar write must never crash the simulator on stop — the video
         # is already saved, missing metadata is recoverable.
         try:
-            self._write_recording_metadata()
+            self._write_recording_metadata(music_credit=music_credit)
         except Exception as e:  # noqa: BLE001  recording overlay, best-effort
             self._rec_msg = f"WARN: sidecar write failed: {e}"
             self._rec_msg_time = time.time()
@@ -31400,7 +32752,94 @@ void main() {
             raise RuntimeError(f"overlay PNG generation failed: {err}")
         return path
 
-    def _write_recording_metadata(self):
+    def _list_audio_tracks(self):
+        """Return sorted absolute paths of usable music files in audio dir."""
+        exts = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac')
+        try:
+            names = sorted(os.listdir(self._rec_audio_dir))
+        except OSError:
+            return []
+        return [os.path.join(self._rec_audio_dir, n) for n in names
+                if n.lower().endswith(exts)]
+
+    @staticmethod
+    def _parse_track_credit(track_path):
+        """Parse 'Title - Artist.ext' into a {track, artist, file} dict."""
+        fname = os.path.basename(track_path)
+        stem = os.path.splitext(fname)[0]
+        title, artist = stem, ''
+        if ' - ' in stem:
+            title, artist = stem.rsplit(' - ', 1)
+        return {'track': title.strip(), 'artist': artist.strip(), 'file': fname}
+
+    def _mux_music_into_recording(self, video_path, track_path, duration):
+        """Mux a clipped, faded music track into a finished recording.
+
+        Runs in a background thread so the (already-saved) video is muxed
+        without stalling the GL loop. Replaces ``video_path`` in place on
+        success; leaves the silent original untouched on any failure.
+        """
+        if not shutil.which('ffmpeg') or duration <= 0.1:
+            return
+        try:
+            # Pick a random start offset inside the track so repeated
+            # recordings don't all open with the same few bars. Needs the
+            # track length, which ffprobe reports; fall back to offset 0.
+            track_len = 0.0
+            if shutil.which('ffprobe'):
+                try:
+                    out = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-show_entries',
+                         'format=duration', '-of',
+                         'default=noprint_wrappers=1:nokey=1', track_path],
+                        capture_output=True, text=True, timeout=15)
+                    track_len = float(out.stdout.strip() or 0.0)
+                except (ValueError, subprocess.SubprocessError):
+                    track_len = 0.0
+            offset = 0.0
+            slack = track_len - duration - 1.0
+            if slack > 0.0:
+                offset = random.uniform(0.0, slack)
+
+            # Fade in over 1s; fade out over the last 2s. Clamp for very
+            # short clips so the fades never overlap or go negative.
+            fade_in = min(1.0, duration * 0.25)
+            fade_out = min(2.0, duration * 0.25)
+            fade_out_start = max(0.0, duration - fade_out)
+            afilter = (f'afade=t=in:st=0:d={fade_in:.3f},'
+                       f'afade=t=out:st={fade_out_start:.3f}:d={fade_out:.3f}')
+
+            tmp_path = video_path + '.mux.mp4'
+            cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-ss', f'{offset:.3f}', '-i', track_path,  # input 0: audio
+                '-i', video_path,                          # input 1: video
+                '-map', '1:v:0', '-map', '0:a:0',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                '-t', f'{duration:.3f}',
+                '-af', afilter,
+                '-movflags', '+faststart',
+                tmp_path,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=120)
+            if proc.returncode == 0 and os.path.exists(tmp_path):
+                os.replace(tmp_path, video_path)
+                self._rec_msg = (
+                    f"Music added: {self._parse_track_credit(track_path)['track']}")
+                self._rec_msg_time = time.time()
+            else:
+                try: os.unlink(tmp_path)
+                except OSError: pass
+                err = (proc.stderr or '').strip().splitlines()
+                self._rec_msg = (
+                    f"WARN: music mux failed: {err[-1][:100]}"
+                    if err else "WARN: music mux failed")
+                self._rec_msg_time = time.time()
+        except Exception as e:  # noqa: BLE001  best-effort post-process
+            sys.stderr.write(f"[record] music mux error: {e}\n")
+
+    def _write_recording_metadata(self, music_credit=None):
         """Write a JSON sidecar with rule info, params, and description."""
         meta_path = self._rec_filename.rsplit('.', 1)[0] + '.json'
         preset = RULE_PRESETS[self.rule_name]
@@ -31427,6 +32866,8 @@ void main() {
             disc = self.discoveries[self.discovery_index]
             meta['discovery_score'] = get_field(disc, 'score', 0)
             meta['discovery_index'] = self.discovery_index
+        if music_credit:
+            meta['music'] = music_credit
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
 

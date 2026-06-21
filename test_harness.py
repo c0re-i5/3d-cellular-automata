@@ -1338,6 +1338,36 @@ class HeadlessRunner:
             self.measure_mode = 'discrete'
             self.alive_threshold = 0.5
             self.change_threshold = 0.01
+        elif shader == 'fcc_bz_spiral_waves':
+            # FCC Belousov-Zhabotinsky CGLE oscillator. Re(A) (ch0) swings
+            # roughly [-1.2, 1.2] everywhere; mirror the cubic bz_3d branch and
+            # measure abs(value) so the active wave crests register without
+            # penalising the limit-cycle oscillation as a blinker.
+            self.measure_channel = 0
+            self.measure_mode = 'wave'  # PDE: use abs(value)
+            self.alive_threshold = 0.3  # abs(Re(A)) > 0.3 catches active wave regions
+            self.change_threshold = 0.01
+        elif shader == 'fcc_lichen':
+            # FCC three-species lichen competition. Species A (ch0) fills the
+            # grid as part of the territorial mosaic, so mirror the cubic
+            # lichen_3d branch and score the A-dominant patches as deviation
+            # from the spatial mean rather than the saturated bulk.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.30
+            self.change_threshold = 0.01
+        elif shader == 'fcc_particle_life':
+            # FCC continuum Particle Life. The primary texture is a composite
+            # display buffer whose alpha (ch3) holds the TOTAL density of all
+            # five colour fields. Living structure = voxels with appreciable
+            # total density; the colours flow and reshape continuously, so the
+            # change metric stays active when a seed produces real dynamics
+            # (and collapses to ~0 for dead seeds that diffuse to nothing or
+            # saturate uniformly).
+            self.measure_channel = 3
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.08
+            self.change_threshold = 0.005
         elif is_agent_rule:
             # Agent-driven rule with a non-trivial voxel shader (e.g.
             # smugglers_3d). The grid carries sparse trails / stashes

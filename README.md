@@ -104,10 +104,11 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 | Category | Rules | Description |
 |----------|-------|-------------|
 | **Classic** | Game of Life, SmoothLife | Discrete and continuous life-like automata |
-| **Reaction-Diffusion** | Gray-Scott, BZ, Barkley, Morphogen, BZ Turbulence | Chemical pattern formation — spots, spirals, scroll waves |
+| **Reaction-Diffusion** | Gray-Scott, BZ, Barkley, Morphogen, BZ Turbulence, Flow Turing (differential-flow) | Chemical pattern formation — spots, spirals, scroll waves, drifting wave trains |
 | **Continuous** | Lenia, Multi-channel Lenia | Kernel-based continuous CAs with lifelike organisms |
 | **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×6), Schrödinger–Poisson, 3+1D Dirac (4-spinor leapfrog) | Wave equations, full-vector electromagnetics, single-particle and self-interacting QM, relativistic spin-½ evolution |
-| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic), Active Nematic (Q-tensor) | Phase separation, anisotropic solidification, brittle fracture, channelised erosion, defect-driven liquid-crystal flow |
+| **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Crystal Coring/Zoning, Directional Solidification (Bridgman), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic), Active Nematic (Q-tensor) | Phase separation, anisotropic and directional solidification, solute zoning, brittle fracture, channelised erosion, defect-driven liquid-crystal flow |
+| **Active Matter** | Active Ising (flocking bands), Active Phase Separation (non-reciprocal Cahn-Hilliard) | Self-propelled and non-reciprocal systems where static order is replaced by perpetual travelling structure |
 | **Biology** | Predator-Prey, Wolf-Sheep-Grass, Flocking (Reynolds + predator), Physarum (adaptive flux), Mycelium (anastomosing), Lichen, Termites (3-aux-field stigmergy), Ant Colony (stigmergic foraging), Ant Colony Rivalry (3 teams sharing one food field), Ant Colony Lifecycle (queens + GPU spawn + worker aging), Wandering Voxels (entity_arena demo) | Population dynamics, swarm behaviour, biological transport networks, stigmergic self-organisation, multi-team rivalry over a shared resource, validation harness for the entity-arena GPU substrate |
 | **Astrophysics** | Galaxy Formation, Compressible Euler (Sod / Kelvin–Helmholtz / blast) | Self-gravity (Jacobi-Poisson) + semi-Lagrangian gas dynamics, finite-volume conservative compressible flow |
 | **Chemistry** | Element CA, Viscous Fingers (Saffman–Taylor), Fire (combustion fluid), Smoke + Wind | 118-element particle chemistry, two-phase porous flow, reactive flow with vorticity confinement, advected scalar with prescribed wind field |
@@ -281,17 +282,19 @@ fcc_viewer.py, lattice_gpu_check.py
                           isotropic discrete diffusion. These standalone
                           files are the original headless proof of
                           concept; the lattice has since been promoted
-                          into the main simulator, where ~19 rules have
+                          into the main simulator, where ~22 rules have
                           been hand-ported onto the 12-NN stencil
                           (`fcc_` prefix in the rule dropdown) spanning
                           reaction-diffusion (Gray-Scott, Schnakenberg,
                           Brusselator, FitzHugh-Nagumo, Gierer-Meinhardt
                           morphogen), excitable/oscillator media (cyclic,
-                          Kuramoto, XY-spin), statistical mechanics
-                          (Ising), growth (Eden, DLA, crystal, forest
-                          fire), and discrete rules (Life, 4-4-5,
-                          sandpile, hodgepodge, spatial Prisoner's
-                          Dilemma). They render through the in-simulator
+                          Kuramoto, XY-spin, BZ spiral waves), statistical
+                          mechanics (Ising), multi-species competition
+                          (lichen), continuum multi-species Particle Life,
+                          growth (Eden, DLA, crystal, forest fire), and
+                          discrete rules (Life, 4-4-5, sandpile,
+                          hodgepodge, spatial Prisoner's Dilemma). They
+                          render through the in-simulator
                           voxel path and are searchable by the headless
                           harness like any cubic preset. The pre-FCC
                           commit is tagged `pre-fcc-transition` for
@@ -441,6 +444,13 @@ The dispatcher writes back the *same* texture format, so:
 | `cahn_hilliard_3d` | order param ∈[-1,1] | chemical potential | — | — | bipolar |
 | `em_wave_3d` | E_x | E_y | E_z | ε_r | bipolar |
 | `fire_3d` | temperature | soot | embers | fuel | rgba_blend |
+| `flow_turing_3d` | U substrate | V catalyst | — | — | rgb_channels |
+| `active_ising_3d` | ρ₊ (up, drifts +x) | ρ₋ (down, drifts −x) | density ρ | magnetization m | bipolar |
+| `active_phase_sep_3d` | φ₁ | chem pot μ₁ | φ₂ | chem pot μ₂ | bipolar |
+| `directional_solidification_3d` | phase φ | thermal field T | — | — | (volumetric) |
+| `fcc_particle_life` | composite R | composite G | composite B | total density | rgba_blend |
+| `fcc_bz_spiral_waves` | Re(A) | Im(A) | amplitude | — | (value on Re A) |
+| `fcc_lichen` | species A | species B | resource | species C | rgb_channels |
 | Schrödinger family (×8) | ψ real | ψ imag | potential V | \|Ψ\|² | (default density on \|Ψ\|²) |
 
 The `wireworld_3d` row carries one important invariant: `ch0` *must* remain `state/3` because the kernel re-reads it via `ww_state()` to recover the discrete state on the next step. Promoting `ch1–ch3` is free; ch0 is load-bearing.
@@ -538,6 +548,10 @@ Filament strength is tracked as $S = |\nabla u \times \nabla v|$ windowed by $4u
 **Morphogen (Gierer-Meinhardt)** — Turing instability with activator saturation:
 
 $$\partial_t a = D_a \nabla^2 a + \rho\!\left(\frac{a^2}{h(1 + \kappa a^2)} - a\right) + \sigma_a, \qquad \partial_t h = D_h \nabla^2 h + \rho(a^2 - h)$$
+
+**Flow Turing (differential-flow Gray-Scott)** — Ordinary Gray-Scott kinetics, but the catalyst $V$ is advected along $+x$ while the substrate $U$ stays put. This *differential-flow instability* (Rovinsky–Menzinger, 1992) replaces the frozen Turing labyrinth with perpetual travelling wave trains — stripes born upstream and swept downstream forever. Flow $\phi = 0$ recovers the static Gray-Scott worms exactly:
+
+$$\partial_t U = D_U \nabla^2 U - UV^2 + F(1-U), \qquad \partial_t V = D_V \nabla^2 V + UV^2 - (F+k)V - \phi\,\partial_x V$$
 
 ---
 
@@ -647,6 +661,22 @@ Integrity is irreversibly broken once any of the 26 bond stretches exceeds the c
 $$C = K_c v^2; \qquad \dot{s} = \begin{cases} K_e(C - s) & C > s\ \text{(erode)} \\\\ K_d(C - s) & C < s\ \text{(deposit)} \end{cases}$$
 
 The positive deposition feedback (slow water drops sediment, raising the bed and slowing flow further) is what carves persistent channels rather than smoothing terrain into a single flat plain.
+
+**Directional Solidification (Bridgman pulling)** — An Allen-Cahn phase field $\phi$ driven by a *travelling* thermal wave pulled through the box at velocity $V_p$. Melt solidifies on the leading (cold) edge of the moving isotherm while solid melts back on the trailing (hot) edge, so a cellular/dendritic band scrolls forever instead of freezing. A quenched per-column threshold offset supplies the bias-free lateral instability that sets the dendrite spacing; $V_p = 0$ recovers a static striped equilibrium:
+
+$$\partial_t \phi = M\!\left[\varepsilon^2\nabla^2\phi + \phi(1-\phi)\!\left(\phi - \tfrac{1}{2} + G\,T\right)\right], \qquad T(x,t) = \cos\!\left(2\pi N_b\,\frac{x - V_p t}{L_x}\right)$$
+
+---
+
+### Active Matter / Non-Equilibrium
+
+**Active Ising (flocking bands)** — Solon–Tailleur self-propelled spins in hydrodynamic form: up-spins drift $+x$, down-spins drift $-x$, while ferromagnetic alignment competes with noise. The state is carried as the two sub-populations $\rho_\pm$ (so transport is exactly conservative and positivity-preserving under donor-cell upwinding), with density $\rho = \rho_+ + \rho_-$ and magnetization $m = \rho_+ - \rho_-$. Above the flocking transition the static domains of the passive Ising model become perpetual travelling bands — dense ordered sheets marching through a dilute disordered gas. Drive $v = 0$ recovers passive coarsening:
+
+$$\partial_t \rho = D\nabla^2\rho - v\,\partial_x m, \qquad \partial_t m = D\nabla^2 m - v\,\partial_x \rho + 2m(\beta\rho - 1) - \frac{2\beta m^3}{\rho}$$
+
+**Active Phase Separation (non-reciprocal Cahn-Hilliard)** — Two conserved order parameters demix simultaneously, coupled *non-reciprocally* (Saha / Agudo-Canalejo / Golestanian 2020): the cross term enters the two chemical potentials with opposite sign, so $\phi_1$ chases $\phi_2$ while $\phi_2$ flees $\phi_1$. Because the coupling is antisymmetric the free energy is non-integrable — there is no minimum to relax into — so spinodal coarsening is replaced by perpetual travelling, chasing demixing waves. Coupling $\chi = 0$ recovers two independent static Cahn-Hilliard fields:
+
+$$\partial_t \phi_i = M\nabla^2 \mu_i, \qquad \mu_1 = \phi_1^3 - \phi_1 - \varepsilon^2\nabla^2\phi_1 + \chi\phi_2, \qquad \mu_2 = \phi_2^3 - \phi_2 - \varepsilon^2\nabla^2\phi_2 - \chi\phi_1$$
 
 ---
 
