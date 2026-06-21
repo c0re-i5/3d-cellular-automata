@@ -253,6 +253,25 @@ def _is_shorts(resolution: list[int]) -> bool:
     return h > w
 
 
+def _music_credit(meta: dict) -> str:
+    """Return a 'Track by Artist' credit string from the sidecar, or ''.
+
+    The simulator records the chosen background track under ``meta['music']``
+    as ``{track, artist, file}`` (parsed from the audio filename). We surface
+    it in the description as a goodwill credit to the artist.
+    """
+    music = meta.get('music')
+    if not isinstance(music, dict):
+        return ''
+    track = (music.get('track') or '').strip()
+    artist = (music.get('artist') or '').strip()
+    if not track and not artist:
+        return ''
+    if track and artist:
+        return f'"{track}" by {artist}'
+    return track or artist
+
+
 # Shorts only show the first ~100 chars of the description before
 # truncating with a "more" link, so a 400-char paragraph just produces
 # an unreadable wall of text on the watch screen.
@@ -310,6 +329,7 @@ def build_metadata(sidecar_path: Path) -> dict:
     shorts = _is_shorts(resolution)
     category = _category_for(rule)
     hook = _hook_from_description(desc)
+    music_credit = _music_credit(meta)
 
     # ── Title ─────────────────────────────────────────────────────────
     # Strip the in-app "Flagship: " curation prefix — viewers searching
@@ -355,6 +375,9 @@ def build_metadata(sidecar_path: Path) -> dict:
     if shorts:
         lines = [body for body in (short_desc,) if body]
         lines.append('')
+        if music_credit:
+            lines.append(f'Music: {music_credit}')
+            lines.append('')
         lines.append(f'Source: {REPO_URL}')
         lines.append('')
         lines.append('#Shorts #CellularAutomata #GenerativeArt '
@@ -400,6 +423,10 @@ def build_metadata(sidecar_path: Path) -> dict:
         if score is not None:
             lines.append(f'    Discovery score : {score:.3f}')
         lines.append('')
+        if music_credit:
+            lines.append('▸ Music')
+            lines.append(f'    {music_credit}')
+            lines.append('')
         lines.append('▸ About this project')
         lines.append(PROJECT_BLURB)
         lines.append('')
