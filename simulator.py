@@ -24115,10 +24115,11 @@ def rule_code_hash(rule_name: str):
 
 class Simulator:
     def __init__(self, size=64, rule='game_of_life_3d', headless=False,
-                 force_precision=None, dims=None):
+                 force_precision=None, dims=None, vsync='adaptive'):
         """
         force_precision: None (auto), 'fp16', or 'fp32'. Overrides both
             the per-preset 'precision' key and the size-based fallback.
+        vsync: 'adaptive' (default), 'on', or 'off'. See self.vsync_mode.
         dims: (W, H, D) tuple for anisotropic grids. If None, falls back
             to cubic (size, size, size). When given, `size` is ignored
             for grid shape but still used as a back-compat scalar via
@@ -24150,6 +24151,13 @@ class Simulator:
         self.step_count = 0
         self.sim_speed = 1  # steps per batch
         self.target_sps = 0  # target steps/sec (0 = unlimited, run every frame)
+        # Vsync / frame-pacing mode. 'adaptive' uses swap_interval(-1): it
+        # paces to the refresh when there's headroom but presents immediately
+        # (tears) when a frame misses a vblank — avoiding the hard
+        # double-buffer cliff where a frame just over one vblank is quantized
+        # down to half the refresh rate (e.g. a ~10ms frame -> 60 FPS instead
+        # of ~93 on a 120Hz panel). 'on' = hard vsync (1), 'off' = uncapped (0).
+        self.vsync_mode = vsync if vsync in ('adaptive', 'on', 'off') else 'adaptive'
         self._last_step_time = 0.0
         self.seed = 42
         # Idle-frame skip: when scene state (sim, camera, render knobs) is
@@ -24430,6 +24438,55 @@ class Simulator:
         self._init_gl()
         self._init_volume()
 
+    def _adaptive_vsync_supported(self):
+        """True only if the platform tear-control extension is present.
+
+        A negative (adaptive) swap interval issued without tear support is a
+        FATAL GLX/WGL BadValue X error -- it aborts the process via the X
+        error handler and is NOT a catchable Python exception. So we must
+        probe support up-front rather than try/except around it. Requires a
+        current GL context.
+        """
+        try:
+            return bool(glfw.extension_supported('GLX_EXT_swap_control_tear')
+                        or glfw.extension_supported('WGL_EXT_swap_control_tear'))
+        except Exception:  # noqa: BLE001  extension query is best-effort
+            return False
+
+    def _apply_vsync(self):
+        """Apply self.vsync_mode to the GL swapchain.
+
+        'adaptive' (-1) avoids the hard double-buffer vsync cliff, but it is
+        only safe when tear control is supported AND we have an on-screen
+        drawable. Headless (offscreen) windows reject a negative interval with
+        a fatal GLX BadValue, so they never use it.
+        """
+        if self.headless:
+            # No on-screen presentation; vsync is irrelevant and adaptive (-1)
+            # crashes on offscreen drawables. Disable swap waits entirely.
+            try:
+                glfw.swap_interval(0)
+            except Exception:  # noqa: BLE001  best-effort
+                pass
+            return
+        interval = {'adaptive': -1, 'on': 1, 'off': 0}.get(self.vsync_mode, -1)
+        if interval < 0 and not self._adaptive_vsync_supported():
+            # Driver doesn't advertise tear control; a negative interval would
+            # be a fatal (uncatchable) X error. Fall back to UNCAPPED (0), not
+            # hard vsync (1): 0 still escapes the double-buffer cliff (the whole
+            # point of 'adaptive') and is safe everywhere. We leave
+            # self.vsync_mode as 'adaptive' so a tear-capable GPU still gets
+            # true adaptive sync.
+            interval = 0
+        try:
+            glfw.swap_interval(interval)
+        except Exception:  # noqa: BLE001  swap-control is best-effort
+            if interval < 0:
+                try:
+                    glfw.swap_interval(0)
+                except Exception:  # noqa: BLE001
+                    pass
+
     def _init_window(self):
         if not glfw.init():
             raise RuntimeError("Failed to initialize GLFW")
@@ -24449,7 +24506,7 @@ class Simulator:
             raise RuntimeError("Failed to create GLFW window")
 
         glfw.make_context_current(self.window)
-        glfw.swap_interval(1)  # vsync
+        self._apply_vsync()  # adaptive vsync by default (see self.vsync_mode)
 
         if self.headless:
             # No imgui, no input callbacks in headless mode. We only need
@@ -28653,14 +28710,72 @@ void main() {
             self.dt = max(dlo, min(dhi, self.dt + random.gauss(0, strength * dt_span)))
         self._reset()
 
+    @staticmethod
+    def _salvage_discovery_objects(text):
+        """Recover every complete top-level object from a truncated JSON
+        array (``[ {..}, {..}, ...``). Tracks string/escape state and brace
+        depth, returning the list parsed from all fully-closed objects."""
+        depth = 0
+        in_str = False
+        esc = False
+        started = False
+        last_complete = None
+        for i, c in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+                started = True
+            elif c == '}':
+                depth -= 1
+                if depth == 0 and started:
+                    last_complete = i + 1
+        if last_complete is None:
+            return []
+        try:
+            return json.loads(text[:last_complete] + "\n]\n")
+        except json.JSONDecodeError:
+            return []
+
     def _load_discoveries(self):
-        """Load discoveries from JSON file."""
+        """Load discoveries from JSON, tolerating a corrupt/truncated file.
+
+        An interrupted write can leave discoveries.json truncated mid-object.
+        Rather than crash on startup, salvage every complete entry, move the
+        corrupt original aside as a timestamped .corrupt backup, and rewrite a
+        clean file."""
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.discovery_file)
-        if os.path.exists(path):
-            with open(path) as f:
-                self.discoveries = json.load(f)
-        else:
+        if not os.path.exists(path):
             self.discoveries = []
+            return
+        with open(path) as f:
+            text = f.read()
+        try:
+            self.discoveries = json.loads(text)
+            return
+        except json.JSONDecodeError as e:
+            salvaged = self._salvage_discovery_objects(text)
+            backup = path + time.strftime('.corrupt_%Y%m%d_%H%M%S')
+            try:
+                os.replace(path, backup)
+            except OSError:
+                pass
+            self.discoveries = salvaged
+            print(f"[discoveries] WARNING: {self.discovery_file} was corrupt "
+                  f"({e}); salvaged {len(salvaged)} entries. Original kept as "
+                  f"{os.path.basename(backup)}.", flush=True)
+            try:
+                self._persist_discoveries()
+            except OSError:
+                pass
 
     def _save_current_to_discoveries(self):
         """Save current params as a new discovery."""
@@ -28690,10 +28805,18 @@ void main() {
         self._disc_by_rule = None  # invalidate browser cache
 
     def _persist_discoveries(self):
-        """Write self.discoveries to disk (pretty JSON)."""
+        """Write self.discoveries to disk atomically (pretty JSON).
+
+        Writes to a sibling temp file, fsyncs, then os.replace()s it into
+        place, so a killed/interrupted write can never leave a truncated
+        discoveries.json that bricks the next startup."""
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.discovery_file)
-        with open(path, 'w') as f:
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, 'w') as f:
             json.dump(self.discoveries, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def _toggle_mark_current_discovery(self):
         """Flip the ``marked`` flag on the currently-loaded discovery and
@@ -31186,6 +31309,22 @@ void main() {
                 if imgui.selectable(label, is_sel)[0]:
                     self.target_sps = val
                     self._last_step_time = 0.0
+                if is_sel:
+                    imgui.set_item_default_focus()
+            imgui.end_combo()
+
+        # Vsync / frame-pacing. 'adaptive' avoids the hard double-buffer
+        # cliff (a frame just over one vblank dropping to half the refresh).
+        vsync_labels = ["Adaptive", "On", "Off"]
+        vsync_values = ['adaptive', 'on', 'off']
+        cur_vsync = self.vsync_mode if self.vsync_mode in vsync_values else 'adaptive'
+        cur_vsync_label = vsync_labels[vsync_values.index(cur_vsync)]
+        if imgui.begin_combo("Vsync", cur_vsync_label):
+            for label, val in zip(vsync_labels, vsync_values):
+                is_sel = (val == self.vsync_mode)
+                if imgui.selectable(label, is_sel)[0]:
+                    self.vsync_mode = val
+                    self._apply_vsync()
                 if is_sel:
                     imgui.set_item_default_focus()
             imgui.end_combo()
@@ -33726,6 +33865,13 @@ def main():
                         help='Force FP32 (rgba32f) compute textures even '
                              'at large grids where FP16 would auto-fall '
                              'back. May fail to allocate above ~512³.')
+    parser.add_argument('--vsync', type=str, default='adaptive',
+                        choices=['adaptive', 'on', 'off'],
+                        help='Frame-pacing mode (default: adaptive). '
+                             '"adaptive" (swap_interval -1) avoids the hard '
+                             'double-buffer vsync cliff where a frame just '
+                             'over one vblank drops to half the refresh rate; '
+                             '"on" = hard vsync; "off" = uncapped.')
     parser.add_argument('--discovery', type=str, default=None,
                         help='Load discovery from JSON file (index with --discovery-index)')
     parser.add_argument('--discovery-index', type=int, default=0,
@@ -33879,7 +34025,8 @@ def main():
         rule = manifest.get("rule", args.rule)
         sim = Simulator(size=int(manifest.get("size", args.size)),
                         rule=rule,
-                        force_precision=_resolve_precision(args), dims=dims)
+                        force_precision=_resolve_precision(args), dims=dims,
+                        vsync=args.vsync)
         # Restore initial seed/dt/params from manifest before any reset.
         if "seed" in manifest:
             sim.seed = int(manifest["seed"])
@@ -33908,7 +34055,8 @@ def main():
         disc = discoveries[args.discovery_index]
         args.rule = disc['rule']
         sim = Simulator(size=args.size, rule=args.rule,
-                        force_precision=_resolve_precision(args), dims=dims)
+                        force_precision=_resolve_precision(args), dims=dims,
+                        vsync=args.vsync)
         # Override params from discovery
         for k, v in disc['params'].items():
             if k in sim.params:
@@ -33922,7 +34070,8 @@ def main():
               f"score={get_field(disc, 'score', '?')} params={disc['params']}")
     else:
         sim = Simulator(size=args.size, rule=args.rule,
-                        force_precision=_resolve_precision(args), dims=dims)
+                        force_precision=_resolve_precision(args), dims=dims,
+                        vsync=args.vsync)
 
     if args.seed is not None:
         sim.seed = int(args.seed)
