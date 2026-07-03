@@ -15887,33 +15887,42 @@ RULE_PRESETS = {
         "shader": "wave_3d",
         # Sliders read by _step_particles into the dedicated u_pl_*
         # uniforms.  Names are kept short so the GUI stays compact.
-        # Defaults tuned for size=64 + 1500 particles + centred-blob
-        # init.  Growth μ ~5 sits just above the random-fill kernel
-        # sum so the system has a gentle drive toward denser packing
-        # without launching particles ballistically; low drag (0.01)
-        # leaves enough kinetic energy that orbits and rearrangement
-        # persist instead of freezing into a static crystal.
+        # Defaults tuned for size=64 + 1500 particles + dispersed
+        # (random_volume) init.  The kernel sum U is normalized by
+        # `Kernel w` so the growth window `Growth μ` is actually
+        # reachable (an un-normalized U scales with neighbour count and
+        # pins the swarm into a frozen repulsion-packed ball).  With
+        # w=0.1 / μ_g=1.5 the particles spread across the whole field,
+        # then nucleate and ATTACH into ordered, crystal-like clusters
+        # (RDF shells grow over a few hundred steps) before slowly
+        # relaxing — the “atoms assembling” look.  Raise Growth μ toward
+        # 2.5 to keep it agitated/dynamic for longer at the cost of
+        # lattice regularity.
         "params": {"Kernel μ": 4.0, "Kernel σ": 1.0,
-                   "Growth μ": 5.0, "Growth σ": 1.5,
+                   "Kernel w": 0.1,
+                   "Growth μ": 1.5, "Growth σ": 1.0,
                    "Repulsion": 1.0, "Repulse R": 1.5},
         "param_ranges": {"Kernel μ":   (1.5, 8.0),  "Kernel σ":   (0.3, 3.0),
-                         "Growth μ":   (1.0, 30.0), "Growth σ":   (0.2, 5.0),
+                         "Kernel w":   (0.01, 0.5),
+                         "Growth μ":   (0.3, 8.0),  "Growth σ":   (0.2, 5.0),
                          "Repulsion":  (0.0, 5.0),  "Repulse R":  (0.3, 4.0)},
         "dt": 0.01,  # voxel pass dt (irrelevant — wave at zero stays zero)
         "dt_range": (0.001, 0.1),
         "init": "blank",  # invisible voxel field
         # Particle layer config — this is what actually runs.
         "particle_count": 1500,
-        "particle_init": "centered_blob",
+        "particle_init": "random_volume",
         "particle_force": "lenia_pp",
         "particle_force_scale": 1.0,
         "particle_dt": 0.10,
         "particle_drag": 0.01,
         "particle_life_decay": 0.0,  # immortal — clusters need to persist
         "particle_respawn": False,
-        "particle_color_mode": "speed",
-        "particle_size": 0.45,
-        "description": "Particle Lenia (Mordvintsev 2022) — pairwise kernel forces produce self-organising clusters, gliders, metastable structures.",
+        "particle_color_mode": "density",  # glow by local kernel potential U
+        "particle_speed_scale": 0.33,      # density colour scale (U~3 -> hot)
+        "particle_size": 0.8,
+        "particle_alpha": 0.7,
+        "description": "Particle Lenia (Mordvintsev 2022) — normalized pairwise kernel forces; dispersed particles nucleate and attach into ordered, crystal-like clusters.",
         "vis_channels": ["(particles)", "—", "—", "—"],
         "vis_default": 0,
         "vis_abs": False,
@@ -23071,6 +23080,7 @@ PARTICLE_COLOR_MODES = {
     'velocity': 1,   # alias — callers expect colour-by-velocity-magnitude
     'lifetime': 2,
     'position': 3,
+    'density': 4,    # colour by kernel potential U (Particle Lenia)
 }
 
 
@@ -26215,6 +26225,7 @@ class Simulator:
         # mode 6 is unreachable from the current call sites.
         self._pu_pl_mu_k    = u.get('u_pl_mu_k',    None)
         self._pu_pl_sigma_k = u.get('u_pl_sigma_k', None)
+        self._pu_pl_w_k     = u.get('u_pl_w_k',     None)
         self._pu_pl_mu_g    = u.get('u_pl_mu_g',    None)
         # Deposit uniforms (force unused / optimised away when DEPOSIT_ENABLED=0).
         self._pu_dep_amount = u.get('u_deposit_amount', None)
@@ -26333,6 +26344,8 @@ class Simulator:
                 self._pu_pl_mu_k.value    = float(p.get('Kernel μ',     3.0))
             if self._pu_pl_sigma_k is not None:
                 self._pu_pl_sigma_k.value = float(p.get('Kernel σ',     1.0))
+            if self._pu_pl_w_k     is not None:
+                self._pu_pl_w_k.value     = float(p.get('Kernel w',     0.05))
             if self._pu_pl_mu_g    is not None:
                 self._pu_pl_mu_g.value    = float(p.get('Growth μ',     2.0))
             if self._pu_pl_sigma_g is not None:

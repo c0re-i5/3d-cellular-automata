@@ -67,6 +67,7 @@ uniform float u_spawn_speed;  // initial random speed magnitude on respawn
 // background field required.
 uniform float u_pl_mu_k;     // kernel centre radius
 uniform float u_pl_sigma_k;  // kernel ring thickness
+uniform float u_pl_w_k;      // kernel weight (normalizes the U sum -> O(1))
 uniform float u_pl_mu_g;     // growth-function centre (target U)
 uniform float u_pl_sigma_g;  // growth-function width
 uniform float u_pl_c_rep;    // repulsion strength
@@ -159,6 +160,10 @@ void main() {
     vec3 pos = a.xyz;
     vec3 vel = b.xyz;
     float life = a.w;
+    // Carried through to the particle's spare slot (b.w). Particle Lenia
+    // overwrites it with the kernel potential U so the renderer can
+    // colour by local density; other modes pass the old value through.
+    float aux_out = b.w;
 
     if (life <= 0.0) {
         if (u_respawn != 0) {
@@ -204,6 +209,7 @@ void main() {
         // and repulsion supports.
         float mu_k    = u_pl_mu_k;
         float sigma_k = max(u_pl_sigma_k, 0.001);
+        float w_k     = u_pl_w_k;
         float mu_g    = u_pl_mu_g;
         float sigma_g = max(u_pl_sigma_g, 0.001);
         float c_rep   = u_pl_c_rep;
@@ -226,6 +232,14 @@ void main() {
             float z = (r - mu_k) / sigma_k;
             U += exp(-0.5 * z * z);
         }
+        // Normalize the kernel sum so U is O(1) and density-calibrated
+        // (Mordvintsev's w_k). Without this, U scales with neighbour
+        // count and the growth window mu_g is unreachable at blob
+        // densities -> the growth term goes inert and the swarm just
+        // freezes into a repulsion-packed ball.
+        U *= w_k;
+        // Expose U to the renderer (density colouring) via the aux slot.
+        aux_out = U;
 
         // G(U) and dG/dU:  G(U) = exp(-½ z²),  z = (U-μ_g)/σ_g
         //                 G'(U) = -G·z/σ_g
@@ -256,6 +270,9 @@ void main() {
                 grad_R += -2.0 * c_rep * t / (r_rep * r) * d;
             }
         }
+        // Same w_k normalization on the potential gradient so the
+        // growth force G'(U)*grad_U stays consistent with U above.
+        grad_U *= w_k;
 
         // F = -∇E = -(∇R - G'·∇U) = G'·∇U - ∇R
         force = u_force_scale * (Gprime * grad_U - grad_R);
@@ -270,7 +287,7 @@ void main() {
     pos = mod(pos, fs);
 
     P.data[2u * i + 0u] = vec4(pos, life);
-    P.data[2u * i + 1u] = vec4(vel, b.w);
+    P.data[2u * i + 1u] = vec4(vel, aux_out);
 
 #if DEPOSIT_ENABLED
     // Splat into the deposit field at the particle's new voxel.  We

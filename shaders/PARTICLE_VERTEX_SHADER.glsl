@@ -55,6 +55,18 @@ void main() {
         col = mix(vec3(1.0, 0.2, 0.1), vec3(0.6, 0.9, 1.0), t);
     } else if (u_color_mode == 3) {
         col = vec3(0.5) + 0.5 * sin(pos * 0.3 + vec3(0.0, 2.0, 4.0));
+    } else if (u_color_mode == 4) {
+        // Density: kernel potential U (Particle Lenia) lives in b.w.
+        // Sparse gas stays dark/cool; crystallizing cores glow warm.
+        // u_speed_scale doubles as the density scale knob here.
+        float t = clamp(b.w * u_speed_scale, 0.0, 1.0);
+        vec3 c0 = vec3(0.04, 0.05, 0.20);   // near-black blue (gas)
+        vec3 c1 = vec3(0.10, 0.45, 0.85);   // blue
+        vec3 c2 = vec3(0.95, 0.80, 0.30);   // warm yellow
+        vec3 c3 = vec3(1.00, 1.00, 0.95);   // white-hot core
+        col = (t < 0.5)  ? mix(c0, c1, t * 2.0)
+            : (t < 0.8)  ? mix(c1, c2, (t - 0.5) / 0.3)
+                         : mix(c2, c3, (t - 0.8) / 0.2);
     } else {
         col = u_color_fixed;
     }
