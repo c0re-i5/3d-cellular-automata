@@ -372,11 +372,20 @@ def main():
 
     if not args.no_merge and not aborted:
         print("\nMerging winners...")
-        subprocess.run([PYTHON, MERGER, "--tmp-dir", tmp_dir, "--out", args.out,
-                        "--filter-blinkers", "--rules", " ".join(sel_rules)],
-                       check=False)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        print(f"Done -> {args.out}  (logs: {log_dir})")
+        rc = subprocess.run([PYTHON, MERGER, "--tmp-dir", tmp_dir, "--out", args.out,
+                             "--filter-blinkers", "--rules", " ".join(sel_rules)],
+                            check=False).returncode
+        if rc == 0:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            print(f"Done -> {args.out}  (logs: {log_dir})")
+        else:
+            # Merge failed — KEEP the per-job results so the run can be
+            # re-merged instead of silently discarding a long search.
+            print(f"\n! merge FAILED (rc={rc}). Per-job results preserved in:"
+                  f"\n    {tmp_dir}"
+                  f"\n  Re-run the merge with:"
+                  f"\n    {PYTHON} {MERGER} --tmp-dir {tmp_dir} --out {args.out} "
+                  f"--filter-blinkers --rules '{' '.join(sel_rules)}'")
     else:
         print(f"\nPer-job results kept in: {tmp_dir}")
 
