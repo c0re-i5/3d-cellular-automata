@@ -22,6 +22,7 @@ Usage:
 import sys, math, time, argparse, json, os, re, random, subprocess, shutil, tempfile, textwrap, threading
 import queue as _queue
 import contextlib
+import faulthandler
 import numpy as np
 import glfw
 import moderngl
@@ -33845,6 +33846,23 @@ def _resolve_precision(args):
 
 
 def main():
+    # Segfault diagnostics: dump every thread's Python stack on a fatal
+    # signal (SIGSEGV/SIGABRT/...) to stderr and a persistent crash log.
+    # Intermittent "after some time" crashes are often gone from the
+    # terminal scrollback by the time they're noticed; the log keeps them.
+    faulthandler.enable(all_threads=True)
+    try:
+        _crash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        os.makedirs(_crash_dir, exist_ok=True)
+        # Keep the handle alive for the whole process (module global) so the
+        # fault handler can still write to it at crash time.
+        global _CRASH_LOG_FILE
+        _CRASH_LOG_FILE = open(os.path.join(_crash_dir, 'crash.log'), 'a', buffering=1)
+        _CRASH_LOG_FILE.write(f"\n===== session start {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} =====\n")
+        faulthandler.enable(file=_CRASH_LOG_FILE, all_threads=True)
+    except Exception:
+        pass  # stderr handler above is enough if the log file can't be opened
+
     parser = argparse.ArgumentParser(description="3D CA Simulator")
     parser.add_argument('--size', type=int, default=64, help='Grid size (default: 64)')
     parser.add_argument('--dims', type=str, default=None,
