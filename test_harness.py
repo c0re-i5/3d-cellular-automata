@@ -3768,10 +3768,11 @@ def cmd_search(ctx, args):
 
     rng = np.random.RandomState(args.seed)
 
-    # Use biased param generator for specific metrics
-    if metric == 'gol_like':
-        _gen_params = _randomize_params_gol_like
-    elif metric == 'elegance':
+    # Use biased param generator for specific metrics. 'gol_like' has no
+    # dedicated biased generator (one was referenced since the initial commit
+    # but never implemented), so it uses the default uniform sampler — the
+    # metric itself still scores for Game-of-Life-like behaviour.
+    if metric == 'elegance':
         _gen_params = _randomize_params_elegance
     else:
         _gen_params = randomize_params
