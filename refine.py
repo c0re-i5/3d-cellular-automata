@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import faulthandler
 import hashlib
 import json
 import os
@@ -689,6 +690,11 @@ def _pick_targets(args, all_disc: list[dict]) -> list[int]:
 
 
 def main():
+    # Refine runs many headless Simulators (one GL context each) per target;
+    # a native fault (segfault) can't be caught by the try/except below, so
+    # dump every thread's stack to stderr (the parent merges it into the
+    # per-hash .log) to pinpoint where the crash occurs.
+    faulthandler.enable(all_threads=True)
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     g = p.add_mutually_exclusive_group(required=True)

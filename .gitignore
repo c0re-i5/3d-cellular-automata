@@ -109,3 +109,7 @@ explorer.html
 validator.html
 tmp_fractal/
 .vscode/
+
+# native crash dumps
+core
+core.*

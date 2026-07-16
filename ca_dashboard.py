@@ -1117,6 +1117,24 @@ class CADashboard(App):
 def main() -> int:
     import argparse
     import shutil
+
+    # Crash forensics: mirror simulator.py's faulthandler setup. The
+    # dashboard has segfaulted in the field (same era as the simulator's
+    # _draw_ui GPF in _PyObject_MakeTpCall); a native-crash traceback
+    # showing the exact Python line is the single most valuable artifact
+    # for attributing it. Appends to the same logs/crash.log.
+    import faulthandler
+    try:
+        os.makedirs(REPO_ROOT / 'logs', exist_ok=True)
+        _crash_fh = open(REPO_ROOT / 'logs' / 'crash.log', 'a')
+        _crash_fh.write(f"\n===== dashboard session start "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"pid={os.getpid()} =====\n")
+        _crash_fh.flush()
+        faulthandler.enable(file=_crash_fh)
+    except OSError:
+        faulthandler.enable()  # fall back to stderr
+
     parser = argparse.ArgumentParser(description='3D CA live dashboard (TUI).')
     parser.add_argument(
         '--stream', action='store_true',
