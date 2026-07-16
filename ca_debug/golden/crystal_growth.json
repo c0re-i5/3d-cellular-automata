@@ -110,7 +110,7 @@
     },
     {
       "step": 250,
-      "hash": "4921b4eda28991dd1b25e8121f8111e3eb65a811f9e365fdc165644b4a559452",
+      "hash": "44b928f7f75b64f501f27bcf927529ba5a6eeb88f91e1efa85fbc4fde75c9ba5",
       "stats": {
         "shape": [
           48,
@@ -144,10 +144,10 @@
             "nonfinite": 0
           },
           {
-            "mean": 2.6239217731927056e-07,
-            "std": 6.234491593204439e-05,
+            "mean": 1.2651159522647504e-05,
+            "std": 0.0029919969383627176,
             "min": 0.0,
-            "max": 0.01661047898232937,
+            "max": 0.7746531963348389,
             "alive": 2,
             "nonfinite": 0
           }
@@ -155,6 +155,6 @@
       }
     }
   ],
-  "blessed_at": "2026-05-26T22:56:39+00:00",
-  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+  "blessed_at": "2026-07-16T16:26:11+00:00",
+  "note": "re-bless post pair-2 harness fix (crystal u_src2 was unbound headless; crystal goldens enshrined stale-binding physics) + post Bug G/H + lenia_multi coupling / flow_lenia upwind-FV rewrites"
 }

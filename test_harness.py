@@ -1430,8 +1430,19 @@ class HeadlessRunner:
             if override is not None:
                 spec["param_names"] = list(override)
             self._pass_specs.append(spec)
-        # Detect whether any pass needs the second texture pair.
-        self._needs_p2 = any('p2' in s['writes'] for s in self._pass_specs)
+        # Detect whether the rule needs the second texture pair. MUST
+        # mirror simulator.Simulator._needs_field2 exactly: (a) explicit
+        # extra_fields >= 1, (b) crystal_growth (historical pair-2 user
+        # predating the flag; its shader reads/writes u_src2/u_dst2 for
+        # solute physics even though it declares no passes), (c) any pass
+        # that writes 'p2'. The previous pass-writes-only check silently
+        # ran all 8 crystal presets with bindings 2/3 UNBOUND in headless
+        # (solute field dead -> ch3 identically 0, wrong physics in every
+        # search/audit result) — found via golden-snapshot sweep 2026-07-16.
+        self._needs_p2 = (
+            self.preset.get('extra_fields', 0) >= 1
+            or self.preset.get('shader', '') == 'crystal_growth'
+            or any('p2' in s['writes'] for s in self._pass_specs))
         # Detect agent passes.
         self._has_agents = self.preset.get('agent_count', 0) > 0
         # Detect entity-arena passes.
@@ -3285,11 +3296,61 @@ def _get_metric(result, metric_name):
         score += min(pc * 0.5, 0.10)
 
         return min(score, 1.0)
+    elif metric_name == 'lenia_organism':
+        # Lenia-specific organism metric: coherent, LOCALISED, ideally MOTILE
+        # soliton-like structures — not churning soup.  The generic
+        # score_interestingness() is blind to spatial coherence (soup and a
+        # clean glider can produce identical alive/activity/surface stats),
+        # which is why 1500+ Lenia discoveries scored 0.97+ yet look like
+        # fog.  Here the generic score is only a not-dead/not-saturated
+        # GATE; the ranking weight sits on structure and motility.
+        s = result['score']
+        if s < 0.05:
+            return 0.0  # dead / saturated / frozen — no organism possible
+        alive = result.get('final_alive', 0.0)
+        glider = result.get('translation_score', 0.0)
+        period = result.get('period_score', 0.0)
+        clust = result.get('cluster_score', 0.0)
+        n_clusters = result.get('n_clusters', 0)
+        lcf = result.get('largest_cluster_frac', 0.0)
+        sv = result.get('spatial_variation', 0.0)
+
+        # LOCALISATION: an organism occupies a small fraction of the volume
+        # with empty surround.  Log-bell over alive fraction peaking at ~6%
+        # (a size-64 orbium-like soliton is ~10⁴ cells ≈ 4%), tolerant
+        # across ~1-30%, near-zero for half-full soup.
+        loc = float(np.exp(-0.5 * ((np.log10(max(alive, 1e-4))
+                                    - np.log10(0.06)) / 0.55) ** 2))
+
+        # FRAGMENTATION: hundreds of disconnected specks = noise, not
+        # organisms.  1-20 components is the creature regime; fade to 0
+        # by ~200 components.
+        if n_clusters <= 0:
+            frag = 0.0
+        elif n_clusters <= 20:
+            frag = 1.0
+        else:
+            frag = max(0.0, 1.0 - (n_clusters - 20) / 180.0)
+
+        # MOTILITY (translation_score) is the crown jewel — a coherent
+        # structure that travels while holding shape is exactly what the
+        # catalogue lacks.  period_score gets a smaller weight (breathing/
+        # pulsing creatures are good, but soup can also oscillate).
+        raw = (0.35 * glider + 0.20 * loc * frag + 0.15 * clust
+               + 0.10 * period + 0.10 * sv + 0.10 * s)
+
+        # PERCOLATION penalty: a large alive fraction dominated by one
+        # giant connected component is system-spanning soup — the exact
+        # failure mode the generic score rewards.
+        if alive > 0.25 and lcf > 0.8:
+            raw -= 0.25
+        return max(0.0, raw)
     else:
         return result.get(metric_name, 0)
 
 
-_DYNAMICS_METRICS = {'period', 'glider', 'growth', 'clusters', 'symmetry', 'elegance'}
+_DYNAMICS_METRICS = {'period', 'glider', 'growth', 'clusters', 'symmetry', 'elegance',
+                     'lenia_organism'}
 
 
 def _needs_dynamics(metric_name):
@@ -4408,7 +4469,7 @@ def main():
                          choices=['score', 'gol_coherence', 'projection', 'structure',
                                   'slice_mi', 'combined', 'period', 'glider',
                                   'growth', 'clusters', 'symmetry', 'elegance',
-                                  'gol_like'],
+                                  'gol_like', 'lenia_organism'],
                          help='Metric to optimize (default: score)')
 
     # search: evolutionary search
@@ -4422,7 +4483,7 @@ def main():
                           choices=['score', 'gol_coherence', 'projection', 'structure',
                                    'slice_mi', 'combined', 'period', 'glider',
                                    'growth', 'clusters', 'symmetry', 'elegance',
-                                   'gol_like', 'target_match'],
+                                   'gol_like', 'target_match', 'lenia_organism'],
                           help='Metric to optimize (default: score)')
     p_search.add_argument('--min_quality', type=float, default=0.25,
                           help='Minimum score to save a discovery (default: 0.25)')
@@ -4440,7 +4501,7 @@ def main():
                            choices=['score', 'gol_coherence', 'projection', 'structure',
                                     'slice_mi', 'combined', 'period', 'glider',
                                     'growth', 'clusters', 'symmetry', 'elegance',
-                                    'gol_like'],
+                                    'gol_like', 'lenia_organism'],
                            help='Metric to optimize (default: combined)')
     p_explore.add_argument('--view-size', type=int, default=64,
                            help='Grid size for viewing (default: 64)')
@@ -4459,7 +4520,7 @@ def main():
                            choices=['score', 'gol_coherence', 'projection', 'structure',
                                     'slice_mi', 'combined', 'period', 'glider',
                                     'growth', 'clusters', 'symmetry', 'elegance',
-                                    'gol_like'])
+                                    'gol_like', 'lenia_organism'])
     p_promote.add_argument('--min_quality', type=float, default=0.20,
                            help='Minimum post-rerun score to keep (default: 0.20)')
 

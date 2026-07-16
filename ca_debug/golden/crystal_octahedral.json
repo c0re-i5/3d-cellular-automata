@@ -18,7 +18,7 @@
   "snapshots": [
     {
       "step": 25,
-      "hash": "9283f650fea78c3ed2f8f59dacf9a50d0f1c9cd39933c567c03c2caee169ebb2",
+      "hash": "422b3781c9708810213d9b85351c3555843d4d9814de65e61db508d675c396a1",
       "stats": {
         "shape": [
           48,
@@ -52,11 +52,11 @@
             "nonfinite": 0
           },
           {
-            "mean": 0.0067959134466946125,
-            "std": 0.08035025000572205,
+            "mean": 0.003906717989593744,
+            "std": 0.05567542091012001,
             "min": 0.0,
-            "max": 1.0,
-            "alive": 878,
+            "max": 0.800000011920929,
+            "alive": 543,
             "nonfinite": 0
           }
         ]
@@ -64,7 +64,7 @@
     },
     {
       "step": 100,
-      "hash": "cb0d97f22ec3d53209f7d9d7859efc8c415c74a933c1989f5a44f5aefa8fd063",
+      "hash": "36d7324ade22ba24f24705854d588dc28ef79c8fcc0471d65a2e9cc47ffa53dc",
       "stats": {
         "shape": [
           48,
@@ -98,11 +98,11 @@
             "nonfinite": 0
           },
           {
-            "mean": 0.3627409338951111,
-            "std": 0.45274749398231506,
+            "mean": 0.20213758945465088,
+            "std": 0.34657323360443115,
             "min": 0.0,
-            "max": 1.0,
-            "alive": 52360,
+            "max": 0.800000011920929,
+            "alive": 28193,
             "nonfinite": 0
           }
         ]
@@ -110,7 +110,7 @@
     },
     {
       "step": 250,
-      "hash": "b8538f5f28ce60b8c5f8faf53a99360009d37f472b03f98a922d32049273879b",
+      "hash": "a191ded1c4ea7ccb7cb37c8ae4ce250ab81c1a65e1399148b57c5135b2d12c65",
       "stats": {
         "shape": [
           48,
@@ -144,17 +144,17 @@
             "nonfinite": 0
           },
           {
-            "mean": 0.7542266845703125,
-            "std": 0.36021101474761963,
+            "mean": 0.37061622738838196,
+            "std": 0.3970426023006439,
             "min": 0.0,
-            "max": 1.0,
-            "alive": 108648,
+            "max": 0.800000011920929,
+            "alive": 51765,
             "nonfinite": 0
           }
         ]
       }
     }
   ],
-  "blessed_at": "2026-05-26T22:56:39+00:00",
-  "note": "initial bootstrap (engine state at d9e8968 + Bug J fix)"
+  "blessed_at": "2026-07-16T16:26:11+00:00",
+  "note": "re-bless post pair-2 harness fix (crystal u_src2 was unbound headless; crystal goldens enshrined stale-binding physics) + post Bug G/H + lenia_multi coupling / flow_lenia upwind-FV rewrites"
 }
