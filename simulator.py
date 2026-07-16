@@ -4297,6 +4297,164 @@ void main() {
 }
 """,
 
+    "lenia_rings_potential": """
+// Multi-ring Lenia -- Pass 1 of 2: kernel convolution.
+//
+// CANONICAL KERNEL FAMILY (Chan 2019).  2D Lenia's creature zoo (orbium,
+// geminium, ...) comes substantially from the kernel's per-ring amplitude
+// vector B: the radius is divided into equally-spaced rings, each carrying
+// a bell profile scaled by its own amplitude.  `lenia_3d` exposes only a
+// single ring at a movable position -- a small slice of that family.  Here
+// the kernel is 3 equally-spaced rings with independent amplitudes
+// (u_param1..3), giving the parameter search the same degrees of freedom
+// that produce the 2D zoo.  (Godot ref impl: ThePathfindersCodex
+// lenia-godot-compute-shader, amplitudes [1/2, 7/12, 3/4, 1].)
+//
+// RADIAL LUT.  lenia_3d evaluates exp() per neighbour tap (up to 15^3 =
+// 3375 exp/cell/step).  The kernel weight is a pure function of r_norm,
+// so on the shared-memory path we build a 64-bin radial LUT cooperatively
+// once per workgroup (64 exp total) and the inner loop is one shared-mem
+// read per tap.  The nouveau fallback path (USE_SHARED_MEM=0) evaluates
+// the kernel analytically per tap -- correct, just slower.
+//
+// Normalisation: U = sum(v*k)/sum(k) over the actual taps, exactly like
+// lenia_3d -- the LUT's absolute scale cancels, so amplitudes only shape
+// the kernel, and the growth-band mu range transfers unchanged.
+//
+// Writes pair 2:  r = U (kernel potential).  Pass 2 applies the growth.
+
+#define MAX_R 7
+#define LUT_N 64
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+// Analytic kernel: 3 equally-spaced rings over r_norm in [0,1), each a
+// gaussian bell (centre 0.5 of the ring span, width 0.15) scaled by its
+// amplitude.  Matches Chan's bell(., 0.5, 0.15) ring profile.
+float ring_kernel(float r_norm, float a0, float a1, float a2) {
+    float ring_f = min(r_norm, 0.9999) * 3.0;
+    int ring = int(ring_f);
+    float t = ring_f - float(ring);           // position within ring [0,1)
+    float z = (t - 0.5) / 0.15;
+    float amp = ring == 0 ? a0 : (ring == 1 ? a1 : a2);
+    return amp * exp(-0.5 * z * z);
+}
+
+#if USE_SHARED_MEM
+#define TILE (8 + 2 * MAX_R)
+#define TILE3 (TILE * TILE * TILE)
+shared float s_tile[TILE3];
+shared float s_lut[LUT_N];
+int tile_idx(int x, int y, int z) {
+    return z * TILE * TILE + y * TILE + x;
+}
+#endif
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+    float radius = u_param0;
+    float a0 = u_param1;
+    float a1 = u_param2;
+    float a2 = u_param3;
+
+    // Same resolution floor / saturation cap as lenia_3d (see its notes:
+    // R>=3 avoids the Nyquist checkerboard, MAX_R caps the tile size).
+    int R = clamp(int(round(radius * h_inv)), 3, MAX_R);
+
+#if USE_SHARED_MEM
+    ivec3 local = ivec3(gl_LocalInvocationID);
+    int local_flat = int(gl_LocalInvocationIndex);
+    ivec3 group_origin = ivec3(gl_WorkGroupID) * 8;
+
+    // Cooperative radial-LUT build: threads 0..63 each fill one bin.
+    if (local_flat < LUT_N) {
+        float r_norm = (float(local_flat) + 0.5) / float(LUT_N);
+        s_lut[local_flat] = ring_kernel(r_norm, a0, a1, a2);
+    }
+
+    ivec3 tile_origin = group_origin - ivec3(R);
+    int tile_size = 8 + 2 * R;
+    int tile_count = tile_size * tile_size * tile_size;
+    for (int i = local_flat; i < tile_count; i += 512) {
+        int tz = i / (tile_size * tile_size);
+        int ty = (i / tile_size) % tile_size;
+        int tx = i % tile_size;
+        int sx = tx + (MAX_R - R);
+        int sy = ty + (MAX_R - R);
+        int sz = tz + (MAX_R - R);
+        s_tile[tile_idx(sx, sy, sz)] = fetch(tile_origin + ivec3(tx, ty, tz)).r;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+    ivec3 tp = local + ivec3(MAX_R);
+#else
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+#endif
+
+    float weighted_sum = 0.0;
+    float weight_total = 0.0;
+    float fR = float(R);
+
+    for (int dz = -R; dz <= R; dz++)
+    for (int dy = -R; dy <= R; dy++)
+    for (int dx = -R; dx <= R; dx++) {
+        float dist2 = float(dx*dx + dy*dy + dz*dz);
+        if (dist2 < 0.25) continue;
+        float dist = sqrt(dist2);
+        if (dist > fR + 0.5) continue;
+        float r_norm = dist / fR;
+
+#if USE_SHARED_MEM
+        int bin = min(int(r_norm * float(LUT_N)), LUT_N - 1);
+        float kernel = s_lut[bin];
+        float v = s_tile[tile_idx(tp.x + dx, tp.y + dy, tp.z + dz)];
+#else
+        float kernel = ring_kernel(min(r_norm, 1.0), a0, a1, a2);
+        float v = fetch(pos + ivec3(dx, dy, dz)).r;
+#endif
+        weighted_sum += v * kernel;
+        weight_total += kernel;
+    }
+
+    // 1e-6 guard: all-zero amplitudes give a degenerate kernel.
+    float U = weight_total > 1e-6 ? weighted_sum / weight_total : 0.0;
+    imageStore(u_dst2, pos, vec4(U, 0.0, 0.0, 0.0));
+}
+""",
+
+    "lenia_rings_growth": """
+// Multi-ring Lenia -- Pass 2 of 2: growth update.
+// Reads pass 1's potential U from pair 2 and applies the standard Lenia
+// growth bell + forward Euler + death floor (identical dynamics to
+// lenia_3d's update stage; see its notes for the dt / floor rationale).
+
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float mu = u_param0;
+    float sigma = max(u_param1, 0.001);
+
+    float self = fetch(pos).r;
+    float U = imageLoad(u_src2, pos).r;
+
+    float gz = (U - mu) / sigma;
+    float growth = 2.0 * exp(-0.5 * gz * gz) - 1.0;
+
+    float result = clamp(self + u_dt * growth, 0.0, 1.0);
+    if (result < 0.005) result = 0.0;
+
+    float growth01 = 0.5 + 0.5 * growth;
+    imageStore(u_dst, pos, vec4(result, U, growth01, abs(result - self)));
+}
+""",
+
     "nca_3d": """
 // 3D Neural Cellular Automaton (Mordvintsev et al., "Growing Neural
 // Cellular Automata", Distill 2020 — extended here to 3 dimensions).
@@ -15778,7 +15936,7 @@ RULE_PRESETS = {
         "dt": 0.05,
         "dt_range": (0.01, 0.3),
         "init": "lenia_fbm",
-        "init_variants": ["lenia_fbm", "lenia_blobs"],
+        "init_variants": ["lenia_fbm", "lenia_blobs", "lenia_seeded"],
         "description": "Continuous CA with kernel-based growth — alien lifeforms.",
         "vis_channels": ["State", "Potential", "Growth", "|Δ|"],
         "vis_default": 0,
@@ -15800,13 +15958,17 @@ RULE_PRESETS = {
         "dt": 0.04,
         "dt_range": (0.01, 0.25),
         "init": "lenia_fbm",
-        "init_variants": ["lenia_fbm", "lenia_blobs"],
+        "init_variants": ["lenia_fbm", "lenia_blobs", "lenia_seeded"],
         "description": "Wider growth tolerance + large kernel — fat pulsing creatures that divide and merge.",
         "vis_channels": ["State", "Potential", "Growth", "|Δ|"],
         "vis_default": 0,
         "vis_abs": False,
         "vis_mode": "rgb_channels",
         "boundary": "toroidal",
+        # Same kernel-convolution shader as lenia_3d, same fp16 divergence
+        # (max-diff ~0.6 vs FP32 within 80 steps) — must not fall through
+        # to the size-based rgba16f fallback at size ≥ ~400.
+        "precision": "fp32",
     },
     "lenia_multi": {
         "label": "Multi-channel Lenia",
@@ -15835,6 +15997,9 @@ RULE_PRESETS = {
         "vis_default": 0,
         "vis_abs": False,
         "boundary": "toroidal",
+        # Kernel convolution accumulates per-cell rounding error rapidly
+        # (see lenia_3d) — keep at FP32 regardless of grid size.
+        "precision": "fp32",
     },
     "flow_lenia": {
         "label": "Flow Lenia",
@@ -15875,6 +16040,49 @@ RULE_PRESETS = {
         "vis_default": 0,
         "vis_abs": False,
         "boundary": "toroidal",
+        # Exact mass conservation is the whole point of this rule — fp16
+        # face-flux round-off would break Σ A invariance on large grids.
+        # Kernel pass shares lenia_3d's fp16-divergence profile besides.
+        "precision": "fp32",
+    },
+    "lenia_rings": {
+        "label": "Multi-ring Lenia",
+        # Canonical Chan kernel family: 3 equally-spaced rings with
+        # independent amplitudes (the B vector that generates most of 2D
+        # Lenia's creature zoo).  Two passes because the framework binds
+        # 4 params per pass: pass 1 = convolution (radius + 3 amplitudes,
+        # radial LUT in shared memory), pass 2 = growth update (mu, sigma).
+        # NEW RULE rather than a lenia_3d change so the existing hash-valid
+        # lenia_3d catalogue (and its validated glider regime) stays valid.
+        "shader": "lenia_rings_growth",  # nominal "main" shader; passes override
+        "passes": [
+            {"shader": "lenia_rings_potential", "writes": ["p2"], "kind": "voxel",
+             "param_names": ["Kernel radius", "Ring amp 1", "Ring amp 2", "Ring amp 3"]},
+            {"shader": "lenia_rings_growth", "writes": ["p1"], "kind": "voxel",
+             "param_names": ["Growth center", "Growth width", "_", "_"]},
+        ],
+        "extra_fields": 1,
+        # Default amplitudes follow Chan's classic ascending B profile
+        # ([1/2, 7/12, 3/4, 1] in the 2D reference; collapsed to 3 rings).
+        "params": {"Growth center": 0.15, "Growth width": 0.025,
+                   "Kernel radius": 5.0,
+                   "Ring amp 1": 0.5, "Ring amp 2": 0.7, "Ring amp 3": 1.0},
+        "param_ranges": {"Growth center": (0.005, 0.6), "Growth width": (0.003, 0.15),
+                         "Kernel radius": (2.5, 7.0),
+                         "Ring amp 1": (0.0, 1.0), "Ring amp 2": (0.0, 1.0),
+                         "Ring amp 3": (0.0, 1.0)},
+        "dt": 0.05,
+        "dt_range": (0.01, 0.3),
+        "init": "lenia_fbm",
+        "init_variants": ["lenia_fbm", "lenia_blobs", "lenia_seeded"],
+        "description": "Lenia with the canonical multi-ring kernel — 3 searchable ring amplitudes (Chan's B vector) instead of one movable ring.",
+        "vis_channels": ["State", "Potential", "Growth", "|Δ|"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",
+        "boundary": "toroidal",
+        # Same kernel-convolution fp16 divergence profile as lenia_3d.
+        "precision": "fp32",
     },
     "particle_lenia": {
         "label": "Particle Lenia",
@@ -18534,6 +18742,67 @@ def init_lenia_multi_fbm(size, rng):
             d2 = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) / (r * r)
             base += (0.35 * np.exp(-0.5 * d2)).astype(np.float32)
         data[:, :, :, ch] = np.clip(base, 0.0, 1.0)
+    return data
+
+
+# ── Lenia seed library ──────────────────────────────────────────────────
+# Known-good organism snapshots captured from validated runs (see
+# scripts/capture_lenia_seed.py).  Each .npz in seeds/lenia/ holds a
+# single-channel crop ('field', float32, (s,s,s)) of a living structure.
+# Stamping real creatures instead of hoping the FBM lottery nucleates one
+# turns "sometimes an organism appears" into "organisms are guaranteed".
+_LENIA_SEED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'seeds', 'lenia')
+_lenia_seed_cache = None
+
+
+def _load_lenia_seeds():
+    """Load and cache all seed crops. Returns list of (name, (s,s,s) f32)."""
+    global _lenia_seed_cache
+    if _lenia_seed_cache is None:
+        seeds = []
+        if os.path.isdir(_LENIA_SEED_DIR):
+            for fn in sorted(os.listdir(_LENIA_SEED_DIR)):
+                if fn.endswith('.npz'):
+                    try:
+                        with np.load(os.path.join(_LENIA_SEED_DIR, fn)) as z:
+                            seeds.append((fn[:-4], z['field'].astype(np.float32)))
+                    except Exception as e:  # noqa: BLE001  corrupt seed ≠ fatal
+                        print(f"[seeds] skipping {fn}: {e!r}")
+        _lenia_seed_cache = seeds
+    return _lenia_seed_cache
+
+
+def init_lenia_seeded(size, rng):
+    """Stamp 1-3 captured Lenia organisms into an empty volume at random
+    positions/orientations (axis-aligned rotations + flips only — arbitrary
+    rotations would resample and blur the creature's fine structure).
+
+    Falls back to init_lenia_fbm when the seed library is empty so presets
+    can list this variant unconditionally."""
+    seeds = _load_lenia_seeds()
+    if not seeds:
+        return init_lenia_fbm(size, rng)
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    n = rng.randint(1, 4)
+    for _ in range(n):
+        _, crop = seeds[rng.randint(len(seeds))]
+        # Random orientation from the octahedral group: axis permutation
+        # + per-axis flips (48 orientations, all resample-free).
+        perm = list(rng.permutation(3))
+        crop = np.transpose(crop, perm)
+        for ax in range(3):
+            if rng.random() < 0.5:
+                crop = np.flip(crop, axis=ax)
+        s = crop.shape[0]
+        if s > size:
+            # Volume smaller than the crop: centre-crop the seed.
+            o = (s - size) // 2
+            crop = crop[o:o + size, o:o + size, o:o + size]
+            s = size
+        lo = [rng.randint(0, size - s + 1) for _ in range(3)]
+        region = data[lo[0]:lo[0]+s, lo[1]:lo[1]+s, lo[2]:lo[2]+s, 0]
+        np.maximum(region, crop, out=region)
     return data
 
 
@@ -22674,6 +22943,7 @@ INIT_FUNCS = {
     'smoothlife_fbm': init_smoothlife_fbm,
     'lenia_fbm': init_lenia_fbm,
     'lenia_multi_fbm': init_lenia_multi_fbm,
+    'lenia_seeded': init_lenia_seeded,
     'center_blob': init_center_blob,
     'crystal_seed': init_crystal_seed,
     'crystal_disc_seed': init_crystal_disc_seed,
@@ -23737,9 +24007,42 @@ INIT_FUNCS['sandbox_empty'] = init_sandbox_empty
 # with ALREADY_SIGNALED / CONDITION_SATISFIED if the GPU has finished,
 # or TIMEOUT_EXPIRED otherwise. On a not-yet-ready fence we simply
 # defer the read to a future frame -- never block.
+# Sentinel fence: the dispatch already blocked on the GPU via a moderngl
+# ctx.finish() (headless batch path), so the result is ready *now* and
+# there is no PyOpenGL GLsync object to poll or delete. Mixing PyOpenGL
+# glClientWaitSync with a standalone moderngl context is fragile and can
+# segfault the subsequent buffer read, so headless callers avoid it.
+_DEBUG_FENCE_READY = object()
+
+
+# Kill switch: when CA_NO_GL_FENCE=1, never issue PyOpenGL fence objects.
+# The fence trio (glFenceSync/glClientWaitSync/glDeleteSync) is the only
+# raw-PyOpenGL code in the per-frame hot loop; with fences disabled the
+# SSBO reads fall through to moderngl's implicit synchronous readback
+# (glGetBufferSubData flushes + waits), which is correct — only slightly
+# slower at 384³+. Used to isolate an intermittent GUI heap-corruption
+# segfault suspected to originate in the PyOpenGL/moderngl context mix.
+_NO_GL_FENCE = os.environ.get('CA_NO_GL_FENCE') == '1'
+
+# Auto-browse repro flag (read once at import). Used in _draw_ui to force
+# the discovery tree open; `os` is shadowed as a local inside _draw_ui so
+# it can't read the env directly there.
+_AUTOBROWSE = os.environ.get('CA_AUTOBROWSE') == '1'
+
+# DEBUG: per-frame discovery-list integrity tripwire (see _disc_integrity).
+_DISC_TRIPWIRE = os.environ.get('CA_DISC_TRIPWIRE') == '1'
+
+# DEBUG: per-frame refcount watcher on `self` (see _refwatch). Confirms/locates
+# a C-extension that leaks a DECREF on the Simulator instance every frame.
+_REFWATCH = os.environ.get('CA_REFWATCH') == '1'
+
+
 def _fence_after_dispatch():
     """Insert a fence right after a compute dispatch. Returns the sync
-    handle, or None if the GL driver doesn't support fences."""
+    handle, or None if the GL driver doesn't support fences (or fences
+    are disabled via CA_NO_GL_FENCE, forcing synchronous readback)."""
+    if _NO_GL_FENCE:
+        return None
     try:
         return GL.glFenceSync(GL.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
     except Exception:  # noqa: BLE001  fence sync not supported by driver
@@ -23749,9 +24052,9 @@ def _fence_after_dispatch():
 def _fence_ready(fence):
     """Non-blocking poll. Returns True iff the fence has been signaled.
     Never flushes, never waits."""
-    if fence is None:
-        # No fence available (driver issue) — fall back to "always ready"
-        # so the system still works, just without the stall protection.
+    if fence is None or fence is _DEBUG_FENCE_READY:
+        # No fence available (driver issue) or already blocked via
+        # ctx.finish() — treat as ready so the read proceeds immediately.
         return True
     try:
         result = GL.glClientWaitSync(fence, 0, 0)  # flags=0, timeout=0 ns
@@ -23761,7 +24064,7 @@ def _fence_ready(fence):
 
 
 def _fence_delete(fence):
-    if fence is None:
+    if fence is None or fence is _DEBUG_FENCE_READY:
         return
     try:
         GL.glDeleteSync(fence)
@@ -24159,6 +24462,21 @@ class Simulator:
         self._current_init = self.preset.get('init')
         self.headless = headless
         self.paused = True
+        # --- Deferred UI action queue --------------------------------------
+        # Actions that recompile GPU shader programs or reallocate GL
+        # resources (rule/discovery loads, resets, size changes) MUST NOT run
+        # in the middle of an imgui frame: imgui's PyOpenGL render backend
+        # saves GL_CURRENT_PROGRAM at the start of render() and restores it at
+        # the end, and it also marshals GL state through ctypes. If a UI button
+        # deletes the currently-bound program (glDeleteProgram) or churns the
+        # heap between imgui.new_frame() and imgui.render(), the restore hits
+        # an invalid program handle (GLError 1281) or dereferences a freed
+        # object (use-after-free segfault). We set _in_imgui_frame True only
+        # while _draw_ui() runs; the guarded entry points below enqueue
+        # themselves here instead of executing, and run() drains the queue
+        # after imgui_renderer.render() has fully flushed the frame.
+        self._in_imgui_frame = False
+        self._deferred_frame_actions = []
         self.step_count = 0
         self.sim_speed = 1  # steps per batch
         self.target_sps = 0  # target steps/sec (0 = unlimited, run every frame)
@@ -27715,6 +28033,9 @@ class Simulator:
                     self.viewport_zoom = self.viewport_zoom_base
 
     def _reset(self):
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(self._reset)
+            return
         self._cull_valid = False
         self._accel_textures_valid = False
         self.step_count = 0
@@ -28030,6 +28351,10 @@ class Simulator:
         return np.asarray(self.viewport_origin, dtype=np.float64)
 
     def _change_rule(self, rule_name):
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(
+                lambda r=rule_name: self._change_rule(r))
+            return
         self.rule_name = rule_name
         self.preset = _resolve_composed_preset(rule_name)
         self.params = dict(self.preset['params'])
@@ -28330,6 +28655,10 @@ void main() {
 
     def _change_size(self, new_size):
         if new_size == self.size:
+            return
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(
+                lambda s=new_size: self._change_size(s))
             return
         self._cull_valid = False
         self.tex_a.release()
@@ -28652,6 +28981,9 @@ void main() {
 
     def _randomize_params(self):
         """Randomize all parameters within their defined ranges, including dt if applicable."""
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(self._randomize_params)
+            return
         # Viewport rules: keep the user's current viewpoint (origin, zoom,
         # camera angles) and only fuzz the shape-defining params — Julia c,
         # Mandelbox scale/min-radius, Menger folds, etc. This lets you park
@@ -28704,6 +29036,10 @@ void main() {
 
     def _mutate_params(self, strength=0.2):
         """Small random perturbation of current params, including dt."""
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(
+                lambda s=strength: self._mutate_params(s))
+            return
         ranges = self.preset['param_ranges']
         for name, (lo, hi) in ranges.items():
             if name.startswith("unused"):
@@ -28950,9 +29286,18 @@ void main() {
             # refinement block appears in the browser.
             self._refine_proc = None
             if rc == 0:
-                self._load_discoveries()
-                self._disc_by_rule = None  # invalidate cache
-                self._refine_report_cache.clear()
+                # Defer the reload to the frame boundary: this poller runs
+                # INSIDE the imgui frame (right above the discovery list),
+                # and _load_discoveries() replaces self.discoveries while
+                # rows built from the old list are still being submitted.
+                def _reload_after_refine():
+                    self._load_discoveries()
+                    self._disc_by_rule = None  # invalidate cache
+                    self._refine_report_cache.clear()
+                if getattr(self, '_in_imgui_frame', False):
+                    self._deferred_frame_actions.append(_reload_after_refine)
+                else:
+                    _reload_after_refine()
                 if self._refine_status is None:
                     self._refine_status = {'state': 'done', 'msg': 'complete'}
                 else:
@@ -29081,13 +29426,20 @@ void main() {
         if rc is not None:
             self._explore_proc = None
             if rc == 0:
-                self._load_discoveries()
-                self._disc_by_rule = None
-                appended = len(self.discoveries) - self._explore_disc_count_at_start
-                self._explore_status = {
-                    'state': 'done',
-                    'msg': f'appended {max(appended, 0)} new entries',
-                    'progress': 1.0}
+                # Same mid-frame hazard as _poll_refinement: defer the
+                # discoveries reload to the frame boundary.
+                def _reload_after_explore():
+                    self._load_discoveries()
+                    self._disc_by_rule = None
+                    appended = len(self.discoveries) - self._explore_disc_count_at_start
+                    self._explore_status = {
+                        'state': 'done',
+                        'msg': f'appended {max(appended, 0)} new entries',
+                        'progress': 1.0}
+                if getattr(self, '_in_imgui_frame', False):
+                    self._deferred_frame_actions.append(_reload_after_explore)
+                else:
+                    _reload_after_explore()
             else:
                 self._explore_status = {
                     'state': 'failed',
@@ -29330,6 +29682,10 @@ void main() {
         random_topk=N>1 → pick uniformly from the top N (by score).
         Surfaces a console message if there are no discoveries for this rule.
         """
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(
+                lambda k=random_topk: self._load_best_for_current_rule(k))
+            return
         if not self.discoveries:
             return
         same_rule = [(i, d) for i, d in enumerate(self.discoveries)
@@ -29359,6 +29715,10 @@ void main() {
         the discovery would silently load with default values for the
         missing params and behave nothing like the recorded run.
         """
+        if getattr(self, '_in_imgui_frame', False):
+            self._deferred_frame_actions.append(
+                lambda i=index: self._load_discovery(i))
+            return
         if not self.discoveries or index < 0 or index >= len(self.discoveries):
             return
         disc = self.discoveries[index]
@@ -29483,7 +29843,17 @@ void main() {
 
         prog.run(*self._cu_groups)
         GL.glMemoryBarrier(GL.GL_BUFFER_UPDATE_BARRIER_BIT)
-        self._debug_fence = _fence_after_dispatch()
+        if self.headless:
+            # Headless batch (e.g. refine.py): there is no framerate to
+            # protect, and the non-blocking PyOpenGL fence path
+            # (glFenceSync/glClientWaitSync) mixed with a standalone
+            # moderngl context intermittently segfaults the SSBO read.
+            # Block once on the GPU via moderngl and mark the result ready
+            # to harvest immediately — deterministic, no PyOpenGL sync.
+            self.ctx.finish()
+            self._debug_fence = _DEBUG_FENCE_READY
+        else:
+            self._debug_fence = _fence_after_dispatch()
         self._debug_pending_step = self.step_count
 
     def _harvest_debug_stats(self):
@@ -31191,7 +31561,59 @@ void main() {
             print(f"[perf] save failed: {e!r}", flush=True)
             return None
 
+    def _disc_integrity(self, tag):
+        """DEBUG tripwire (CA_DISC_TRIPWIRE=1): detect the moment a discovery
+        entry stops being a dict — i.e. its slot was prematurely freed and
+        recycled into another object (observed: a closure 'cell'). Logs once
+        with the offending index/type so the first-failing `tag` localises the
+        per-frame region that corrupts the list. Cheap: a type scan of
+        self.discoveries, guarded to fire only once."""
+        if getattr(self, '_disc_corrupt_seen', False):
+            return
+        discs = self.discoveries
+        if type(discs) is not list:
+            self._disc_corrupt_seen = True
+            sys.stderr.write(
+                f"\n[DISC-CORRUPT] tag={tag} self.discoveries is "
+                f"{type(discs).__name__}, not list\n")
+            sys.stderr.flush()
+            return
+        for i, e in enumerate(discs):
+            if type(e) is not dict:
+                self._disc_corrupt_seen = True
+                sys.stderr.write(
+                    f"\n[DISC-CORRUPT] tag={tag} index={i} "
+                    f"type={type(e).__name__} id=0x{id(e):x} "
+                    f"n={len(discs)}\n")
+                try:
+                    if type(e).__name__ == 'cell':
+                        sys.stderr.write(
+                            "[DISC-CORRUPT] cell_contents type="
+                            f"{type(e.cell_contents).__name__}\n")
+                except Exception as _ce:  # noqa: BLE001
+                    sys.stderr.write(f"[DISC-CORRUPT] cell read failed: {_ce!r}\n")
+                sys.stderr.flush()
+                return
+
+    def _refwatch(self, tag):
+        """DEBUG watcher (CA_REFWATCH=1): log sys.getrefcount(self) at fixed
+        per-frame phase boundaries. The `crash` (self becoming a tuple in
+        _draw_colormap_legend) means the Simulator instance is over-DECREF'd a
+        little each frame until it hits 0 and is freed. Comparing the rc value
+        at consecutive tags WITHIN one frame localises the interval that leaks
+        the DECREF; the same tag's value across frames confirms the net drift."""
+        if not _REFWATCH:
+            return
+        if tag == 'post-step':
+            self._refwatch_frame = getattr(self, '_refwatch_frame', 0) + 1
+        n = getattr(self, '_refwatch_frame', 0)
+        rc = sys.getrefcount(self)
+        sys.stderr.write(f"[REFWATCH] f={n} {tag} rc={rc}\n")
+        sys.stderr.flush()
+
     def _draw_ui(self):
+        if _DISC_TRIPWIRE:
+            self._disc_integrity('draw-top')
         imgui.set_next_window_pos(imgui.ImVec2(10, 10), imgui.Cond_.first_use_ever)
         imgui.set_next_window_size(imgui.ImVec2(320, 0), imgui.Cond_.first_use_ever)
 
@@ -31718,28 +32140,58 @@ void main() {
             # ── Refinement controls ──────────────────────────────
             # Poll the running refine subprocess (cheap; throttled to
             # 4 Hz internally) and draw the status row / launch buttons.
+            if _DISC_TRIPWIRE:
+                self._disc_integrity('pre-poll_refinement')
             self._poll_refinement()
+            if _DISC_TRIPWIRE:
+                self._disc_integrity('post-poll_refinement')
             self._draw_refinement_controls()
+            if _DISC_TRIPWIRE:
+                self._disc_integrity('post-refinement_controls')
 
             # Scrollable discovery list with rule headers
             if imgui.begin_child("##disc_list", imgui.ImVec2(0, 200), imgui.ChildFlags_.borders):
+                # Auto-browse repro: sweep the scroll position through the
+                # whole list each frame so every clipped row is rendered/
+                # hovered over time — this mimics the manual scrolling that
+                # surfaces the heap corruption (the list lives in a clipped
+                # child, so a pinned scroll only ever renders the top rows).
+                if _AUTOBROWSE:
+                    _maxsy = imgui.get_scroll_max_y()
+                    if _maxsy > 0:
+                        _frac = (time.time() * 0.12) % 1.0
+                        imgui.set_scroll_y(_frac * _maxsy)
+                if _DISC_TRIPWIRE:
+                    self._disc_integrity('pre-disclist-loop')
+                # Hold a strong reference to every discovery dict for the
+                # duration of the list render. self.discoveries is read fresh
+                # each row via `discs[idx]`, so an over-DECREF or a mid-frame
+                # list replacement can no longer free a dict out from under
+                # the render (root cause of the browse-time heap corruption:
+                # a freed dict's block was recycled into a sort-lambda cell).
+                discs = list(self.discoveries)
                 show_rules = by_rule.keys() if self._disc_show_all else \
                     [r for r in by_rule if r == self.rule_name]
                 for rule_name in show_rules:
                     indices = by_rule[rule_name]
                     if self._disc_marked_only:
-                        indices = [i for i in indices if self.discoveries[i].get('marked')]
+                        indices = [i for i in indices if discs[i].get('marked')]
                         if not indices:
                             continue
                     # Sort by selected mode
                     if self._disc_sort_mode == 0:
-                        indices_sorted = sorted(indices, key=lambda i: get_field(self.discoveries[i], 'score', 0), reverse=True)
+                        indices_sorted = sorted(indices, key=lambda i: get_field(discs[i], 'score', 0), reverse=True)
                     else:
                         indices_sorted = sorted(indices, reverse=True)  # newest first (highest index)
+                    # Auto-browse repro: force every rule's tree node open so
+                    # the full per-row discovery loop (the crash surface where
+                    # the float64 heap corruption manifests) renders each frame.
+                    if _AUTOBROWSE:
+                        imgui.set_next_item_open(True)
                     header_open = imgui.tree_node(f"{rule_name} ({len(indices)})##rh_{rule_name}")
                     if header_open:
                         for idx in indices_sorted:
-                            d = self.discoveries[idx]
+                            d = discs[idx]
                             sc = get_field(d, 'score', 0)
                             gc = d.get('gol_coherence', 0)
                             pc = d.get('projection_complexity', 0)
@@ -33047,6 +33499,114 @@ void main() {
                 t_after_poll = time.perf_counter()
                 sec['poll'] = t_after_poll - t0
 
+                # ── Hands-off auto-browse driver (CA_AUTOBROWSE=1) ─────
+                # Reproduces the intermittent GUI heap-corruption segfault
+                # without manual interaction: steps through saved
+                # discoveries (the exact "browse the list" action that
+                # triggers it) so the corrupting write can be caught under
+                # valgrind / faulthandler unattended. Env knobs:
+                #   CA_AUTOBROWSE_RULE   filter to one rule (default: all)
+                #   CA_AUTOBROWSE_STEPS  steps/batch = sim_speed (default 2)
+                #   CA_AUTOBROWSE_DWELL  sim steps per discovery (default 200)
+                #   CA_AUTOBROWSE_SWEEPS full passes before quit (default 3)
+                if os.environ.get('CA_AUTOBROWSE') == '1' and self.discoveries:
+                    if not hasattr(self, '_ab_indices'):
+                        want = os.environ.get('CA_AUTOBROWSE_RULE', '').strip()
+                        self._ab_indices = [
+                            i for i, d in enumerate(self.discoveries)
+                            if (not want or get_field(d, 'rule', '') == want)
+                        ]
+                        # Match the UI's default "Newest first" sort: browse
+                        # highest-index (newest) entries first. Set
+                        # CA_AUTOBROWSE_REVERSE=0 to go oldest-first instead.
+                        if os.environ.get('CA_AUTOBROWSE_REVERSE', '1') != '0':
+                            self._ab_indices.reverse()
+                        self._ab_pos = -1
+                        self._ab_sweeps = 0
+                        self._ab_load_step = 0
+                        self._ab_speed = max(1, int(
+                            os.environ.get('CA_AUTOBROWSE_STEPS', '2')))
+                        self._ab_dwell = max(1, int(
+                            os.environ.get('CA_AUTOBROWSE_DWELL', '200')))
+                        self._ab_max_sweeps = int(
+                            os.environ.get('CA_AUTOBROWSE_SWEEPS', '3'))
+                        sys.stderr.write(
+                            f"[autobrowse] {len(self._ab_indices)} discoveries "
+                            f"match rule={want or '<all>'}; {self._ab_speed} "
+                            f"steps/batch, dwell {self._ab_dwell} steps, "
+                            f"{self._ab_max_sweeps} sweeps\n")
+                        sys.stderr.flush()
+                    # Force unpaused stepping at the requested batch size.
+                    self.paused = False
+                    self.sim_speed = self._ab_speed
+                    if self._ab_indices:
+                        need_advance = (
+                            self._ab_pos < 0
+                            or (self.step_count - self._ab_load_step)
+                            >= self._ab_dwell)
+                        if need_advance:
+                            self._ab_pos += 1
+                            if self._ab_pos >= len(self._ab_indices):
+                                self._ab_pos = 0
+                                self._ab_sweeps += 1
+                                sys.stderr.write(
+                                    f"[autobrowse] sweep {self._ab_sweeps}/"
+                                    f"{self._ab_max_sweeps} complete "
+                                    f"({len(self._ab_indices)} entries)\n")
+                                sys.stderr.flush()
+                                if self._ab_sweeps >= self._ab_max_sweeps:
+                                    glfw.set_window_should_close(
+                                        self.window, True)
+                            idx = self._ab_indices[self._ab_pos]
+                            try:
+                                self._load_discovery(idx)
+                            except Exception as e:  # noqa: BLE001  keep going
+                                sys.stderr.write(
+                                    f"[autobrowse] load {idx} failed: {e}\n")
+                            self._ab_load_step = self.step_count
+                            if self._ab_pos % 25 == 0:
+                                sys.stderr.write(
+                                    f"[autobrowse] pos {self._ab_pos}/"
+                                    f"{len(self._ab_indices)} -> disc #{idx}\n")
+                                sys.stderr.flush()
+
+                # ── Hands-off auto-randomize driver (CA_AUTORANDOM=1) ──
+                # The user reproduces the heap-corruption segfault by
+                # hammering the Randomize button. Randomize and load-
+                # discovery share the CA-reload path (_reset: rewrite GPU
+                # textures, release+realloc agents/particles/entity-arena,
+                # rotate run recorder). This driver fires _randomize_params
+                # every CA_AUTORANDOM_DWELL frames, un-deferred (we are NOT
+                # inside an imgui frame here), so the reset runs synchronously
+                # and any wild heap write is caught by the tripwire /
+                # faulthandler without manual clicking.
+                #   CA_AUTORANDOM_DWELL  frames between randomizes (default 4)
+                if os.environ.get('CA_AUTORANDOM') == '1':
+                    if not hasattr(self, '_ar_dwell'):
+                        self._ar_dwell = max(1, int(
+                            os.environ.get('CA_AUTORANDOM_DWELL', '4')))
+                        self._ar_last = 0
+                        self._ar_count = 0
+                        sys.stderr.write(
+                            f"[autorandom] randomize every {self._ar_dwell} "
+                            "frames\n")
+                        sys.stderr.flush()
+                    self._ar_last += 1
+                    if self._ar_last >= self._ar_dwell:
+                        self._ar_last = 0
+                        self._ar_count += 1
+                        try:
+                            self._randomize_params()
+                        except Exception as e:  # noqa: BLE001  keep going
+                            sys.stderr.write(
+                                f"[autorandom] randomize failed: {e}\n")
+                        if _DISC_TRIPWIRE:
+                            self._disc_integrity('post-autorandom')
+                        if self._ar_count % 50 == 0:
+                            sys.stderr.write(
+                                f"[autorandom] {self._ar_count} randomizes\n")
+                            sys.stderr.flush()
+
                 # Auto-rotate camera (frame-rate independent). Wall-clock
                 # advance for the live preview + realtime-mode recording;
                 # per_step-mode recording uses output-FPS advance applied
@@ -33109,6 +33669,10 @@ void main() {
                 # or fence not yet signaled). Cheap.
                 self._harvest_debug_stats()
                 sec['step'] = time.perf_counter() - t_step_start - sec.get('score', 0.0)
+                if _DISC_TRIPWIRE:
+                    self._disc_integrity('post-step')
+                if _REFWATCH:
+                    self._refwatch('post-step')
 
                 # Render — skip if scene state is identical to last frame
                 # (camera still, sim paused or between steps, UI knobs idle).
@@ -33139,6 +33703,8 @@ void main() {
                             if not k.startswith('_'):
                                 sec[f'render.{k}'] = v
                 sec['render'] = time.perf_counter() - t_render_start
+                if _REFWATCH:
+                    self._refwatch('post-render')
 
                 # Capture frame for video (scene only, before UI overlay).
                 # Two cadences:
@@ -33195,12 +33761,39 @@ void main() {
 
                 # Render UI
                 t_ui_start = time.perf_counter()
+                if _DISC_TRIPWIRE:
+                    self._disc_integrity('pre-draw_ui')
+                if _REFWATCH:
+                    self._refwatch('pre-ui')
                 imgui.new_frame()
+                self._in_imgui_frame = True
                 self._draw_ui()
+                if _REFWATCH:
+                    self._refwatch('post-draw_ui')
                 self._draw_debug_overlay()
                 self._draw_perf_overlay(section_history)
+                if _REFWATCH:
+                    self._refwatch('post-overlays')
+                self._in_imgui_frame = False
                 imgui.render()
+                if _REFWATCH:
+                    self._refwatch('post-imgui_render')
                 self.imgui_renderer.render(imgui.get_draw_data())
+                if _REFWATCH:
+                    self._refwatch('post-renderer_render')
+                # Drain UI-triggered actions that recompile shaders / realloc
+                # GL resources now that the imgui frame is fully flushed. Doing
+                # this here (rather than mid-_draw_ui) is what keeps a deleted
+                # GL program from being left bound when imgui restores its saved
+                # GL_CURRENT_PROGRAM — the root cause of the intermittent
+                # glUseProgram(deleted) GLError / use-after-free segfault.
+                if self._deferred_frame_actions:
+                    _pending = self._deferred_frame_actions
+                    self._deferred_frame_actions = []
+                    for _act in _pending:
+                        _act()
+                if _DISC_TRIPWIRE:
+                    self._disc_integrity('post-drain')
                 sec['ui'] = time.perf_counter() - t_ui_start
 
                 t_swap_start = time.perf_counter()
