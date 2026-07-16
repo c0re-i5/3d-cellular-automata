@@ -1,0 +1,91 @@
+# Valgrind suppressions for NVIDIA/Mesa GL, GLFW, OpenBLAS and pyarrow noise.
+# These libraries do intentional-but-valgrind-unfriendly things (custom
+# allocators, uninitialised pad reads, thread-pool spin state). Suppressing
+# them keeps the log focused on OUR heap-corruption bug. Regenerate/extend
+# with --gen-suppressions=all if new noise appears.
+
+{
+   nvidia-gl-cond
+   Memcheck:Cond
+   obj:*/libnvidia-*.so*
+}
+{
+   nvidia-gl-value8
+   Memcheck:Value8
+   obj:*/libnvidia-*.so*
+}
+{
+   nvidia-gl-addr8
+   Memcheck:Addr8
+   obj:*/libnvidia-*.so*
+}
+{
+   nvidia-gl-addr4
+   Memcheck:Addr4
+   obj:*/libnvidia-*.so*
+}
+{
+   nvidia-gl-addr16
+   Memcheck:Addr16
+   obj:*/libnvidia-*.so*
+}
+{
+   nvidia-gl-leak
+   Memcheck:Leak
+   obj:*/libnvidia-*.so*
+}
+{
+   nvidia-glcore-cond
+   Memcheck:Cond
+   obj:*/libGLX_nvidia.so*
+}
+{
+   nvidia-egl-cond
+   Memcheck:Cond
+   obj:*/libEGL_nvidia.so*
+}
+{
+   nvidia-eglcore-addr8
+   Memcheck:Addr8
+   obj:*/libEGL_nvidia.so*
+}
+{
+   nvidia-eglcore-addr4
+   Memcheck:Addr4
+   obj:*/libEGL_nvidia.so*
+}
+{
+   libgl-cond
+   Memcheck:Cond
+   obj:*/libGL.so*
+}
+{
+   libglx-cond
+   Memcheck:Cond
+   obj:*/libGLX.so*
+}
+{
+   glfw-cond
+   Memcheck:Cond
+   obj:*/libglfw*.so*
+}
+{
+   openblas-cond
+   Memcheck:Cond
+   obj:*/libscipy_openblas*.so*
+}
+{
+   openblas-value8
+   Memcheck:Value8
+   obj:*/libscipy_openblas*.so*
+}
+{
+   arrow-cond
+   Memcheck:Cond
+   obj:*/libarrow.so*
+}
+{
+   arrow-leak
+   Memcheck:Leak
+   obj:*/libarrow.so*
+}
