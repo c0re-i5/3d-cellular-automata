@@ -117,54 +117,56 @@ def _category_for(rule: str) -> str:
     return 'Cellular Automaton'
 
 
-# Human "hooks" for Shorts titles.  These translate the technical preset
-# name into a concrete, swipe-stopping phrase: an active verb + a
-# physical metaphor a non-specialist can picture in half a second.  The
-# searchable proper noun still lives in the science category that
-# follows the em-dash (e.g. "3D Spin System"), so we keep algorithm
-# reach while giving a human a reason to stop.
+# Human "hooks" for Shorts titles.  These now lead with the actual
+# model / algorithm proper noun (Ising, Gray-Scott, Lenia, Kuramoto,
+# Belousov-Zhabotinsky …) followed by a short concrete descriptor.  The
+# proper noun is simultaneously the most technically accurate label AND
+# the most searchable keyword, so it "catches the algorithm" (SEO) while
+# still telling a viewer exactly what they're looking at.  When the hook
+# already contains the science category (see the title assembly), the
+# "— 3D {category}" anchor is dropped to avoid a literal keyword repeat.
 #
 # Order matters: the first matching prefix wins (same as _CATEGORY_RULES).
 # Rules whose label is ALREADY human and high-search (Game of Life,
 # SmoothLife, Crystal, 4/4/5) are intentionally absent so their proven
 # label passes through unchanged.
 _HOOK_RULES: tuple[tuple[str, str], ...] = (
-    ('bz_', 'Chemical Spirals That Never Stop'),
-    ('hodgepodge', 'A Chemical Clock Comes Alive'),
-    ('cyclic_ca', 'Colors Chasing Each Other Forever'),
-    ('greenberg_hastings', 'Self-Healing Waves Race Around'),
-    ('gray_scott', 'Patterns That Copy Themselves'),
-    ('reaction_diffusion', 'Patterns That Copy Themselves'),
-    ('schnakenberg', 'Spots Growing Into Stripes'),
-    ('brusselator', 'A Chemical Clock Ticking in 3D'),
-    ('morphogen', 'How an Animal Gets Its Spots'),
-    ('fitzhugh', 'Heartbeat Waves Pulsing in 3D'),
-    ('xy_spin', 'A Magnet Making Up Its Mind'),
-    ('ising', 'A Magnet Making Up Its Mind'),
-    ('kuramoto', 'Thousands of Clocks Snapping Into Sync'),
-    ('flocking', 'A Swarm That Thinks as One'),
-    ('active_nematic', 'A Fluid That Stirs Itself'),
-    ('lenia', 'Digital Lifeforms Evolving'),
-    ('eden', 'A Crystal That Builds Itself'),
-    ('forest_fire', 'Fires That Never Burn Out'),
-    ('sandpile', 'The Pile That Collapses Itself'),
-    ('predator_prey', 'Hunters and Prey Locked in Balance'),
-    ('prisoners_dilemma', 'Cooperation vs Betrayal, Spreading'),
-    ('physarum', 'Slime Mold Finding the Shortest Path'),
-    ('mycelium', 'A Fungal Network Creeping Outward'),
-    ('lichen', 'Lichen Crawling Across Stone'),
-    ('sine_gordon', 'Solitons Passing Through Each Other'),
-    ('em_wave', 'Light Waves You Can Actually See'),
-    ('dirac', 'Antimatter Rippling Through Space'),
-    ('quantum_', 'A Quantum Particle Spreading Out'),
-    ('wave', 'Ripples Racing Through a 3D Lattice'),
-    ('hopfion', 'A Knot of Energy That Holds Its Shape'),
-    ('phase_separation', 'Oil and Water Pulling Apart'),
-    ('nucleation', 'Droplets Condensing Out of Nothing'),
-    ('fracture', 'Watch a Solid Shatter From Within'),
-    ('erosion', 'A Landscape Carving Itself'),
-    ('wireworld', 'Electricity Computing on a Grid'),
-    ('langton_ant', 'One Ant Builds a Highway'),
+    ('bz_', 'Belousov-Zhabotinsky Spirals'),
+    ('hodgepodge', 'The Hodgepodge Machine'),
+    ('cyclic_ca', 'Cyclic Automaton Spiral Waves'),
+    ('greenberg_hastings', 'Greenberg-Hastings Waves'),
+    ('gray_scott', 'Gray-Scott Patterns Replicating'),
+    ('reaction_diffusion', 'Turing Patterns Emerging'),
+    ('schnakenberg', 'Schnakenberg Turing Patterns'),
+    ('brusselator', 'The Brusselator Oscillating'),
+    ('morphogen', 'Morphogenesis: How Spots Form'),
+    ('fitzhugh', 'FitzHugh-Nagumo Heartbeat Waves'),
+    ('xy_spin', 'The XY Model Aligning Spins'),
+    ('ising', 'The Ising Model Flipping Spins'),
+    ('kuramoto', 'Kuramoto Model Synchronizing'),
+    ('flocking', 'Vicsek Flocking Swarm'),
+    ('active_nematic', 'Active Nematic Turbulence'),
+    ('lenia', 'Lenia: Continuous Digital Life'),
+    ('eden', 'The Eden Growth Model'),
+    ('forest_fire', 'The Forest-Fire Model'),
+    ('sandpile', 'The Abelian Sandpile'),
+    ('predator_prey', 'Lotka-Volterra Predator & Prey'),
+    ('prisoners_dilemma', "Spatial Prisoner's Dilemma"),
+    ('physarum', 'Physarum Slime-Mold Networks'),
+    ('mycelium', 'Mycelium Network Growing'),
+    ('lichen', 'Diffusion-Limited Lichen Growth'),
+    ('sine_gordon', 'Sine-Gordon Solitons Colliding'),
+    ('em_wave', "Maxwell's Electromagnetic Waves"),
+    ('dirac', 'The Dirac Equation in 3D'),
+    ('quantum_', 'Schrödinger Wavefunction'),
+    ('wave', 'The 3D Wave Equation'),
+    ('hopfion', 'A Hopfion: Knotted Energy Field'),
+    ('phase_separation', 'Cahn-Hilliard Phase Separation'),
+    ('nucleation', 'Nucleation and Droplet Growth'),
+    ('fracture', 'Peridynamic Fracture'),
+    ('erosion', 'Hydraulic Erosion Carving Terrain'),
+    ('wireworld', 'Wireworld: A Circuit That Computes'),
+    ('langton_ant', "Langton's Ant Builds a Highway"),
 )
 
 
@@ -347,7 +349,15 @@ def build_metadata(sidecar_path: Path) -> dict:
         # high-search (Game of Life, SmoothLife, 4/4/5, Crystal) fall
         # back to their cleaned label.
         hook_seg = _hook_for(rule) or _humanize_label(title_label)
-        title = f'{hook_seg} — 3D {category} #Shorts'
+        # If the hook already names the science proper noun (i.e. the
+        # category phrase appears within it, e.g. "The 3D Wave Equation"
+        # vs category "Wave Equation"), the "— 3D {category}" anchor is a
+        # literal keyword repeat — analytics flagged repeats as a negative
+        # "same again" signal — so drop it. Otherwise keep it for reach.
+        if category.lower() in hook_seg.lower():
+            title = f'{hook_seg} #Shorts'
+        else:
+            title = f'{hook_seg} — 3D {category} #Shorts'
         if len(title) > TITLE_MAX:
             title = f'{hook_seg} #Shorts'
         if len(title) > TITLE_MAX:
