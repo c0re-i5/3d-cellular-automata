@@ -4595,7 +4595,9 @@ def cmd_explore(ctx, args):
 def main():
     parser = argparse.ArgumentParser(description="3D CA Test Harness")
     parser.add_argument('--size', type=int, default=32, help='Grid size (default: 32)')
-    parser.add_argument('--steps', type=int, default=100, help='Simulation steps (default: 100)')
+    parser.add_argument('--steps', type=int, default=None,
+                        help='Simulation steps. Default: the rule\'s measured '
+                             'horizon from simulator.SEARCH_STEPS, else 100.')
     parser.add_argument('--seed', type=int, default=42, help='RNG seed')
     parser.add_argument('--verbose', '-v', action='store_true')
     parser.add_argument('--record', action='store_true',
@@ -4700,6 +4702,17 @@ def main():
 
     if not args.command:
         args.command = 'audit'
+
+    # Unspecified --steps resolves to the rule's measured horizon. Running a
+    # rule past its active window collapses it to the score floor, which the
+    # search then rejects; see simulator.SEARCH_STEPS.
+    if args.steps is None:
+        from simulator import SEARCH_STEPS_DEFAULT, get_search_steps
+        rule = getattr(args, 'rule', None)
+        # `test` is an interactive spot-check, so it stays cheap when the rule
+        # has no measured horizon. Everything else runs for real.
+        fallback = 100 if args.command == 'test' else SEARCH_STEPS_DEFAULT
+        args.steps = get_search_steps(rule, default=fallback) if rule else fallback
 
     window, ctx = create_headless_context()
 

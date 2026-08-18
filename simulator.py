@@ -25931,6 +25931,79 @@ def _mandelbulb_surface_point(power=8.0, bailout=4.0, max_iter=200, rng=None,
     return np.array([-0.521, 0.221, 0.7])
 
 
+# Measured step horizons -- the tracked fix for the horizon bug class.
+#
+# Most rules are interesting only inside a finite window and then settle into
+# a uniform field.  Run past that window and the spatial-uniformity damper
+# drags the score to the 0.100 floor; because MIN_QUALITY is 0.10, *every*
+# trial is then rejected and the rule looks broken when only its step count
+# was wrong.  A few rules have the opposite problem and are still developing
+# at 500.
+#
+# This lived in STEPS_BY_RULE inside gitignored batch_*.sh, so the one fact
+# that decides whether a rule can score at all was untracked and invisible to
+# the harness.  It lives here now.
+#
+# Values are the earliest horizon reaching >=90% of the rule's peak score,
+# measured at size 64 over 2 seeds.  The comment records the peak and the
+# fraction of achievable score given up by running at 500 instead.
+# Regenerate with:  python -m ca_debug.horizon --all --only-misfit
+#
+# Rules absent from this table use SEARCH_STEPS_DEFAULT.
+SEARCH_STEPS_DEFAULT = 500
+
+SEARCH_STEPS = {
+    '445_rule'                        :   50,  # peak 0.779@200, 500 lost 30%
+    'active_phase_separation'         :   50,  # peak 0.152@50, 500 lost 90%
+    'compressible_euler_3d'           : 1000,  # peak 0.171@1000, 500 lost 69%
+    'crystal_cubic'                   :  200,  # peak 0.871@200, 500 lost 94%
+    'crystal_octahedral'              :  100,  # peak 0.726@100, 500 lost 98%
+    'crystal_polycrystal'             :  200,  # peak 0.807@200, 500 lost 96%
+    'eden_3d'                         :   50,  # peak 0.338@50, 500 lost 97%
+    'element_ca'                      :  200,  # peak 0.355@200, 500 lost 40%
+    'fcc_445'                         :   50,  # peak 0.774@50, 500 lost 59%
+    'fcc_eden'                        :   50,  # peak 0.762@50, 500 lost 99%
+    'fcc_gray_scott'                  :  200,  # peak 0.707@200, 500 lost 55%
+    'fcc_gray_scott_worms'            :  200,  # peak 0.761@200, 500 lost 39%
+    'fcc_hodgepodge'                  :  100,  # peak 0.124@100, 500 lost 66%
+    'fcc_lichen'                      :   50,  # peak 0.564@50, 500 lost 88%
+    'fcc_particle_life'               :  200,  # peak 0.541@200, 500 lost 34%
+    'fcc_sandpile'                    : 2000,  # peak 0.544@2000, 500 lost 54%
+    'fcc_xy_spin'                     : 2000,  # peak 0.517@2000, 500 lost 38%
+    'fire'                            :   50,  # peak 0.687@200, 500 lost 100%
+    'flagship_dendrite_crystal'       :  200,  # peak 0.916@200, 500 lost 78%
+    'flagship_dual_lenia'             :   50,  # peak 0.742@50, 500 lost 58%
+    'flagship_iso_smoothlife'         :  200,  # peak 0.892@200, 500 lost 73%
+    'flagship_lightning_fire'         : 1000,  # peak 0.350@1000, 500 lost 71%
+    'flagship_sphere_genesis'         :   50,  # peak 0.744@100, 500 lost 61%
+    'genome_ca_3d'                    :   50,  # peak 0.465@50, 500 lost 98%
+    'hopfion_3d'                      :  200,  # peak 0.830@200, 500 lost 58%
+    'lenia_3d'                        :  200,  # peak 0.911@200, 500 lost 58%
+    'lenia_geminium'                  :  200,  # peak 0.881@200, 500 lost 55%
+    'lenia_rings'                     :  200,  # peak 0.886@200, 500 lost 37%
+    'lichen'                          :   50,  # peak 0.564@50, 500 lost 91%
+    'mycelium'                        :  200,  # peak 0.922@2000, 500 lost 84%
+    'phase_separation'                :   50,  # peak 0.111@50, 500 lost 91%
+    'physarum'                        :   50,  # peak 0.616@50, 500 lost 43%
+    'schnakenberg_3d'                 : 2000,  # peak 0.337@2000, 500 lost 65%
+    'smoothlife_3d'                   :  200,  # peak 0.892@200, 500 lost 73%
+    'volcanic_3d'                     :  200,  # peak 0.749@200, 500 lost 34%
+    'wave_3d'                         :  200,  # peak 0.762@200, 500 lost 41%
+    'wireworld_3d'                    :   50,  # peak 0.624@100, 500 lost 78%
+}
+
+
+def get_search_steps(rule_name, default=None):
+    """Steps to run `rule_name` for. A preset's own 'search_steps' wins."""
+    preset = RULE_PRESETS.get(rule_name)
+    if preset is not None:
+        own = preset.get('search_steps')
+        if own:
+            return int(own)
+    return int(SEARCH_STEPS.get(
+        rule_name, SEARCH_STEPS_DEFAULT if default is None else default))
+
+
 def _resolve_composed_preset(name):
     """Return a fully-resolved preset dict for `name`, expanding any
     `compose` field into a concatenated passes list. If the named preset
