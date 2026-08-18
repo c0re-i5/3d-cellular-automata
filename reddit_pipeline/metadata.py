@@ -95,6 +95,9 @@ def build_submission(sidecar_path: Path, youtube_url: str) -> dict:
                   and resolution[1] > resolution[0])
     category = _category_for(rule)
     hook = _hook_from_description(desc)
+    time_axis = meta.get('time_axis') or {}
+    is_time_axis = bool(time_axis.get('enabled'))
+    ta_reduction = time_axis.get('reduction', 'slice')
 
     # ── Title ─────────────────────────────────────────────────────────
     # Audience here already knows it's a CA simulation, so skip the
@@ -115,6 +118,10 @@ def build_submission(sidecar_path: Path, youtube_url: str) -> dict:
             title = f'{label}  [{category}]'
     else:
         title = f'{label}  [{category}]'
+    if is_time_axis:
+        _st = ' · Spacetime'
+        if len(title) + len(_st) <= TITLE_MAX:
+            title += _st
     title = title[:TITLE_MAX]
 
     # ── Body ──────────────────────────────────────────────────────────
@@ -133,6 +140,22 @@ def build_submission(sidecar_path: Path, youtube_url: str) -> dict:
     # the submission is also a link post. Visible inline matters.
     parts.append('')
     parts.append(f'🎬 **[Watch the full recording]({youtube_url})**')
+
+    # Spacetime note — explain the time-as-an-axis rendering when active.
+    if is_time_axis:
+        parts.append('')
+        parts.append('### Visualization: spacetime (time as an axis)')
+        parts.append('')
+        _mode = ('the densest cell of each column is projected down the '
+                 'time axis' if ta_reduction == 'shadow'
+                 else 'a single 2D cross-section is stacked over time')
+        parts.append(
+            'This is rendered as a **spacetime diagram**: each successive '
+            'generation is stacked along the vertical (z) axis, so time '
+            'itself becomes the third spatial dimension. The 3D shape is the '
+            "rule's entire recent history at once — a travelling pattern "
+            'traces a diagonal world-line, an oscillator becomes a periodic '
+            f'column, and growth fans into a solid volume ({_mode}).')
 
     # Reproduction block. The whole point of this community is that
     # discoveries are reproducible, so this gets prominent placement.

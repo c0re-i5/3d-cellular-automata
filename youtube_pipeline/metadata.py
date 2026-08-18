@@ -47,7 +47,10 @@ _CATEGORY_RULES: tuple[tuple[str, str], ...] = (
     ('flocking', 'Active Matter'),
     ('active_nematic', 'Active Matter'),
     ('xy_spin', 'Spin System'),
+    ('frustrated_af', 'Frustrated Magnetism'),
     ('ising', 'Spin System'),
+    ('potts_grain', 'Materials Science'),
+    ('stacking', 'Materials Science'),
     ('kuramoto', 'Coupled Oscillators'),
     ('sine_gordon', 'Soliton Dynamics'),
     ('wave', 'Wave Equation'),
@@ -79,6 +82,8 @@ _CATEGORY_RULES: tuple[tuple[str, str], ...] = (
     ('larger_than_life', 'Life-Like CA'),
     ('445_rule', 'Life-Like CA'),
     ('445', 'Life-Like CA'),
+    ('hex_spacetime', 'Spacetime CA'),
+    ('spacetime', 'Spacetime CA'),
     ('game_of_life', 'Life-Like CA'),
     ('smoothlife', 'Life-Like CA'),
     ('life', 'Life-Like CA'),
@@ -142,7 +147,10 @@ _HOOK_RULES: tuple[tuple[str, str], ...] = (
     ('morphogen', 'Morphogenesis: How Spots Form'),
     ('fitzhugh', 'FitzHugh-Nagumo Heartbeat Waves'),
     ('xy_spin', 'The XY Model Aligning Spins'),
+    ('frustrated_af', 'Geometric Frustration: Spins That Cannot Agree'),
     ('ising', 'The Ising Model Flipping Spins'),
+    ('potts_grain', 'Watching Metal Grains Grow'),
+    ('stacking', 'Stacking Faults and Crystal Twins'),
     ('kuramoto', 'Kuramoto Model Synchronizing'),
     ('flocking', 'Vicsek Flocking Swarm'),
     ('active_nematic', 'Active Nematic Turbulence'),
@@ -167,6 +175,7 @@ _HOOK_RULES: tuple[tuple[str, str], ...] = (
     ('erosion', 'Hydraulic Erosion Carving Terrain'),
     ('wireworld', 'Wireworld: A Circuit That Computes'),
     ('langton_ant', "Langton's Ant Builds a Highway"),
+    ('hex_spacetime', 'A Hexagonal Automaton Growing a Crystal'),
 )
 
 
@@ -332,6 +341,11 @@ def build_metadata(sidecar_path: Path) -> dict:
     category = _category_for(rule)
     hook = _hook_from_description(desc)
     music_credit = _music_credit(meta)
+    # Spacetime "time-axis" render flag (set by the simulator when the clip
+    # was recorded with time rendered as the third axis).
+    time_axis = meta.get('time_axis') or {}
+    is_time_axis = bool(time_axis.get('enabled'))
+    ta_reduction = time_axis.get('reduction', 'slice')
 
     # ── Title ─────────────────────────────────────────────────────────
     # Strip the in-app "Flagship: " curation prefix — viewers searching
@@ -375,6 +389,16 @@ def build_metadata(sidecar_path: Path) -> dict:
                 title = f'{title_label} | {anchor}'
         else:
             title = f'{title_label} | {anchor}'
+    # Spacetime marker: flag the time-as-an-axis rendering in the title,
+    # but only when it actually fits under the length cap.
+    if is_time_axis:
+        _st = ' · Spacetime'
+        if shorts and title.endswith(' #Shorts'):
+            _cand = title[:-len(' #Shorts')] + _st + ' #Shorts'
+        else:
+            _cand = title + _st
+        if len(_cand) <= TITLE_MAX:
+            title = _cand
     title = title[:TITLE_MAX]
 
     # ── Description ───────────────────────────────────────────────────
@@ -383,7 +407,10 @@ def build_metadata(sidecar_path: Path) -> dict:
     # Long-form: rich description with viewer-facing context, technical
     # details, project blurb, repo link, hashtags.
     if shorts:
-        lines = [body for body in (short_desc,) if body]
+        st_prefix = ('Time is the vertical axis — a spacetime diagram. '
+                     if is_time_axis else '')
+        body = (st_prefix + short_desc).strip()
+        lines = [body] if body else []
         lines.append('')
         if music_credit:
             lines.append(f'Music: {music_credit}')
@@ -396,6 +423,24 @@ def build_metadata(sidecar_path: Path) -> dict:
         lines: list[str] = []
         if desc:
             lines.append(desc)
+            lines.append('')
+        if is_time_axis:
+            lines.append('▸ Visualization: Spacetime (time as an axis)')
+            _ta_para = (
+                "This clip renders the automaton as a spacetime diagram: "
+                "instead of animating in place, each successive generation is "
+                "stacked along the vertical (z) axis, so time itself becomes "
+                "the third spatial dimension. The 3D form is the rule's entire "
+                "recent history shown at once — a travelling pattern traces a "
+                "diagonal world-line, an oscillator becomes a periodic column, "
+                "and a growing structure fans into a solid volume.")
+            if ta_reduction == 'shadow':
+                _ta_para += (" (Shadow mode: the densest cell of each column "
+                             "is projected down the time axis.)")
+            else:
+                _ta_para += (" (Slice mode: a single 2D cross-section is "
+                             "stacked over time.)")
+            lines.append(_ta_para)
             lines.append('')
         lines.append('▸ What you\'re seeing')
         what = (
@@ -458,6 +503,9 @@ def build_metadata(sidecar_path: Path) -> dict:
         title_label.lower(),
         rule.replace('_', ' ') if rule else '',
     ]
+    if is_time_axis:
+        raw_tags += ['spacetime', 'spacetime diagram', 'time as an axis',
+                     'space-time', '4d spacetime']
     # Dedup case-insensitively, preserve order, drop empties.
     seen: set[str] = set()
     tags: list[str] = []
