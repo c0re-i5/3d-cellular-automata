@@ -379,6 +379,69 @@ void main() {
 }
 """,
 
+    "spacetime_life": """
+// Spacetime Life — a 2D life-like CA rendered with TIME as the third axis.
+//
+// The "live" 2D world lives on the TOP z-plane (z = D-1 = "now").  Every
+// step the entire volume scrolls one cell toward z=0, so a generation laid
+// down at the top streams downward over time — z becomes AGE.  A fresh
+// generation is then computed on the top plane from its 8 IN-PLANE (Moore)
+// neighbours only: this is a genuine 2-D rule (no z coupling), it's the
+// stacking that makes the third dimension.
+//
+// The result is a 3-D spacetime diagram of the 2-D automaton: a glider
+// becomes a clean diagonal tube, a blinker a dashed column, an oscillator a
+// periodic stack, and a random soup a forest of organic tendrils.  Because
+// the column starts empty below the seed, the first D steps look like the
+// history being *extruded* downward from the top; after that the oldest
+// slice falls off the bottom and it scrolls forever.
+//
+// u_param0..3 = Birth min, Birth max, Survive min, Survive max (integer
+// neighbour counts). Conway's Life is B3/S23 -> (3, 3, 2, 3).  Any
+// contiguous-range life-like rule works; non-contiguous rulestrings
+// (e.g. HighLife B36/S23) can't be expressed by a single min/max pair.
+//
+// No shared-memory path: the kernel is a cheap copy for all but one plane,
+// so tiling would not help.  fetch() supplies the boundary policy, so the
+// 2-D world is toroidal / clamped / mirrored exactly like every other rule.
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int top = u_size - 1;  // z index of the live "now" plane (cubic grid)
+
+    // History planes inherit the plane directly above them: the whole
+    // volume scrolls one cell toward z=0 each step (z = age).  Copy the
+    // full vec4 so the historical density (ch1) and birth-flash (ch2) of
+    // that generation are preserved as the slice ages downward.
+    if (pos.z < top) {
+        imageStore(u_dst, pos, fetch(ivec3(pos.x, pos.y, pos.z + 1)));
+        return;
+    }
+
+    // Top plane (z = now): advance the 2-D CA one generation using the 8
+    // in-plane Moore neighbours. Neighbours are sampled at z = top only, so
+    // there is no coupling along the time axis.
+    float self_v = fetch(pos).r;
+    int n = 0;
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        if (dx == 0 && dy == 0) continue;
+        if (fetch(ivec3(pos.x + dx, pos.y + dy, top)).r > 0.5) n++;
+    }
+
+    int bmin = int(u_param0 + 0.5), bmax = int(u_param1 + 0.5);
+    int smin = int(u_param2 + 0.5), smax = int(u_param3 + 0.5);
+    bool alive = self_v > 0.5;
+    bool nxt = alive ? (n >= smin && n <= smax) : (n >= bmin && n <= bmax);
+
+    float v    = nxt ? 1.0 : 0.0;
+    float born = (nxt && !alive) ? 1.0 : 0.0;  // dead->alive this step
+    // ch0 = state, ch1 = neighbour density (n/8), ch2 = birth flash.
+    imageStore(u_dst, pos, vec4(v, float(n) / 8.0, born, 0.0));
+}
+""",
+
     "smoothlife_3d": """
 // 3D SmoothLife — continuous states, smooth transitions
 // Uses Rafler's SmoothLife transition with birth/survival intervals.
@@ -2367,6 +2430,370 @@ void main() {
     }
 
     imageStore(u_dst, pos, vec4(new_a, new_b, new_res, new_c));
+}
+""",
+
+    "fcc_potts_grain": """
+// Q-state Potts grain growth / recrystallisation on the FCC lattice.
+//
+// Every cell carries a crystallographic ORIENTATION id q in [0, Q). A bond
+// between unlike neighbours costs energy, so the system minimises total
+// grain-boundary AREA: curvature drives boundaries toward their centre of
+// curvature, small grains are devoured by their larger neighbours, and the
+// mean grain radius coarsens as <R> ~ t^(1/2). This Monte-Carlo Potts model
+// is the standard metallurgical treatment of annealing and normal grain
+// growth -- the thing that happens inside a metal while it sits in a furnace.
+//
+// WHY FCC: Potts grain growth is famously LATTICE-SENSITIVE. On a cubic
+// grid the boundary energy inherits the 6/26-neighbour anisotropy, so
+// boundaries facet onto the coordinate planes and grains come out cubical --
+// a well-documented artifact normally patched by dragging in extra
+// neighbour shells. The 12 equidistant FCC neighbours give a near-isotropic
+// boundary energy for free, so grains grow as rounded, physically-shaped
+// polyhedra and the t^(1/2) law comes out clean.
+//
+//   u_param0 = Q (number of distinct orientations)
+//   u_param1 = Temperature kT (boundary roughening; -> 0 is greedy descent)
+//   u_param2 = Mobility (per-attempt acceptance probability)
+//   u_param3 = Pinning (fraction of immobile second-phase particles; these
+//              snag boundaries and stagnate growth -- Zener pinning, which
+//              is how real alloys are kept fine-grained)
+//
+// R = orientation id q            G = q/(Q-1), a hue ramp for rendering
+// B = boundary fraction (unlike neighbours / 12)   A = pinned flag
+
+const ivec3 FCC_NN[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int   Q   = clamp(int(u_param0 + 0.5), 2, 64);
+    float T   = max(u_param1, 1e-4);
+    float mob = clamp(u_param2, 0.0, 1.0);
+    float pin = clamp(u_param3, 0.0, 1.0);
+
+    // Orientations are stored as exact integers; the modulo lets a single
+    // random init serve every Q without re-seeding.
+    int q = int(fetch(pos).r + 0.5) % Q;
+
+    int nq[12];
+    int unlike = 0;
+    for (int i = 0; i < 12; ++i) {
+        nq[i] = int(fetch(pos + FCC_NN[i]).r + 0.5) % Q;
+        if (nq[i] != q) unlike++;
+    }
+
+    // Quenched inert particles: never reorient, so boundaries hang up on them.
+    float pinned = (hash_static(pos, 7) < pin) ? 1.0 : 0.0;
+
+    // 8-colouring by per-axis parity. Every FCC offset has at least one odd
+    // component, so no two same-colour cells are neighbours (the cubic
+    // red-black checkerboard does NOT work here -- FCC has triangles).
+    int colour = (pos.x & 1) + 2 * (pos.y & 1) + 4 * (pos.z & 1);
+
+    int new_q = q;
+    if (colour == (u_frame & 7) && pinned < 0.5 && unlike > 0
+            && hash_temporal(pos, 0) < mob) {
+        // Propose a RANDOM NEIGHBOUR'S orientation rather than a uniformly
+        // random one: once grains are more than a few cells across, almost
+        // every uniformly-random trial is rejected and growth stalls.
+        int pick  = clamp(int(hash_temporal(pos, 1) * 12.0), 0, 11);
+        int trial = nq[pick];
+        if (trial != q) {
+            int unlike_trial = 0;
+            for (int i = 0; i < 12; ++i) if (nq[i] != trial) unlike_trial++;
+            float dE  = float(unlike_trial - unlike);
+            float acc = dE <= 0.0 ? 1.0 : exp(-dE / T);
+            if (hash_temporal(pos, 2) < acc) new_q = trial;
+        }
+    }
+
+    int unlike_new = unlike;
+    if (new_q != q) {
+        unlike_new = 0;
+        for (int i = 0; i < 12; ++i) if (nq[i] != new_q) unlike_new++;
+    }
+
+    float hue = float(new_q) / float(max(Q - 1, 1));
+    imageStore(u_dst, pos,
+               vec4(float(new_q), hue, float(unlike_new) / 12.0, pinned));
+}
+""",
+
+    "fcc_stacking": """
+// Close-packed STACKING SEQUENCE: stacking faults, annealing twins and the
+// FCC <-> HCP martensitic transformation.
+//
+// GEOMETRY (this rule cannot exist on a cubic lattice): in FCC index space
+// every z = const plane is a close-packed {111} layer -- a TRIANGULAR
+// lattice whose 6 in-plane nearest neighbours sit at exactly 60 degrees to
+// one another. The remaining 6 of the 12 FCC neighbours are the 3 hollows
+// directly above and the 3 below, which is precisely what "each sphere
+// rests in three hollows of the layer beneath" means. A layer can occupy
+// one of three lateral registers: A, B or C.
+//
+// Hard spheres forbid two ADJACENT layers sharing a register. What happens
+// two layers out is what selects the polytype:
+//     ... A B C A B C ...   s(L+2) != s(L)  ->  FCC  (cubic close packed)
+//     ... A B A B A B ...   s(L+2) == s(L)  ->  HCP  (hexagonal close packed)
+// A reversal inside an FCC stack (A B C A C B A) is a TWIN BOUNDARY; an
+// isolated ABAB sliver inside FCC is an intrinsic STACKING FAULT, i.e. a
+// lamella of HCP martensite. This is the Ising model of polytypism: J2 > 0
+// buys FCC, J2 < 0 buys HCP, and J2 ~ 0 gives random-stacking disorder
+// where twins nucleate constantly.
+//
+//   u_param0 = Temperature kT
+//   u_param1 = In-plane coherence Jin (holds one layer in a single register)
+//   u_param2 = Adjacent-layer repulsion J1 (hard spheres: layers must differ)
+//   u_param3 = Polytype bias J2 (>0 FCC, <0 HCP, ~0 random stacking)
+//
+// R = register s in {0,1,2}   G = s/2, a hue ramp for rendering
+// B = local HCP fraction (same register two layers out): 0 in a perfect FCC
+//     crystal, 1 inside an HCP lamella -- so faults and twin boundaries
+//     light up as bright sheets threading a dark cubic crystal
+// A = flipped this step
+
+// 6 in-plane triangular neighbours (dz = 0).
+const ivec3 SK_IN[6] = ivec3[6](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0)
+);
+// 3 hollows above + 3 below (the other 6 FCC nearest neighbours).
+const ivec3 SK_ADJ[6] = ivec3[6](
+    ivec3( 0, 0, 1), ivec3( 0,-1, 1), ivec3(-1, 0, 1),
+    ivec3( 0, 0,-1), ivec3( 0, 1,-1), ivec3( 1, 0,-1)
+);
+// Two layers out, laterally nearby: the polytype-selecting shell.
+const ivec3 SK_NEXT2[6] = ivec3[6](
+    ivec3( 0, 0, 2), ivec3( 0,-1, 2), ivec3(-1, 0, 2),
+    ivec3( 0, 0,-2), ivec3( 0, 1,-2), ivec3( 1, 0,-2)
+);
+
+int sk_reg(ivec3 p) { return int(fetch(p).r + 0.5) % 3; }
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float T   = max(u_param0, 1e-4);
+    float Jin = u_param1;
+    float J1  = u_param2;
+    float J2  = u_param3;
+
+    int s = sk_reg(pos);
+
+    int in_r[3];  in_r[0] = 0; in_r[1] = 0; in_r[2] = 0;
+    int ad_r[3];  ad_r[0] = 0; ad_r[1] = 0; ad_r[2] = 0;
+    int n2_r[3];  n2_r[0] = 0; n2_r[1] = 0; n2_r[2] = 0;
+    for (int i = 0; i < 6; ++i) {
+        in_r[sk_reg(pos + SK_IN[i])]++;
+        ad_r[sk_reg(pos + SK_ADJ[i])]++;
+        n2_r[sk_reg(pos + SK_NEXT2[i])]++;
+    }
+
+    // 16-colouring: per-axis parity in x,y but z mod 4, because this rule
+    // reaches TWO layers out and (0,0,2) leaves the z parity unchanged --
+    // an 8-colour sweep would let a cell and its L+2 neighbour move at the
+    // same time and race.
+    int colour = (pos.x & 1) + 2 * (pos.y & 1) + 4 * (pos.z & 3);
+
+    int   new_s   = s;
+    float flipped = 0.0;
+    if (colour == (u_frame & 15)) {
+        // Propose one of the two OTHER registers.
+        int trial = (s + 1 + int(hash_temporal(pos, 0) * 2.0)) % 3;
+        float e_old = -Jin * float(in_r[s])     + J1 * float(ad_r[s])
+                    +  J2 * float(n2_r[s]);
+        float e_new = -Jin * float(in_r[trial]) + J1 * float(ad_r[trial])
+                    +  J2 * float(n2_r[trial]);
+        float dE  = e_new - e_old;
+        float acc = dE <= 0.0 ? 1.0 : exp(-dE / T);
+        if (hash_temporal(pos, 1) < acc) { new_s = trial; flipped = 1.0; }
+    }
+
+    // Same register two layers out == locally hexagonal stacking.
+    float hcp = float(n2_r[new_s]) / 6.0;
+    imageStore(u_dst, pos, vec4(float(new_s), float(new_s) * 0.5, hcp, flipped));
+}
+""",
+
+    "fcc_frustrated_af": """
+// Geometrically FRUSTRATED antiferromagnet on the FCC lattice.
+//
+// WHY FCC: the simple-cubic lattice is BIPARTITE, so a cubic antiferromagnet
+// has a unique and trivially satisfiable Neel ground state -- colour the two
+// sublattices up and down and every single bond is happy. The FCC
+// nearest-neighbour graph is NOT bipartite: it is built out of edge-sharing
+// TRIANGLES, and no assignment of up/down spins can make all three bonds of
+// a triangle antiparallel. At least one bond in every triangle must be
+// wrong. The antiferromagnet is therefore geometrically FRUSTRATED: the
+// ground state is macroscopically degenerate, ordering is suppressed far
+// below the mean-field temperature, and the system lingers in a
+// cooperative-paramagnet / spin-liquid regime seething with defects.
+// Measured here: cooling to kT=0.5 drives the MEAN unsatisfied-bond fraction
+// down to 0.346 and no further -- the geometric floor is 4/12 = 1/3, and no
+// amount of cooling beats it (net magnetisation stays 0, as an AF's should).
+// None of this exists on a cubic grid.
+//
+//   u_param0 = Temperature kT
+//   u_param1 = J1 nearest-neighbour coupling (NEGATIVE = antiferromagnetic)
+//   u_param2 = J2 second-neighbour coupling -- lifts the degeneracy and
+//              selects which of the tied ground states wins ("order by
+//              disorder"); J2 < 0 favours the type-I collinear state
+//   u_param3 = Update probability
+//
+// R = spin (0/1)   G = frustrated-bond fraction (unsatisfied / 12)
+// B = local bond energy remapped to [0,1]   A = flipped this step
+
+const ivec3 AF_NN1[12] = ivec3[12](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 0, 0, 1), ivec3( 0, 0,-1),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0),
+    ivec3( 0, 1,-1), ivec3( 0,-1, 1),
+    ivec3( 1, 0,-1), ivec3(-1, 0, 1)
+);
+// Second shell (distance sqrt(2)): the 6 cubic-axis directions in world space.
+const ivec3 AF_NN2[6] = ivec3[6](
+    ivec3( 1, 1,-1), ivec3(-1,-1, 1),
+    ivec3( 1,-1, 1), ivec3(-1, 1,-1),
+    ivec3(-1, 1, 1), ivec3( 1,-1,-1)
+);
+
+float af_spin(ivec3 p) { return fetch(p).r > 0.5 ? 1.0 : -1.0; }
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    float self_v = fetch(pos).r;
+    float s = self_v > 0.5 ? 1.0 : -1.0;
+
+    float T     = max(u_param0, 1e-3);
+    float J1    = u_param1;
+    float J2    = u_param2;
+    float pflip = clamp(u_param3, 0.0, 1.0);
+
+    float S1 = 0.0;
+    int   unsat = 0;
+    for (int i = 0; i < 12; ++i) {
+        float sj = af_spin(pos + AF_NN1[i]);
+        S1 += sj;
+        // Bond energy is -J1*s*sj; the bond is frustrated when that is
+        // positive, i.e. when the pair cannot satisfy the coupling's sign.
+        if (J1 * s * sj <= 0.0) unsat++;
+    }
+    float S2 = 0.0;
+    for (int i = 0; i < 6; ++i) S2 += af_spin(pos + AF_NN2[i]);
+
+    float frust = float(unsat) / 12.0;
+    // Local bond energy, normalised to [0,1] over its attainable range.
+    float e_loc = -(J1 * s * S1 + J2 * s * S2);
+    float e_max = 12.0 * abs(J1) + 6.0 * abs(J2);
+    float e01   = clamp(0.5 + 0.5 * e_loc / max(e_max, 1e-6), 0.0, 1.0);
+
+    // 8-colouring by per-axis parity. Every offset above (both shells) has
+    // at least one odd component, so it is conflict-free for both.
+    int colour = (pos.x & 1) + 2 * (pos.y & 1) + 4 * (pos.z & 1);
+    if (colour != (u_frame & 7)) {
+        imageStore(u_dst, pos, vec4(self_v, frust, e01, 0.0));
+        return;
+    }
+
+    // dE for s -> -s
+    float dE  = 2.0 * s * (J1 * S1 + J2 * S2);
+    float acc = dE <= 0.0 ? 1.0 : exp(-dE / T);
+
+    float new_s = s;
+    if (hash_temporal(pos, 0) < pflip && hash_temporal(pos, 1) < acc) new_s = -s;
+
+    float flipped = (new_s != s) ? 1.0 : 0.0;
+    if (new_s != s) {
+        // Recompute the frustration the flip actually produced so the render
+        // channel matches the stored spin.
+        unsat = 0;
+        for (int i = 0; i < 12; ++i) {
+            if (J1 * new_s * af_spin(pos + AF_NN1[i]) <= 0.0) unsat++;
+        }
+        frust = float(unsat) / 12.0;
+    }
+    imageStore(u_dst, pos,
+               vec4(new_s > 0.0 ? 1.0 : 0.0, frust, e01, flipped));
+}
+""",
+
+    "fcc_hex_spacetime": """
+// Triangular-lattice life on close-packed layers, with TIME as the stacking
+// axis -- so the spacetime diagram IS an FCC crystal.
+//
+// GEOMETRY: in FCC index space every z = const plane is a close-packed {111}
+// layer, a TRIANGULAR lattice whose 6 in-plane nearest neighbours sit at
+// exactly 60 degrees to one another (verify: the index offsets with dz = 0
+// map to world vectors of equal length separated by 60 degrees). The other
+// 6 of the 12 FCC neighbours are the 3 hollows above and 3 below. Laying
+// down one generation of a 2-D hexagonal automaton per layer and stacking
+// them is therefore literally how an FCC crystal is assembled: one
+// close-packed plane at a time, each nesting into the hollows of the last.
+//
+// The live world is the TOP layer (z = D-1 = "now"). Each step the whole
+// volume scrolls one layer toward z = 0, so z becomes AGE, and a fresh
+// generation is computed on the top layer from its 6 in-plane triangular
+// neighbours only -- a genuine 2-D rule; the stacking makes the third
+// dimension. A travelling hex pattern traces a world-line through the
+// crystal; a hex oscillator becomes a periodic column.
+//
+// Hexagonal life is a different creature from Conway's: with only 6
+// neighbours the birth/survival windows are narrow, and the classic
+// interesting regime is B2/S3-4.
+//
+//   u_param0..3 = Birth min, Birth max, Survive min, Survive max
+//                 (integer counts out of the 6 triangular neighbours)
+//
+// R = state, G = neighbour count / 6, B = birth flash, A = 0
+
+const ivec3 HEX_NN[6] = ivec3[6](
+    ivec3( 1, 0, 0), ivec3(-1, 0, 0),
+    ivec3( 0, 1, 0), ivec3( 0,-1, 0),
+    ivec3( 1,-1, 0), ivec3(-1, 1, 0)
+);
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    int top = u_size - 1;  // the live "now" layer
+
+    // History layers inherit the layer above: the stack scrolls toward z=0.
+    if (pos.z < top) {
+        imageStore(u_dst, pos, fetch(ivec3(pos.x, pos.y, pos.z + 1)));
+        return;
+    }
+
+    // All 6 offsets have dz = 0, so these stay on the live layer: no
+    // coupling along the time axis.
+    float self_v = fetch(pos).r;
+    int n = 0;
+    for (int i = 0; i < 6; ++i) {
+        if (fetch(pos + HEX_NN[i]).r > 0.5) n++;
+    }
+
+    int bmin = int(u_param0 + 0.5), bmax = int(u_param1 + 0.5);
+    int smin = int(u_param2 + 0.5), smax = int(u_param3 + 0.5);
+    bool alive = self_v > 0.5;
+    bool nxt = alive ? (n >= smin && n <= smax) : (n >= bmin && n <= bmax);
+
+    float v    = nxt ? 1.0 : 0.0;
+    float born = (nxt && !alive) ? 1.0 : 0.0;
+    imageStore(u_dst, pos, vec4(v, float(n) / 6.0, born, 0.0));
 }
 """,
 
@@ -11836,6 +12263,72 @@ ACCEL_FUSED_SHADER = _load_glsl("ACCEL_FUSED_SHADER.glsl")
 # which is plenty for colormaps and iso thresholds.
 VIEW_TEX_BUILD_SHADER = _load_glsl("VIEW_TEX_BUILD_SHADER.glsl")
 
+# ── Spacetime "time-axis" reslice shader ─────────────────────────────
+# Tier 1 of the spacetime view: turn ANY grid rule into a "time as the z
+# axis" display without touching the rule. Every sim generation we take a
+# 2-D reduction of the freshly-built view texture (either a fixed z-slice
+# or a max-projection "shadow" down z) and write it to the TOP plane of a
+# scrolling history volume; the rest of the volume scrolls one cell toward
+# z=0 so older generations sink downward (z = age). The raymarcher then
+# displays this history volume in place of the live view texture — exactly
+# the spacetime_life mechanic, applied to a 2-D shadow of any 3-D CA.
+#
+# Reads/writes are ping-ponged (two ST textures) so the scroll's read of
+# plane z+1 can't race a neighbour's write of plane z. The reduction
+# copies the full RGBA (baked colour in .gba + density in .r) so the
+# spacetime diagram keeps the rule's own colours.
+SPACETIME_SCROLL_SHADER = """
+#version 430
+layout(local_size_x=4, local_size_y=4, local_size_z=4) in;
+
+layout(rgba16f, binding=0) readonly  uniform image3D u_st_src;  // previous history
+layout(rgba16f, binding=1) writeonly uniform image3D u_st_dst;  // new history
+uniform sampler3D u_src;    // live sim state, RAW channels (unit 0)
+uniform ivec3 u_dims;       // (W, H, D)
+uniform int u_reduce;       // 0 = fixed z-slice, 1 = max-projection down z
+uniform int u_slice_z;      // z index sampled in slice mode
+uniform int u_channel;      // channel used to rank "density" in shadow mode
+uniform int u_use_abs;      // 1 = rank by |value| (signed fields)
+
+float rank(vec4 v) {
+    float s = v[u_channel];
+    return (u_use_abs == 1) ? abs(s) : s;
+}
+
+void main() {
+    ivec3 p = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(p, u_dims))) return;
+    int top = u_dims.z - 1;
+
+    // History planes inherit the plane above: the volume scrolls toward
+    // z=0 each generation, so z becomes AGE.
+    if (p.z < top) {
+        imageStore(u_st_dst, p, imageLoad(u_st_src, ivec3(p.x, p.y, p.z + 1)));
+        return;
+    }
+
+    // Top plane (z = now): write this generation's 2-D reduction of the
+    // LIVE grid, keeping the raw channels so the chosen renderer colours
+    // and thresholds it exactly like the live volume.
+    vec4 outv;
+    if (u_reduce == 1) {
+        // Max-projection "shadow": the column's most-active voxel.
+        vec4 best = texelFetch(u_src, ivec3(p.x, p.y, 0), 0);
+        float br = rank(best);
+        for (int z = 1; z < u_dims.z; ++z) {
+            vec4 v = texelFetch(u_src, ivec3(p.x, p.y, z), 0);
+            float r = rank(v);
+            if (r > br) { br = r; best = v; }
+        }
+        outv = best;
+    } else {
+        int sz = clamp(u_slice_z, 0, u_dims.z - 1);
+        outv = texelFetch(u_src, ivec3(p.x, p.y, sz), 0);
+    }
+    imageStore(u_st_dst, p, outv);
+}
+"""
+
 # ── Half-resolution bilateral upsample shader ────────────────────────
 # Upsamples a half-res volume render to full res using edge-aware bilateral filter
 UPSAMPLE_VERTEX_SHADER = """
@@ -14553,7 +15046,12 @@ RULE_PRESETS = {
         # FBM at 18% puts local maxima in the viable band while global
         # density stays low enough that births have room to happen.
         "init": "life_fbm_moderate",
-        "init_variants": ["life_fbm_moderate", "life_fbm_dense", "random_dense", "game_of_life_centered"],
+        # life_hollow_shell / life_twin_clusters added 2026-08-07 (analytics
+        # push on winners): symmetric shell implosion + colony collision.
+        # Validated at defaults, median 0.710/0.705 vs base 0.701.
+        "init_variants": ["life_fbm_moderate", "life_fbm_dense", "random_dense",
+                          "game_of_life_centered", "life_hollow_shell",
+                          "life_twin_clusters"],
         "description": "Classic discrete Life in 3D. B6-7/S5-7 — stable clusters.",
         "vis_channels": ["Alive", "Neighbour density", "Δ (just-changed)"],
         "vis_default": 0,
@@ -14581,7 +15079,11 @@ RULE_PRESETS = {
         # seed cluster from which the diamond-shaped attractor can grow
         # outward into empty space.
         "init": "game_of_life_centered",
-        "init_variants": ["game_of_life_centered", "life_fbm_sparse"],
+        # crystal_445_octahedron / crystal_445_plate added 2026-08-07:
+        # 7 merging diamonds / planar-slab morphology. Both passed the full
+        # random-param microscope bar (median 0.694/0.693, base 0.699).
+        "init_variants": ["game_of_life_centered", "life_fbm_sparse",
+                          "crystal_445_octahedron", "crystal_445_plate"],
         "description": "B4/S4 — strict rule grows diamond-like crystals.",
         "vis_channels": ["Alive", "Neighbour density", "Δ (just-changed)"],
         "vis_default": 0,
@@ -14590,6 +15092,48 @@ RULE_PRESETS = {
         "render_mode": "voxel",
         "boundary": "toroidal",
         "sparse_dispatch": True,
+    },
+
+    "spacetime_life": {
+        "label": "Spacetime Life (time axis)",
+        "shader": "spacetime_life",
+        # 2-D life-like CA with the time axis extruded into z. Default is
+        # Conway's Life (B3/S23): Birth exactly 3, Survive 2-3. The sliders
+        # expose the full contiguous B/S range so you can explore other
+        # 2-D life-like rules (e.g. B2/S23 "Seeds"-ish, B3/S1-3 mazes).
+        "params": {"Birth min": 3, "Birth max": 3, "Survive min": 2, "Survive max": 3},
+        "param_ranges": {"Birth min": (0, 8), "Birth max": (0, 8),
+                         "Survive min": (0, 8), "Survive max": (0, 8)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),  # discrete CA — one generation per step
+        # A bigger cube = a longer visible time-history. 96³ shows 96
+        # generations of trailing spacetime before the oldest scrolls off.
+        "default_size": 96,
+        "init": "spacetime_random",
+        # glider_gun / acorn added 2026-08-07: gun = periodic glider-tube
+        # factory (verified +5 cells/30 gens), acorn = methuselah fossil
+        # tree. Defaults median 0.699/0.703 (rpentomino base 0.702).
+        "init_variants": ["spacetime_random", "spacetime_rpentomino",
+                          "spacetime_glider", "spacetime_glider_gun",
+                          "spacetime_acorn"],
+        "description": ("A 2-D cellular automaton with TIME as the third axis. "
+                        "Conway's Life runs on the top plane; each generation "
+                        "scrolls downward so the volume is a 3-D spacetime "
+                        "diagram — gliders become diagonal tubes, oscillators "
+                        "periodic stacks, a random soup a forest of tendrils."),
+        "vis_channels": ["Alive", "Neighbour density", "Just born"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",  # ch0=state, ch1=density, ch2=birth flash
+        "render_mode": "voxel",
+        # Discrete cells — nearest filtering + a gap so the spacetime
+        # worms read as distinct stacked cubes rather than a smeared mass.
+        "voxel_filter": "nearest",
+        "voxel_threshold": 0.5,
+        "voxel_gap": 0.15,
+        # 2-D torus: the top-plane world wraps in x and y. The scroll along
+        # z never wraps (history just ages off the bottom).
+        "boundary": "toroidal",
     },
 
     "smoothlife_3d": {
@@ -14634,6 +15178,8 @@ RULE_PRESETS = {
         "dt": 0.5,
         "dt_range": (0.1, 2.5),
         "init": "gray_scott",
+        "init_variants": ["gray_scott", "gray_scott_planar",
+                          "gray_scott_points", "gray_scott_shell"],
         "description": "Gray-Scott: two coupled species produce spots that divide (mitosis).",
         "vis_channels": ["U (substrate)", "V (catalyst)"],
         "vis_default": 1,
@@ -14657,7 +15203,11 @@ RULE_PRESETS = {
         "dt": 1.0,
         "dt_range": (0.1, 2.5),
         "init": "gray_scott",
-        "init_variants": ["gray_scott"],
+        # Seed GEOMETRY variants (all verified median>=0.65 via microscope):
+        # planar = one organised invading front, points = colliding colonies,
+        # shell = inward+outward fronts of opposite curvature.
+        "init_variants": ["gray_scott", "gray_scott_planar",
+                          "gray_scott_points", "gray_scott_shell"],
         "description": ("Gray-Scott on the face-centred-cubic lattice: 12 isotropic "
                         "nearest neighbours (rhombic-dodecahedron cell) remove the "
                         "cubic-axis bias of the standard grid. Cells render through "
@@ -14686,7 +15236,8 @@ RULE_PRESETS = {
         "dt": 1.0,
         "dt_range": (0.1, 2.5),
         "init": "gray_scott",
-        "init_variants": ["gray_scott"],
+        "init_variants": ["gray_scott", "gray_scott_planar",
+                          "gray_scott_points", "gray_scott_shell"],
         "description": ("Gray-Scott worm regime on the face-centred-cubic lattice: "
                         "labyrinthine stripe filaments branch and wander through the "
                         "12 isotropic nearest neighbours with no cubic-axis bias."),
@@ -14792,7 +15343,10 @@ RULE_PRESETS = {
         "dt": 0.1,
         "dt_range": (0.03, 0.15),
         "init": "lichen_dense",
-        "init_variants": ["lichen_dense"],
+        "init_variants": ["lichen_dense", "lichen_territories"],
+        # invasion floods to ~99% alive at every horizon (0.012); kept for
+        # browsing only, never sampled by the search.
+        "init_extras": ["lichen_invasion"],
         "description": ("Three species compete for space on the face-centred-cubic "
                         "lattice -- pioneer, competitor and nomad lock into a "
                         "rock-paper-scissors cycle and tile the box with an axis-free "
@@ -14890,7 +15444,7 @@ RULE_PRESETS = {
         "dt": 0.1,
         "dt_range": (0.02, 0.5),
         "init": "crystal_seed",
-        "init_variants": ["crystal_seed"],
+        "init_variants": ["crystal_seed", "crystal_disc_seed"],
         "audit_steps": 2000,
         "description": ("Solidification phase-field on the FCC lattice: a seed grows "
                         "into the lattice's natural rhombic-dodecahedral / octahedral "
@@ -14925,7 +15479,10 @@ RULE_PRESETS = {
         "dt": 1.0,
         "dt_range": (1.0, 1.0),
         "init": "cyclic_ca",
-        "init_variants": ["cyclic_ca"],
+        # cyclic_stripes (sequential-state stripes -> coherent planar waves
+        # buckling into spirals) added 2026-08-07: defaults median 0.730 vs
+        # base 0.459. cyclic_blocks FAILED here (0.350) — cubic-only variant.
+        "init_variants": ["cyclic_ca", "cyclic_stripes"],
         "description": ("Cyclic (Greenberg-Hastings) CA on the face-centred-cubic "
                         "lattice: a 3D rock-paper-scissors colour cycle whose "
                         "wavefronts self-organise into nested concentric target and "
@@ -15021,7 +15578,11 @@ RULE_PRESETS = {
         "dt": 0.5,
         "dt_range": (0.1, 2.0),
         "init": "schnakenberg",
-        "init_variants": ["schnakenberg"],
+        # gradient (Turing front sweeps the box) / shell (spots crystallise
+        # on a sphere) added 2026-08-07: defaults median 0.685 / 0.750 vs
+        # base 0.727. Both FAILED on cubic schnakenberg_3d — FCC-only.
+        "init_variants": ["schnakenberg", "schnakenberg_gradient",
+                          "schnakenberg_shell"],
         "description": ("Schnakenberg activator-substrate Turing system on the "
                         "face-centred-cubic lattice: V-activator spots self-organise "
                         "into an isotropic rhombic-dodecahedral packing with no "
@@ -15090,7 +15651,7 @@ RULE_PRESETS = {
         "dt": 0.2,
         "dt_range": (0.05, 0.5),
         "init": "fitzhugh_nagumo",
-        "init_variants": ["fitzhugh_nagumo"],
+        "init_variants": ["fitzhugh_nagumo", "fhn_filament_pair", "fhn_scroll_ring"],
         "description": ("FitzHugh-Nagumo excitable medium on the face-centred-cubic "
                         "lattice: auto-oscillatory nerve-impulse kinetics whose only "
                         "the depolarised wavefronts are drawn, sweeping the box as "
@@ -15233,7 +15794,9 @@ RULE_PRESETS = {
                          "J coupling": (-2.0, 2.0), "Update prob": (0.1, 1.0)},
         "dt": 1.0,
         "init": "random_spins",
-        "init_variants": ["random_spins"],
+        # spins_slab (median 0.53 vs 0.37) isolates one flat domain wall
+        # instead of the many small domains a random start condenses into.
+        "init_variants": ["random_spins", "spins_slab"],
         "description": ("3D Ising model with Metropolis dynamics on the face-centred-"
                         "cubic lattice. The 12-coordinated NN graph is non-bipartite, "
                         "so updates use an 8-colour per-axis-parity sweep instead of "
@@ -15417,7 +15980,10 @@ RULE_PRESETS = {
                          "k1 healthy": (1.0, 8.0), "k2 ill": (1.0, 8.0)},
         "dt": 1.0,
         "init": "hodgepodge_random",
-        "init_variants": ["hodgepodge_random"],
+        # hotspots (3-6 infected balls -> clean expanding BZ target shells)
+        # added 2026-08-07: defaults median 0.307 vs base 0.044. On cubic
+        # hodgepodge_3d both inits sit at the coarsening-scorer floor — skip.
+        "init_variants": ["hodgepodge_random", "hodgepodge_hotspots"],
         "description": ("Gerhardt-Schuster cyclic CA on the FCC lattice: each cell "
                         "cycles healthy -> infected -> ill -> healthy under a 12-NN "
                         "infection rule, producing self-organising spirals and target "
@@ -15433,6 +15999,178 @@ RULE_PRESETS = {
         "boundary": "toroidal",
     },
 
+    "fcc_potts_grain": {
+        "label": "FCC Potts Grain Growth",
+        "shader": "fcc_potts_grain",
+        "lattice": "fcc",
+        # Monte-Carlo Potts grain growth -- the metallurgist's model of what
+        # happens inside a metal in a furnace. Boundaries move to reduce
+        # their own area, small grains vanish, <R> ~ t^(1/2). This is a rule
+        # where the lattice genuinely matters: cubic Potts is known to facet
+        # boundaries onto the coordinate planes (grains come out cubical) and
+        # has to be patched with extra neighbour shells; the 12 equidistant
+        # FCC neighbours give near-isotropic boundary energy for free.
+        # Pinning > 0 sprinkles immobile particles that snag boundaries and
+        # freeze the structure (Zener pinning) instead of letting one grain
+        # eat the whole box.
+        "params": {"Orientations Q": 32.0, "Temperature": 0.6,
+                   "Mobility": 1.0, "Pinning": 0.0},
+        "param_ranges": {"Orientations Q": (4.0, 64.0), "Temperature": (0.02, 3.0),
+                         "Mobility": (0.1, 1.0), "Pinning": (0.0, 0.15)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "potts_random",
+        "init_variants": ["potts_random", "potts_nuclei"],
+        "audit_steps": 2000,
+        "description": ("Monte-Carlo Potts grain growth on the face-centred-cubic "
+                        "lattice: each cell holds a crystal orientation, unlike "
+                        "neighbours cost energy, and the structure coarsens by "
+                        "eating its own grain boundaries -- the same process that "
+                        "anneals a metal. The 12 equidistant neighbours keep the "
+                        "boundary energy isotropic, so grains stay rounded instead "
+                        "of faceting onto the grid axes as they do on a cubic "
+                        "lattice."),
+        "vis_channels": ["Orientation", "Grain hue", "Boundary", "Pinned"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "density",
+        "vis_range": (0.0, 1.0),
+        "voxel_threshold": 0.0,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_stacking": {
+        "label": "FCC Stacking Faults & Twins",
+        "shader": "fcc_stacking",
+        "lattice": "fcc",
+        # Ising model of polytypism on the close-packed layers. In FCC index
+        # space the z-planes ARE the {111} close-packed layers (6 in-plane
+        # triangular neighbours, 3 hollows above, 3 below), and each layer
+        # sits in one of three registers A/B/C. Adjacent layers must differ;
+        # what happens two layers out picks the polytype. Polytype bias > 0
+        # buys ABCABC (FCC), < 0 buys ABAB (HCP), ~0 gives random stacking
+        # where twins nucleate constantly. Default view is the HCP fraction,
+        # so faults and twin boundaries show as bright sheets inside an
+        # otherwise dark cubic crystal.
+        # Temperature 0.9 is the tuned annealing window: measured HCP
+        # fraction 0.81 at J2=-1.5 vs 0.25 at J2=+1.5 while layers stay
+        # >94% register-pure. Colder (0.25) quenches the sequence into
+        # frozen twins before the polytype bias can act (separation drops
+        # from 0.56 to 0.27) -- realistic for a real casting, but it makes
+        # the J2 knob look dead.
+        "params": {"Temperature": 0.9, "In-plane Jin": 2.0,
+                   "Layer repulsion J1": 2.0, "Polytype bias J2": 0.6},
+        "param_ranges": {"Temperature": (0.02, 2.0), "In-plane Jin": (0.0, 4.0),
+                         "Layer repulsion J1": (0.0, 4.0),
+                         "Polytype bias J2": (-2.0, 2.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "stacking_layers",
+        "init_variants": ["stacking_layers", "stacking_fcc"],
+        "audit_steps": 2000,
+        "description": ("Stacking faults, annealing twins and the FCC-to-HCP "
+                        "martensitic transformation, simulated on the close-packed "
+                        "layers of the lattice itself. Every z-plane is a {111} "
+                        "close-packed layer occupying one of three registers A, B or "
+                        "C; adjacent layers must differ, and the two-layer coupling "
+                        "decides whether the crystal stacks ABCABC (cubic) or ABAB "
+                        "(hexagonal). Reversals of the sequence are twin boundaries. "
+                        "This rule has no cubic-lattice analogue -- its state space "
+                        "is the close packing."),
+        "vis_channels": ["Register", "Register hue", "HCP fraction", "Flipped"],
+        "vis_default": 2,
+        "vis_abs": False,
+        "vis_mode": "density",
+        "vis_range": (0.4, 1.0),
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_frustrated_af": {
+        "label": "FCC Frustrated Antiferromagnet",
+        "shader": "fcc_frustrated_af",
+        "lattice": "fcc",
+        # Geometric frustration -- the phenomenon a cubic lattice CANNOT
+        # exhibit. Simple cubic is bipartite, so an antiferromagnet on it
+        # satisfies every bond in a trivial Neel state. The FCC NN graph is
+        # made of edge-sharing triangles, so at least one bond per triangle
+        # must be wrong: the ground state is macroscopically degenerate and
+        # the system sits in a fluctuating cooperative-paramagnet regime.
+        # The attainable floor is 4/12 unsatisfied bonds on average, which is
+        # why the frustration channel's vis_range starts at 1/3 rather than 0.
+        # J2 lifts the degeneracy and selects an ordered state. kT=1.5 is the
+        # tuned default: cold enough that the background is near the 1/3 floor,
+        # warm enough that a sparse (~7%) network of over-frustrated defect
+        # cells stays lit and churning. Raising kT floods the box.
+        "params": {"Temperature": 1.5, "J1 coupling": -1.0,
+                   "J2 coupling": 0.0, "Update prob": 1.0},
+        "param_ranges": {"Temperature": (0.2, 12.0), "J1 coupling": (-2.0, 0.0),
+                         "J2 coupling": (-1.0, 1.0), "Update prob": (0.1, 1.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "init": "random_spins",
+        "init_variants": ["random_spins"],
+        "description": ("A geometrically frustrated antiferromagnet on the "
+                        "face-centred-cubic lattice. The FCC neighbour graph is built "
+                        "from edge-sharing triangles, and no arrangement of up/down "
+                        "spins can make all three bonds of a triangle antiparallel -- "
+                        "so at best 4 of every 12 bonds stay unsatisfied and the "
+                        "system never settles into a simple ordered state. The view "
+                        "shows the frustrated-bond network itself. On a cubic lattice "
+                        "this effect does not exist at all: that lattice is bipartite "
+                        "and every bond can be satisfied at once."),
+        "vis_channels": ["Spin", "Frustration", "Bond energy", "Flipped"],
+        "vis_default": 1,
+        "vis_abs": False,
+        "vis_mode": "density",
+        "vis_range": (0.3333, 0.75),
+        "voxel_threshold": 0.45,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
+    "fcc_hex_spacetime": {
+        "label": "FCC Hex Spacetime (time axis)",
+        "shader": "fcc_hex_spacetime",
+        "lattice": "fcc",
+        # A 2-D hexagonal life-like CA whose history is stacked along the
+        # close-packed direction, so the spacetime volume IS an FCC crystal.
+        # Every z-plane in FCC index space is a {111} close-packed layer with
+        # 6 in-plane neighbours at 60 degrees; stacking one generation per
+        # layer is exactly how the crystal is built. With only 6 neighbours
+        # the interesting rule windows are narrow -- B2/S3-4 is the tuned
+        # default (hexagonal life's analogue of Conway's B3/S23).
+        "params": {"Birth min": 2.0, "Birth max": 2.0,
+                   "Survive min": 3.0, "Survive max": 4.0},
+        "param_ranges": {"Birth min": (1.0, 6.0), "Birth max": (1.0, 6.0),
+                         "Survive min": (1.0, 6.0), "Survive max": (1.0, 6.0)},
+        "dt": 1.0,
+        "dt_range": (1.0, 1.0),
+        "default_size": 96,
+        "init": "hex_spacetime_random",
+        "init_variants": ["hex_spacetime_random", "hex_spacetime_seed"],
+        "description": ("A hexagonal cellular automaton drawn with TIME as the "
+                        "stacking axis. Each z-plane of the face-centred-cubic "
+                        "lattice is a close-packed triangular layer, so laying down "
+                        "one generation per layer and stacking them is literally how "
+                        "an FCC crystal grows -- each plane nesting into the hollows "
+                        "of the one before. The solid you see is the automaton's "
+                        "entire history: travelling patterns become world-lines and "
+                        "oscillators become periodic columns."),
+        "vis_channels": ["Alive", "Neighbours/6", "Birth flash"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "voxel_threshold": 0.5,
+        "render_mode": "voxel",
+        "boundary": "toroidal",
+        "precision": "fp32",
+    },
+
     "gray_scott_worms": {
         "label": "Gray-Scott (worms)",
         "shader": "reaction_diffusion_3d",
@@ -15445,7 +16183,9 @@ RULE_PRESETS = {
         "init": "gray_scott",
         # Dropped 'gray_scott_worms_dense' (median 0.34 vs 0.86 for
         # 'gray_scott') — INIT_DEAD per ca_debug.triage.
-        "init_variants": ["gray_scott"],
+        # Seed-geometry variants added 2026-08 (median 0.67-0.84, microscope).
+        "init_variants": ["gray_scott", "gray_scott_planar",
+                          "gray_scott_points", "gray_scott_shell"],
         "description": "Gray-Scott worm regime — labyrinthine stripe patterns.",
         "vis_channels": ["U (substrate)", "V (catalyst)"],
         "vis_default": 1,
@@ -15515,6 +16255,7 @@ RULE_PRESETS = {
         "dt": 0.2,
         "dt_range": (0.05, 0.5),
         "init": "fitzhugh_nagumo",
+        "init_variants": ["fitzhugh_nagumo", "fhn_filament_pair", "fhn_scroll_ring"],
         "description": "FitzHugh-Nagumo — excitable membrane producing travelling pulses and scroll waves.",
         "vis_channels": ["V (potential)", "W (recovery)"],
         "vis_default": 0,
@@ -15564,13 +16305,20 @@ RULE_PRESETS = {
     "cyclic_ca_3d": {
         "label": "Cyclic CA (RPS spirals)",
         "shader": "cyclic_ca_3d",
-        "params": {"N states": 10.0, "Threshold": 2.0,
+        # N=6/T=1 tuned 2026-08-08 (score 0.290 vs 0.159 at old N=10/T=2):
+        # same lesson as fcc_cyclic — fewer colours + threshold 1 is what
+        # lets coherent wavefronts keep sweeping instead of freezing.
+        "params": {"N states": 6.0, "Threshold": 1.0,
                    "unused_0": 0.0, "unused_1": 0.0},
         "param_ranges": {"N states": (4.0, 16.0), "Threshold": (1.0, 4.0),
                          "unused_0": (0.0, 1.0), "unused_1": (0.0, 1.0)},
         "dt": 1.0,
         "dt_range": (1.0, 1.0),
         "init": "cyclic_ca",
+        # cyclic_blocks (coarse domains -> walls eat each other, spirals at
+        # junctions) added 2026-08-07: defaults median 0.350 vs base 0.165.
+        # cyclic_stripes FAILED here (0.100) — only added on fcc_cyclic.
+        "init_variants": ["cyclic_ca", "cyclic_blocks"],
         "description": "Cyclic CA — N-state rock-paper-scissors producing 3D spiral waves.",
         "vis_channels": ["State", "Phase"],
         "vis_default": 1,
@@ -15586,6 +16334,10 @@ RULE_PRESETS = {
         "dt": 0.15,
         "dt_range": (0.02, 0.5),
         "init": "wave_pulse",
+        # plane (travelling sheet) / droplet_grid (27-pulse interference
+        # lattice) added 2026-08-07: both passed the full random-param
+        # microscope bar (0.642 / 0.747 vs base 0.681).
+        "init_variants": ["wave_pulse", "wave_plane", "wave_droplet_grid"],
         "description": "3D wave equation — watch spherical waves propagate and reflect.",
         "vis_channels": ["Displacement", "Velocity"],
         "vis_default": 0,
@@ -15991,7 +16743,10 @@ RULE_PRESETS = {
         # work with everywhere, eliminating the "holes with no voxels"
         # pathology the blob init produced.
         "init": "lenia_multi_fbm",
-        "init_variants": ["lenia_multi_fbm", "lenia_multi", "lenia_multi_colocated"],
+        # shells (onion organism) / axes (3 orthogonal channel bars) added
+        # 2026-08-07. Defaults median 0.762/0.793 vs lenia_multi base 0.790.
+        "init_variants": ["lenia_multi_fbm", "lenia_multi", "lenia_multi_colocated",
+                          "lenia_multi_shells", "lenia_multi_axes"],
         "description": "3-channel Lenia with cross-kernel coupling — creatures with internal organs and differentiation.",
         "vis_channels": ["Channel A", "Channel B", "Channel C", "Activity"],
         "vis_default": 0,
@@ -16412,6 +17167,7 @@ RULE_PRESETS = {
         "dt": 0.2,
         "dt_range": (0.05, 0.5),
         "init": "sodium_water",
+        "init_variants": ["sodium_water", "element_mix"],
         "description": "Drop sodium into water — watch the exothermic reaction!",
         "vis_channels": ["Element", "Temperature"],
         "vis_default": 0,
@@ -16553,7 +17309,7 @@ RULE_PRESETS = {
         "dt_range": (0.02, 0.3),
         "init": "mycelium",
         # Dropped 'mycelium_foraging' — INIT_DEAD per ca_debug.triage.
-        "init_variants": ["mycelium"],
+        "init_variants": ["mycelium", "mycelium_veins", "mycelium_ring"],
         "description": (
             "Fungal hyphal network with directional persistence and "
             "anastomosis.  Each tip remembers the direction it last "
@@ -16695,7 +17451,8 @@ RULE_PRESETS = {
         # Dropped 'fire_fluid_sparse' — INIT_DEAD per ca_debug.triage,
         # also propagates to flagship_lightning_fire which uses the
         # composed 'fire_fluid_sparse+lsystem:lightning' init.
-        "init_variants": ["fire_fluid"],
+        # 'fire_sparse' re-verified 2026-08 (median 0.66 vs 0.70) — healthy.
+        "init_variants": ["fire_fluid", "fire_sparse"],
         "description": (
             "Buoyant combustion plume.  Two-pass pipeline: chemistry "
             "(Arrhenius-gated combustion + soot/ember production + "
@@ -16850,7 +17607,8 @@ RULE_PRESETS = {
         # Swap default to 'lichen_dense' — the bare 'lichen' init was
         # INIT_DEAD per ca_debug.triage (median 0.10, max 0.10).
         "init": "lichen_dense",
-        "init_variants": ["lichen_dense"],
+        "init_variants": ["lichen_dense", "lichen_territories"],
+        "init_extras": ["lichen_invasion"],
         "description": "Three species compete for space — pioneer, competitor, and nomad create territorial mosaic.",
         "vis_channels": ["Species A", "Species B", "Resource", "Species C"],
         "vis_default": 0,
@@ -17059,7 +17817,7 @@ RULE_PRESETS = {
                          "J coupling": (-2.0, 2.0), "Update prob": (0.1, 1.0)},
         "dt": 1.0,
         "init": "random_spins",
-        "init_variants": ["random_spins"],
+        "init_variants": ["random_spins", "spins_slab"],
         "description": ("3D Ising model with Metropolis dynamics on a spin-parity "
                         "checkerboard. Critical T_c ≈ 4.51 for J=1, h=0; below it the "
                         "system magnetises into one of two phases, above it stays "
@@ -17367,7 +18125,7 @@ RULE_PRESETS = {
         "dt": 0.5,
         "dt_range": (0.05, 1.5),
         "init": "fluid_quiescent",
-        "init_variants": ["fluid_quiescent"],
+        "init_variants": ["fluid_quiescent", "fluid_turbulent"],
         "description": ("Wind-blown smoke plume.  Same incompressible "
                         "Navier-Stokes solver as 3D Smoke Plume, but the "
                         "source is offset toward the upwind edge and a "
@@ -17406,7 +18164,7 @@ RULE_PRESETS = {
         "dt": 0.4,
         "dt_range": (0.05, 1.0),
         "init": "fluid_quiescent",
-        "init_variants": ["fluid_quiescent"],
+        "init_variants": ["fluid_quiescent", "fluid_turbulent"],
         "description": ("Wide, hot eruption column.  Buoyancy lifts the "
                         "core, while ash gravity makes dense material "
                         "fall back, producing a mushroom cap and a "
@@ -17439,12 +18197,16 @@ RULE_PRESETS = {
         "extra_fields": 1,
         "field2_init": "zero",
         "params": {"Viscosity": 0.001, "Heating": 0.5, "Therm. diff.": 0.02, "Buoyancy": 0.4},
-        "param_ranges": {"Viscosity": (0.0, 0.02), "Heating": (0.0, 1.0),
-                         "Therm. diff.": (0.0, 0.05), "Buoyancy": (0.0, 1.5)},
+        # Heating/Buoyancy floors raised 2026-08-08: below ~0.2/0.3 there is
+        # no convection (sub-critical Rayleigh number) and random search just
+        # samples dead runs — defaults score 0.622 but the microscope median
+        # was 0.000. Same discoverability precedent as fcc_brusselator.
+        "param_ranges": {"Viscosity": (0.0, 0.02), "Heating": (0.2, 1.0),
+                         "Therm. diff.": (0.0, 0.05), "Buoyancy": (0.3, 1.5)},
         "dt": 0.4,
         "dt_range": (0.05, 1.0),
         "init": "rayleigh_benard",
-        "init_variants": ["rayleigh_benard"],
+        "init_variants": ["rayleigh_benard", "rayleigh_hot_spot", "rayleigh_rolls"],
         "description": ("Spontaneous convection: the floor is heated and "
                         "the ceiling cooled, with no source.  Above the "
                         "critical Rayleigh number, hexagonal convection "
@@ -17864,7 +18626,7 @@ RULE_PRESETS = {
         # (median 0.10) while 'wireworld_lattice' is healthy
         # (median 0.97).
         "init": "wireworld_lattice",
-        "init_variants": ["wireworld_lattice"],
+        "init_variants": ["wireworld_lattice", "wireworld_rings", "wireworld_bus"],
         "description": ("3D Wireworld: a 4-state programmable substrate (empty / "
                         "head / tail / conductor) capable of universal computation. "
                         "The default ring init runs as a self-sustaining electron "
@@ -17913,7 +18675,10 @@ RULE_PRESETS = {
         # Swap default to 'sine_gordon_breather' — 'sine_gordon_kink'
         # was INIT_DEAD per ca_debug.triage.
         "init": "sine_gordon_breather",
-        "init_variants": ["sine_gordon_breather"],
+        "init_variants": ["sine_gordon_shell", "sine_gordon_breather"],
+        # collision floods the box (85% alive, act 0.78) so the scorer marks it
+        # down, but a fully-ringing field may still film well.
+        "init_extras": ["sine_gordon_collision"],
         "description": ("∂²u/∂t² = c²∇²u − sin(u) — nonlinear wave equation "
                         "supporting topological soliton solutions. In 3D the 1D "
                         "kink lifts to a planar π-wall that propagates, oscillates, "
@@ -18433,6 +19198,11 @@ RULE_PRESETS['flagship_dual_lenia'] = {
         {'rule': 'lenia_geminium', 'prefix': 'b_'},
     ],
     'init': 'lenia_fbm',
+    # Explicit list (was inherited from lenia_3d via compose). torus/shell
+    # added 2026-08-07: ring-necklace break-up / shell fragmentation.
+    # Defaults median 0.577 (torus, best of all variants) / 0.533.
+    'init_variants': ['lenia_fbm', 'lenia_blobs', 'lenia_seeded',
+                      'lenia_torus', 'lenia_shell'],
     'search_size': 48,
 }
 
@@ -18675,6 +19445,49 @@ def init_life_fbm_dense(size, rng):
     return data
 
 
+def init_life_hollow_shell(size, rng):
+    """FBM-thresholded ~20% density confined to a spherical SHELL with an
+    empty core and empty surround. The rule eats the shell from both faces
+    at once — a symmetric implosion/bloom that reads instantly on camera,
+    then survivors recolonise both the core and the outside."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r = np.sqrt((x - c)**2 + (y - c)**2 + (z - c)**2)
+    r0 = 0.32 * size
+    shell = np.abs(r - r0) < (0.07 * size)
+    field = _canonical_fbm(size, rng, octaves=5)
+    vals = field[shell]
+    if vals.size:
+        threshold = np.quantile(vals, 1.0 - 0.20)
+        data[:, :, :, 0] = ((field > threshold) & shell).astype(np.float32)
+    return data
+
+
+def init_life_twin_clusters(size, rng):
+    """Two dense FBM colonies on opposite sides of the box that grow toward
+    each other and collide — the collision front is the dramatic moment.
+    Each ball is thresholded to ~22% local density (the B6-7/S5-7 viable
+    band), separated by enough empty space that the approach is visible."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    # Random separation axis so runs differ; offset keeps both balls in-box.
+    axis = rng.uniform(-1.0, 1.0, 3)
+    axis /= max(np.linalg.norm(axis), 1e-6)
+    off = 0.18 * size * axis
+    field = _canonical_fbm(size, rng, octaves=5)
+    ball_r = 0.16 * size
+    for sign in (-1.0, 1.0):
+        cx, cy, cz = c + sign * off[0], c + sign * off[1], c + sign * off[2]
+        ball = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) < ball_r * ball_r
+        vals = field[ball]
+        if vals.size:
+            threshold = np.quantile(vals, 1.0 - 0.22)
+            data[:, :, :, 0][ball] = (field[ball] > threshold).astype(np.float32)
+    return data
+
+
 def init_smoothlife_fbm(size, rng):
     """FBM-based continuous field for SmoothLife, localized to a central
     ball with empty surround. Active region has FBM mean ~0.22 (matches
@@ -18688,6 +19501,264 @@ def init_smoothlife_fbm(size, rng):
     envelope = _localized_envelope(size, rng, fill_fraction=0.4, edge_softness=0.20)
     data[:, :, :, 0] = (field * envelope).astype(np.float32)
     return data
+
+
+# ── Spacetime-mode inits (seed only the top z-plane = "now"; the rest of
+# the column is the empty future the spacetime_life scroll fills in) ──
+# Reminder: numpy axis 0 == Z (depth), so the live plane is data[size-1].
+
+def init_spacetime_random(size, rng):
+    """Random 2-D soup on the top plane for the spacetime_life rule.
+    ~30% density is a lively Conway soup that settles into a rich mix of
+    oscillators, still-lifes and the occasional glider — a good forest of
+    spacetime tendrils. Density-preserving across sizes via the canonical
+    binary mask (one z-plane of it)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    mask = _canonical_binary_mask(size, rng, 0.30)  # (size,size,size) bool
+    data[size - 1, :, :, 0] = mask[size - 1].astype(np.float32)
+    return data
+
+
+def _stamp_top_plane(data, cells, cy_frac=0.5, cx_frac=0.5):
+    """Stamp a list of (dy, dx) live-cell offsets onto the top z-plane,
+    centred at (cy_frac, cx_frac) of the grid. Offsets are in cell units."""
+    size = data.shape[0]
+    cy = int(size * cy_frac)
+    cx = int(size * cx_frac)
+    for dy, dx in cells:
+        y = (cy + dy) % size
+        x = (cx + dx) % size
+        data[size - 1, y, x, 0] = 1.0
+
+
+def init_spacetime_rpentomino(size, rng):
+    """The R-pentomino methuselah on the top plane. Under Conway's Life it
+    stays chaotic for ~1100 generations, ejecting gliders — the spacetime
+    diagram is a spectacular branching fossil record with glider tubes
+    shooting off in all four diagonal directions."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    #  .XX
+    #  XX.
+    #  .X.
+    r_pent = [(-1, 0), (-1, 1), (0, -1), (0, 0), (1, 0)]
+    _stamp_top_plane(data, r_pent)
+    return data
+
+
+def init_spacetime_glider(size, rng):
+    """A single Conway glider near one corner of the top plane. Produces the
+    cleanest possible spacetime tube: one straight diagonal worm travelling
+    forever across the toroidal world."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    #  .X.
+    #  ..X
+    #  XXX
+    glider = [(-1, 0), (0, 1), (1, -1), (1, 0), (1, 1)]
+    _stamp_top_plane(data, glider, cy_frac=0.25, cx_frac=0.25)
+    return data
+
+
+# Gosper glider gun, (row, col) cells of the canonical 36x9 pattern,
+# stored as offsets from its centre (row 4, col 17).
+_GOSPER_GUN_CELLS = [
+    (24, 0), (22, 1), (24, 1), (12, 2), (13, 2), (20, 2), (21, 2), (34, 2),
+    (35, 2), (11, 3), (15, 3), (20, 3), (21, 3), (34, 3), (35, 3), (0, 4),
+    (1, 4), (10, 4), (16, 4), (20, 4), (21, 4), (0, 5), (1, 5), (10, 5),
+    (14, 5), (16, 5), (17, 5), (22, 5), (24, 5), (10, 6), (16, 6), (24, 6),
+    (11, 7), (15, 7), (12, 8), (13, 8),
+]
+_GOSPER_GUN_OFFSETS = [(row - 4, col - 17) for col, row in _GOSPER_GUN_CELLS]
+
+
+def init_spacetime_glider_gun(size, rng):
+    """The Gosper glider gun on the top plane — the icon of Life engineering.
+    Every 30 generations it fires a glider, so the spacetime volume becomes a
+    factory column with an evenly-spaced stream of diagonal glider tubes
+    marching away from it. (Pattern is 36 cells wide; on small toroidal
+    worlds the stream eventually wraps and demolishes the gun, which is its
+    own dramatic third act.)"""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    _stamp_top_plane(data, _GOSPER_GUN_OFFSETS)
+    return data
+
+
+def init_spacetime_acorn(size, rng):
+    """The acorn methuselah: 7 cells that stay chaotic for ~5000 generations
+    under Conway's Life. The spacetime diagram grows from a single hair-thin
+    stem into an enormous branching tree of tendrils and glider tubes — the
+    most spectacular long-form fossil in the catalogue."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    #  .X.....
+    #  ...X...
+    #  XX..XXX
+    acorn = [(-1, -2), (0, 0), (1, -3), (1, -2), (1, 1), (1, 2), (1, 3)]
+    _stamp_top_plane(data, acorn)
+    return data
+
+
+def init_potts_random(size, rng):
+    """Fully random orientation field for fcc_potts_grain: every cell is its
+    own nucleus, so the very first sweeps condense a fine-grained mosaic that
+    then coarsens. Ids are drawn from [0,64) and the shader takes them mod Q,
+    so one init serves every Q without re-seeding."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = rng.randint(0, 64, size=(size, size, size)).astype(np.float32)
+    return data
+
+
+def init_potts_nuclei(size, rng):
+    """Recrystallisation start: a uniform deformed matrix (orientation 0) with
+    a sprinkle of distinct nuclei. The nuclei sweep outward and consume the
+    matrix, then impinge on one another and coarsen — the classic
+    recrystallisation-then-grain-growth sequence rather than the
+    everything-at-once condensation of a fully random field."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    n_nuclei = max(8, int(size ** 3 * 2e-4))
+    for i in range(n_nuclei):
+        z, y, x = (rng.randint(0, size), rng.randint(0, size), rng.randint(0, size))
+        data[z, y, x, 0] = float(1 + (i % 63))
+    return data
+
+
+def init_stacking_layers(size, rng):
+    """Random-polytype start for fcc_stacking: each close-packed layer (a
+    z-plane in FCC index space) gets ONE random register A/B/C. Layers are
+    already internally coherent, so the run goes straight to the interesting
+    physics — resolving the stacking sequence into FCC/HCP domains and twins —
+    instead of spending its first hundreds of steps on in-plane ordering."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    regs = rng.randint(0, 3, size=size).astype(np.float32)
+    data[:, :, :, 0] = regs[:, None, None]
+    return data
+
+
+def init_stacking_fcc(size, rng):
+    """A perfect ABCABC crystal (register = z mod 3): flawless FCC. Nothing
+    happens at kT=0; warm it up and stacking faults nucleate and spread as
+    thin HCP lamellae, which is exactly how deformation twinning starts."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z = np.arange(size, dtype=np.float32) % 3.0
+    data[:, :, :, 0] = z[:, None, None]
+    return data
+
+
+def init_hex_spacetime_random(size, rng):
+    """Random soup on the top close-packed layer for fcc_hex_spacetime. A
+    6-neighbour triangular lattice saturates far more easily than Conway's
+    8-neighbour Moore grid, so the useful soup density is well under the 30%
+    used for the cubic spacetime rule."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    mask = _canonical_binary_mask(size, rng, 0.16)
+    data[size - 1, :, :, 0] = mask[size - 1].astype(np.float32)
+    return data
+
+
+def init_hex_spacetime_seed(size, rng):
+    """A single compact cluster on the top layer: a centre cell plus its 6
+    triangular neighbours. From one hexagon the growth front spreads as a
+    hexagonal shell, so the stacked history is a clean crystal cone whose
+    facets are the lattice's own close-packed directions."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    hexagon = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0), (-1, 1), (1, -1)]
+    _stamp_top_plane(data, hexagon)
+    return data
+
+
+# ── Gray-Scott seeding variants ───────────────────────────────────────
+# All keep init_gray_scott's encoding: U (ch0) = 1 in the pristine medium and
+# 0.5 inside a seeded region, V (ch1) = the catalyst. Only the GEOMETRY of the
+# seed differs, which is what selects how the Turing instability unfolds.
+
+def init_gray_scott_planar(size, rng):
+    """Gray-Scott seeded on one flat slab. The instability then invades the
+    pristine medium as a single organised front instead of nucleating
+    everywhere at once, so the pattern grows with a clear direction of
+    travel and a visible leading edge."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = 1.0
+    thick = max(2, int(size * 0.06))
+    lo = size // 2 - thick // 2
+    data[lo:lo + thick, :, :, 0] = 0.5
+    data[lo:lo + thick, :, :, 1] = 0.25
+    # Without noise a perfectly flat front stays flat forever.
+    data[:, :, :, 1] += _canonical_noise(size, rng, 0.0, 0.01)
+    return data
+
+
+def init_gray_scott_points(size, rng):
+    """Gray-Scott seeded from a few isolated points. Each grows into its own
+    colony; the interesting structure is the collision fronts where two
+    independently-oriented colonies meet and have to reconcile."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = 1.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    radius = max(2.0, size * 0.05)
+    for _ in range(rng.randint(3, 8)):
+        cx = rng.uniform(0.15, 0.85) * size
+        cy = rng.uniform(0.15, 0.85) * size
+        cz = rng.uniform(0.15, 0.85) * size
+        mask = ((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) < radius ** 2
+        data[:, :, :, 0][mask] = 0.5
+        data[:, :, :, 1][mask] = 0.25
+    data[:, :, :, 1] += _canonical_noise(size, rng, 0.0, 0.01)
+    return data
+
+
+def init_gray_scott_shell(size, rng):
+    """Gray-Scott seeded on a hollow spherical shell, so the reaction spreads
+    both inward and outward from a closed surface. The inward front focuses
+    on the centre while the outward one expands — two fronts of opposite
+    curvature from a single seed."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = 1.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r = rng.uniform(0.22, 0.34) * size
+    thick = max(1.5, size * 0.04)
+    d = np.sqrt((x - c) ** 2 + (y - c) ** 2 + (z - c) ** 2)
+    mask = np.abs(d - r) < thick
+    data[:, :, :, 0][mask] = 0.5
+    data[:, :, :, 1][mask] = 0.25
+    data[:, :, :, 1] += _canonical_noise(size, rng, 0.0, 0.01)
+    return data
+
+
+# ── Ising / spin seeding variants ─────────────────────────────────────
+# Encoding matches init_random_spins: ch0 holds {0.0, 1.0} for down/up.
+
+def init_spins_aligned(size, rng):
+    """Fully magnetised start with a sprinkle of flipped spins. Complements
+    random_spins by approaching the transition from the ORDERED side: below
+    T_c this state survives, above it melts. On a frustrated lattice it is
+    also the worst possible configuration, so relaxation is dramatic."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = 1.0
+    data[:, :, :, 0][_canonical_binary_mask(size, rng, 0.02)] = 0.0
+    return data
+
+
+def init_spins_slab(size, rng):
+    """Two magnetic domains meeting at one flat wall. Isolates domain-wall
+    physics: the interface roughens with temperature and is free to wander,
+    instead of the many small domains a random start produces."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:size // 2, :, :, 0] = 1.0
+    return data
+
+
+def init_spins_droplet(size, rng):
+    """A down-spin droplet in an up-spin sea. Classical nucleation: below the
+    critical radius the droplet evaporates, above it grows without bound, so
+    the run is a direct read-out of the surface-tension vs bulk balance."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = 1.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r = rng.uniform(0.12, 0.28) * size
+    d2 = (x - c) ** 2 + (y - c) ** 2 + (z - c) ** 2
+    data[:, :, :, 0][d2 < r * r] = 0.0
+    return data
+
 
 
 def init_lenia_fbm(size, rng):
@@ -18716,6 +19787,45 @@ def init_lenia_fbm(size, rng):
         d2 = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) / (r * r)
         base += (0.4 * np.exp(-0.5 * d2)).astype(np.float32)
     data[:, :, :, 0] = np.clip(base, 0.0, 1.0)
+    return data
+
+
+def init_lenia_torus(size, rng):
+    """A solid ring of Lenia matter in the equatorial plane, FBM-modulated so
+    it is not perfectly uniform, over a faint sub-threshold background. The
+    ring is unstable as a whole: it pinches into a necklace of blobs that
+    orbit, merge and spawn gliders — a strong loopable opening shot."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    ring_r = 0.26 * size
+    tube = 0.07 * size
+    # Distance to the circle x²+y²=ring_r² in the z=c plane.
+    rho = np.sqrt((x - c)**2 + (y - c)**2)
+    d2 = (rho - ring_r)**2 + (z - c)**2
+    fbm = _canonical_fbm(size, rng, octaves=4)
+    ring = 0.50 * np.exp(-0.5 * d2 / (tube * tube)) * (0.7 + 0.6 * fbm)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.45, edge_softness=0.20)
+    background = 0.05 * fbm * envelope
+    data[:, :, :, 0] = np.clip(ring + background, 0.0, 1.0).astype(np.float32)
+    return data
+
+
+def init_lenia_shell(size, rng):
+    """A hollow sphere of Lenia-band matter with FBM surface variation. The
+    shell can't hold: it buckles and fragments into creatures that scatter
+    both inward and outward — symmetric, camera-friendly break-up."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r = np.sqrt((x - c)**2 + (y - c)**2 + (z - c)**2)
+    r0 = 0.28 * size
+    width = 0.05 * size
+    fbm = _canonical_fbm(size, rng, octaves=4)
+    shell = 0.45 * np.exp(-0.5 * ((r - r0) / width)**2) * (0.7 + 0.6 * fbm)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.45, edge_softness=0.20)
+    background = 0.05 * fbm * envelope
+    data[:, :, :, 0] = np.clip(shell + background, 0.0, 1.0).astype(np.float32)
     return data
 
 
@@ -19135,6 +20245,45 @@ def init_schnakenberg(size, rng):
     data[:, :, :, 1] = V_star + rng.uniform(-0.02, 0.02, (size, size, size)).astype(np.float32)
     return data
 
+def init_schnakenberg_gradient(size, rng):
+    """Fixed point + noise whose AMPLITUDE ramps along a random axis: spots
+    nucleate on the noisy side first and the Turing front visibly sweeps
+    across the box — pattern formation as a travelling event rather than
+    everywhere-at-once."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    a, b = 0.1, 0.9
+    U_star = a + b
+    V_star = b / max(U_star * U_star, 1e-6)
+    axis = rng.randint(0, 3)
+    ramp = (np.mgrid[0:size, 0:size, 0:size][axis].astype(np.float32) / max(size - 1, 1))
+    noise_u = rng.uniform(-1.0, 1.0, (size, size, size)).astype(np.float32)
+    noise_v = rng.uniform(-1.0, 1.0, (size, size, size)).astype(np.float32)
+    data[:, :, :, 0] = U_star + 0.04 * ramp * noise_u
+    data[:, :, :, 1] = V_star + 0.04 * ramp * noise_v
+    return data
+
+
+def init_schnakenberg_shell(size, rng):
+    """Perturbation confined to a spherical shell around the centre; the
+    rest of the box sits exactly on the homogeneous fixed point. Spots
+    crystallise on the sphere first, then seed growth rings inward and
+    outward — a clean geometric reveal."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    a, b = 0.1, 0.9
+    U_star = a + b
+    V_star = b / max(U_star * U_star, 1e-6)
+    data[:, :, :, 0] = U_star
+    data[:, :, :, 1] = V_star
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r = np.sqrt((x - c)**2 + (y - c)**2 + (z - c)**2)
+    shell = np.abs(r - 0.3 * size) < (0.05 * size)
+    n = int(shell.sum())
+    data[:, :, :, 0][shell] += rng.uniform(-0.04, 0.04, n).astype(np.float32)
+    data[:, :, :, 1][shell] += rng.uniform(-0.04, 0.04, n).astype(np.float32)
+    return data
+
+
 def init_fitzhugh_nagumo(size, rng):
     """FN: seed a scroll filament so 3-D activity persists.
 
@@ -19189,6 +20338,50 @@ def init_fitzhugh_nagumo(size, rng):
     data[:, :, :, 1] = W.astype(np.float32)
     return data
 
+def init_fhn_scroll_ring(size, rng):
+    """Closed scroll RING: the phase winds 2π around a circular filament
+    (a torus core) instead of a straight axis. This is the canonical 3-D
+    excitable-medium object — a self-sustaining smoke-ring of excitation
+    that keeps rotating and cannot decay without unwinding its topology.
+    Uses the same FHN limit-cycle parameterisation as init_fitzhugh_nagumo."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    mid = size / 2.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    R = 0.25 * size  # ring radius
+    rho = np.sqrt((x - mid) ** 2 + (y - mid) ** 2)
+    # Poloidal angle in the (distance-from-ring, z) half-plane.
+    phase = np.arctan2((z - mid).astype(np.float64), (rho - R).astype(np.float64))
+    V0, Vamp = 0.5, 1.5
+    W0, Wamp = 1.0 / 6.0, 5.0 / 6.0
+    V = V0 + Vamp * np.cos(phase) + rng.uniform(-0.01, 0.01, phase.shape)
+    W = W0 + Wamp * np.sin(phase)
+    data[:, :, :, 0] = V.astype(np.float32)
+    data[:, :, :, 1] = W.astype(np.float32)
+    return data
+
+
+def init_fhn_filament_pair(size, rng):
+    """Two parallel scroll filaments with opposite winding (a vortex/
+    antivortex pair). They rotate in opposite senses, so their wavefronts
+    interlock and beat against each other instead of tiling space uniformly
+    — much busier than the single-filament init."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    mid = size / 2.0
+    sep = 0.20 * size
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    dx1 = (x - (mid - sep)).astype(np.float64)
+    dx2 = (x - (mid + sep)).astype(np.float64)
+    dy = (y - mid).astype(np.float64)
+    phase = np.arctan2(dy, dx1) - np.arctan2(dy, dx2)
+    V0, Vamp = 0.5, 1.5
+    W0, Wamp = 1.0 / 6.0, 5.0 / 6.0
+    V = V0 + Vamp * np.cos(phase) + rng.uniform(-0.01, 0.01, phase.shape)
+    W = W0 + Wamp * np.sin(phase)
+    data[:, :, :, 0] = V.astype(np.float32)
+    data[:, :, :, 1] = W.astype(np.float32)
+    return data
+
+
 def init_brusselator(size, rng):
     """Brusselator: start at the homogeneous fixed point U=A, V=B/A
     plus small noise to seed the Turing/Hopf instability."""
@@ -19207,6 +20400,44 @@ def init_cyclic_ca(size, rng):
     N = 14
     data = np.zeros((size, size, size, 4), dtype=np.float32)
     states = rng.randint(0, N, (size, size, size)).astype(np.float32)
+    data[:, :, :, 0] = states
+    data[:, :, :, 1] = states / float(N)
+    return data
+
+
+def init_cyclic_blocks(size, rng):
+    """Coarse single-state domains (8³ blocks of one colour). Dominance
+    fronts only exist along domain walls, so instead of instant confetti the
+    first act is large blocks eating each other, then spirals nucleate at
+    the junctions — same encoding as cyclic_ca."""
+    N = 14
+    nb = 8
+    small = rng.randint(0, N, (nb, nb, nb)).astype(np.float32)
+    if size % nb == 0:
+        states = np.repeat(np.repeat(np.repeat(small, size // nb, 0),
+                                     size // nb, 1), size // nb, 2)
+    else:
+        from scipy.ndimage import zoom
+        states = zoom(small, size / nb, order=0).astype(np.float32)
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 0] = states
+    data[:, :, :, 1] = states / float(N)
+    return data
+
+
+def init_cyclic_stripes(size, rng):
+    """Sequential-state stripes along a random axis: state i is beaten by
+    the stripe next to it, so the whole stack marches as coherent planar
+    waves from frame 1, then buckles into spirals where the noise cells
+    seed defects. ~2% random cells break perfect symmetry."""
+    N = 14
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    width = max(2, size // 16)
+    axis = rng.randint(0, 3)
+    coord = np.mgrid[0:size, 0:size, 0:size][axis]
+    states = ((coord // width) % N).astype(np.float32)
+    noise_mask = rng.random((size, size, size)) < 0.02
+    states[noise_mask] = rng.randint(0, N, int(noise_mask.sum())).astype(np.float32)
     data[:, :, :, 0] = states
     data[:, :, :, 1] = states / float(N)
     return data
@@ -19271,6 +20502,46 @@ def init_wave_pulse(size, rng):
         vdist = np.sqrt((x - vcx)**2 + (y - vcy)**2 + (z - vcz)**2)
         data[:, :, :, 1] = (rng.uniform(-1.0, 1.0) * np.exp(-0.5 * (vdist / vr)**2)).astype(np.float32)
     return data
+
+def init_wave_plane(size, rng):
+    """A single Gaussian SHEET travelling along a random axis — the cleanest
+    wave shot: one flat front sweeping the box and reflecting off the mirror
+    boundaries. Velocity is set to -c∂u/∂n (d'Alembert) so the sheet moves
+    instead of just splitting in place."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    axis = rng.randint(0, 3)
+    coord = np.mgrid[0:size, 0:size, 0:size][axis].astype(np.float32)
+    z0 = rng.uniform(0.25, 0.4) * size
+    w = rng.uniform(0.03, 0.06) * size
+    amp = rng.uniform(0.8, 1.4)
+    sheet = amp * np.exp(-0.5 * ((coord - z0) / w)**2)
+    data[:, :, :, 0] = sheet.astype(np.float32)
+    # Travelling-wave velocity: u_t = -c u_n; c~0.35 (preset default speed).
+    data[:, :, :, 1] = (0.35 * amp * (coord - z0) / (w * w)
+                        * np.exp(-0.5 * ((coord - z0) / w)**2)).astype(np.float32)
+    return data
+
+
+def init_wave_droplet_grid(size, rng):
+    """A 3×3×3 lattice of small pulses with checkerboard-alternating signs.
+    All 27 droplets ring at once and their wakes interfere — a standing
+    interference lattice that beats and shimmers instead of one lonely
+    expanding sphere."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    r = rng.uniform(0.025, 0.045) * size
+    amp = rng.uniform(0.6, 1.2)
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                cx = (0.25 + 0.25 * i) * size
+                cy = (0.25 + 0.25 * j) * size
+                cz = (0.25 + 0.25 * k) * size
+                sign = 1.0 if (i + j + k) % 2 == 0 else -1.0
+                d2 = (x - cx)**2 + (y - cy)**2 + (z - cz)**2
+                data[:, :, :, 0] += (sign * amp * np.exp(-0.5 * d2 / (r * r))).astype(np.float32)
+    return data
+
 
 def init_gray_scott(size, rng):
     """Gray-Scott: U=1 everywhere, V seeded in irregular noise-thresholded clusters.
@@ -19744,6 +21015,65 @@ def init_mycelium(size, rng):
                     data[pz, py, px, 0] = 0.2   # growing tip
                     data[pz, py, px, 3] = 1.0   # tip marker
     return data
+
+def init_mycelium_ring(size, rng):
+    """Fairy ring: filament seeds spaced around a circle, all pointing
+    outward. The colony expands as an annulus with a spent hollow centre —
+    the real mycological growth form, and a strong radial-symmetry shot.
+    Same encoding as init_mycelium (ch0 biomass, ch1 nutrient, ch3 tip)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    data[:, :, :, 1] = _canonical_noise(size, rng, 0.5, 1.0)
+    c = size // 2
+    ring_r = 0.18 * size
+    n_seeds = rng.randint(10, 17)
+    for i in range(n_seeds):
+        ang = 2.0 * np.pi * i / n_seeds
+        px = int(c + ring_r * np.cos(ang))
+        py = int(c + ring_r * np.sin(ang))
+        pz = c + rng.randint(-2, 3)
+        if not (0 <= px < size and 0 <= py < size and 0 <= pz < size):
+            continue
+        data[pz, py, px, 0] = 1.0
+        # Tip one cell further out along the radius so growth heads outward.
+        tx = int(c + (ring_r + 2) * np.cos(ang))
+        ty = int(c + (ring_r + 2) * np.sin(ang))
+        if 0 <= tx < size and 0 <= ty < size:
+            data[pz, ty, tx, 0] = 0.2
+            data[pz, ty, tx, 3] = 1.0
+    return data
+
+
+def init_mycelium_veins(size, rng):
+    """Nutrient confined to filamentary veins (thresholded FBM) instead of a
+    uniform field, with tips seeded off the veins. The network is forced to
+    hunt for and then follow the food channels, so it grows as a sparse
+    branching web tracing hidden structure rather than a fuzzy ball."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    fbm = _canonical_fbm(size, rng, octaves=4)
+    # Vein set = a thin iso-surface band of the FBM (~ a connected network).
+    veins = np.abs(fbm - np.quantile(fbm, 0.55)) < 0.03
+    nutrient = np.full((size, size, size), 0.05, dtype=np.float32)
+    nutrient[veins] = 1.0
+    data[:, :, :, 1] = nutrient
+    n_seeds = rng.randint(5, 12)
+    for _ in range(n_seeds):
+        sx = rng.randint(size // 4, 3 * size // 4)
+        sy = rng.randint(size // 4, 3 * size // 4)
+        sz = rng.randint(size // 4, 3 * size // 4)
+        data[sz, sy, sx, 0] = 1.0
+        axis = rng.randint(0, 3)
+        tx, ty, tz = sx, sy, sz
+        if axis == 0:
+            tx += 1
+        elif axis == 1:
+            ty += 1
+        else:
+            tz += 1
+        if 0 <= tx < size and 0 <= ty < size and 0 <= tz < size:
+            data[tz, ty, tx, 0] = 0.2
+            data[tz, ty, tx, 3] = 1.0
+    return data
+
 
 def init_em_wave(size, rng):
     """EM wave: Gaussian Ez dipole at the box centre.
@@ -20950,6 +22280,47 @@ def init_game_of_life_centered(size, rng):
     return data
 
 
+def init_crystal_445_octahedron(size, rng):
+    """Six dense seed balls at the octahedral vertices (±x, ±y, ±z from
+    centre) plus one at the origin. Under B4/S4 each seed carves down to a
+    coherent nucleus and grows its own diamond; the seven crystals then
+    merge into a single faceted super-structure — growth AND collision in
+    one clip."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    d = 0.24 * size
+    seed_r = 0.07 * size
+    field = rng.random((size, size, size)).astype(np.float32)
+    centers = [(c, c, c)]
+    for axis in range(3):
+        for sign in (-1.0, 1.0):
+            offset = [0.0, 0.0, 0.0]
+            offset[axis] = sign * d
+            centers.append((c + offset[0], c + offset[1], c + offset[2]))
+    for cx, cy, cz in centers:
+        ball = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) < seed_r * seed_r
+        data[:, :, :, 0][ball] = (field[ball] < 0.35).astype(np.float32)
+    return data
+
+
+def init_crystal_445_plate(size, rng):
+    """A thin dense slab through the centre. B4/S4 carves the plate to its
+    stable skeleton and then grows outward with planar symmetry — a faceted
+    sheet crystallising into 3D, visually distinct from the point-seeded
+    diamond morphology."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    c = size // 2
+    t = max(2, int(0.04 * size))
+    lo = int(size * 0.15)
+    hi = int(size * 0.85)
+    field = rng.random((size, size, size)).astype(np.float32)
+    slab = np.zeros((size, size, size), dtype=bool)
+    slab[c - t:c + t, lo:hi, lo:hi] = True
+    data[:, :, :, 0][slab] = (field[slab] < 0.35).astype(np.float32)
+    return data
+
+
 def init_smoothlife_sparse(size, rng):
     """A few smooth blobs in empty space — watch creatures nucleate and interact."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
@@ -21007,6 +22378,54 @@ def init_lenia_multi_colocated(size, rng):
             data[:, :, :, ch] += (amp * np.exp(-0.5 * d2)).astype(np.float32)
 
     data[:, :, :, :3] = np.clip(data[:, :, :, :3], 0.0, 1.0)
+    return data
+
+
+def init_lenia_multi_shells(size, rng):
+    """Concentric onion organism: channel A is a solid core, channel B a
+    mid-radius shell, channel C an outer shell. Cross-channel coupling acts
+    along clean radial interfaces so the layers visibly negotiate — the
+    creature differentiates from the inside out. A faint shared FBM
+    background keeps coupling alive outside the shells."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    r = np.sqrt((x - c)**2 + (y - c)**2 + (z - c)**2)
+    envelope = _localized_envelope(size, rng, fill_fraction=0.4, edge_softness=0.20)
+    layers = [
+        (0.0,        0.11 * size, 0.50),   # ch0: core ball
+        (0.17 * size, 0.05 * size, 0.45),  # ch1: mid shell
+        (0.27 * size, 0.05 * size, 0.40),  # ch2: outer shell
+    ]
+    for ch, (r0, width, amp) in enumerate(layers):
+        fbm = _canonical_fbm(size, rng, octaves=4)
+        shell = amp * np.exp(-0.5 * ((r - r0) / width)**2) * (0.75 + 0.5 * fbm)
+        background = 0.06 * fbm * envelope
+        data[:, :, :, ch] = np.clip(shell + background, 0.0, 1.0).astype(np.float32)
+    return data
+
+
+def init_lenia_multi_axes(size, rng):
+    """Three orthogonal FBM-modulated bars — one per channel, one per axis —
+    crossing at the centre. Each channel owns a direction, and all three
+    collide in the middle where cross-coupling is strongest: a three-way
+    chemical wrestling match with a clear geometric read."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    c = size / 2.0
+    sigma = 0.09 * size
+    envelope = _localized_envelope(size, rng, fill_fraction=0.45, edge_softness=0.20)
+    # Transverse-distance² for a bar along each axis (z, y, x order = mgrid).
+    transverse = [
+        (y - c)**2 + (x - c)**2,  # bar along z
+        (z - c)**2 + (x - c)**2,  # bar along y
+        (z - c)**2 + (y - c)**2,  # bar along x
+    ]
+    for ch in range(3):
+        fbm = _canonical_fbm(size, rng, octaves=4)
+        bar = 0.45 * np.exp(-0.5 * transverse[ch] / (sigma * sigma)) * (0.7 + 0.6 * fbm)
+        data[:, :, :, ch] = np.clip(bar * envelope + 0.05 * fbm * envelope,
+                                    0.0, 1.0).astype(np.float32)
     return data
 
 
@@ -21105,6 +22524,44 @@ def init_lichen_dense(size, rng):
     data[:, :, :, 0] = np.clip(data[:, :, :, 0], 0, 1)
     data[:, :, :, 1] = np.clip(data[:, :, :, 1], 0, 1)
     data[:, :, :, 3] = np.clip(data[:, :, :, 3], 0, 1)
+    return data
+
+
+def init_lichen_territories(size, rng):
+    """Three species each confined to their own contiguous slab, meeting at
+    two flat interfaces. All the action is on those fronts, so the clip is a
+    clean three-way border war instead of blobs re-sorting everywhere.
+    Encoding matches init_lichen_dense (ch0=A, ch1=B, ch3=C, ch2=resource)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    axis = rng.randint(0, 3)
+    coord = np.mgrid[0:size, 0:size, 0:size][axis]
+    third = size / 3.0
+    rough = _canonical_fbm(size, rng, octaves=3) * (0.06 * size)
+    for ch, lo, hi in [(0, -1e9, third), (1, third, 2 * third), (3, 2 * third, 1e9)]:
+        band = (coord + rough >= lo) & (coord + rough < hi)
+        data[:, :, :, ch][band] = 0.8
+    data[:, :, :, 2] = 0.5
+    return data
+
+
+def init_lichen_invasion(size, rng):
+    """Species A owns the whole box; B and C start as a handful of tiny
+    spores. Whether the invaders punch through as fractal fronts or get
+    absorbed depends sharply on the competition parameter — an underdog
+    story with a visible, expanding answer."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    data[:, :, :, 0] = 0.8
+    data[:, :, :, 2] = 0.5
+    for ch in (1, 3):
+        for _ in range(rng.randint(2, 5)):
+            cx = rng.uniform(0.2, 0.8) * size
+            cy = rng.uniform(0.2, 0.8) * size
+            cz = rng.uniform(0.2, 0.8) * size
+            r = rng.uniform(0.03, 0.06) * size
+            spore = ((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) < r * r
+            data[:, :, :, ch][spore] = 0.9
+            data[:, :, :, 0][spore] = 0.0
     return data
 
 
@@ -21895,6 +23352,26 @@ def init_hodgepodge_random(size, rng):
     return data
 
 
+def init_hodgepodge_hotspots(size, rng):
+    """3-6 small infected balls in an otherwise perfectly healthy medium.
+    Each hotspot grows its own concentric target-wave engine, so the run
+    opens with clean expanding BZ shells that then collide — versus the
+    everywhere-at-once turbulence of the 15% scattered init. Same
+    [0.05, 0.15] low-state encoding as hodgepodge_random."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    levels = _canonical_noise(size, rng) * 0.10 + 0.05
+    n_spots = rng.randint(3, 7)
+    for _ in range(n_spots):
+        cx = rng.uniform(0.2, 0.8) * size
+        cy = rng.uniform(0.2, 0.8) * size
+        cz = rng.uniform(0.2, 0.8) * size
+        r = rng.uniform(0.04, 0.08) * size
+        ball = ((x - cx)**2 + (y - cy)**2 + (z - cz)**2) < r * r
+        data[:, :, :, 0][ball] = levels[ball]
+    return data
+
+
 def init_margolus_gas(size, rng):
     """Random binary particles for the Margolus 3D lattice gas.
     Density ~25% gives a fluid regime with frequent collisions but
@@ -22223,6 +23700,39 @@ def init_rayleigh_benard(size, rng):
     return data
 
 
+def init_rayleigh_hot_spot(size, rng):
+    """A single hot blob sitting on the floor: one buoyant plume launches,
+    mushrooms against the ceiling, and only then does the rest of the layer
+    destabilise into full convection. Gives the clip a clear protagonist
+    instead of the everywhere-at-once nucleation of the white-noise init.
+    Temperature is the W channel; velocity starts at rest."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    cx = rng.uniform(0.35, 0.65) * size
+    cy = rng.uniform(0.35, 0.65) * size
+    r = rng.uniform(0.08, 0.14) * size
+    d2 = (x - cx)**2 + (y - cy)**2 + (z - 1.0)**2
+    blob = 0.25 * np.exp(-0.5 * d2 / (r * r))
+    noise = rng.random((size, size, size)).astype(np.float32) - 0.5
+    data[:, :, :, 3] = (blob + 0.02 * noise).astype(np.float32)
+    return data
+
+
+def init_rayleigh_rolls(size, rng):
+    """Temperature pre-seeded with a sinusoidal roll pattern near the
+    critical wavelength (cell width ~ layer depth), so ordered convection
+    rolls lock in within a few steps instead of slowly annealing out of
+    noise. 2-4 rolls across the box; a little noise lets defects form."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    k = rng.randint(2, 5) * 2.0 * np.pi / size
+    vertical = np.sin(np.pi * z / max(size - 1, 1))  # zero at both plates
+    rolls = 0.15 * np.cos(k * x) * vertical
+    noise = rng.random((size, size, size)).astype(np.float32) - 0.5
+    data[:, :, :, 3] = (rolls + 0.01 * noise).astype(np.float32)
+    return data
+
+
 # ── Inits for the 2026-05 CA additions ──────────────────────────────
 
 def init_sandpile_uniform(size, rng):
@@ -22329,6 +23839,73 @@ def init_wireworld_lattice(size, rng):
     return data
 
 
+def init_wireworld_rings(size, rng):
+    """Closed conductor loops, each carrying one electron head+tail. With
+    decay/spark at zero the signals circulate forever, so the volume becomes
+    a set of clean rotating light-rings — perfectly loopable, unlike the
+    random scaffold which fizzles into noise. Encoding matches
+    init_wireworld_lattice: conductor=1.0, head=1/3, tail=2/3."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = np.zeros((size, size, size), dtype=np.float32)
+    n_rings = rng.randint(4, 9)
+    for _ in range(n_rings):
+        axis = rng.randint(0, 3)
+        radius = rng.uniform(0.12, 0.30) * size
+        cx = rng.uniform(0.3, 0.7) * size
+        cy = rng.uniform(0.3, 0.7) * size
+        plane = rng.randint(0, size)
+        n_pts = max(16, int(2 * np.pi * radius * 1.5))
+        pts = []
+        for i in range(n_pts):
+            ang = 2.0 * np.pi * i / n_pts
+            a = int(round(cx + radius * np.cos(ang)))
+            b = int(round(cy + radius * np.sin(ang)))
+            if not (0 <= a < size and 0 <= b < size):
+                continue
+            p = [0, 0, 0]
+            p[axis] = plane
+            p[(axis + 1) % 3] = a
+            p[(axis + 2) % 3] = b
+            if p not in pts:
+                pts.append(p)
+        for p in pts:
+            field[p[0], p[1], p[2]] = 1.0
+        # One head + trailing tail launches a single circulating pulse.
+        if len(pts) >= 3:
+            h = pts[0]
+            t = pts[-1]
+            field[h[0], h[1], h[2]] = 1.0 / 3.0
+            field[t[0], t[1], t[2]] = 2.0 / 3.0
+    data[:, :, :, 0] = field
+    return data
+
+
+def init_wireworld_bus(size, rng):
+    """An axis-aligned 3-D bus lattice: straight conductor lines on a coarse
+    grid, so the volume reads as an actual circuit board rather than random
+    dust. Heads injected at several line ends send pulses racing down the
+    tracks and interacting at the junctions."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    field = np.zeros((size, size, size), dtype=np.float32)
+    spacing = max(4, size // 8)
+    offs = list(range(spacing // 2, size, spacing))
+    for a in offs:
+        for b in offs:
+            field[a, b, :] = 1.0
+            field[a, :, b] = 1.0
+            field[:, a, b] = 1.0
+    n_heads = max(8, size // 3)
+    for _ in range(n_heads):
+        a = offs[rng.randint(0, len(offs))]
+        b = offs[rng.randint(0, len(offs))]
+        c = rng.randint(0, size)
+        axis = rng.randint(0, 3)
+        p = [a, b, c] if axis == 0 else ([a, c, b] if axis == 1 else [c, a, b])
+        field[p[0], p[1], p[2]] = 1.0 / 3.0
+    data[:, :, :, 0] = field
+    return data
+
+
 def init_forest_dense(size, rng):
     """Dense forest at 75% density with no fires — let the rule kindle
     its own ignitions via lightning. Best for visualising the SOC
@@ -22380,6 +23957,43 @@ def init_sine_gordon_breather(size, rng):
     sigma = max(2.0, size / 16.0)
     pulse = np.exp(-r2 / (2.0 * sigma * sigma))
     data[:, :, :, 1] = (pulse * 0.5).astype(np.float32)   # velocity kick
+    return data
+
+
+def init_sine_gordon_collision(size, rng):
+    """Kink + antikink launched toward each other along y. Their collision is
+    the canonical soliton demonstration: at low speed they bounce, at high
+    speed they pass straight through each other and re-form unchanged. Both
+    walls carry the matching velocity field so they actually travel."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    y_idx = np.arange(size, dtype=np.float32)
+    w = 3.0
+    y1 = size * 0.30
+    y2 = size * 0.70
+    v = rng.uniform(0.2, 0.6)
+    kink = 4.0 * np.arctan(np.exp((y_idx - y1) / w))
+    antikink = -4.0 * np.arctan(np.exp((y_idx - y2) / w))
+    u = kink + antikink
+    # du/dt for a pair travelling inward at speed v.
+    du1 = (4.0 / w) / (np.exp(-(y_idx - y1) / w) + np.exp((y_idx - y1) / w))
+    du2 = (4.0 / w) / (np.exp(-(y_idx - y2) / w) + np.exp((y_idx - y2) / w))
+    vel = v * (-du1 + du2)
+    data[:, :, :, 0] = np.broadcast_to(u[None, :, None], (size, size, size)).copy()
+    data[:, :, :, 1] = np.broadcast_to(vel[None, :, None], (size, size, size)).copy()
+    return data
+
+
+def init_sine_gordon_shell(size, rng):
+    """A spherical shell of velocity kick centred on the box: the excitation
+    collapses inward, focuses at the origin in a bright flash, then rebounds
+    outward as a ringing breather. Radially symmetric, so it looks the same
+    from every camera angle — ideal for a short rotating clip."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    coords = np.indices((size, size, size)).astype(np.float32) - size / 2.0
+    r = np.sqrt(np.sum(coords ** 2, axis=0))
+    r0 = rng.uniform(0.22, 0.34) * size
+    width = max(1.5, size / 24.0)
+    data[:, :, :, 1] = (0.6 * np.exp(-0.5 * ((r - r0) / width) ** 2)).astype(np.float32)
     return data
 
 
@@ -22940,9 +24554,22 @@ INIT_FUNCS = {
     'life_fbm_sparse': init_life_fbm_sparse,
     'life_fbm_moderate': init_life_fbm_moderate,
     'life_fbm_dense': init_life_fbm_dense,
+    'life_hollow_shell': init_life_hollow_shell,
+    'life_twin_clusters': init_life_twin_clusters,
+    'crystal_445_octahedron': init_crystal_445_octahedron,
+    'crystal_445_plate': init_crystal_445_plate,
     'smoothlife_fbm': init_smoothlife_fbm,
+    'spacetime_random': init_spacetime_random,
+    'spacetime_rpentomino': init_spacetime_rpentomino,
+    'spacetime_glider': init_spacetime_glider,
+    'spacetime_glider_gun': init_spacetime_glider_gun,
+    'spacetime_acorn': init_spacetime_acorn,
     'lenia_fbm': init_lenia_fbm,
+    'lenia_torus': init_lenia_torus,
+    'lenia_shell': init_lenia_shell,
     'lenia_multi_fbm': init_lenia_multi_fbm,
+    'lenia_multi_shells': init_lenia_multi_shells,
+    'lenia_multi_axes': init_lenia_multi_axes,
     'lenia_seeded': init_lenia_seeded,
     'center_blob': init_center_blob,
     'crystal_seed': init_crystal_seed,
@@ -22950,11 +24577,19 @@ INIT_FUNCS = {
     'crystal_dla_seed': init_crystal_dla_seed,
     'crystal_dla_multi_seed': init_crystal_dla_multi_seed,
     'wave_pulse': init_wave_pulse,
+    'wave_plane': init_wave_plane,
+    'wave_droplet_grid': init_wave_droplet_grid,
     'gray_scott': init_gray_scott,
     'schnakenberg': init_schnakenberg,
+    'schnakenberg_gradient': init_schnakenberg_gradient,
+    'schnakenberg_shell': init_schnakenberg_shell,
     'fitzhugh_nagumo': init_fitzhugh_nagumo,
+    'fhn_scroll_ring': init_fhn_scroll_ring,
+    'fhn_filament_pair': init_fhn_filament_pair,
     'brusselator': init_brusselator,
     'cyclic_ca': init_cyclic_ca,
+    'cyclic_blocks': init_cyclic_blocks,
+    'cyclic_stripes': init_cyclic_stripes,
     'fcc_excitable': init_fcc_excitable,
     'fcc_dla': init_fcc_dla,
     'fcc_sandpile': init_fcc_sandpile,
@@ -22976,6 +24611,8 @@ INIT_FUNCS = {
     'directional_solidification': init_directional_solidification,
     'erosion_terrain': init_erosion_terrain,
     'mycelium': init_mycelium,
+    'mycelium_ring': init_mycelium_ring,
+    'mycelium_veins': init_mycelium_veins,
     'em_wave': init_em_wave,
     'em_dipole_pair': init_em_dipole_pair,
     'em_plane_wave': init_em_plane_wave,
@@ -23018,6 +24655,8 @@ INIT_FUNCS = {
     'kuramoto_clusters': init_kuramoto_clusters,
     'galaxy_filaments': init_galaxy_filaments,
     'lichen_dense': init_lichen_dense,
+    'lichen_territories': init_lichen_territories,
+    'lichen_invasion': init_lichen_invasion,
     'mycelium_foraging': init_mycelium_foraging,
     'bz_turbulence_high_amp': init_bz_turbulence_high_amp,
     'fire_sparse': init_fire_sparse,
@@ -23041,11 +24680,14 @@ INIT_FUNCS = {
     'eden_seeds': init_eden_seeds,
     'eden_scattered': init_eden_scattered,
     'hodgepodge_random': init_hodgepodge_random,
+    'hodgepodge_hotspots': init_hodgepodge_hotspots,
     'margolus_gas': init_margolus_gas,
     'margolus_blob': init_margolus_blob,
     'fluid_quiescent': init_fluid_quiescent,
     'fluid_turbulent': init_fluid_turbulent,
     'rayleigh_benard': init_rayleigh_benard,
+    'rayleigh_hot_spot': init_rayleigh_hot_spot,
+    'rayleigh_rolls': init_rayleigh_rolls,
     'euler_blast': init_euler_blast,
     'euler_shocktube': init_euler_shocktube,
     'euler_kelvin_helmholtz': init_euler_kelvin_helmholtz,
@@ -23061,15 +24703,32 @@ INIT_FUNCS = {
     'excitable_random': init_excitable_random,
     'wireworld_torus': init_wireworld_torus,
     'wireworld_lattice': init_wireworld_lattice,
+    'wireworld_rings': init_wireworld_rings,
+    'wireworld_bus': init_wireworld_bus,
     'forest_dense': init_forest_dense,
     'forest_burning_seed': init_forest_burning_seed,
     'sine_gordon_kink': init_sine_gordon_kink,
+    'sine_gordon_collision': init_sine_gordon_collision,
+    'sine_gordon_shell': init_sine_gordon_shell,
     'sine_gordon_breather': init_sine_gordon_breather,
     'lifelike_cluster': init_lifelike_cluster,
     'pd_random': init_pd_random,
     'pd_invading': init_pd_invading,
     'xy_random': init_xy_random,
     'xy_aligned': init_xy_aligned,
+    # 2026-08 FCC lattice-native additions
+    'potts_random': init_potts_random,
+    'potts_nuclei': init_potts_nuclei,
+    'stacking_layers': init_stacking_layers,
+    'stacking_fcc': init_stacking_fcc,
+    'hex_spacetime_random': init_hex_spacetime_random,
+    'hex_spacetime_seed': init_hex_spacetime_seed,
+    'gray_scott_planar': init_gray_scott_planar,
+    'gray_scott_points': init_gray_scott_points,
+    'gray_scott_shell': init_gray_scott_shell,
+    'spins_aligned': init_spins_aligned,
+    'spins_slab': init_spins_slab,
+    'spins_droplet': init_spins_droplet,
 }
 
 
@@ -24992,6 +26651,20 @@ class Simulator:
         # Compile the view-texture baker (full-res R16F scalar).
         self._view_build_prog = self.ctx.compute_shader(VIEW_TEX_BUILD_SHADER)
 
+        # ── Spacetime "time-axis" display (Tier 1) ──
+        # Scrolling history volume + reslice shader. Textures are allocated
+        # lazily on first enable so users who never turn it on pay nothing.
+        self._st_scroll_prog = self.ctx.compute_shader(SPACETIME_SCROLL_SHADER)
+        self._st_tex_a = None
+        self._st_tex_b = None
+        self._st_ping = 0
+        self._st_current = None       # last-written ST texture (what we display)
+        self._st_dims = None          # (W,H,D) the ST textures were sized for
+        self._st_last_step = -1       # step_count at last scroll (one/generation)
+        self._time_axis_mode = False  # off by default; UI toggles it
+        self._st_reduction = 0        # 0 = fixed z-slice, 1 = max-projection shadow
+        self._st_slice_frac = 0.5     # slice position along z as a fraction
+
         # Acceleration texture state
         self._occ_block_size = 4  # default; recomputed per-size in _alloc_accel_textures
         self._accel_textures_valid = False
@@ -25382,10 +27055,15 @@ class Simulator:
         # opted-in presets at runtime.
         self._alloc_sparse_dispatch((W, H, D))
 
-    def _build_accel_textures(self):
+    def _build_accel_textures(self, src_override=None):
         """Dispatch occupancy and min/max compute shaders to build acceleration structures.
-        Called once per sim step (cheap — typically (size/4)³ threads)."""
-        src_tex = self.tex_a if self.ping == 0 else self.tex_b
+        Called once per sim step (cheap — typically (size/4)³ threads).
+
+        `src_override` (a texture3d) builds the view tex + accel from that
+        texture instead of the live sim state — used by the time-axis
+        spacetime display, which renders a scrolling history volume."""
+        src_tex = src_override if src_override is not None else (
+            self.tex_a if self.ping == 0 else self.tex_b)
         size = self.size
         bs = self._occ_block_size
         occ_dim = self._occ_dim
@@ -30093,17 +31771,89 @@ void main() {
 
     # ── Rendering ─────────────────────────────────────────────────────
 
+    def _ensure_st_textures(self):
+        """Lazily (re)allocate the ping-pong spacetime history volumes to
+        match the current grid. RGBA16F mirrors the view-texture format
+        (.r density + .gba baked colour) so the raymarcher samples them
+        exactly like the live view tex. Zero-initialised so the history
+        starts empty and fills from the top plane downward."""
+        dims = (self.W, self.H, self.D)
+        if self._st_tex_a is not None and self._st_dims == dims:
+            return
+        for t in (self._st_tex_a, self._st_tex_b):
+            if t is not None:
+                try: t.release()
+                except Exception: pass  # noqa: BLE001  GL release, never fatal
+        zero = bytes(self.W * self.H * self.D * 8)  # 4 ch × f16
+        self._st_tex_a = self.ctx.texture3d(dims, 4, zero, dtype='f2')
+        self._st_tex_b = self.ctx.texture3d(dims, 4, zero, dtype='f2')
+        for t in (self._st_tex_a, self._st_tex_b):
+            t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            t.repeat_x = t.repeat_y = t.repeat_z = False
+        self._st_ping = 0
+        self._st_current = self._st_tex_a
+        self._st_dims = dims
+        self._st_last_step = -1
+
+    def _advance_spacetime(self):
+        """Scroll the history volume down one plane and write the current
+        generation's 2-D reduction (slice or max-projection shadow) of the
+        LIVE grid to the top plane, keeping raw channels. Self-gated to run
+        once per sim generation (step_count change)."""
+        self._ensure_st_textures()
+        if self.step_count == self._st_last_step:
+            return  # already scrolled for this generation (or paused)
+        src = self._st_tex_a if self._st_ping == 0 else self._st_tex_b
+        dst = self._st_tex_b if self._st_ping == 0 else self._st_tex_a
+        live = self.tex_a if self.ping == 0 else self.tex_b
+        # Channel / abs used to rank column activity for the shadow mode
+        # (mirror the accel + voxel-cull channel logic).
+        shader = self.preset['shader']
+        if self.preset.get('is_element_ca', False):
+            ch, ab = 0, 0
+        elif shader in ('wave_3d', 'em_wave_3d', 'em_yee_E_3d'):
+            ch, ab = self.vis_channel, 1
+        else:
+            ch, ab = self.vis_channel, int(self.vis_abs)
+        GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
+        src.bind_to_image(0, read=True, write=False)
+        dst.bind_to_image(1, read=False, write=True)
+        live.use(location=0)
+        prog = self._st_scroll_prog
+        prog['u_src'].value = 0
+        prog['u_dims'].value = (self.W, self.H, self.D)
+        prog['u_reduce'].value = int(self._st_reduction)
+        prog['u_slice_z'].value = int(round(self._st_slice_frac * (self.D - 1)))
+        prog['u_channel'].value = int(ch)
+        prog['u_use_abs'].value = int(ab)
+        prog.run((self.W + 3) // 4, (self.H + 3) // 4, (self.D + 3) // 4)
+        GL.glMemoryBarrier(GL.GL_ALL_BARRIER_BITS)
+        self._st_ping ^= 1
+        self._st_current = dst
+        self._st_last_step = self.step_count
+        # The render source changed — force accel + voxel-cull rebuild.
+        self._accel_textures_valid = False
+        self._cull_valid = False
+
     def _render_volume(self):
         sub = getattr(self, '_render_sub', None)
         _t = time.perf_counter() if sub is not None else 0.0
-        # Build acceleration structures if stale
+        # Time-axis (spacetime) display: scroll the history volume, then
+        # build the view tex + accel FROM the history (raw channels) so the
+        # raymarcher shows the spacetime volume instead of the live grid.
+        _time_axis = (self._time_axis_mode and not self._is_viewport_kind())
+        if _time_axis:
+            self._advance_spacetime()
+        # Build acceleration structures if stale (from history when time-axis)
         if not self._accel_textures_valid:
-            self._build_accel_textures()
+            self._build_accel_textures(
+                src_override=self._st_current if _time_axis else None)
         if sub is not None:
             sub['accel'] = time.perf_counter() - _t
             sub['_t_disp'] = time.perf_counter()  # closed out at function end
 
-        src_tex = self.tex_a if self.ping == 0 else self.tex_b
+        src_tex = (self._st_current if (_time_axis and self._st_current is not None)
+                   else (self.tex_a if self.ping == 0 else self.tex_b))
 
         cam_pos = self._get_camera_pos()
         cam_rot = self._get_camera_rot()
@@ -30579,6 +32329,13 @@ void main() {
         are ever dropped regardless of grid size or fill density."""
         sub = getattr(self, '_render_sub', None)
         _t = time.perf_counter() if sub is not None else 0.0
+        # Time-axis (spacetime) display: scroll the history volume, then
+        # build accel from it. The history holds raw sim channels, so the
+        # voxel cull / draw below sample it exactly like the live grid,
+        # giving crisp stacked-cube spacetime worms.
+        _time_axis = (self._time_axis_mode and not self._is_viewport_kind())
+        if _time_axis:
+            self._advance_spacetime()
         # Ensure the min/max acceleration mipmap is up to date -- the
         # adaptive voxel-threshold updater piggybacks on it inside
         # _build_accel_textures().  Without this call the voxel renderer
@@ -30587,7 +32344,8 @@ void main() {
         # the rule's natural background, causing the entire cube to render
         # as a solid block).
         if not self._accel_textures_valid:
-            self._build_accel_textures()
+            self._build_accel_textures(
+                src_override=self._st_current if _time_axis else None)
         if sub is not None:
             sub['accel'] = time.perf_counter() - _t
             _t_disp = time.perf_counter()
@@ -30598,7 +32356,8 @@ void main() {
             self.ctx.enable(moderngl.BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
 
-        src_tex = self.tex_a if self.ping == 0 else self.tex_b
+        src_tex = (self._st_current if (_time_axis and self._st_current is not None)
+                   else (self.tex_a if self.ping == 0 else self.tex_b))
 
         # Determine rule-specific cull parameters (channel, mode, threshold)
         shader = self.preset['shader']
@@ -30881,6 +32640,11 @@ void main() {
         # Reset sub-timings dict; populated by the chosen renderer path.
         # Captured by the main loop into sec['render.*'] entries.
         self._render_sub = {}
+        # Time-axis (spacetime) display works in BOTH voxel and volumetric
+        # renderers — the history volume holds raw sim channels, so each
+        # renderer samples it exactly as it would the live grid. We honour
+        # the user's chosen renderer_mode; the spacetime source-swap happens
+        # inside _render_voxels / _render_volume.
         if self.renderer_mode == 'voxel':
             self._render_voxels()
         elif self.renderer_mode == 'sdf_viewport':
@@ -30917,6 +32681,11 @@ void main() {
             self.render_mode, round(self.iso_threshold, 4), self.colormap,
             round(self.slice_pos, 4), self.slice_axis,
             self.vis_channel, bool(self.vis_abs),
+            # Time-axis (spacetime) display state — toggling / adjusting it
+            # must invalidate the cached frame immediately.
+            bool(getattr(self, '_time_axis_mode', False)),
+            int(getattr(self, '_st_reduction', 0)),
+            round(float(getattr(self, '_st_slice_frac', 0.5)), 3),
             # Recording disables caching (we need a fresh render each frame)
             bool(getattr(self, '_recording', False)),
             # Particles always animate; including count forces re-render.
@@ -31801,18 +33570,23 @@ void main() {
             # so user-entered negatives or huge values don't crash _reset().
             self.seed = int(max(0, min(0xFFFFFFFF, new_seed)))
 
-        # Init pattern selector (if variants exist)
-        variants = self.preset.get('init_variants', [])
-        if variants:
+        # Init pattern selector (if variants exist).
+        # 'init_extras' are browsable here but excluded from the batch-search
+        # sampler -- kept for exploration, not because they score well.
+        variants = list(self.preset.get('init_variants', []))
+        extras = [v for v in self.preset.get('init_extras', []) if v not in variants]
+        if variants or extras:
             current = getattr(self, '_current_init', self.preset['init'])
-            all_inits = [self.preset['init']] + [v for v in variants if v != self.preset['init']]
+            all_inits = [self.preset['init']]
+            all_inits += [v for v in variants + extras if v != self.preset['init']]
             if current not in all_inits:
                 all_inits.append(current)
             imgui.text("Init pattern:")
             if imgui.begin_combo("##init", current):
                 for name in all_inits:
                     is_sel = (name == current)
-                    if imgui.selectable(name, is_sel)[0]:
+                    label = f"{name}  (explore)" if name in extras else name
+                    if imgui.selectable(label, is_sel)[0]:
                         self._current_init = name
                         self._reset()
                     if is_sel:
@@ -32249,6 +34023,56 @@ void main() {
                 if is_sel:
                     imgui.set_item_default_focus()
             imgui.end_combo()
+
+        # ── Time-axis (spacetime) display ──
+        # Turn any grid rule into a "time as the z axis" spacetime diagram:
+        # each generation's 2-D reduction is stacked into a scrolling volume.
+        # Meaningless for viewport/SDF rules (no grid), so hide it there.
+        if not self._is_viewport_kind():
+            ch_ta, self._time_axis_mode = imgui.checkbox(
+                "Time axis (spacetime)", self._time_axis_mode)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Stack each generation along z so TIME becomes the\n"
+                    "third axis — a live spacetime diagram of any rule.\n"
+                    "Works in both the volumetric and voxel renderers.")
+            if ch_ta:
+                # Clear the history so it re-fills cleanly from 'now'
+                # (force a zeroed realloc + accel/cull rebuild).
+                self._st_dims = None
+                self._st_last_step = -1
+                self._accel_textures_valid = False
+                self._cull_valid = False
+            if self._time_axis_mode:
+                imgui.same_line()
+                red_labels = ["Slice", "Shadow (max)"]
+                imgui.set_next_item_width(150)
+                if imgui.begin_combo("##st_reduce", red_labels[self._st_reduction]):
+                    for i, label in enumerate(red_labels):
+                        sel = (i == self._st_reduction)
+                        if imgui.selectable(label, sel)[0] and i != self._st_reduction:
+                            self._st_reduction = i
+                            self._st_dims = None      # clear history on mode change
+                            self._st_last_step = -1
+                            self._accel_textures_valid = False
+                            self._cull_valid = False
+                        if sel:
+                            imgui.set_item_default_focus()
+                    imgui.end_combo()
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "Slice: history of one z-plane cross-section.\n"
+                        "Shadow: max-projection silhouette down z\n"
+                        "(keeps the 3-D structure's outline).")
+                if self._st_reduction == 0:
+                    ch_sl, new_sl = imgui.slider_float(
+                        "Slice z##st_slice", self._st_slice_frac, 0.0, 1.0)
+                    if ch_sl:
+                        self._st_slice_frac = float(new_sl)
+                        self._st_dims = None
+                        self._st_last_step = -1
+                        self._accel_textures_valid = False
+                        self._cull_valid = False
 
         imgui.text("Boundary:")
         boundary_modes = ["Toroidal (wrap)", "Clamped (Dirichlet)", "Mirror (Neumann)"]
@@ -33471,6 +35295,15 @@ void main() {
             disc = self.discoveries[self.discovery_index]
             meta['discovery_score'] = get_field(disc, 'score', 0)
             meta['discovery_index'] = self.discovery_index
+        # Spacetime "time-axis" display: record that this clip renders time
+        # as the third (z) axis so the upload pipelines can describe/tag it
+        # as a spacetime view. Only written when the mode was actually on.
+        if getattr(self, '_time_axis_mode', False) and not self._is_viewport_kind():
+            meta['time_axis'] = {
+                'enabled': True,
+                'reduction': 'shadow' if self._st_reduction == 1 else 'slice',
+                'slice_frac': round(float(self._st_slice_frac), 3),
+            }
         if music_credit:
             meta['music'] = music_credit
         with open(meta_path, 'w') as f:
