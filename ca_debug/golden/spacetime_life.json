@@ -1,0 +1,160 @@
+{
+  "rule": "spacetime_life",
+  "size": 96,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "spacetime_random",
+  "params": {
+    "Birth min": 3,
+    "Birth max": 3,
+    "Survive min": 2,
+    "Survive max": 3
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "c259eaedf069c4b02577b570f905e150a94390b20e967ac799013e79f1cf48ec",
+      "stats": {
+        "shape": [
+          96,
+          96,
+          96,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.053769711405038834,
+            "std": 0.2255626916885376,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 47572,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.05217940732836723,
+            "std": 0.13363631069660187,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 150273,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.022670039907097816,
+            "std": 0.1488492786884308,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 20057,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "3b6f385ec9960c6c862f56efc3b334f79c76121243e3fea89c2690921b5cb7f5",
+      "stats": {
+        "shape": [
+          96,
+          96,
+          96,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.13704653084278107,
+            "std": 0.3438964784145355,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 121250,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.13829097151756287,
+            "std": 0.18175674974918365,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 418126,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.05620433762669563,
+            "std": 0.2303158938884735,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 49726,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "e8beb5989d83cff3af619f02781e1eb50c97bf0f6076944d07663015f774837f",
+      "stats": {
+        "shape": [
+          96,
+          96,
+          96,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.07726146280765533,
+            "std": 0.2670058608055115,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 68356,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.07762202620506287,
+            "std": 0.14574307203292847,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 252283,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.029138635843992233,
+            "std": 0.16819505393505096,
+            "min": 0.0,
+            "max": 1.0,
+            "alive": 25780,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-07-21T16:28:25+00:00",
+  "note": "new rule: 2D life-like CA with time extruded as z axis (spacetime diagram)"
+}
