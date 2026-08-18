@@ -21,6 +21,9 @@ youtube_pipeline/__pycache__/
 reddit_pipeline/credentials/
 reddit_pipeline/__pycache__/
 
+# Background music library — third-party licensed tracks, not ours to redistribute
+youtube_pipeline/audio/
+
 # Discoveries — generated at runtime, not committed
 discoveries.json
 discoveries.json.lock
@@ -82,6 +85,7 @@ batch_flagships.sh
 batch_prescreen.sh
 batch_fcc.sh
 logs/
+refwatch.log
 
 # Content exports (YouTube Studio archive downloads, etc.)
 *.zip
@@ -109,6 +113,9 @@ explorer.html
 validator.html
 tmp_fractal/
 .vscode/
+
+# Personal documents — unrelated to this project
+career/
 
 # native crash dumps
 core
