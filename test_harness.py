@@ -860,14 +860,17 @@ class HeadlessRunner:
             self.alive_threshold = 0.1  # captures Turing spots/stripes without over-counting
             self.change_threshold = 0.02  # PDE field: need meaningful structural change
         elif shader in ('brusselator_3d', 'schnakenberg_3d'):
-            # Continuous reaction-diffusion concentration fields (range ~[0,2]).
-            # Without this branch they fell through to the discrete default
-            # (alive_threshold=0.5) which marked every cell alive from step 0,
-            # masking real Turing pattern formation and tanking their score.
+            # Turing activator fields with a non-zero bulk (U*~0.8-1.0) and
+            # bright spots at 1.6-2.5. The old 'deviation 0.1' saturated
+            # (64-100% of cells deviate -> filled cube -> score floor 0.03-
+            # 0.12) — the exact failure the fcc_schnakenberg branch comment
+            # documents. Mirror the FCC fix: isolate the bright spots with a
+            # value threshold (cubic peaks ~2.4, so 1.6 keeps spots sparse).
+            # Measured: schnakenberg 0.115 -> 0.760, brusselator 0.033 -> 0.286.
             self.measure_channel = 0  # activator (U)
-            self.measure_mode = 'deviation'  # Turing spots: deviation from spatial mean
-            self.alive_threshold = 0.1
-            self.change_threshold = 0.02
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 1.6
+            self.change_threshold = 0.05
         elif shader == 'kuramoto_3d':
             self.measure_channel = 0  # phase [0,1]
             self.measure_mode = 'phase_coherence'  # alive = domain boundary cells
@@ -892,6 +895,17 @@ class HeadlessRunner:
         elif shader == 'cahn_hilliard':
             self.measure_channel = 0  # order parameter c ∈ [-1,1]
             self.measure_mode = 'deviation'  # interesting = deviation from mean (domain walls)
+            self.alive_threshold = 0.3
+            self.change_threshold = 0.01
+        elif shader == 'active_phase_sep_3d':
+            # Non-reciprocal (active) demixing: two conserved order
+            # parameters with anti-symmetric coupling. Same layout as
+            # cahn_hilliard, but with NO branch here it fell through to the
+            # generic default, whose threshold sits above the amplitude this
+            # field ever reaches (|c| ~ 0.44 at 300 steps) -> alive was
+            # identically 0 and the rule scored 0.000 at its own defaults.
+            self.measure_channel = 0
+            self.measure_mode = 'deviation'
             self.alive_threshold = 0.3
             self.change_threshold = 0.01
         elif shader == 'erosion_3d':
@@ -1027,15 +1041,33 @@ class HeadlessRunner:
             self.alive_threshold = 0.5
             self.change_threshold = 0.005
         elif shader == 'hodgepodge_3d':
-            # State 0 = healthy background, >0 = excited. Threshold 0.5
-            # in normalised units catches state>=1 (the integer encoding
-            # divides by N-1, and the smallest nonzero state encodes to
-            # >=1/(N-1) >= ~0.004; threshold 0.05 stays well below that
-            # while excluding floating-point quantisation noise).
+            # After transient the medium is ~99.9% nonzero (every cell is
+            # somewhat infected), so the old 'discrete 0.05' read a saturated
+            # cube (score 0.062). The BZ waves show as deviation from the
+            # ~0.76 state bulk (~30% of cells). Measured 0.062 -> 0.350.
             self.measure_channel = 0
-            self.measure_mode = 'discrete'
-            self.alive_threshold = 0.05
+            self.measure_mode = 'deviation'
+            self.alive_threshold = 0.10
             self.change_threshold = 0.01
+        elif shader == 'cyclic_ca_3d':
+            # Raw states 0..N-1 in ch0 made the generic 'discrete 0.5'
+            # fallthrough count ~90% of cells alive (saturated cube). Mirror
+            # the fcc_cyclic branch: measure the G=phase channel with
+            # phase_coherence so "alive" = colour-domain boundary cells
+            # (the wavefronts).
+            self.measure_channel = 1
+            self.measure_mode = 'phase_coherence'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.02
+        elif shader == 'flow_turing_3d':
+            # Gray-Scott-family fields: U substrate bulk ~0.7 meant the
+            # generic 'discrete 0.5' fallthrough counted 78% alive. Measure
+            # the V catalyst (the travelling wave trains) like the other
+            # gray_scott rules. Measured 0.264 -> 0.900.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.10
+            self.change_threshold = 0.001
         elif shader == 'margolus_3d':
             # Particle channel is binary {0,1}. Conservation laws mean
             # global counts won't budge — score should reflect spatial
@@ -1083,12 +1115,14 @@ class HeadlessRunner:
             self.alive_threshold = 0.05
             self.change_threshold = 0.002
         elif shader == 'sandpile_3d':
-            # Grain count varies 0..T. Deviation catches avalanche fronts
-            # against the bulk near-critical background.
-            self.measure_channel = 0
-            self.measure_mode = 'deviation'
+            # Heights (ch0) spread 0..12 around mean ~4, so 'deviation 0.5'
+            # marked 97% of cells alive (saturated cube, score 0.081). The
+            # avalanches ARE the visual: ch1 is the toppling flag (~20% of
+            # cells during activity). Measured 0.081 -> 0.687.
+            self.measure_channel = 1
+            self.measure_mode = 'discrete'
             self.alive_threshold = 0.5
-            self.change_threshold = 0.1
+            self.change_threshold = 0.05
         elif shader == 'greenberg_hastings_3d':
             # State / (N-1). Any non-zero state = active wave cell.
             self.measure_channel = 0
@@ -1368,6 +1402,50 @@ class HeadlessRunner:
             self.measure_mode = 'continuous'
             self.alive_threshold = 0.08
             self.change_threshold = 0.005
+        elif shader == 'fcc_potts_grain':
+            # FCC Potts grain growth. The orientation field fills the volume
+            # (every cell belongs to some grain), so measuring it would read
+            # as a solid cube and hit the quality floor exactly like
+            # fcc_lichen did. The structure that matters is the grain
+            # BOUNDARY network (ch2 = unlike-neighbour fraction), which is
+            # naturally sparse: interior cells sit at 0 and only boundary
+            # cells register. 0.15 = at least two unlike neighbours out of
+            # twelve, which excludes single-cell roughness on a flat face.
+            self.measure_channel = 2
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.15
+            self.change_threshold = 0.02
+        elif shader == 'fcc_stacking':
+            # FCC stacking / polytypism. ch2 is the local HCP fraction: 0 in
+            # a perfect ABCABC crystal, 1 inside an HCP lamella. The
+            # interesting states are the ones carrying stacking faults and
+            # twin boundaries, which appear as sparse sheets, so threshold
+            # above the FCC background rather than measuring the register
+            # field itself (which fills the box).
+            self.measure_channel = 2
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.02
+        elif shader == 'fcc_frustrated_af':
+            # FCC frustrated antiferromagnet. ch1 is the frustrated-bond
+            # fraction. Geometry puts a hard floor at 4/12 = 0.333 on the mean
+            # (measured: cooling stalls at 0.346), so the threshold sits just
+            # above the ordered background to isolate the sparse network of
+            # over-frustrated defect cells rather than the whole volume.
+            self.measure_channel = 1
+            self.measure_mode = 'continuous'
+            self.alive_threshold = 0.45
+            self.change_threshold = 0.02
+        elif shader == 'fcc_hex_spacetime':
+            # FCC hexagonal spacetime: ch0 is the binary state stacked into a
+            # history volume. Mirrors the discrete life-like branches. The
+            # change metric is naturally high (the whole volume scrolls one
+            # layer per step), so keep the threshold loose and let the alive
+            # ratio carry the score.
+            self.measure_channel = 0
+            self.measure_mode = 'discrete'
+            self.alive_threshold = 0.5
+            self.change_threshold = 0.01
         elif is_agent_rule:
             # Agent-driven rule with a non-trivial voxel shader (e.g.
             # smugglers_3d). The grid carries sparse trails / stashes
@@ -1386,6 +1464,18 @@ class HeadlessRunner:
             self.alive_threshold = 0.5
             self.change_threshold = 0.01
 
+        # Preset-level measure override. The chain above keys on SHADER, so
+        # preset-only variants (nucleation vs cahn_hilliard, fcc_445 vs
+        # fcc_life) silently inherit their parent's thresholds even when they
+        # run in a completely different amplitude regime. A preset can opt out
+        # with `"measure": {"channel":, "mode":, "alive":, "change":}`.
+        _mo = self.preset.get('measure')
+        if _mo:
+            self.measure_channel = int(_mo.get('channel', self.measure_channel))
+            self.measure_mode = _mo.get('mode', self.measure_mode)
+            self.alive_threshold = float(_mo.get('alive', self.alive_threshold))
+            self.change_threshold = float(_mo.get('change', self.change_threshold))
+
         # Allow param/dt override
         self.params = dict(self.preset['params'])
         if params:
@@ -1399,9 +1489,8 @@ class HeadlessRunner:
         # Pass entries can be either a string shader key or a dict
         # {"shader": str, "writes": ["p1"|"p2", ...]}. Strings default to
         # writes=["p1"], matching legacy behaviour.
-        # NOTE: this headless runner does NOT yet allocate a second texture
-        # pair, so multi-pass rules that need pair 2 are not supported here.
-        # Use the full simulator (--rule X) for those.
+        # Pair 2 (bindings 2/3) and the extras (4/5, 6/7, ...) ARE allocated
+        # and bound here, mirroring Simulator._needs_field2/_extras_count.
         shader_key = self.preset.get('shader')
         if 'passes' in self.preset:
             raw_passes = list(self.preset['passes'])
@@ -1713,6 +1802,27 @@ class HeadlessRunner:
             self.tex_b2 = ctx.texture3d((size, size, size), 4, init2_bytes,
                                          dtype=self._tex_dtype)
 
+        # Additional auxiliary fields (extras[i] = preset field i+3), bound at
+        # image units (4/5), (6/7), ... exactly like Simulator does. Without
+        # these, any rule declaring extra_fields >= 2 ran headless with those
+        # units UNBOUND — the pair-3 twin of the Probe #20 pair-2 bug that
+        # silently killed the crystal presets.
+        self.tex_a_extras = []
+        self.tex_b_extras = []
+        self.ping_extras = []
+        n_extras = max(0, int(self.preset.get('extra_fields', 0)) - 1)
+        field_inits = list(self.preset.get('field_inits') or [])
+        for i in range(n_extras):
+            # field_inits[0] is field2; extras[i] uses field_inits[i + 1].
+            name = field_inits[i + 1] if len(field_inits) > i + 1 else None
+            arr = self._make_named_field_init(name, size, seed)
+            b = np.ascontiguousarray(arr.astype(self._tex_np_dtype)).tobytes()
+            self.tex_a_extras.append(
+                ctx.texture3d((size, size, size), 4, b, dtype=self._tex_dtype))
+            self.tex_b_extras.append(
+                ctx.texture3d((size, size, size), 4, b, dtype=self._tex_dtype))
+            self.ping_extras.append(0)
+
         # Optional agent buffer for agent-kind passes (e.g., Langton's ant).
         self.agent_ssbo = None
         self.agent_count = 0
@@ -1768,6 +1878,12 @@ class HeadlessRunner:
         init_name = self.preset.get('field2_init')
         if init_name is None and self.preset.get('shader') == 'crystal_growth':
             init_name = 'crystal_solute'
+        return self._make_named_field_init(init_name, size, seed)
+
+    def _make_named_field_init(self, init_name, size, seed):
+        """Build one auxiliary field array by name. Shared by field2 and the
+        extras (fields 3..N) so both go through the same mirror of
+        `Simulator._make_field_init`."""
         arr = np.zeros((size, size, size, 4), dtype=np.float32)
         if init_name == 'crystal_solute':
             arr[..., 0] = 1.0
@@ -1790,6 +1906,30 @@ class HeadlessRunner:
             arr[..., 1] = 0.7 + r[..., 1] * 0.6
             arr[..., 2] = (r[..., 2] - 0.5) * 0.6
             arr[..., 3] = r[..., 3]
+        elif init_name == 'random_sparse_r':
+            rng = np.random.default_rng(seed if seed is not None else 0)
+            mask = rng.random((size, size, size), dtype=np.float32) < 0.05
+            arr[..., 0] = mask.astype(np.float32)
+        elif init_name in ('plife_rand', 'plife_rand_r'):
+            # Low-frequency blob seed for fcc_particle_life. Must match
+            # simulator.py:_make_field_init('plife_rand') exactly, including
+            # the +101 seed offset for the colour-4 field, or headless runs
+            # start from a different soup than the live engine.
+            from scipy.ndimage import gaussian_filter
+            base = seed if seed is not None else 0
+            offset = 0 if init_name == 'plife_rand' else 101
+            rng = np.random.default_rng(base + offset)
+            nch = 4 if init_name == 'plife_rand' else 1
+            sigma = max(2.0, size / 16.0)
+            for c in range(nch):
+                noise = rng.standard_normal((size, size, size)).astype(np.float32)
+                fld = gaussian_filter(noise, sigma=sigma, mode='wrap')
+                fld -= fld.mean()
+                std = fld.std()
+                if std > 1e-6:
+                    fld /= std
+                amp = np.clip((fld - 0.9) / 1.6, 0.0, 1.0)
+                arr[..., c] = (0.4 + 0.6 * amp) * (amp > 0.0)
         elif init_name == 'euler_pair2_auto':
             # Compressible Euler pair-2 init: build E from the same
             # primitives the rule's pair-1 init used so the two
@@ -1873,6 +2013,14 @@ class HeadlessRunner:
                     src2.bind_to_image(2, read=True, write=False)
                     dst2.bind_to_image(3, read=False, write=True)
 
+                for i, (ea, eb) in enumerate(zip(self.tex_a_extras,
+                                                 self.tex_b_extras)):
+                    p = self.ping_extras[i]
+                    (ea if p == 0 else eb).bind_to_image(
+                        4 + 2 * i, read=True, write=False)
+                    (eb if p == 0 else ea).bind_to_image(
+                        5 + 2 * i, read=False, write=True)
+
             if self.is_element_ca:
                 self.element_ssbo.bind_to_storage_buffer(2)
             if self.agent_ssbo is not None:
@@ -1955,6 +2103,10 @@ class HeadlessRunner:
                     self.ping = 1 - self.ping
                 if 'p2' in spec['writes'] and self.tex_a2 is not None:
                     self.ping2 = 1 - self.ping2
+                # 'p3', 'p4', ... map to extras[0], extras[1], ...
+                for i in range(len(self.ping_extras)):
+                    if f'p{i + 3}' in spec['writes']:
+                        self.ping_extras[i] = 1 - self.ping_extras[i]
 
         self._frame += 1
 
@@ -2202,6 +2354,12 @@ class HeadlessRunner:
             try: self.tex_b2.release()
             except Exception: pass  # noqa: BLE001  GL resource release, never fatal
             self.tex_b2 = None
+        for t in (getattr(self, 'tex_a_extras', None) or []) + \
+                 (getattr(self, 'tex_b_extras', None) or []):
+            try: t.release()
+            except Exception: pass  # noqa: BLE001  GL resource release, never fatal
+        self.tex_a_extras = []
+        self.tex_b_extras = []
         if self.agent_ssbo is not None:
             try: self.agent_ssbo.release()
             except Exception: pass  # noqa: BLE001  GL resource release, never fatal
@@ -4140,11 +4298,16 @@ def cmd_search(ctx, args):
                   f"{r.get('projection_structure', 0):5.3f} "
                   f"{r.get('slice_mi_max', 0):5.3f}  {_fmt_params(r['params'])}")
 
-    # Save -- deduplicate behaviorally similar discoveries before saving
+    # Save -- persist the WHOLE elite archive, not just the display top-N.
+    # Each MAP-Elites grid cell is by construction a distinct behavioural
+    # niche; discarding all but the top-10 threw away 80-90% of what the
+    # search spent hours finding (e.g. 400 trials -> 68 elites -> 9 saved).
+    # `--top` now only controls the console table above. min_quality and
+    # behavioural dedup still apply (adjacent cells can be near-identical).
     if args.save:
         min_q = getattr(args, 'min_quality', 0.25)
         candidates = [_make_discovery(r)
-                      for r in best_results[:top_n]
+                      for r in best_results
                       if _is_quality(r, min_score=min_q)]
 
         # Behavioural deduplication in z-scored fingerprint space.
