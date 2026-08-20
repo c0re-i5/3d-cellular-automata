@@ -1397,10 +1397,12 @@ class HeadlessRunner:
             # total density; the colours flow and reshape continuously, so the
             # change metric stays active when a seed produces real dynamics
             # (and collapses to ~0 for dead seeds that diffuse to nothing or
-            # saturate uniformly).
+            # saturate uniformly). alive_threshold matches the render
+            # voxel_threshold (0.32): scoring below it counted invisible fog and
+            # saturated to the floor exactly where the render looked best.
             self.measure_channel = 3
             self.measure_mode = 'continuous'
-            self.alive_threshold = 0.08
+            self.alive_threshold = 0.32
             self.change_threshold = 0.005
         elif shader == 'fcc_potts_grain':
             # FCC Potts grain growth. The orientation field fills the volume
@@ -4205,7 +4207,8 @@ def cmd_search(ctx, args):
             # stay in or adjacent to the parent's regime. The grid takes
             # care of macro-exploration; mutation only does local refine.
             scale = 0.05 + rng.random() * 0.10
-            params = _mutate_params(parent['params'], preset['param_ranges'], rng, scale=scale)
+            params = _mutate_params(parent['params'], preset['param_ranges'], rng,
+                                    scale=scale, genome=preset.get('genome_params'))
             # Joint mutation of dt + density: inherit from parent then jitter.
             parent_dt = parent.get('dt', preset.get('dt'))
             trial_dt = sample_dt(parent_dt) if dt_range else None
@@ -4353,17 +4356,28 @@ def cmd_search(ctx, args):
     _profile_print()
 
 
-def _mutate_params(params, ranges, rng, scale=0.15):
+def _mutate_params(params, ranges, rng, scale=0.15, genome=None):
     """Mutate parameters by small random amounts within valid ranges.
 
     Defensive against reversed (lo > hi) ranges in malformed presets.
+
+    `genome` names categorical params (e.g. a hash seed) whose neighbouring
+    values are unrelated universes: perturbing them wipes out any refinement
+    of the continuous physics params. Those are held fixed most of the time so
+    a good universe can be locally optimised, and only occasionally resampled.
     """
+    genome = genome or ()
     mutated = {}
     for name, val in params.items():
+        if name in genome and rng.random() >= 0.25:
+            mutated[name] = val
+            continue
         lo, hi = ranges[name]
         if lo > hi:
             lo, hi = hi, lo
-        if isinstance(lo, int) and isinstance(hi, int):
+        if name in genome:
+            mutated[name] = int(rng.randint(int(lo), int(hi) + 1))
+        elif isinstance(lo, int) and isinstance(hi, int):
             delta = max(1, int((hi - lo) * scale))
             new_val = int(val + rng.randint(-delta, delta + 1))
             mutated[name] = max(lo, min(hi, new_val))
@@ -4525,7 +4539,8 @@ def cmd_explore(ctx, args):
     for trial in range(args.trials):
         if best_results and rng.random() < 0.4:
             parent = best_results[rng.randint(len(best_results))]
-            params = _mutate_params(parent['params'], preset['param_ranges'], rng, scale=0.15)
+            params = _mutate_params(parent['params'], preset['param_ranges'], rng,
+                                    scale=0.15, genome=preset.get('genome_params'))
         else:
             params = randomize_params(preset, rng)
 

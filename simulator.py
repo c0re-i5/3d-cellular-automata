@@ -977,9 +977,12 @@ void main() {
                       vec3(PL_S, 0.0, PL_S),
                       vec3(PL_S, PL_S, 0.0));
 
-    // Force window covering the world-space interaction radius rmax (one
-    // integer step ~ 1/sqrt(2) of a diagonal), kept tight (2..3).
-    int R = clamp(int(rmax * PL_S + 1.0), 2, 3);
+    // Force window: box half-width that fully contains the world-space sphere
+    // of radius rmax. An FCC integer step's shortest world projection is
+    // sqrt(2/3) per unit, so R must reach rmax*sqrt(3/2)=1.2247*rmax; the old
+    // rmax/sqrt(2) under-covered by a shell (68% of neighbours at rmax=2.8/4.0),
+    // truncating the kernel anisotropically along the cubic axes.
+    int R = clamp(int(rmax * 1.2247449), 1, 4);
 
     // Compute THIS cell's velocity once and publish it to the shared tile.
     // ALL 512 threads (including any past the grid edge in a partial tile)
@@ -1018,7 +1021,11 @@ void main() {
     // chase, snake and reorganise forever instead of relaxing into blobs.
     float net[5];
     for (int i = 0; i < 5; ++i) net[i] = 0.0;
-    const float DIFF = 0.05;     // diffusion strength (caps density spikes)
+    // Advection can move up to 0.5 of a cell's mass per face; DIFF must be a
+    // meaningful fraction of that or peaks run away (max density ~700 vs mean
+    // ~0.6) and bodies shatter into single-voxel dust. 0.20 keeps bodies
+    // coherent (~200 clusters) without percolating into one blob (0.35+).
+    const float DIFF = 0.20;     // diffusion strength (caps density spikes)
 
     for (int f = 0; f < 12; ++f) {
         ivec3 d = NB12[f];
@@ -15273,6 +15280,10 @@ RULE_PRESETS = {
                          "Repel radius": (0.05, 0.80),
                          "Interaction radius": (1.3, 4.0),
                          "Speed": (0.05, 1.20)},
+        # Matrix seed is a hash-derived categorical genome: neighbouring values
+        # are unrelated universes, so the search holds it fixed while refining
+        # the continuous physics params and only occasionally resamples it.
+        "genome_params": ["Matrix seed"],
         "dt": 1.0,
         "dt_range": (0.1, 2.0),
         "init": "blank",          # primary texture is display-only (rebuilt each step)
@@ -25967,7 +25978,7 @@ SEARCH_STEPS = {
     'fcc_gray_scott_worms'            :  200,  # peak 0.761@200, 500 lost 39%
     'fcc_hodgepodge'                  :  100,  # peak 0.124@100, 500 lost 66%
     'fcc_lichen'                      :   50,  # peak 0.564@50, 500 lost 88%
-    'fcc_particle_life'               :  200,  # peak 0.541@200, 500 lost 34%
+    'fcc_particle_life'               :  200,  # isotropic kernel + DIFF 0.20: mean 0.73@200
     'fcc_sandpile'                    : 2000,  # peak 0.544@2000, 500 lost 54%
     'fcc_xy_spin'                     : 2000,  # peak 0.517@2000, 500 lost 38%
     'fire'                            :   50,  # peak 0.687@200, 500 lost 100%
