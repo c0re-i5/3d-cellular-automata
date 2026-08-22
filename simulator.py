@@ -1255,6 +1255,7 @@ void main() {
     float kcat2 = mix(0.10,  0.40,  pl_hash(seed, 211)); // E autocatalysis
     float koff2 = mix(0.004, 0.025, pl_hash(seed, 212)); // E turnover
     float thr2  = mix(0.08,  0.30,  pl_hash(seed, 213)); // E co-density threshold
+    float kfb   = mix(0.0,   0.6,   pl_hash(seed, 214)); // E->C enzymatic feedback
 
     float beta  = clamp(u_param1, 0.05, 0.9);
     float rmax  = clamp(u_param2, 1.3, 4.0);
@@ -1336,8 +1337,12 @@ void main() {
         float cC = newd[5];
         float cE = newd[6];
 
-        // step 1: pa + pb <-> C
-        float f1 = u_dt * (knuc1 * ((cA * cB >= thr1) ? 1.0 : 0.0) + kcat1 * cC) * cA * cB;
+        // step 1: pa + pb <-> C. The kfb*cE term lets the downstream product E
+        // catalyse C production, closing a positive loop C->E->C: balanced
+        // against turnover this makes the medium excitable (pulses/waves) rather
+        // than relaxing to a static steady state.
+        float f1 = u_dt * (knuc1 * ((cA * cB >= thr1) ? 1.0 : 0.0)
+                           + kcat1 * cC + kfb * cE) * cA * cB;
         f1 = min(f1, 2.0 * min(cA, cB));
         float b1 = min(u_dt * koff1 * cC, cC);
         cC += f1 - b1;                       // C feeds step 2 with its new value
@@ -1370,7 +1375,12 @@ void main() {
     float wsum = 0.0;
     float total = 0.0;
     for (int i = 0; i < 7; ++i) {
-        float w = newd[i] * newd[i] * newd[i];
+        // Organelles (5,6) are a low-density minority; weight their hue higher
+        // and use density^2 (not ^3) so compartments read as white/cyan even
+        // where a base colour is locally denser. Only affects display, not the
+        // conserved densities, the total, or the render threshold.
+        float w = (i >= 5) ? (8.0 * newd[i] * newd[i])
+                           : (newd[i] * newd[i] * newd[i]);
         chue += HUE[i] * w;
         wsum += w;
         total += newd[i];
