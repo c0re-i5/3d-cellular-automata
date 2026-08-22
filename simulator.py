@@ -1102,33 +1102,36 @@ void main() {
 """,
 
     "fcc_organelle": """
-// Multi-species Particle Life on the FCC lattice WITH AUTOCATALYTIC CHEMISTRY.
+// Multi-species Particle Life on the FCC lattice WITH A METABOLIC PATHWAY.
 //
 // Base model (see fcc_particle_life): 5 "colour" density fields transported by
 // a hash-derived non-reciprocal force matrix via conservative FCC flux, so
 // mass per base colour is exactly conserved and structures chase/curl forever.
 //
-// On top of the transport we add a REACTION layer: one emergent "organelle"
-// species (colour 5) that assembles autocatalytically from a hash-picked
-// COMPLEMENTARY precursor pair (pa, pb) of base colours:
+// On top of the transport we add a TWO-STEP autocatalytic reaction chain that
+// grows two emergent "organelle" species (colours 5 and 6) in sequence:
 //
-//   pa + pb  --(nucleation, only above co-density thr)-->  C     (rare seed)
-//   pa + pb  --(autocatalysis, rate ~ C)-->               2 C    (chain front)
-//   C        --(turnover)-->                              pa + pb (disassembly)
+//   step 1:  pa + pb  <-->  C     (C = colour 5, the primary organelle)
+//   step 2:  C  + pd  <-->  E      (E = colour 6, assembled FROM the organelle)
 //
-// The reaction is mass-conserving (C gains exactly what pa,pb lose and vice
-// versa) and positivity-preserving (formation is capped by the available
-// precursor), so the box stays bounded with no clamp. Because C has its OWN
-// row in the (now 6x6) force matrix it MOVES and ORGANISES differently from
-// its parts -- a genuine new species that nucleates where its precursors meet,
-// spreads as an autocatalytic front, then dissolves back into components, like
-// a self-assembling compartment. Every seed synthesises its own matrix AND its
-// own reaction constants, so the chemistry is part of the universe genome.
+// pa,pb are the most mutually-attractive base pair (so precursors congregate),
+// and pd is the base colour most attracted to C. Each step nucleates rarely
+// above a co-density threshold, then runs as an AUTOCATALYTIC front (rate ~ the
+// product already present), and reverses by first-order turnover. Because C is
+// the product of step 1 AND a reactant of step 2, it is a genuine metabolic
+// intermediate: E can only appear where C has already assembled -- a chain
+// reaction, like an organelle that only forms once an earlier compartment is
+// present. Both reactions are mass-conserving (their per-step deltas sum to
+// zero) and positivity-preserving (formation capped by available precursor),
+// so the box stays bounded with no clamp. C and E each have their own row in
+// the (now 7x7) force matrix, so they move and organise differently from their
+// parts and from each other. Every seed synthesises its own matrix AND its own
+// reaction constants, so the whole chemistry is part of the universe genome.
 //
 // Texture layout:
 //   u_dst   (main)  = vec4(display.rgb, total_density)
 //   u_src2/u_dst2   = densities of colours 0,1,2,3
-//   u_src3/u_dst3   = colour 4 in .r, organelle colour 5 in .g
+//   u_src3/u_dst3   = colour 4 .r, organelle C .g, organelle E .b
 //
 //   u_param0 = matrix + chemistry seed (cast to int)
 //   u_param1 = repulsion radius fraction beta
@@ -1137,8 +1140,8 @@ void main() {
 
 layout(rgba32f, binding=2) uniform image3D u_src2;   // colours 0..3 (read)
 layout(rgba32f, binding=3) uniform image3D u_dst2;   // colours 0..3 (write)
-layout(rgba32f, binding=4) uniform image3D u_src3;   // colour 4 .r, organelle 5 .g (read)
-layout(rgba32f, binding=5) uniform image3D u_dst3;   // colour 4 .r, organelle 5 .g (write)
+layout(rgba32f, binding=4) uniform image3D u_src3;   // colour 4 .r, C .g, E .b (read)
+layout(rgba32f, binding=5) uniform image3D u_dst3;   // colour 4 .r, C .g, E .b (write)
 
 const float PL_S = 0.70710678;  // 1/sqrt(2)
 
@@ -1150,23 +1153,23 @@ float pl_hash(int a, int b) {
     return float(s) * INV_U32_MAX;
 }
 
-// Read colour `ci` (0..5) at an integer cell with toroidal wrap.
+// Read colour `ci` (0..6) at an integer cell with toroidal wrap.
 float pl_colorAt(ivec3 p, int ci) {
     ivec3 w = (p + ivec3(u_size) * 4) % ivec3(u_size);
     if (ci < 4) return imageLoad(u_src2, w)[ci];
-    return imageLoad(u_src3, w)[ci - 4];   // ci=4 -> .r, ci=5 -> .g
+    return imageLoad(u_src3, w)[ci - 4];   // ci=4 -> .r, 5 -> .g, 6 -> .b
 }
 
 // Force matrix, identical for every thread (depends only on the seed), so it
 // is filled once per workgroup into shared memory rather than held in every
 // thread's registers -- keeps register pressure low enough to stop the
 // per-species velocity/density arrays spilling to local memory.
-shared float s_A[36];
+shared float s_A[49];
 
-// Per-colour force-velocity at integer cell `c` over the 6 species.
+// Per-colour force-velocity at integer cell `c` over the 7 species.
 void pl_velocity(ivec3 c, mat3 BASIS, float beta, float rmax,
-                 int R, out vec3 vel[6]) {
-    for (int i = 0; i < 6; ++i) vel[i] = vec3(0.0);
+                 int R, out vec3 vel[7]) {
+    for (int i = 0; i < 7; ++i) vel[i] = vec3(0.0);
     for (int dz = -R; dz <= R; ++dz)
     for (int dy = -R; dy <= R; ++dy)
     for (int dx = -R; dx <= R; ++dx) {
@@ -1180,26 +1183,26 @@ void pl_velocity(ivec3 c, mat3 BASIS, float beta, float rmax,
         float rep = (rn < beta) ? (1.0 - rn / beta) : 0.0;
         ivec3 w = (c + ivec3(dx, dy, dz) + ivec3(u_size) * 4) % ivec3(u_size);
         vec4 nb = imageLoad(u_src2, w);
-        vec2 ne = imageLoad(u_src3, w).rg;
-        float nd[6];
+        vec3 ne = imageLoad(u_src3, w).rgb;
+        float nd[7];
         nd[0] = nb.x; nd[1] = nb.y; nd[2] = nb.z; nd[3] = nb.w;
-        nd[4] = ne.x; nd[5] = ne.y;
-        float Tn = nd[0] + nd[1] + nd[2] + nd[3] + nd[4] + nd[5];
-        for (int i = 0; i < 6; ++i) {
+        nd[4] = ne.x; nd[5] = ne.y; nd[6] = ne.z;
+        float Tn = nd[0] + nd[1] + nd[2] + nd[3] + nd[4] + nd[5] + nd[6];
+        for (int i = 0; i < 7; ++i) {
             float coeff = 0.0;
-            for (int j = 0; j < 6; ++j) coeff += s_A[i * 6 + j] * nd[j];
+            for (int j = 0; j < 7; ++j) coeff += s_A[i * 7 + j] * nd[j];
             float fmag = att * coeff - 3.0 * rep * Tn;
             vel[i] += dir * fmag;
         }
     }
 }
 
-// 6 species * 3 floats = 18 per cell; 512 cells * 18 * 4 B = 36 KB < 48 KB.
-shared float pl_vs[8 * 8 * 8 * 18];
+// 7 species * 3 floats = 21 per cell; 512 cells * 21 * 4 B = 42 KB < 48 KB.
+shared float pl_vs[8 * 8 * 8 * 21];
 
-void pl_storeVel(int lidx, vec3 v[6]) {
-    int b = lidx * 18;
-    for (int i = 0; i < 6; ++i) {
+void pl_storeVel(int lidx, vec3 v[7]) {
+    int b = lidx * 21;
+    for (int i = 0; i < 7; ++i) {
         pl_vs[b + i * 3 + 0] = v[i].x;
         pl_vs[b + i * 3 + 1] = v[i].y;
         pl_vs[b + i * 3 + 2] = v[i].z;
@@ -1207,7 +1210,7 @@ void pl_storeVel(int lidx, vec3 v[6]) {
 }
 
 vec3 pl_loadVel(int lidx, int i) {
-    int b = lidx * 18 + i * 3;
+    int b = lidx * 21 + i * 3;
     return vec3(pl_vs[b], pl_vs[b + 1], pl_vs[b + 2]);
 }
 
@@ -1216,31 +1219,42 @@ void main() {
     ivec3 lid = ivec3(gl_LocalInvocationID);
     int   lidx = (lid.z * 8 + lid.y) * 8 + lid.x;
 
-    // ── Force matrix (row-major 6x6) from the seed, filled cooperatively
+    // ── Force matrix (row-major 7x7) from the seed, filled cooperatively
     //    into shared memory once per workgroup (identical for all threads) ──
     int seed = int(u_param0 + 0.5);
-    for (int k = int(gl_LocalInvocationIndex); k < 36; k += 512) {
+    for (int k = int(gl_LocalInvocationIndex); k < 49; k += 512) {
         float v = pl_hash(seed, k) * 2.0 - 1.0;
-        if (k / 6 == k % 6) v += 0.35;      // diagonal self-attraction
+        if (k / 7 == k % 7) v += 0.35;      // diagonal self-attraction
         s_A[k] = v;
     }
     barrier();
 
-    // ── Organelle chemistry constants from the same seed ───────────────
-    // Precursors pa,pb = the most mutually-attractive base pair, so they
-    // actually congregate and react (a random pair might repel and never
-    // meet); species 5 is the organelle assembled from them.
+    // ── Metabolic-chain constants from the same seed ───────────────────
+    // pa,pb = most mutually-attractive base pair -> they congregate and react
+    // into organelle C (species 5). pd = the base colour most attracted to C,
+    // so C and pd meet and react on into organelle E (species 6).
     int pa = 0, pb = 1;
     float bestAff = -1e9;
     for (int i = 0; i < 5; ++i)
     for (int j = i + 1; j < 5; ++j) {
-        float aff = s_A[i * 6 + j] + s_A[j * 6 + i];
+        float aff = s_A[i * 7 + j] + s_A[j * 7 + i];
         if (aff > bestAff) { bestAff = aff; pa = i; pb = j; }
     }
-    float knuc = mix(0.004, 0.015, pl_hash(seed, 202)); // spontaneous nucleation
-    float kcat = mix(0.15,  0.45,  pl_hash(seed, 203)); // autocatalytic growth
-    float koff = mix(0.003, 0.020, pl_hash(seed, 204)); // organelle turnover
-    float thr  = mix(0.10,  0.35,  pl_hash(seed, 205)); // co-density threshold
+    int pd = 0;
+    float bestC = -1e9;
+    for (int j = 0; j < 5; ++j) {
+        if (j == pa || j == pb) continue;
+        float aff = s_A[5 * 7 + j] + s_A[j * 7 + 5];   // attraction to C
+        if (aff > bestC) { bestC = aff; pd = j; }
+    }
+    float knuc1 = mix(0.004, 0.015, pl_hash(seed, 202)); // C nucleation
+    float kcat1 = mix(0.15,  0.45,  pl_hash(seed, 203)); // C autocatalysis
+    float koff1 = mix(0.003, 0.020, pl_hash(seed, 204)); // C turnover
+    float thr1  = mix(0.10,  0.35,  pl_hash(seed, 205)); // C co-density threshold
+    float knuc2 = mix(0.003, 0.012, pl_hash(seed, 210)); // E nucleation
+    float kcat2 = mix(0.10,  0.40,  pl_hash(seed, 211)); // E autocatalysis
+    float koff2 = mix(0.004, 0.025, pl_hash(seed, 212)); // E turnover
+    float thr2  = mix(0.08,  0.30,  pl_hash(seed, 213)); // E co-density threshold
 
     float beta  = clamp(u_param1, 0.05, 0.9);
     float rmax  = clamp(u_param2, 1.3, 4.0);
@@ -1252,15 +1266,15 @@ void main() {
 
     int R = clamp(int(rmax * 1.2247449), 1, 4);
 
-    vec3 vc[6];
+    vec3 vc[7];
     pl_velocity(pos, BASIS, beta, rmax, R, vc);
     pl_storeVel(lidx, vc);
     barrier();
 
     if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
 
-    float cd[6];
-    for (int i = 0; i < 6; ++i) cd[i] = pl_colorAt(pos, i);
+    float cd[7];
+    for (int i = 0; i < 7; ++i) cd[i] = pl_colorAt(pos, i);
 
     const ivec3 NB12[12] = ivec3[12](
         ivec3( 1, 0, 0), ivec3(-1, 0, 0),
@@ -1270,8 +1284,8 @@ void main() {
         ivec3( 1, 0,-1), ivec3(-1, 0, 1),
         ivec3( 0, 1,-1), ivec3( 0,-1, 1));
 
-    float net[6];
-    for (int i = 0; i < 6; ++i) net[i] = 0.0;
+    float net[7];
+    for (int i = 0; i < 7; ++i) net[i] = 0.0;
     const float DIFF = 0.20;
 
     for (int f = 0; f < 12; ++f) {
@@ -1280,20 +1294,20 @@ void main() {
         float r = length(wo);
         vec3 dhat = wo / r;
         ivec3 nc = pos + d;
-        float nd[6];
-        for (int i = 0; i < 6; ++i) nd[i] = pl_colorAt(nc, i);
+        float nd[7];
+        for (int i = 0; i < 7; ++i) nd[i] = pl_colorAt(nc, i);
 
-        vec3 vn[6];
+        vec3 vn[7];
         ivec3 lp = lid + d;
         if (all(greaterThanEqual(lp, ivec3(0))) && all(lessThan(lp, ivec3(8)))
                 && all(greaterThanEqual(nc, ivec3(0)))
                 && all(lessThan(nc, ivec3(u_size)))) {
             int nlidx = (lp.z * 8 + lp.y) * 8 + lp.x;
-            for (int i = 0; i < 6; ++i) vn[i] = pl_loadVel(nlidx, i);
+            for (int i = 0; i < 7; ++i) vn[i] = pl_loadVel(nlidx, i);
         } else {
             pl_velocity(nc, BASIS, beta, rmax, R, vn);
         }
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 7; ++i) {
             float vface = 0.5 * dot(vc[i] + vn[i], dhat) * speed;
             vface = clamp(vface, -0.5, 0.5);
             float F = (vface > 0.0) ? cd[i] * vface : nd[i] * vface;
@@ -1302,48 +1316,60 @@ void main() {
         }
     }
 
-    float newd[6];
-    for (int i = 0; i < 6; ++i) {
+    float newd[7];
+    for (int i = 0; i < 7; ++i) {
         newd[i] = max(cd[i] + (u_dt / 12.0) * net[i], 0.0);
     }
 
-    // ── Autocatalytic organelle chemistry (local, mass-conserving) ─────
-    // form = rare nucleation above thr + autocatalysis ~ existing C, both
-    // gated by precursor availability and capped so a precursor can't go
-    // negative; back = first-order turnover of C back into pa+pb. The three
-    // deltas sum to zero, so total mass is conserved exactly. Precursors are
-    // gathered/scattered by masked SELECT (not newd[pa]) so the array stays
-    // in registers -- a data-dependent index would spill newd to local memory.
+    // ── Two-step autocatalytic metabolic chain (local, mass-conserving) ─
+    // Precursors are gathered/scattered by masked SELECT (not newd[pa]) so
+    // the array stays in registers -- a data-dependent index would spill
+    // newd to local memory. Each step's deltas sum to zero, and C is updated
+    // by step 1 before it is consumed by step 2 (a true intermediate).
     {
-        float cA = 0.0, cB = 0.0;
+        float cA = 0.0, cB = 0.0, cD = 0.0;
         for (int s = 0; s < 5; ++s) {
             cA += (s == pa) ? newd[s] : 0.0;
             cB += (s == pb) ? newd[s] : 0.0;
+            cD += (s == pd) ? newd[s] : 0.0;
         }
         float cC = newd[5];
-        float trig = (cA * cB >= thr) ? 1.0 : 0.0;
-        float form = u_dt * (knuc * trig + kcat * cC) * cA * cB;
-        form = min(form, 2.0 * min(cA, cB));
-        float back = min(u_dt * koff * cC, cC);
-        float delta = 0.5 * back - 0.5 * form;   // applied to each precursor
+        float cE = newd[6];
+
+        // step 1: pa + pb <-> C
+        float f1 = u_dt * (knuc1 * ((cA * cB >= thr1) ? 1.0 : 0.0) + kcat1 * cC) * cA * cB;
+        f1 = min(f1, 2.0 * min(cA, cB));
+        float b1 = min(u_dt * koff1 * cC, cC);
+        cC += f1 - b1;                       // C feeds step 2 with its new value
+
+        // step 2: C + pd <-> E
+        float f2 = u_dt * (knuc2 * ((cC * cD >= thr2) ? 1.0 : 0.0) + kcat2 * cE) * cC * cD;
+        f2 = min(f2, 2.0 * min(cC, cD));
+        float b2 = min(u_dt * koff2 * cE, cE);
+
+        float dPre = 0.5 * b1 - 0.5 * f1;    // to each of pa, pb
+        float dD   = 0.5 * b2 - 0.5 * f2;    // to pd
         for (int s = 0; s < 5; ++s) {
-            newd[s] += ((s == pa) || (s == pb)) ? delta : 0.0;
+            newd[s] += ((s == pa) || (s == pb)) ? dPre : 0.0;
+            newd[s] += (s == pd) ? dD : 0.0;
         }
-        newd[5] += form - back;
+        newd[5] = cC + 0.5 * b2 - 0.5 * f2;  // C: step-1 net already folded in
+        newd[6] = cE + f2 - b2;
     }
 
-    // ── Display colour: dominant-species hue over all 6 colours ────────
-    vec3 HUE[6] = vec3[6](
+    // ── Display colour: dominant-species hue over all 7 colours ────────
+    vec3 HUE[7] = vec3[7](
         vec3(1.0, 0.20, 0.20),   // red
         vec3(0.25, 1.0, 0.30),   // green
         vec3(0.25, 0.50, 1.0),   // blue
         vec3(1.0, 0.85, 0.15),   // yellow
         vec3(1.0, 0.30, 1.0),    // magenta
-        vec3(1.0, 1.0, 1.0));    // organelle: white
+        vec3(1.0, 1.0, 1.0),     // organelle C: white
+        vec3(0.10, 0.95, 1.0));  // organelle E: cyan
     vec3 chue = vec3(0.0);
     float wsum = 0.0;
     float total = 0.0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         float w = newd[i] * newd[i] * newd[i];
         chue += HUE[i] * w;
         wsum += w;
@@ -1353,7 +1379,7 @@ void main() {
 
     imageStore(u_dst,  pos, vec4(disp, total));
     imageStore(u_dst2, pos, vec4(newd[0], newd[1], newd[2], newd[3]));
-    imageStore(u_dst3, pos, vec4(newd[4], newd[5], 0.0, 0.0));
+    imageStore(u_dst3, pos, vec4(newd[4], newd[5], newd[6], 0.0));
 }
 """,
 
@@ -15562,16 +15588,15 @@ RULE_PRESETS = {
     },
 
     "fcc_organelle": {
-        "label": "FCC Organelle (autocatalytic)",
+        "label": "FCC Organelle (metabolic chain)",
         "shader": "fcc_organelle",
         "lattice": "fcc",
         # fcc_particle_life (5 conserved colour fields under a hash-derived
-        # force matrix) PLUS an autocatalytic reaction layer: a 6th "organelle"
-        # species assembles from a seed-picked complementary precursor pair via
-        # nucleation + autocatalysis and disassembles via turnover, all mass-
-        # conserving. The organelle has its own matrix row, so it is a genuine
-        # new species that condenses where its parts meet, spreads as a front,
-        # and dissolves -- self-assembling compartments from empty space.
+        # force matrix) PLUS a two-step autocatalytic metabolic chain: base pair
+        # pa+pb assemble into organelle C, then C+pd react on into organelle E,
+        # each via nucleation + autocatalysis + turnover, all mass-conserving.
+        # C and E have their own matrix rows, so they are genuine new species; E
+        # can only form where C already has, a self-assembling chain reaction.
         "extra_fields": 2,
         "field2_init": "plife_rand",
         "field_inits": ["plife_rand", "plife_rand_r"],
@@ -15595,13 +15620,15 @@ RULE_PRESETS = {
         "description": ("Autocatalytic Particle Life on the face-centred-cubic "
                         "lattice. Five colour densities push and pull through a "
                         "5x5 force matrix (each seed = a new universe); on top of "
-                        "the transport a sixth ORGANELLE species assembles "
-                        "autocatalytically from a complementary precursor pair -- "
-                        "nucleating rarely, then spreading as a chain-reaction "
-                        "front, then dissolving back into its parts. Mass is "
-                        "conserved exactly, so self-assembling compartments "
-                        "condense out of empty space and turn over like a cell."),
-        "vis_channels": ["Composite (6 colours)"],
+                        "the transport a two-step metabolic chain assembles two "
+                        "ORGANELLE species -- a complementary base pair reacts "
+                        "into organelle C, then C reacts on with a third colour "
+                        "into organelle E. Each step nucleates rarely, spreads as "
+                        "an autocatalytic front, then turns over; E only appears "
+                        "where C already has. Mass is conserved exactly, so a "
+                        "self-assembling chain of compartments condenses out of "
+                        "empty space and turns over like a cell."),
+        "vis_channels": ["Composite (7 colours)"],
         "vis_default": 0,
         "vis_abs": False,
         "vis_mode": "rgba_blend",   # primary rgb = composite colour, a = total density
