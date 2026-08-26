@@ -26321,6 +26321,7 @@ SEARCH_STEPS = {
     'fcc_hodgepodge'                  :  100,  # peak 0.124@100, 500 lost 66%
     'fcc_lichen'                      :   50,  # peak 0.564@50, 500 lost 88%
     'fcc_particle_life'               :  200,  # isotropic kernel + DIFF 0.20: mean 0.73@200
+    'fcc_organelle'                   :  400,  # chain + feedback need time to develop
     'fcc_sandpile'                    : 2000,  # peak 0.544@2000, 500 lost 54%
     'fcc_xy_spin'                     : 2000,  # peak 0.517@2000, 500 lost 38%
     'fire'                            :   50,  # peak 0.687@200, 500 lost 100%

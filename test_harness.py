@@ -506,6 +506,7 @@ _MODE_ID = {
     'element':          2,   # non-vacuum & non-wall (uses ch0)
     'deviation':        3,   # alive iff |v - field_mean| > thr (needs 2 passes)
     'phase_coherence':  4,   # alive iff incoherence > thr (uses 6-nb sin)
+    'organelle':        5,   # alive iff a dense voxel is organelle-hue dominated
 }
 
 # Layout of the metrics SSBO. All slots are uint32. Floats are bit-encoded
@@ -573,6 +574,16 @@ shared uint s_alive;
 shared uint s_surface;
 shared uint s_activity;
 
+// Organelle content of a voxel for measure mode 5. The composite display hue
+// makes organelles (white C, cyan E) the only species with BOTH green and
+// blue high, so min(G,B) separates them from every base colour (all <=0.5).
+// Gated by total density (cell.a) so a faint organelle-ish hue in near-empty
+// space is not counted -- only visible organelle structure scores.
+#define ORG_DENSITY_FLOOR 0.32   // matches the rule's render voxel_threshold
+float org_strength(vec4 cell) {
+    return (cell.a > ORG_DENSITY_FLOOR) ? min(cell.g, cell.b) : 0.0;
+}
+
 bool is_alive(vec4 cell, ivec3 pos) {
     float v = cell[u_channel];
     if (u_mode == 2) {
@@ -581,6 +592,7 @@ bool is_alive(vec4 cell, ivec3 pos) {
     }
     if (u_mode == 1) return abs(v) > u_alive_thr;
     if (u_mode == 3) return abs(v - u_field_mean) > u_alive_thr;
+    if (u_mode == 5) return org_strength(cell) > u_alive_thr;
     if (u_mode == 4) {
         // phase_coherence: alive iff mean |sin(nb_phase - phase)| > thr.
         // Phase stored as v in [0,1] = [0, 2pi].
@@ -618,7 +630,7 @@ void main() {
 
     if (in_grid) {
         vec4 cur = imageLoad(u_grid, pos);
-        float v = cur[u_channel];
+        float v = (u_mode == 5) ? org_strength(cur) : cur[u_channel];
 
         // ── Scalar stats on measured channel ────────────────────────
         if (isnan(v))      atomicAdd(s_nan, 1u);
@@ -663,7 +675,8 @@ void main() {
         // ── Activity (vs prev_grid) ─────────────────────────────────
         if (u_have_prev != 0) {
             vec4 prev = imageLoad(u_prev, pos);
-            bool changed = abs(v - prev[u_channel]) > u_change_thr;
+            float pv = (u_mode == 5) ? org_strength(prev) : prev[u_channel];
+            bool changed = abs(v - pv) > u_change_thr;
             if (u_is_element != 0 && !changed) {
                 // Temperature shimmer from heat diffusion is sub-degree
                 // every step at high baseline temperatures; only count
@@ -1404,6 +1417,19 @@ class HeadlessRunner:
             self.measure_mode = 'continuous'
             self.alive_threshold = 0.32
             self.change_threshold = 0.005
+        elif shader == 'fcc_organelle':
+            # FCC metabolic chain. The scientifically interesting product is the
+            # organelle content (species C+E), which the composite display shows
+            # as white/cyan -- the only hues with both green and blue high. The
+            # 'organelle' measure mode scores min(g,b) in dense voxels, so the
+            # search rewards universes that build lots of structured, dynamic
+            # ORGANELLE mass (not just any base structure). alive_threshold is
+            # the organelle-hue cut (0.8: organelle hues are >=0.95, while base
+            # colours and their blends stay <~0.65); density gate is in shader.
+            self.measure_channel = 3
+            self.measure_mode = 'organelle'
+            self.alive_threshold = 0.8
+            self.change_threshold = 0.02
         elif shader == 'fcc_potts_grain':
             # FCC Potts grain growth. The orientation field fills the volume
             # (every cell belongs to some grain), so measuring it would read
@@ -2385,6 +2411,15 @@ def compute_metrics(grid, prev_grid, runner):
     if mode == 'element':
         alive_mask = np.abs(grid[:, :, :, 0]) > 0.5  # non-vacuum
         alive_mask &= np.abs(grid[:, :, :, 0] - 119.0) > 0.5  # exclude wall
+    elif mode == 'organelle':
+        # Organelle content = min(display.g, display.b), which only the white
+        # (C) and cyan (E) organelle hues raise; gated by total density so
+        # faint fog is ignored. Overrides `ch` so all value stats/activity below
+        # operate on organelle strength (matches GPU measure mode 5).
+        _org = np.where(grid[:, :, :, 3] > 0.32,
+                        np.minimum(grid[:, :, :, 1], grid[:, :, :, 2]), 0.0)
+        ch = _org.astype(ch.dtype, copy=False)
+        alive_mask = _org > runner.alive_threshold
     elif mode == 'wave':
         alive_mask = np.abs(ch) > runner.alive_threshold
     elif mode == 'deviation':
@@ -2448,6 +2483,10 @@ def compute_metrics(grid, prev_grid, runner):
     activity = 0.0
     if prev_grid is not None:
         prev_ch = prev_grid[:, :, :, runner.measure_channel]
+        if mode == 'organelle':
+            prev_ch = np.where(prev_grid[:, :, :, 3] > 0.32,
+                               np.minimum(prev_grid[:, :, :, 1],
+                                          prev_grid[:, :, :, 2]), 0.0)
         changed = np.abs(ch - prev_ch) > runner.change_threshold
         if mode == 'element':
             # Also count temperature changes as activity, but only
@@ -2529,7 +2568,8 @@ def score_interestingness(metric_history):
     alive_std = np.std(alive_ratios)
 
     mode = metric_history[0].get('measure_mode', 'discrete')
-    continuous_field = mode in ('deviation', 'phase_coherence', 'continuous', 'wave')
+    continuous_field = mode in ('deviation', 'phase_coherence', 'continuous',
+                                'wave', 'organelle')
 
     # Dead penalty — soft: if both final AND median are dead, it's truly dead
     if repr_alive < 0.001:
@@ -3351,7 +3391,8 @@ def _get_metric(result, metric_name):
         # Skip blinker penalty for continuous-field CAs
         density_penalty = 0.0
         mmode = result.get('measure_mode', 'discrete')
-        is_pde = mmode in ('continuous', 'wave', 'deviation', 'phase_coherence')
+        is_pde = mmode in ('continuous', 'wave', 'deviation', 'phase_coherence',
+                           'organelle')
         if not is_pde:
             if alive > 0.40 and activity > 0.6:
                 act_ratio = activity / max(alive, 0.01)
@@ -3677,7 +3718,8 @@ def _is_quality(result, min_score=0.15):
     # Skip for continuous-field CAs where activity is PDE evolution, not toggling
     # Use act_ratio > 1.8 (near-complete toggling) to avoid rejecting evolving CAs
     mode = result.get('measure_mode', 'discrete')
-    if mode not in ('deviation', 'phase_coherence', 'continuous', 'wave'):
+    if mode not in ('deviation', 'phase_coherence', 'continuous', 'wave',
+                    'organelle'):
         if repr_alive > 0.15 and activity > 0.02:
             act_ratio = activity / max(repr_alive, 0.01)
             if act_ratio > 1.8:
@@ -3688,7 +3730,8 @@ def _is_quality(result, min_score=0.15):
     # Skip for PDE rules where sv may be low but field has real structure (surface_ratio)
     sv = result.get('spatial_variation', -1)
     mode = result.get('measure_mode', 'discrete')
-    is_pde = mode in ('deviation', 'phase_coherence', 'continuous', 'wave')
+    is_pde = mode in ('deviation', 'phase_coherence', 'continuous', 'wave',
+                      'organelle')
     if sv >= 0 and sv < 0.02 and repr_alive > 0.05 and best_activity > 0.01:
         if not is_pde or result.get('final_surface', 0) < 0.15:
             return False
