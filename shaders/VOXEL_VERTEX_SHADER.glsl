@@ -126,6 +126,7 @@ out vec3 v_normal;
 out vec3 v_world_pos;
 out vec3 v_color;
 out float v_value;
+out vec3 v_local;   // cell-local vertex position (cube [0,1]^3 or RD frame)
 
 bool nb_alive(ivec3 p) {
     if (any(lessThan(p, ivec3(0))) || any(greaterThanEqual(p, u_dims))) return false;
@@ -164,6 +165,7 @@ void main() {
         v_world_pos = vec3(0.0);
         v_color = vec3(0.0);
         v_value = 0.0;
+        v_local = vec3(0.0);
         return;
     }
 
@@ -245,12 +247,14 @@ void main() {
         const float RD_SCALE = 0.35355339;  // 0.5 / sqrt(2)
         world_pos = center + rd_verts[vert_id] * (cell_size * RD_SCALE * shrink);
         normal = rd_normals[face_id];
+        v_local = rd_verts[vert_id];
     } else {
         // Cubic: unit cube mapped into the [0,1]^3 box (legacy path, unchanged).
         vec3 local_pos = cube_verts[vert_id];
         normal = cube_normals[face_id];
         vec3 offset = cell_pos * cell_size + cell_size * 0.5 * (1.0 - shrink);
         world_pos = offset + local_pos * cell_size * shrink;
+        v_local = local_pos;
     }
 
     gl_Position = u_view_proj * vec4(world_pos, 1.0);

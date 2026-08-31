@@ -12450,6 +12450,7 @@ in vec3 v_normal;
 in vec3 v_world_pos;
 in vec3 v_color;
 in float v_value;
+in vec3 v_local;
 out vec4 fragColor;
 
 uniform vec3 u_camera_pos;
@@ -12458,6 +12459,11 @@ uniform int u_colormap;
 uniform int u_is_element_ca;
 uniform int u_vis_mode;  // 0=DENSITY use colormap, >0 use v_color directly
 uniform float u_alpha;  // transparency (1.0 = opaque)
+uniform int u_lattice_fcc;      // 1 = rhombic-dodecahedron cells (FCC)
+uniform float u_edge_strength;  // 0 = off; additive rim glow along cell edges
+uniform float u_edge_width;     // edge line width (normalised cell units)
+uniform int u_hq_shading;       // 1 = HQ lighting (bevel + fill + fresnel rim)
+uniform float u_rim_strength;   // fresnel silhouette-rim intensity
 
 vec3 colormap_fire(float t) {
     return vec3(clamp(t*3.0, 0.0, 1.0), clamp(t*3.0-1.0, 0.0, 1.0), clamp(t*3.0-2.0, 0.0, 1.0));
@@ -12490,6 +12496,36 @@ vec3 colormap_discrete(float t) {
     return rgb + vec3(v - c);
 }
 """ + _NEW_COLORMAPS_GLSL + """
+// Normalised distance from the nearest CELL EDGE (0 at an edge, 1 at a face
+// centre). For cubes: on a face one local axis is pinned, so the edge is where
+// a SECOND axis reaches the face border -> second-smallest face distance. For
+// FCC rhombic-dodecahedron cells: an edge is where two face-support values tie,
+// so the gap between the largest and second-largest support over the 12 face
+// normals goes to zero.
+const vec3 RD_EDGE_N[12] = vec3[12](
+    vec3( 0.70710678,  0.70710678, 0.0), vec3(-0.70710678, -0.70710678, 0.0),
+    vec3( 0.0,  0.70710678,  0.70710678), vec3( 0.0, -0.70710678, -0.70710678),
+    vec3( 0.70710678, 0.0,  0.70710678), vec3(-0.70710678, 0.0, -0.70710678),
+    vec3( 0.70710678, 0.0, -0.70710678), vec3(-0.70710678, 0.0,  0.70710678),
+    vec3(-0.70710678,  0.70710678, 0.0), vec3( 0.70710678, -0.70710678, 0.0),
+    vec3( 0.0,  0.70710678, -0.70710678), vec3( 0.0, -0.70710678,  0.70710678)
+);
+float edge_dist_norm() {
+    if (u_lattice_fcc == 1) {
+        float m1 = -1e9, m2 = -1e9;
+        for (int i = 0; i < 12; ++i) {
+            float d = dot(v_local, RD_EDGE_N[i]);
+            if (d > m1) { m2 = m1; m1 = d; } else if (d > m2) { m2 = d; }
+        }
+        return clamp((m1 - m2) / 0.7071, 0.0, 1.0);
+    }
+    vec3 d = min(v_local, 1.0 - v_local);
+    float lo = min(d.x, min(d.y, d.z));
+    float hi = max(d.x, max(d.y, d.z));
+    float mid = (d.x + d.y + d.z) - lo - hi;
+    return clamp(mid / 0.5, 0.0, 1.0);
+}
+
 void main() {
     vec3 color;
     if (u_is_element_ca == 1) {
@@ -12522,14 +12558,42 @@ void main() {
     }
 
     // Phong lighting
-    vec3 light_dir = normalize(vec3(0.5, 1.0, 0.3));
     vec3 normal = normalize(v_normal);
-    float diffuse = max(dot(normal, light_dir), 0.0);
-    float ambient = 0.2;
     vec3 view_dir = normalize(u_camera_pos - v_world_pos);
-    float specular = pow(max(dot(reflect(-light_dir, normal), view_dir), 0.0), 32.0);
-
-    vec3 lit = color * (ambient + diffuse * 0.7) * u_brightness + vec3(specular * 0.2);
+    vec3 lit;
+    if (u_hq_shading == 1) {
+        // Beveled normal: near an edge, tilt the face normal toward the
+        // outward (cell-centre -> fragment) direction so cubes read as softly
+        // rounded blocks that catch light along their edges.
+        vec3 out_dir = (u_lattice_fcc == 1) ? normalize(v_local)
+                                            : normalize(v_local - vec3(0.5));
+        float en = edge_dist_norm();
+        float bevel = 1.0 - smoothstep(0.0, 0.35, en);
+        vec3 N = normalize(mix(normal, out_dir, 0.6 * bevel));
+        // Three-point-ish rig: key + dim fill + ambient, a tight spec, and a
+        // Fresnel rim that lights grazing-angle silhouettes (blooms under HQ).
+        vec3 keyL = normalize(vec3(0.5, 1.0, 0.3));
+        vec3 fillL = normalize(vec3(-0.6, 0.25, -0.5));
+        float key = max(dot(N, keyL), 0.0);
+        float fill = max(dot(N, fillL), 0.0);
+        float fres = pow(1.0 - max(dot(N, view_dir), 0.0), 3.0);
+        float spec = pow(max(dot(reflect(-keyL, N), view_dir), 0.0), 48.0);
+        lit = color * (0.25 + key * 0.8 + fill * 0.25) * u_brightness
+            + vec3(spec * 0.3)
+            + fres * u_rim_strength * mix(color, vec3(1.0), 0.5);
+        if (u_edge_strength > 0.0) {
+            // Crisp colour-tinted wireframe along the cell edges (additive).
+            float edge = 1.0 - smoothstep(0.0, max(u_edge_width, 1e-3), en);
+            lit += edge * u_edge_strength * mix(color, vec3(1.0), 0.6);
+        }
+    } else {
+        // Standard Phong -- unchanged when HQ is off so goldens stay identical.
+        vec3 light_dir = normalize(vec3(0.5, 1.0, 0.3));
+        float diffuse = max(dot(normal, light_dir), 0.0);
+        float ambient = 0.2;
+        float specular = pow(max(dot(reflect(-light_dir, normal), view_dir), 0.0), 32.0);
+        lit = color * (ambient + diffuse * 0.7) * u_brightness + vec3(specular * 0.2);
+    }
     fragColor = vec4(lit, u_alpha);
 }
 """
@@ -12641,6 +12705,168 @@ void main() {
 """
 
 UPSAMPLE_FRAGMENT_SHADER = _load_glsl("UPSAMPLE_FRAGMENT_SHADER.glsl")
+
+# ── High-quality post-processing (optional, global, all renderers) ────
+# A toggleable cinematic pass applied to the FINAL rendered image, so it is
+# renderer-agnostic (voxel / raymarch / SDF / particles all benefit). The
+# scene is drawn into an HDR float target at a supersampled resolution; three
+# fullscreen passes then add bloom and tone-map it while the composite pass
+# samples the supersampled scene with a linear filter to resolve SSAA. All
+# passes reuse UPSAMPLE_VERTEX_SHADER (a fullscreen quad that emits v_uv).
+
+# Bright-pass: keep only the pixels above a soft luminance threshold; these
+# are what will glow.
+HQ_BRIGHT_FRAGMENT = """
+#version 430
+in vec2 v_uv;
+out vec4 f_color;
+uniform sampler2D u_scene;
+uniform float u_threshold;
+uniform float u_knee;
+void main() {
+    vec3 c = texture(u_scene, v_uv).rgb;
+    float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float w = smoothstep(u_threshold, u_threshold + max(u_knee, 1e-4), luma);
+    f_color = vec4(c * w, 1.0);
+}
+"""
+
+# Separable Gaussian blur (9-tap). Run once horizontally, once vertically per
+# iteration; u_dir carries the per-tap texel offset along one axis.
+HQ_BLUR_FRAGMENT = """
+#version 430
+in vec2 v_uv;
+out vec4 f_color;
+uniform sampler2D u_tex;
+uniform vec2 u_dir;
+void main() {
+    float w[5] = float[5](0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+    vec3 acc = texture(u_tex, v_uv).rgb * w[0];
+    for (int i = 1; i < 5; ++i) {
+        vec2 off = u_dir * float(i);
+        acc += texture(u_tex, v_uv + off).rgb * w[i];
+        acc += texture(u_tex, v_uv - off).rgb * w[i];
+    }
+    f_color = vec4(acc, 1.0);
+}
+"""
+
+# Composite: sample the supersampled HDR scene (linear filter => SSAA resolve),
+# add the blurred bloom, apply exposure and an ACES filmic tone-map, and an
+# optional vignette. Outputs display-ready colour to the real target.
+HQ_COMPOSITE_FRAGMENT = """
+#version 430
+in vec2 v_uv;
+out vec4 f_color;
+uniform sampler2D u_scene;
+uniform sampler2D u_bloom;
+uniform sampler2D u_ao;
+uniform sampler2D u_depth;
+uniform sampler2D u_dof;
+uniform float u_dof_strength;
+uniform float u_dof_range;
+uniform float u_exposure;
+uniform float u_bloom_intensity;
+uniform float u_vignette;
+uniform vec3 u_bg_color;
+uniform float u_bg_intensity;
+uniform float u_saturation;
+uniform float u_contrast;
+uniform float u_temp;
+uniform float u_grain;
+uniform float u_grain_seed;
+vec3 aces(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+float lin_depth(float z01) {
+    const float NEAR = 0.01, FAR = 100.0;
+    float z = 2.0 * z01 - 1.0;
+    return (2.0 * NEAR * FAR) / (FAR + NEAR - z * (FAR - NEAR));
+}
+float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+void main() {
+    vec3 hdr = texture(u_scene, v_uv).rgb;
+    // Depth of field: blend toward the blurred scene by a circle-of-confusion
+    // that grows with distance from the auto-focused frame centre.
+    if (u_dof_strength > 0.0) {
+        float fz = lin_depth(texture(u_depth, vec2(0.5, 0.5)).r);
+        float pz = lin_depth(texture(u_depth, v_uv).r);
+        float coc = clamp(abs(pz - fz) / max(u_dof_range, 1e-3), 0.0, 1.0) * u_dof_strength;
+        hdr = mix(hdr, texture(u_dof, v_uv).rgb, min(coc, 1.0));
+    }
+    vec3 bloom = texture(u_bloom, v_uv).rgb;
+    float ao = texture(u_ao, v_uv).r;
+    // Environment gradient added only into the empty (dark) background so the
+    // lit subject is untouched but the frame no longer floats on flat black.
+    float sceneLuma = dot(hdr, vec3(0.2126, 0.7152, 0.0722));
+    float emptiness = 1.0 - smoothstep(0.015, 0.12, sceneLuma);
+    float radial = smoothstep(1.0, 0.0, length(v_uv - 0.5) * 1.4142);
+    vec3 bg = u_bg_color * (0.2 + 0.8 * radial) * u_bg_intensity;
+    vec3 c = hdr * ao + bg * emptiness;
+    c = (c + bloom * u_bloom_intensity) * u_exposure;
+    c = aces(c);
+    // Colour grading: saturation, contrast (about 0.5), temperature (warm/cool).
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c = mix(vec3(l), c, u_saturation);
+    c = (c - 0.5) * u_contrast + 0.5;
+    c += vec3(u_temp, 0.0, -u_temp) * 0.1;
+    c = clamp(c, 0.0, 1.0);
+    if (u_vignette > 0.0) {
+        float d = length(v_uv - 0.5) * 1.41421356;
+        c *= mix(1.0, smoothstep(1.0, 0.4, d), clamp(u_vignette, 0.0, 1.0));
+    }
+    // Per-pixel noise: a tiny always-on dither kills gradient banding; the rest
+    // is optional film grain.
+    float n = hash21(v_uv * vec2(1920.0, 1080.0) + u_grain_seed) - 0.5;
+    c += n * (1.0 / 255.0) + n * u_grain * 0.15;
+    f_color = vec4(c, 1.0);
+}
+"""
+
+# Ambient occlusion (depth-darkening). For each pixel, compare its linear depth
+# against a ring of neighbours: where the centre sits deeper than its
+# surroundings (a crevice) it is darkened. No normal buffer needed, and it is a
+# no-op where nothing wrote depth (e.g. the volumetric raymarcher), so it only
+# shadows solid voxel geometry.
+HQ_AO_FRAGMENT = """
+#version 430
+in vec2 v_uv;
+out vec4 f_color;
+uniform sampler2D u_depth;
+uniform float u_radius;     // sample ring radius in UV units
+uniform float u_strength;
+const float NEAR = 0.01;
+const float FAR = 100.0;
+float lin(float d) {
+    float z = 2.0 * d - 1.0;
+    return (2.0 * NEAR * FAR) / (FAR + NEAR - z * (FAR - NEAR));
+}
+void main() {
+    float dc = texture(u_depth, v_uv).r;
+    if (dc >= 1.0) { f_color = vec4(1.0); return; }
+    float c = lin(dc);
+    float range = c * 0.04 + 0.002;   // depth gap that counts as fully occluded
+    float maxdiff = c * 0.35;         // reject silhouette jumps to background
+    vec2 dirs[8] = vec2[8](
+        vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
+        vec2(0.7071, 0.7071), vec2(-0.7071, 0.7071),
+        vec2(0.7071, -0.7071), vec2(-0.7071, -0.7071));
+    float occ = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        float dn = texture(u_depth, v_uv + dirs[i] * u_radius).r;
+        if (dn >= 1.0) continue;
+        float diff = c - lin(dn);   // >0 => neighbour nearer => centre recessed
+        if (abs(diff) < maxdiff) occ += clamp(diff / range, 0.0, 1.0);
+    }
+    float ao = 1.0 - (occ / 8.0) * u_strength;
+    f_color = vec4(vec3(max(ao, 0.0)), 1.0);
+}
+"""
 
 # ── Compute-shader raymarcher ────────────────────────────────────────
 # Alternative to the fragment shader: raymarches in a compute shader,
@@ -27033,6 +27259,58 @@ class Simulator:
         self._up_u_half_res.value = 0
         self._upsample_vao = self.ctx.simple_vertex_array(self._upsample_prog, self.vbo, 'in_pos')
 
+        # ── High-quality post-processing programs (optional; see HQ_* shaders) ──
+        self._hq_bright_prog = self.ctx.program(
+            vertex_shader=UPSAMPLE_VERTEX_SHADER,
+            fragment_shader=HQ_BRIGHT_FRAGMENT)
+        self._hq_bright_vao = self.ctx.simple_vertex_array(
+            self._hq_bright_prog, self.vbo, 'in_pos')
+        self._hq_blur_prog = self.ctx.program(
+            vertex_shader=UPSAMPLE_VERTEX_SHADER,
+            fragment_shader=HQ_BLUR_FRAGMENT)
+        self._hq_blur_vao = self.ctx.simple_vertex_array(
+            self._hq_blur_prog, self.vbo, 'in_pos')
+        self._hq_comp_prog = self.ctx.program(
+            vertex_shader=UPSAMPLE_VERTEX_SHADER,
+            fragment_shader=HQ_COMPOSITE_FRAGMENT)
+        self._hq_comp_vao = self.ctx.simple_vertex_array(
+            self._hq_comp_prog, self.vbo, 'in_pos')
+        self._hq_ao_prog = self.ctx.program(
+            vertex_shader=UPSAMPLE_VERTEX_SHADER,
+            fragment_shader=HQ_AO_FRAGMENT)
+        self._hq_ao_vao = self.ctx.simple_vertex_array(
+            self._hq_ao_prog, self.vbo, 'in_pos')
+        # HQ state. Off by default -> the render path is unchanged until toggled.
+        self._hq_mode = False
+        self._hq_ss = 2                 # supersample factor (1 / 2)
+        self._hq_bloom = 0.55           # bloom intensity
+        self._hq_bloom_threshold = 0.75  # luminance where glow begins
+        self._hq_bloom_knee = 0.5       # soft-knee width above the threshold
+        self._hq_exposure = 1.15        # pre-tonemap exposure
+        self._hq_vignette = 0.25        # 0 = off
+        self._hq_edge = 0.6             # voxel edge rim-glow strength (0 = off)
+        self._hq_edge_width = 0.14      # edge line width (normalised cell units)
+        self._hq_rim = 0.5              # fresnel silhouette-rim intensity
+        self._hq_ao = 0.6               # ambient-occlusion strength (0 = off)
+        self._hq_bg = 0.0               # background environment glow (0 = off)
+        self._hq_bg_color = (0.05, 0.08, 0.16)  # environment tint (dark blue)
+        self._hq_sat = 1.0              # colour saturation (1 = neutral)
+        self._hq_contrast = 1.0         # contrast about mid-grey (1 = neutral)
+        self._hq_temp = 0.0             # colour temperature (- cool .. + warm)
+        self._hq_grain = 0.0            # film grain (anti-band dither always on)
+        self._hq_dof = 0.0             # depth-of-field strength (0 = off)
+        self._hq_dof_range = 6.0       # focus falloff distance (view units)
+        self._hq_preset = 'Custom'      # active look preset name (UI)
+        self._hq_scene_fbo = None
+        self._hq_scene_tex = None
+        self._hq_scene_depth = None
+        self._hq_scene_size = None
+        self._hq_bloom_fbo_a = self._hq_bloom_fbo_b = None
+        self._hq_bloom_tex_a = self._hq_bloom_tex_b = None
+        self._hq_ao_fbo = self._hq_ao_tex = None
+        self._hq_dof_fbo = self._hq_dof_tex = None
+        self._hq_bloom_size = None
+
         # ── SDF viewport program (per-pixel sphere-traced fractals) ─────
         # Used by viewport-kind presets (e.g. Mandelbulb) for genuine deep
         # zoom. Bypasses the voxel grid entirely.
@@ -27131,6 +27409,10 @@ class Simulator:
         self._vp_u_lattice_fcc = vp.get('u_lattice_fcc', None)
         self._vp_u_lattice_M = vp.get('u_lattice_M', None)
         self._vp_u_lattice_M_inv = vp.get('u_lattice_M_inv', None)
+        self._vp_u_edge_strength = vp.get('u_edge_strength', None)
+        self._vp_u_edge_width = vp.get('u_edge_width', None)
+        self._vp_u_hq_shading = vp.get('u_hq_shading', None)
+        self._vp_u_rim_strength = vp.get('u_rim_strength', None)
         # Empty VAO for instanced rendering (vertices come from SSBO)
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
 
@@ -27290,6 +27572,10 @@ class Simulator:
         self._vp_u_lattice_fcc = vp.get('u_lattice_fcc', None)
         self._vp_u_lattice_M = vp.get('u_lattice_M', None)
         self._vp_u_lattice_M_inv = vp.get('u_lattice_M_inv', None)
+        self._vp_u_edge_strength = vp.get('u_edge_strength', None)
+        self._vp_u_edge_width = vp.get('u_edge_width', None)
+        self._vp_u_hq_shading = vp.get('u_hq_shading', None)
+        self._vp_u_rim_strength = vp.get('u_rim_strength', None)
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
 
     def _voxel_pack_inject(self, src: str) -> str:
@@ -29697,6 +29983,9 @@ class Simulator:
                 self.brush_tool = 2  # eraser
             elif key == glfw.KEY_F12:
                 self._show_perf_overlay = not getattr(self, '_show_perf_overlay', False)
+            elif key == glfw.KEY_F9:
+                # Global high-quality post-processing toggle
+                self._hq_mode = not self._hq_mode
             elif key == glfw.KEY_F11:
                 # Master toggle for the debug stats overlay
                 self._debug_enabled = not self._debug_enabled
@@ -32295,7 +32584,7 @@ void main() {
         # switching to self.ctx.screen.
         target_fbo = self.ctx.fbo if self.ctx.fbo is not None else self.ctx.screen
         target_viewport = self.ctx.viewport
-        use_half = self._use_half_res and self.size >= 96
+        use_half = self._use_half_res and self.size >= 96 and not self._hq_mode
         if use_half:
             hw, hh = max(self.width // 2, 1), max(self.height // 2, 1)
             if (self._half_res_fbo is None or
@@ -32843,6 +33132,17 @@ void main() {
         is_fcc = getattr(self, 'lattice', 'cubic') == 'fcc'
         if self._vp_u_lattice_fcc is not None:
             self._vp_u_lattice_fcc.value = 1 if is_fcc else 0
+        # Edge rim glow — only active in HQ mode (0 otherwise -> voxel output
+        # is byte-identical to the standard path, so goldens are unaffected).
+        if self._vp_u_edge_strength is not None:
+            self._vp_u_edge_strength.value = (
+                float(self._hq_edge) if self._hq_mode else 0.0)
+        if self._vp_u_edge_width is not None:
+            self._vp_u_edge_width.value = float(self._hq_edge_width)
+        if self._vp_u_hq_shading is not None:
+            self._vp_u_hq_shading.value = 1 if self._hq_mode else 0
+        if self._vp_u_rim_strength is not None:
+            self._vp_u_rim_strength.value = float(self._hq_rim)
         if is_fcc and self._vp_u_lattice_M is not None:
             self._vp_u_lattice_M.value = _FCC_M_COLMAJOR
             if self._vp_u_lattice_M_inv is not None:
@@ -33062,16 +33362,10 @@ void main() {
                 self.ctx.copy_buffer(self._total_staging, self._voxel_total_counter)
                 self._total_staging_fence = _fence_after_dispatch()
 
-    def _render(self):
-        """Dispatch to the appropriate renderer."""
-        # Reset sub-timings dict; populated by the chosen renderer path.
-        # Captured by the main loop into sec['render.*'] entries.
-        self._render_sub = {}
-        # Time-axis (spacetime) display works in BOTH voxel and volumetric
-        # renderers — the history volume holds raw sim channels, so each
-        # renderer samples it exactly as it would the live grid. We honour
-        # the user's chosen renderer_mode; the spacetime source-swap happens
-        # inside _render_voxels / _render_volume.
+    def _dispatch_scene(self):
+        """Run the active scene renderer + overlays into the bound framebuffer.
+        Shared by the window path and the recording path so both get identical
+        composition (and the optional HQ post-processing wrapper)."""
         if self.renderer_mode == 'voxel':
             self._render_voxels()
         elif self.renderer_mode == 'sdf_viewport':
@@ -33086,6 +33380,191 @@ void main() {
         self._render_glyphs()
         # Optional marching-cubes iso-surface overlay.
         self._render_iso_surface()
+
+    def _hq_enabled(self):
+        """True when the HQ post-processing path should wrap the scene render."""
+        return self._hq_mode and getattr(self, '_hq_comp_prog', None) is not None
+
+    def _apply_hq_preset(self, name):
+        """Set the whole HQ look from a named preset (bloom .. grain)."""
+        p = {
+            'Clean':   dict(bloom=0.35, exposure=1.10, vignette=0.15, edge=0.4,
+                            rim=0.35, ao=0.5, bg=0.0, bg_color=(0.05, 0.08, 0.16),
+                            sat=1.0, contrast=1.05, temp=0.0, grain=0.0),
+            'Vibrant': dict(bloom=0.9, exposure=1.25, vignette=0.3, edge=1.0,
+                            rim=0.8, ao=0.7, bg=0.3, bg_color=(0.05, 0.09, 0.20),
+                            sat=1.3, contrast=1.15, temp=0.05, grain=0.0),
+            'Neon':    dict(bloom=1.8, exposure=1.2, vignette=0.45, edge=2.5,
+                            rim=1.5, ao=0.6, bg=0.5, bg_color=(0.10, 0.02, 0.22),
+                            sat=1.5, contrast=1.2, temp=-0.1, grain=0.05),
+            'Filmic':  dict(bloom=0.5, exposure=1.05, vignette=0.4, edge=0.5,
+                            rim=0.5, ao=0.8, bg=0.2, bg_color=(0.12, 0.09, 0.06),
+                            sat=0.95, contrast=1.1, temp=0.12, grain=0.12),
+        }.get(name)
+        if not p:
+            return
+        self._hq_bloom = p['bloom']; self._hq_exposure = p['exposure']
+        self._hq_vignette = p['vignette']; self._hq_edge = p['edge']
+        self._hq_rim = p['rim']; self._hq_ao = p['ao']
+        self._hq_bg = p['bg']; self._hq_bg_color = p['bg_color']
+        self._hq_sat = p['sat']; self._hq_contrast = p['contrast']
+        self._hq_temp = p['temp']; self._hq_grain = p['grain']
+        self._hq_preset = name
+
+    def _ensure_hq_targets(self, sw, sh):
+        """Allocate/resize the supersampled HDR scene target and bloom buffers."""
+        if self._hq_scene_size != (sw, sh):
+            for obj in (self._hq_scene_fbo, self._hq_scene_tex, self._hq_scene_depth):
+                if obj is not None:
+                    try: obj.release()
+                    except Exception: pass  # noqa: BLE001  GL release, never fatal
+            self._hq_scene_tex = self.ctx.texture((sw, sh), 4, dtype='f2')
+            self._hq_scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._hq_scene_tex.repeat_x = self._hq_scene_tex.repeat_y = False
+            # Depth as a sampleable texture so the AO pass can read it.
+            self._hq_scene_depth = self.ctx.depth_texture((sw, sh))
+            self._hq_scene_depth.compare_func = ''
+            self._hq_scene_depth.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._hq_scene_fbo = self.ctx.framebuffer(
+                color_attachments=[self._hq_scene_tex],
+                depth_attachment=self._hq_scene_depth)
+            self._hq_scene_size = (sw, sh)
+        bw, bh = max(sw // 2, 1), max(sh // 2, 1)
+        if self._hq_bloom_size != (bw, bh):
+            for obj in (self._hq_bloom_fbo_a, self._hq_bloom_fbo_b,
+                        self._hq_bloom_tex_a, self._hq_bloom_tex_b,
+                        self._hq_ao_fbo, self._hq_ao_tex):
+                if obj is not None:
+                    try: obj.release()
+                    except Exception: pass  # noqa: BLE001  GL release, never fatal
+            self._hq_bloom_tex_a = self.ctx.texture((bw, bh), 4, dtype='f2')
+            self._hq_bloom_tex_b = self.ctx.texture((bw, bh), 4, dtype='f2')
+            for t in (self._hq_bloom_tex_a, self._hq_bloom_tex_b):
+                t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                t.repeat_x = t.repeat_y = False
+            self._hq_bloom_fbo_a = self.ctx.framebuffer(
+                color_attachments=[self._hq_bloom_tex_a])
+            self._hq_bloom_fbo_b = self.ctx.framebuffer(
+                color_attachments=[self._hq_bloom_tex_b])
+            self._hq_ao_tex = self.ctx.texture((bw, bh), 4, dtype='f2')
+            self._hq_ao_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._hq_ao_tex.repeat_x = self._hq_ao_tex.repeat_y = False
+            self._hq_ao_fbo = self.ctx.framebuffer(color_attachments=[self._hq_ao_tex])
+            self._hq_dof_tex = self.ctx.texture((bw, bh), 4, dtype='f2')
+            self._hq_dof_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._hq_dof_tex.repeat_x = self._hq_dof_tex.repeat_y = False
+            self._hq_dof_fbo = self.ctx.framebuffer(color_attachments=[self._hq_dof_tex])
+            self._hq_bloom_size = (bw, bh)
+
+    def _hq_render_wrapped(self, dispatch, out_fbo, out_w, out_h):
+        """Render the scene into a supersampled HDR target, then bloom + tone-map
+        it down into `out_fbo` at (out_w, out_h). Renderer-agnostic."""
+        ss = max(1, int(self._hq_ss))
+        sw, sh = max(1, out_w * ss), max(1, out_h * ss)
+        self._ensure_hq_targets(sw, sh)
+        old_w, old_h = self.width, self.height
+        old_vp = self.ctx.viewport
+        # 1) scene -> supersampled HDR target (renderers read self.width/height
+        #    and the bound FBO, so temporarily posing as the SS target routes
+        #    every renderer through it).
+        self._hq_scene_fbo.use()
+        self.width, self.height = sw, sh
+        self.ctx.viewport = (0, 0, sw, sh)
+        try:
+            dispatch()
+        finally:
+            self.width, self.height = old_w, old_h
+        # 2) bloom + tone-map, resolving SS -> out_fbo
+        self._hq_postprocess(out_fbo, out_w, out_h)
+        self.ctx.viewport = old_vp
+
+    def _hq_postprocess(self, out_fbo, out_w, out_h):
+        """Bright-pass -> separable blur -> composite (exposure + ACES) into out_fbo."""
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.BLEND)
+        bw, bh = self._hq_bloom_size
+        # bright-pass: HDR scene -> bloom_a (downsampled)
+        self._hq_bloom_fbo_a.use()
+        self.ctx.viewport = (0, 0, bw, bh)
+        self._hq_scene_tex.use(location=0)
+        self._hq_bright_prog['u_scene'].value = 0
+        self._hq_bright_prog['u_threshold'].value = float(self._hq_bloom_threshold)
+        self._hq_bright_prog['u_knee'].value = float(self._hq_bloom_knee)
+        self._hq_bright_vao.render(moderngl.TRIANGLE_STRIP)
+        # separable Gaussian blur, ping-pong a<->b
+        tx, ty = 1.0 / bw, 1.0 / bh
+        self._hq_blur_prog['u_tex'].value = 0
+        for _ in range(2):
+            self._hq_bloom_fbo_b.use()
+            self._hq_bloom_tex_a.use(location=0)
+            self._hq_blur_prog['u_dir'].value = (tx, 0.0)
+            self._hq_blur_vao.render(moderngl.TRIANGLE_STRIP)
+            self._hq_bloom_fbo_a.use()
+            self._hq_bloom_tex_b.use(location=0)
+            self._hq_blur_prog['u_dir'].value = (0.0, ty)
+            self._hq_blur_vao.render(moderngl.TRIANGLE_STRIP)
+        # ambient occlusion from the scene depth -> ao_tex
+        self._hq_ao_fbo.use()
+        self.ctx.viewport = (0, 0, bw, bh)
+        self._hq_scene_depth.use(location=0)
+        self._hq_ao_prog['u_depth'].value = 0
+        self._hq_ao_prog['u_radius'].value = 2.5 / bw
+        self._hq_ao_prog['u_strength'].value = float(self._hq_ao)
+        self._hq_ao_vao.render(moderngl.TRIANGLE_STRIP)
+        # depth-of-field: a blurred copy of the scene (only when enabled)
+        if self._hq_dof > 0.0:
+            self._hq_blur_prog['u_tex'].value = 0
+            self._hq_bloom_fbo_b.use()
+            self.ctx.viewport = (0, 0, bw, bh)
+            self._hq_scene_tex.use(location=0)
+            self._hq_blur_prog['u_dir'].value = (tx, 0.0)
+            self._hq_blur_vao.render(moderngl.TRIANGLE_STRIP)
+            self._hq_dof_fbo.use()
+            self._hq_bloom_tex_b.use(location=0)
+            self._hq_blur_prog['u_dir'].value = (0.0, ty)
+            self._hq_blur_vao.render(moderngl.TRIANGLE_STRIP)
+        # composite: SS scene (linear = SSAA resolve) + bloom + AO -> out_fbo
+        out_fbo.use()
+        self.ctx.viewport = (0, 0, out_w, out_h)
+        self._hq_scene_tex.use(location=0)
+        self._hq_bloom_tex_a.use(location=1)
+        self._hq_ao_tex.use(location=2)
+        self._hq_scene_depth.use(location=3)
+        self._hq_dof_tex.use(location=4)
+        self._hq_comp_prog['u_scene'].value = 0
+        self._hq_comp_prog['u_bloom'].value = 1
+        self._hq_comp_prog['u_ao'].value = 2
+        self._hq_comp_prog['u_depth'].value = 3
+        self._hq_comp_prog['u_dof'].value = 4
+        self._hq_comp_prog['u_dof_strength'].value = float(self._hq_dof)
+        self._hq_comp_prog['u_dof_range'].value = float(self._hq_dof_range)
+        self._hq_comp_prog['u_exposure'].value = float(self._hq_exposure)
+        self._hq_comp_prog['u_bloom_intensity'].value = float(self._hq_bloom)
+        self._hq_comp_prog['u_vignette'].value = float(self._hq_vignette)
+        self._hq_comp_prog['u_bg_color'].value = tuple(self._hq_bg_color)
+        self._hq_comp_prog['u_bg_intensity'].value = float(self._hq_bg)
+        self._hq_comp_prog['u_saturation'].value = float(self._hq_sat)
+        self._hq_comp_prog['u_contrast'].value = float(self._hq_contrast)
+        self._hq_comp_prog['u_temp'].value = float(self._hq_temp)
+        self._hq_comp_prog['u_grain'].value = float(self._hq_grain)
+        self._hq_comp_prog['u_grain_seed'].value = float(int(self.step_count) % 4096)
+        self._hq_comp_vao.render(moderngl.TRIANGLE_STRIP)
+
+    def _render(self):
+        """Dispatch to the appropriate renderer (optionally via HQ post)."""
+        # Reset sub-timings dict; populated by the chosen renderer path.
+        # Captured by the main loop into sec['render.*'] entries.
+        self._render_sub = {}
+        # Time-axis (spacetime) display works in BOTH voxel and volumetric
+        # renderers — the history volume holds raw sim channels, so each
+        # renderer samples it exactly as it would the live grid. We honour
+        # the user's chosen renderer_mode; the spacetime source-swap happens
+        # inside _render_voxels / _render_volume.
+        if self._hq_enabled():
+            self._hq_render_wrapped(self._dispatch_scene, self.ctx.screen,
+                                    self.width, self.height)
+        else:
+            self._dispatch_scene()
 
     def _scene_hash(self):
         """Tuple of every state bit that affects what a rendered frame shows.
@@ -33115,6 +33594,18 @@ void main() {
             round(float(getattr(self, '_st_slice_frac', 0.5)), 3),
             # Recording disables caching (we need a fresh render each frame)
             bool(getattr(self, '_recording', False)),
+            # HQ post-processing state — toggling it (or its knobs) on an
+            # otherwise-idle scene must invalidate the cached frame so the
+            # change shows immediately.
+            bool(self._hq_mode), int(self._hq_ss),
+            round(float(self._hq_bloom), 3), round(float(self._hq_exposure), 3),
+            round(float(self._hq_vignette), 3), round(float(self._hq_edge), 3),
+            round(float(self._hq_rim), 3), round(float(self._hq_ao), 3),
+            round(float(self._hq_bg), 3), tuple(self._hq_bg_color),
+            round(float(self._hq_sat), 3), round(float(self._hq_contrast), 3),
+            round(float(self._hq_temp), 3), round(float(self._hq_grain), 3),
+            round(float(self._hq_dof), 3),
+            int(self.step_count) if self._hq_grain > 0 else 0,
             # Particles always animate; including count forces re-render.
             int(getattr(self, 'particle_count', 0)),
             # Glyphs always re-sample the live field; force re-render.
@@ -34574,6 +35065,73 @@ void main() {
                 self.viewport_zoom = self.viewport_zoom_base
             imgui.separator()
 
+        # ── High-quality rendering (global; applies to every renderer) ──
+        changed, val = imgui.checkbox("High quality (HQ)  [F9]", self._hq_mode)
+        if changed:
+            self._hq_mode = val
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Supersampled render + bloom + filmic tone-map. "
+                              "Best for recording; costs more GPU.")
+        if self._hq_mode:
+            preset_names = ["Custom", "Clean", "Vibrant", "Neon", "Filmic"]
+            cur_preset = getattr(self, '_hq_preset', 'Custom')
+            if imgui.begin_combo("Look", cur_preset):
+                for name in preset_names:
+                    if imgui.selectable(name, name == cur_preset)[0] and name != "Custom":
+                        self._apply_hq_preset(name)
+                imgui.end_combo()
+            ss_labels = ["1x", "2x", "3x", "4x"]
+            ss_idx = min(max(self._hq_ss - 1, 0), 3)
+            if imgui.begin_combo("Supersample", ss_labels[ss_idx]):
+                for i, lab in enumerate(ss_labels):
+                    if imgui.selectable(lab, i == ss_idx)[0]:
+                        self._hq_ss = i + 1
+                    if i == ss_idx:
+                        imgui.set_item_default_focus()
+                imgui.end_combo()
+            changed, v = imgui.slider_float("Bloom", self._hq_bloom, 0.0, 4.0)
+            if changed:
+                self._hq_bloom = v
+            changed, v = imgui.slider_float("Exposure", self._hq_exposure, 0.2, 3.0)
+            if changed:
+                self._hq_exposure = v
+            changed, v = imgui.slider_float("Vignette", self._hq_vignette, 0.0, 1.5)
+            if changed:
+                self._hq_vignette = v
+            changed, v = imgui.slider_float("Edge glow", self._hq_edge, 0.0, 5.0)
+            if changed:
+                self._hq_edge = v
+            changed, v = imgui.slider_float("Rim light", self._hq_rim, 0.0, 3.0)
+            if changed:
+                self._hq_rim = v
+            changed, v = imgui.slider_float("Ambient occlusion", self._hq_ao, 0.0, 1.5)
+            if changed:
+                self._hq_ao = v
+            changed, v = imgui.slider_float("Background", self._hq_bg, 0.0, 1.5)
+            if changed:
+                self._hq_bg = v
+                self._hq_preset = 'Custom'
+            changed, col = imgui.color_edit3("BG tint", list(self._hq_bg_color))
+            if changed:
+                self._hq_bg_color = tuple(col)
+            changed, v = imgui.slider_float("Saturation", self._hq_sat, 0.0, 2.0)
+            if changed:
+                self._hq_sat = v
+            changed, v = imgui.slider_float("Contrast", self._hq_contrast, 0.5, 1.8)
+            if changed:
+                self._hq_contrast = v
+            changed, v = imgui.slider_float("Temperature", self._hq_temp, -1.0, 1.0)
+            if changed:
+                self._hq_temp = v
+            changed, v = imgui.slider_float("Film grain", self._hq_grain, 0.0, 1.0)
+            if changed:
+                self._hq_grain = v
+            changed, v = imgui.slider_float("Depth of field", self._hq_dof, 0.0, 1.0)
+            if changed:
+                self._hq_dof = v
+                self._hq_preset = 'Custom'
+        imgui.separator()
+
         if self.renderer_mode == 'voxel':
             # Voxel-specific settings
             changed, new_val = imgui.slider_float("Cube gap", self.voxel_gap, 0.0, 0.5)
@@ -35435,24 +35993,14 @@ void main() {
         self.ctx.viewport = (0, 0, self._rec_width, self._rec_height)
 
         try:
-            # Render the scene (same as screen, just different resolution).
-            # Mirror _render()'s dispatch so SDF-viewport presets (Mandelbox,
-            # Mandelbulb, Juliabulb, Menger when in sdf_viewport mode) record
-            # the per-pixel sphere-traced view instead of falling back to the
-            # voxel-bake volume renderer.
-            if self.renderer_mode == 'voxel':
-                self._render_voxels()
-            elif self.renderer_mode == 'sdf_viewport':
-                self._render_sdf_viewport()
-            elif self._use_compute_ray:
-                self._render_volume_compute()
+            # Same composition as the window (voxel/sdf/volume + overlays) via
+            # the shared dispatch; wrap in the HQ post path when enabled so
+            # recordings get the same cinematic treatment as the live view.
+            if self._hq_enabled():
+                self._hq_render_wrapped(self._dispatch_scene, self._rec_fbo,
+                                        self._rec_width, self._rec_height)
             else:
-                self._render_volume()
-            # Overlays (particles/glyphs/iso) — match _render() so the
-            # recording shows the same scene composition as the window.
-            self._render_particles()
-            self._render_glyphs()
-            self._render_iso_surface()
+                self._dispatch_scene()
         finally:
             # Restore screen state even if rendering fails
             self.ctx.screen.use()
