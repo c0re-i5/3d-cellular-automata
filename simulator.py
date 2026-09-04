@@ -12464,6 +12464,13 @@ uniform float u_edge_strength;  // 0 = off; additive rim glow along cell edges
 uniform float u_edge_width;     // edge line width (normalised cell units)
 uniform int u_hq_shading;       // 1 = HQ lighting (bevel + fill + fresnel rim)
 uniform float u_rim_strength;   // fresnel silhouette-rim intensity
+uniform float u_shadow;         // volume-traced self-shadow strength (0 = off)
+uniform sampler3D u_volume_tex; // sim volume (unit 0) sampled by the shadow ray
+uniform int u_size;
+uniform float u_threshold;      // cull/alive threshold (shared with vertex)
+uniform int u_channel;
+uniform int u_use_abs;
+uniform mat3 u_lattice_M_inv;   // world -> FCC index (set for FCC presets)
 
 vec3 colormap_fire(float t) {
     return vec3(clamp(t*3.0, 0.0, 1.0), clamp(t*3.0-1.0, 0.0, 1.0), clamp(t*3.0-2.0, 0.0, 1.0));
@@ -12526,6 +12533,32 @@ float edge_dist_norm() {
     return clamp(mid / 0.5, 0.0, 1.0);
 }
 
+// World position -> normalised grid coordinate ([0,1] over the volume texture).
+vec3 world_to_gridN(vec3 w) {
+    if (u_lattice_fcc == 1) return u_lattice_M_inv * (w - vec3(0.5)) + vec3(0.5);
+    return w;   // cubic: world already spans the [0,1] grid
+}
+bool cell_alive_at(vec3 g) {
+    if (any(lessThan(g, vec3(0.0))) || any(greaterThan(g, vec3(1.0)))) return false;
+    float v = texture(u_volume_tex, g)[u_channel];
+    if (u_use_abs == 1) v = abs(v);
+    else if (u_use_abs == 2) v = abs(clamp(v, -1.0, 1.0));
+    return v > u_threshold;
+}
+// Soft self-shadow: march a short ray toward the key light through the voxel
+// volume; a nearer occluder darkens more (distance-attenuated penumbra). Starts
+// past the current cell so a voxel never shadows itself.
+float self_shadow() {
+    if (u_shadow <= 0.0) return 0.0;
+    vec3 L = normalize(vec3(0.5, 1.0, 0.3));
+    float cell = 1.0 / float(u_size);
+    for (int i = 0; i < 16; ++i) {
+        vec3 g = world_to_gridN(v_world_pos + L * ((1.5 + float(i)) * cell));
+        if (cell_alive_at(g)) return 1.0 - float(i) / 16.0;
+    }
+    return 0.0;
+}
+
 void main() {
     vec3 color;
     if (u_is_element_ca == 1) {
@@ -12574,7 +12607,7 @@ void main() {
         // Fresnel rim that lights grazing-angle silhouettes (blooms under HQ).
         vec3 keyL = normalize(vec3(0.5, 1.0, 0.3));
         vec3 fillL = normalize(vec3(-0.6, 0.25, -0.5));
-        float key = max(dot(N, keyL), 0.0);
+        float key = max(dot(N, keyL), 0.0) * (1.0 - self_shadow() * u_shadow);
         float fill = max(dot(N, fillL), 0.0);
         float fres = pow(1.0 - max(dot(N, view_dir), 0.0), 3.0);
         float spec = pow(max(dot(reflect(-keyL, N), view_dir), 0.0), 48.0);
@@ -27292,6 +27325,7 @@ class Simulator:
         self._hq_edge_width = 0.14      # edge line width (normalised cell units)
         self._hq_rim = 0.5              # fresnel silhouette-rim intensity
         self._hq_ao = 0.6               # ambient-occlusion strength (0 = off)
+        self._hq_shadow = 0.5          # volume-traced self-shadow strength (0 = off)
         self._hq_bg = 0.0               # background environment glow (0 = off)
         self._hq_bg_color = (0.05, 0.08, 0.16)  # environment tint (dark blue)
         self._hq_sat = 1.0              # colour saturation (1 = neutral)
@@ -27305,6 +27339,7 @@ class Simulator:
         self._hq_scene_tex = None
         self._hq_scene_depth = None
         self._hq_scene_size = None
+        self._hq_targets = {}           # (sw,sh) -> target set; avoids realloc churn
         self._hq_bloom_fbo_a = self._hq_bloom_fbo_b = None
         self._hq_bloom_tex_a = self._hq_bloom_tex_b = None
         self._hq_ao_fbo = self._hq_ao_tex = None
@@ -27413,6 +27448,7 @@ class Simulator:
         self._vp_u_edge_width = vp.get('u_edge_width', None)
         self._vp_u_hq_shading = vp.get('u_hq_shading', None)
         self._vp_u_rim_strength = vp.get('u_rim_strength', None)
+        self._vp_u_shadow = vp.get('u_shadow', None)
         # Empty VAO for instanced rendering (vertices come from SSBO)
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
 
@@ -27576,6 +27612,7 @@ class Simulator:
         self._vp_u_edge_width = vp.get('u_edge_width', None)
         self._vp_u_hq_shading = vp.get('u_hq_shading', None)
         self._vp_u_rim_strength = vp.get('u_rim_strength', None)
+        self._vp_u_shadow = vp.get('u_shadow', None)
         self.voxel_vao = self.ctx.vertex_array(self.voxel_prog, [])
 
     def _voxel_pack_inject(self, src: str) -> str:
@@ -33143,6 +33180,8 @@ void main() {
             self._vp_u_hq_shading.value = 1 if self._hq_mode else 0
         if self._vp_u_rim_strength is not None:
             self._vp_u_rim_strength.value = float(self._hq_rim)
+        if self._vp_u_shadow is not None:
+            self._vp_u_shadow.value = (float(self._hq_shadow) if self._hq_mode else 0.0)
         if is_fcc and self._vp_u_lattice_M is not None:
             self._vp_u_lattice_M.value = _FCC_M_COLMAJOR
             if self._vp_u_lattice_M_inv is not None:
@@ -33389,72 +33428,97 @@ void main() {
         """Set the whole HQ look from a named preset (bloom .. grain)."""
         p = {
             'Clean':   dict(bloom=0.35, exposure=1.10, vignette=0.15, edge=0.4,
-                            rim=0.35, ao=0.5, bg=0.0, bg_color=(0.05, 0.08, 0.16),
-                            sat=1.0, contrast=1.05, temp=0.0, grain=0.0),
+                            rim=0.35, ao=0.5, shadow=0.4, bg=0.0,
+                            bg_color=(0.05, 0.08, 0.16),
+                            sat=1.0, contrast=1.05, temp=0.0, grain=0.0, dof=0.0),
             'Vibrant': dict(bloom=0.9, exposure=1.25, vignette=0.3, edge=1.0,
-                            rim=0.8, ao=0.7, bg=0.3, bg_color=(0.05, 0.09, 0.20),
-                            sat=1.3, contrast=1.15, temp=0.05, grain=0.0),
+                            rim=0.8, ao=0.7, shadow=0.6, bg=0.3,
+                            bg_color=(0.05, 0.09, 0.20),
+                            sat=1.3, contrast=1.15, temp=0.05, grain=0.0, dof=0.0),
             'Neon':    dict(bloom=1.8, exposure=1.2, vignette=0.45, edge=2.5,
-                            rim=1.5, ao=0.6, bg=0.5, bg_color=(0.10, 0.02, 0.22),
-                            sat=1.5, contrast=1.2, temp=-0.1, grain=0.05),
+                            rim=1.5, ao=0.6, shadow=0.5, bg=0.5,
+                            bg_color=(0.10, 0.02, 0.22),
+                            sat=1.5, contrast=1.2, temp=-0.1, grain=0.05, dof=0.0),
             'Filmic':  dict(bloom=0.5, exposure=1.05, vignette=0.4, edge=0.5,
-                            rim=0.5, ao=0.8, bg=0.2, bg_color=(0.12, 0.09, 0.06),
-                            sat=0.95, contrast=1.1, temp=0.12, grain=0.12),
+                            rim=0.5, ao=0.8, shadow=0.7, bg=0.2,
+                            bg_color=(0.12, 0.09, 0.06),
+                            sat=0.95, contrast=1.1, temp=0.12, grain=0.12, dof=0.35),
         }.get(name)
         if not p:
             return
         self._hq_bloom = p['bloom']; self._hq_exposure = p['exposure']
         self._hq_vignette = p['vignette']; self._hq_edge = p['edge']
-        self._hq_rim = p['rim']; self._hq_ao = p['ao']
+        self._hq_rim = p['rim']; self._hq_ao = p['ao']; self._hq_shadow = p['shadow']
         self._hq_bg = p['bg']; self._hq_bg_color = p['bg_color']
         self._hq_sat = p['sat']; self._hq_contrast = p['contrast']
-        self._hq_temp = p['temp']; self._hq_grain = p['grain']
+        self._hq_temp = p['temp']; self._hq_grain = p['grain']; self._hq_dof = p['dof']
         self._hq_preset = name
 
-    def _ensure_hq_targets(self, sw, sh):
-        """Allocate/resize the supersampled HDR scene target and bloom buffers."""
-        if self._hq_scene_size != (sw, sh):
-            for obj in (self._hq_scene_fbo, self._hq_scene_tex, self._hq_scene_depth):
-                if obj is not None:
-                    try: obj.release()
-                    except Exception: pass  # noqa: BLE001  GL release, never fatal
-            self._hq_scene_tex = self.ctx.texture((sw, sh), 4, dtype='f2')
-            self._hq_scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            self._hq_scene_tex.repeat_x = self._hq_scene_tex.repeat_y = False
-            # Depth as a sampleable texture so the AO pass can read it.
-            self._hq_scene_depth = self.ctx.depth_texture((sw, sh))
-            self._hq_scene_depth.compare_func = ''
-            self._hq_scene_depth.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self._hq_scene_fbo = self.ctx.framebuffer(
-                color_attachments=[self._hq_scene_tex],
-                depth_attachment=self._hq_scene_depth)
-            self._hq_scene_size = (sw, sh)
+    def _alloc_hq_target_set(self, sw, sh):
+        """Build one full set of HQ render targets at supersampled size (sw, sh)."""
         bw, bh = max(sw // 2, 1), max(sh // 2, 1)
-        if self._hq_bloom_size != (bw, bh):
-            for obj in (self._hq_bloom_fbo_a, self._hq_bloom_fbo_b,
-                        self._hq_bloom_tex_a, self._hq_bloom_tex_b,
-                        self._hq_ao_fbo, self._hq_ao_tex):
-                if obj is not None:
-                    try: obj.release()
-                    except Exception: pass  # noqa: BLE001  GL release, never fatal
-            self._hq_bloom_tex_a = self.ctx.texture((bw, bh), 4, dtype='f2')
-            self._hq_bloom_tex_b = self.ctx.texture((bw, bh), 4, dtype='f2')
-            for t in (self._hq_bloom_tex_a, self._hq_bloom_tex_b):
-                t.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                t.repeat_x = t.repeat_y = False
-            self._hq_bloom_fbo_a = self.ctx.framebuffer(
-                color_attachments=[self._hq_bloom_tex_a])
-            self._hq_bloom_fbo_b = self.ctx.framebuffer(
-                color_attachments=[self._hq_bloom_tex_b])
-            self._hq_ao_tex = self.ctx.texture((bw, bh), 4, dtype='f2')
-            self._hq_ao_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            self._hq_ao_tex.repeat_x = self._hq_ao_tex.repeat_y = False
-            self._hq_ao_fbo = self.ctx.framebuffer(color_attachments=[self._hq_ao_tex])
-            self._hq_dof_tex = self.ctx.texture((bw, bh), 4, dtype='f2')
-            self._hq_dof_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            self._hq_dof_tex.repeat_x = self._hq_dof_tex.repeat_y = False
-            self._hq_dof_fbo = self.ctx.framebuffer(color_attachments=[self._hq_dof_tex])
-            self._hq_bloom_size = (bw, bh)
+        scene_tex = self.ctx.texture((sw, sh), 4, dtype='f2')
+        scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        scene_tex.repeat_x = scene_tex.repeat_y = False
+        scene_depth = self.ctx.depth_texture((sw, sh))
+        scene_depth.compare_func = ''
+        scene_depth.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        scene_fbo = self.ctx.framebuffer(color_attachments=[scene_tex],
+                                         depth_attachment=scene_depth)
+
+        def _half():
+            t = self.ctx.texture((bw, bh), 4, dtype='f2')
+            t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            t.repeat_x = t.repeat_y = False
+            return t, self.ctx.framebuffer(color_attachments=[t])
+
+        bloom_tex_a, bloom_fbo_a = _half()
+        bloom_tex_b, bloom_fbo_b = _half()
+        ao_tex, ao_fbo = _half()
+        dof_tex, dof_fbo = _half()
+        return dict(
+            scene_fbo=scene_fbo, scene_tex=scene_tex, scene_depth=scene_depth,
+            bloom_fbo_a=bloom_fbo_a, bloom_fbo_b=bloom_fbo_b,
+            bloom_tex_a=bloom_tex_a, bloom_tex_b=bloom_tex_b,
+            ao_fbo=ao_fbo, ao_tex=ao_tex, dof_fbo=dof_fbo, dof_tex=dof_tex,
+            bloom_size=(bw, bh))
+
+    def _release_hq_target_set(self, ent):
+        for k, obj in ent.items():
+            if k == 'bloom_size':
+                continue
+            try: obj.release()
+            except Exception: pass  # noqa: BLE001  GL release, never fatal
+
+    def _ensure_hq_targets(self, sw, sh):
+        """Activate the HQ target set for (sw, sh), building + caching on demand.
+
+        The window and the recording FBO render at DIFFERENT resolutions, so a
+        single resizable set would release+reallocate every large 4K-ish target
+        twice per frame while recording -- the source of the record-mode stutter
+        and the VRAM-churn crash. Caching per size keeps both sets alive and
+        eliminates the churn entirely."""
+        key = (sw, sh)
+        ent = self._hq_targets.get(key)
+        if ent is None:
+            ent = self._alloc_hq_target_set(sw, sh)
+            self._hq_targets[key] = ent
+            # Bound the cache (window + record + a spare SS); evict the oldest.
+            while len(self._hq_targets) > 4:
+                old_key = next(iter(self._hq_targets))
+                self._release_hq_target_set(self._hq_targets.pop(old_key))
+        self._hq_scene_fbo = ent['scene_fbo']
+        self._hq_scene_tex = ent['scene_tex']
+        self._hq_scene_depth = ent['scene_depth']
+        self._hq_bloom_fbo_a = ent['bloom_fbo_a']
+        self._hq_bloom_fbo_b = ent['bloom_fbo_b']
+        self._hq_bloom_tex_a = ent['bloom_tex_a']
+        self._hq_bloom_tex_b = ent['bloom_tex_b']
+        self._hq_ao_fbo = ent['ao_fbo']
+        self._hq_ao_tex = ent['ao_tex']
+        self._hq_dof_fbo = ent['dof_fbo']
+        self._hq_dof_tex = ent['dof_tex']
+        self._hq_bloom_size = ent['bloom_size']
 
     def _hq_render_wrapped(self, dispatch, out_fbo, out_w, out_h):
         """Render the scene into a supersampled HDR target, then bloom + tone-map
@@ -33604,7 +33668,7 @@ void main() {
             round(float(self._hq_bg), 3), tuple(self._hq_bg_color),
             round(float(self._hq_sat), 3), round(float(self._hq_contrast), 3),
             round(float(self._hq_temp), 3), round(float(self._hq_grain), 3),
-            round(float(self._hq_dof), 3),
+            round(float(self._hq_dof), 3), round(float(self._hq_shadow), 3),
             int(self.step_count) if self._hq_grain > 0 else 0,
             # Particles always animate; including count forces re-render.
             int(getattr(self, 'particle_count', 0)),
@@ -35107,6 +35171,10 @@ void main() {
             changed, v = imgui.slider_float("Ambient occlusion", self._hq_ao, 0.0, 1.5)
             if changed:
                 self._hq_ao = v
+            changed, v = imgui.slider_float("Self-shadow", self._hq_shadow, 0.0, 1.0)
+            if changed:
+                self._hq_shadow = v
+                self._hq_preset = 'Custom'
             changed, v = imgui.slider_float("Background", self._hq_bg, 0.0, 1.5)
             if changed:
                 self._hq_bg = v
