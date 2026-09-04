@@ -1,6 +1,6 @@
 # 3D Cellular Automata
 
-A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with an extensive physical-correctness suite (`ca_debug.*`, 25+ audit probes covering shader hygiene, spatial equivariance, parameter coupling, conservation laws, determinism, dt/grid convergence, init-variant smoke, long-run drift, discovery-replay fidelity, slider-endpoint runnability, render-side visibility, golden-snapshot regression guards, analytic-oracle ground truth, param-fuzz NaN hunting, PDE stability vs. grid size, seed-sensitivity bounds, live-vs-headless equivalence, and entity-arena invariants), plus an end-to-end recording → YouTube → Reddit publishing pipeline.
+A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray marching, 70+ distinct compute shaders, and 100+ built-in presets — from classic Game of Life to quantum mechanics (incl. self-interacting Schrödinger–Poisson and 3+1D Dirac), peridynamic fracture, Saffman–Taylor viscous fingering, compressible Euler with Sod / Kelvin–Helmholtz / blast initial conditions, and active nematic chirality. Ships with an extensive physical-correctness suite (`ca_debug.*`, 25+ audit probes covering shader hygiene, spatial equivariance, parameter coupling, conservation laws, determinism, dt/grid convergence, init-variant smoke, long-run drift, discovery-replay fidelity, slider-endpoint runnability, render-side visibility, golden-snapshot regression guards, analytic-oracle ground truth, param-fuzz NaN hunting, PDE stability vs. grid size, seed-sensitivity bounds, live-vs-headless equivalence, and entity-arena invariants), plus an end-to-end recording → YouTube → Reddit publishing pipeline. An optional toggleable high-quality render mode (`F9`) layers supersampled anti-aliasing, bloom, ambient occlusion, depth of field, cinematic tone-mapping/grading, and volume-traced self-shadows on top of any rule for polished recordings.
 
 ![OpenGL 4.3](https://img.shields.io/badge/OpenGL-4.3%20Compute-blue)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow)
@@ -41,6 +41,16 @@ A GPU-accelerated 3D cellular automata simulator with real-time volumetric ray m
 - **Compute raymarcher** — optional shared-memory cached ray-marching shader with occupancy-grid brick DDA (matches fragment path)
 - **Adaptive brick DDA** — occupancy grid block edge is 4³ (small grids) or 8³ (≥192³) for fewer DDA steps and lower cache pressure
 - **Idle-frame blit cache** — when camera, simulation state, and render knobs are all unchanged, the previous frame is re-displayed via a GPU framebuffer blit (~0.3 ms) instead of re-marching rays (5–30 ms at 512³)
+
+#### High-Quality Mode (`F9`)
+An optional, toggleable **cinematic post-processing path** applied to the *final image* of every renderer (voxel / volumetric / SDF / particles) — so it is renderer-agnostic and works for every rule, and video recordings route through it too. **Off by default**: the standard render path is byte-for-byte unchanged and all golden snapshots are identical, so nothing regresses when it is disabled.
+- **Supersampled HDR pipeline** — the scene is drawn into a 16-bit float target at 1–4× resolution; the final downsample is the anti-aliasing (SSAA), which improves *every* renderer uniformly (cubes, raymarch, SDF, particles)
+- **Bloom** — bright-pass + separable blur so emissive structure glows
+- **Ambient occlusion** — depth-darkening contact shadows in crevices (no normal buffer; a no-op where nothing wrote depth, e.g. the raymarcher)
+- **Depth of field** — auto-focus on the frame centre with circle-of-confusion blur
+- **ACES filmic tone-map** with exposure, plus an environment background glow added only into empty areas, colour grading (saturation / contrast / temperature), vignette, and an always-on dither that removes gradient banding (+ optional film grain)
+- **Cinematic voxel shading** (HQ only) — beveled cell edges, a key + fill + Fresnel-rim light rig, an additive per-cell edge glow, and **volume-traced soft self-shadows** (each voxel marches a short ray toward the key light through the sim volume). All of it works on both cubic cells and FCC rhombic-dodecahedron cells
+- **Look presets** — Clean / Vibrant / Neon / Filmic one-click looks, plus ~15 live sliders; per-size target caching keeps window + recording resolutions churn-free
 
 ### Recording
 - **MP4 video capture** via ffmpeg (H.264 NVENC by default, libx264 fallback)
@@ -153,6 +163,7 @@ Use the imgui panel to switch presets, adjust parameters, and control the simula
 | **P** | Toggle paint mode |
 | **1 / 2 / 3** | Brush tool: element / temperature / eraser |
 | **F5** | Start / stop recording |
+| **F9** | Toggle high-quality render mode |
 | **Escape** | Quit |
 
 #### Mouse Controls
@@ -290,7 +301,11 @@ fcc_viewer.py, lattice_gpu_check.py
                           morphogen), excitable/oscillator media (cyclic,
                           Kuramoto, XY-spin, BZ spiral waves), statistical
                           mechanics (Ising), multi-species competition
-                          (lichen), continuum multi-species Particle Life,
+                          (lichen), continuum multi-species Particle Life
+                          (and its autocatalytic-chemistry sibling
+                          `fcc_organelle`, which grows self-assembling
+                          "organelle" species out of empty space via a
+                          two-step, feedback-driven metabolic chain),
                           growth (Eden, DLA, crystal, forest fire), and
                           discrete rules (Life, 4-4-5, sandpile,
                           hodgepodge, spatial Prisoner's Dilemma). They
@@ -449,6 +464,7 @@ The dispatcher writes back the *same* texture format, so:
 | `active_phase_sep_3d` | φ₁ | chem pot μ₁ | φ₂ | chem pot μ₂ | bipolar |
 | `directional_solidification_3d` | phase φ | thermal field T | — | — | (volumetric) |
 | `fcc_particle_life` | composite R | composite G | composite B | total density | rgba_blend |
+| `fcc_organelle` | composite R | composite G | composite B | total density | rgba_blend |
 | `fcc_bz_spiral_waves` | Re(A) | Im(A) | amplitude | — | (value on Re A) |
 | `fcc_lichen` | species A | species B | resource | species C | rgb_channels |
 | Schrödinger family (×8) | ψ real | ψ imag | potential V | \|Ψ\|² | (default density on \|Ψ\|²) |
