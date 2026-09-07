@@ -9672,7 +9672,12 @@ void main() {
     vec4 st = imageLoad(u_src2, pos);
     vec4 f4 = imageLoad(u_src4, pos);
     float B = st.r, S = st.g, Q = st.b;
-    float F = f4.r, L = f4.g, V = f4.b, T = f4.a;
+    float F = f4.r, L = f4.g, T = f4.a;
+    // Cover channel packs vegetation (>=0) and glacier ice (<0, thickness -cover);
+    // a glaciated cell carries no vegetation, so freeze it out and pass through.
+    float cover = f4.b;
+    if (cover < 0.0) { imageStore(u_dst4, pos, vec4(F, L, cover, T)); return; }
+    float V = cover;
     float h_sea = 0.30 * float(u_size);
 
     float sx = surf_at(pos.x+1,pos.z) - surf_at(pos.x-1,pos.z);
@@ -9700,6 +9705,111 @@ void main() {
     V = clamp(V, 0.0, 1.0);
 
     imageStore(u_dst4, pos, vec4(F, L, V, T));
+}
+""",
+
+    "lem_iceflux": """
+// LEM glacier flow — shallow-ice approximation as a bounded virtual-pipe flux.
+// Ice thickness H is packed as the NEGATIVE of the cover channel (field4.b):
+// cover>=0 is vegetation, cover<0 is glacier ice of thickness -cover (the two
+// are mutually exclusive -- a glacier scrapes the ground bare). Ice creeps
+// toward lower ICE-SURFACE neighbours (bed B+S plus ice H); the flux grows with
+// thickness (thick ice deforms and slides, thin ice is frozen to the bed) and
+// is capped (<= half the ice, <= half the surface drop) so it is unconditionally
+// stable and exactly conservative. field3 (scratch) = ice sent to (+x,-x,+z,-z).
+layout(rgba32f, binding=2) uniform image3D u_src2;    // B,S,Q,C
+layout(rgba32f, binding=6) uniform image3D u_src4;    // F,L,cover,T
+layout(rgba32f, binding=5) uniform image3D u_dst3;    // ice flux out (scratch)
+
+float Hice(int x, int z) {
+    return max(0.0, -imageLoad(u_src4, ivec3(clamp(x,0,u_size-1),0,clamp(z,0,u_size-1))).b);
+}
+float bed(int x, int z) {
+    vec4 s = imageLoad(u_src2, ivec3(clamp(x,0,u_size-1),0,clamp(z,0,u_size-1)));
+    return s.r + s.g;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    float H = Hice(pos.x, pos.z);
+    if (H <= 0.001) { imageStore(u_dst3, pos, vec4(0.0)); return; }
+    float hs = bed(pos.x, pos.z) + H;                 // my ice surface
+    float d0 = max(0.0, hs - (bed(pos.x+1,pos.z) + Hice(pos.x+1,pos.z)));
+    float d1 = max(0.0, hs - (bed(pos.x-1,pos.z) + Hice(pos.x-1,pos.z)));
+    float d2 = max(0.0, hs - (bed(pos.x,pos.z+1) + Hice(pos.x,pos.z+1)));
+    float d3 = max(0.0, hs - (bed(pos.x,pos.z-1) + Hice(pos.x,pos.z-1)));
+    float sum = d0 + d1 + d2 + d3;
+    if (sum <= 0.0) { imageStore(u_dst3, pos, vec4(0.0)); return; }
+    float mob = clamp(H * 0.0005, 0.0, 0.2);          // thin ice frozen to bed; keeps a convex profile
+    float move = min(mob * H, 0.5 * sum);
+    float k = move / sum;
+    imageStore(u_dst3, pos, vec4(k*d0, k*d1, k*d2, k*d3));
+}
+""",
+
+    "lem_iceupdate": """
+// LEM glacier mass balance. Applies the shallow-ice flux (field3), then the
+// climate mass balance about the snowline (ELA): above it snow accumulates,
+// below it the ice ablates and the meltwater is handed to the standing-water
+// field L (proglacial lakes / outwash). The ELA drifts slowly in time -> ICE
+// AGES (glaciers advance and retreat). Ice is stored as NEGATIVE cover
+// (field4.b); vegetation (cover>=0) is frozen out wherever ice exists.
+//   u_param1 = Rainfall (snow supply)
+layout(rgba32f, binding=2) uniform image3D u_src2;    // B,S,Q,C
+layout(rgba32f, binding=6) uniform image3D u_src4;    // F,L,cover,T (src)
+layout(rgba32f, binding=7) uniform image3D u_dst4;    // (dst)
+layout(rgba32f, binding=4) uniform image3D u_src3;    // ice flux (scratch)
+
+vec4 icef(int x, int z) {
+    if (x < 0 || x >= u_size || z < 0 || z >= u_size) return vec4(0.0);
+    return imageLoad(u_src3, ivec3(x, 0, z));
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    vec4 f4 = imageLoad(u_src4, pos);
+    float cover = f4.b;
+    float H = max(0.0, -cover);
+    float elev = st.r + st.g;
+    float sizef = float(u_size);
+    float h_sea = 0.30 * sizef;
+    bool edge = (pos.x==0 || pos.x==u_size-1 || pos.z==0 || pos.z==u_size-1);
+
+    // Shallow-ice flux transfer (conservative: my inflow = neighbours' flux to me).
+    vec4 fo = icef(pos.x, pos.z);
+    float outflow = fo.x + fo.y + fo.z + fo.w;
+    float inflow = icef(pos.x-1,pos.z).x + icef(pos.x+1,pos.z).y
+                 + icef(pos.x,pos.z-1).z + icef(pos.x,pos.z+1).w;
+    H = max(0.0, H - outflow + inflow);
+
+    // Climate mass balance about a slowly drifting snowline (ELA, measured on the
+    // GROUND surface) -> ice ages. Accumulation self-limits toward a maximum
+    // thickness Hmax, so a high plateau can't grow ice without bound; below the
+    // ELA the ice ablates hard so a glacier's terminus melts back to the snowline.
+    float ela = (0.50 - 0.02 * sin(float(u_frame) * 0.004)) * sizef;
+    float Hmax = 0.16 * sizef;
+    float accum = clamp(u_param1, 0.0, 0.2) * 0.22;      // snowfall grows with precip
+    float bdot;
+    if (elev > ela) {
+        bdot = accum * clamp((elev - ela) / (0.04 * sizef), 0.0, 1.0)
+                     * clamp(1.0 - H / Hmax, 0.0, 1.0);
+    } else {
+        bdot = -0.12 * clamp((ela - elev) / (0.10 * sizef), 0.0, 1.0);   // ablation (a few x accum)
+    }
+    float Hnew = clamp(H + bdot * u_dt, 0.0, Hmax);
+    if (elev < h_sea) Hnew = 0.0;                        // no ice below the sea (calves off)
+    if (edge) Hnew = 0.0;
+
+    // Ablation meltwater is routed as proglacial DISCHARGE by lem_hydro (streams
+    // and jokulhlaup floods), so it is not injected into the standing-water field here.
+    float L = f4.g;
+
+    // Pack: ice present -> negative cover; else keep the vegetation value.
+    float outcover = (Hnew > 0.001) ? -Hnew : max(cover, 0.0);
+    imageStore(u_dst4, pos, vec4(f4.r, L, outcover, f4.a));
 }
 """,
 
@@ -9902,6 +10012,13 @@ float rock_hardness(float x, float z, float elev) {
     float hv = hash_static(ivec3(int(layer), 7, 3), 77);
     return clamp(0.12 + 0.85 * hv, 0.1, 1.0);
 }
+// Ice-surface elevation (bed + sediment + ice) for the basal-sliding gradient.
+float landice(int x, int z) {
+    ivec3 p = ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1));
+    vec4 s = imageLoad(u_src2, p);
+    float cv = imageLoad(u_src4, p).b;
+    return s.r + s.g + max(-cv, 0.0);
+}
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -9949,6 +10066,18 @@ void main() {
                       smoothstep(0.0, 1.0, fract(speriod)));
     float storm = 0.6 + 0.9 * srand;
     W += clamp(u_param1, 0.0, 0.2) * storm * u_dt;
+    // Proglacial meltwater: ablating ice (the snout, below the snowline) sheds
+    // water into the channel network. Rare subglacial releases fire a JOKULHLAUP
+    // -- a glacial outburst flood that surges down-valley for a spell.
+    float iceW = max(-imageLoad(u_src4, pos).b, 0.0);
+    if (iceW > 0.15) {
+        float elaW = (0.50 - 0.02 * sin(float(u_frame) * 0.004)) * float(u_size);
+        float ablation = 0.12 * clamp((elaW - (B + S)) / (0.10 * float(u_size)), 0.0, 1.0);
+        float sp = floor(float(u_frame) / 50.0);
+        float bk = hash_static(ivec3(pos.x / 24, int(mod(sp, 64.0)), pos.z / 24), 91);
+        float surge = (bk > 0.99) ? 25.0 : 1.0;                 // rare outburst flood
+        W += min(ablation, iceW) * 6.0 * surge * u_dt;
+    }
     vec4 myf = fl_at(pos.x, pos.z);
     float outflow = myf.z;
     float inflow = 0.0;
@@ -9974,11 +10103,13 @@ void main() {
     vec2 grad = 0.5 * vec2(Fget(pos.x+1,pos.z) - Fget(pos.x-1,pos.z),
                            Fget(pos.x,pos.z+1) - Fget(pos.x,pos.z-1));
     float slope = length(grad);
-    float veg = imageLoad(u_src4, pos).b;                        // vegetation cover (last frame)
+    float veg = max(imageLoad(u_src4, pos).b, 0.0);             // vegetation cover (ice packs as negative here)
+    float ice = max(-imageLoad(u_src4, pos).b, 0.0);            // glacier thickness (packed as negative cover)
     // Vegetation armours HILLSLOPES (weak flow), but strong river channels scour
     // through it -- so rivers keep incising while vegetated slopes are protected.
     float veg_protect = veg * clamp(1.0 - discharge * 0.03, 0.0, 1.0);
     float Ke = clamp(u_param2, 0.0, 1.0) * (1.0 - 0.6 * veg_protect);
+    Ke *= clamp(1.0 - ice * 0.5, 0.0, 1.0);                      // thick ice buries rivers (no fluvial incision)
     // Rock type from the fixed geologic column at the current bedrock surface:
     // hard beds resist erosion and stand in cliffs, soft beds wear back.
     float hardness = rock_hardness(float(pos.x), float(pos.z), B);
@@ -9999,6 +10130,22 @@ void main() {
         // river would create material and pile phantom sediment mountains.
         float dep = min(-delta, Cadv);
         S += dep; Cadv -= dep;
+    }
+
+    // --- Glacial erosion: sliding ice grinds bedrock into cirques & U-valleys ---
+    // Basal sliding scales with ice thickness and surface slope; the abrasion
+    // turns rock into subglacial till (sediment) that is exposed as moraine when
+    // the ice later retreats. Ice quarries broad flat-floored troughs (thick,
+    // fast ice in valley bottoms) instead of the narrow V-notches water cuts.
+    if (ice > 0.3) {
+        float gsx = landice(pos.x+1,pos.z) - landice(pos.x-1,pos.z);
+        float gsz = landice(pos.x,pos.z+1) - landice(pos.x,pos.z-1);
+        float gslope = 0.5 * length(vec2(gsx, gsz));
+        float slide = ice * gslope;                             // basal sliding proxy
+        float gero = clamp(clamp(u_param2,0.0,1.0) * 0.18 * slide, 0.0, 0.4)
+                     * mix(1.3, 0.6, hardness);                 // soft rock grinds faster
+        gero = min(gero, B);
+        B -= gero; S += gero;                                   // bedrock -> subglacial till
     }
 
     // --- Mass wasting: episodic landslides triggered by river undercutting ---
@@ -10082,10 +10229,14 @@ void main() {
 
     vec4 col = imageLoad(u_src2, ivec3(pos.x, 0, pos.z));
     float B = col.r, S = col.g;
-    float veg = imageLoad(u_src4, ivec3(pos.x, 0, pos.z)).b;   // vegetation cover
+    float cover = imageLoad(u_src4, ivec3(pos.x, 0, pos.z)).b;
+    float veg = max(cover, 0.0);                     // vegetation cover
+    float ice = max(-cover, 0.0);                    // glacier thickness (packed as negative cover)
     float y = float(pos.y);
     float h_sea = 0.30 * float(u_size);              // must match lem_hydro base level
     float land = B + S;
+    float icetop = land + ice;
+    bool glac = ice > 0.15;
 
     // WATER SURFACE: flood this column up to the highest water surface found in
     // a small neighbourhood -- lake (flat terr+L), river ribbon, or ocean. Taking
@@ -10117,6 +10268,7 @@ void main() {
 
     bool water = wl > land + 0.05;
     float surface = water ? wl : land;
+    if (glac && icetop > surface) surface = icetop;   // glacier ice caps the column
 
     if (y >= surface) { imageStore(u_dst, pos, vec4(0.0)); return; }
 
@@ -10127,6 +10279,11 @@ void main() {
         c = mix(vec3(0.56, 0.47, 0.36), vec3(0.40, 0.38, 0.37), hd) * shade;  // soft tan -> hard grey beds
     } else if (y < land) {
         c = vec3(0.80, 0.70, 0.48);                       // sediment / talus / sand
+    } else if (glac && y < icetop && icetop >= wl) {
+        // Glacier: bright snow at the surface deepening to compacted blue ice.
+        float t = clamp(ice / 22.0, 0.0, 1.0);
+        float shade = 0.85 + 0.15 * clamp((icetop - y) / 8.0, 0.0, 1.0);
+        c = mix(vec3(0.95, 0.97, 1.00), vec3(0.50, 0.70, 0.90), t) * shade;
     } else {
         float wdepth = surface - land;                     // total water column
         float depth = clamp((surface - y) / 6.0, 0.0, 1.0);
@@ -10137,7 +10294,7 @@ void main() {
     }
     // Vegetation drapes the top dry-land voxel: light grass at low cover ->
     // dark forest green at high cover.
-    if (!water && y < land && (land - y) < 1.5 && land >= h_sea) {
+    if (!water && !glac && y < land && (land - y) < 1.5 && land >= h_sea) {
         vec3 vegcol = mix(vec3(0.45, 0.55, 0.26), vec3(0.10, 0.30, 0.09), smoothstep(0.35, 0.85, veg));
         c = mix(c, vegcol, clamp(veg * 1.4, 0.0, 0.95));
     }
@@ -19336,6 +19493,8 @@ RULE_PRESETS = {
             {"shader": "lem_fill",     "kind": "voxel", "writes": ["p4"]},
             {"shader": "lem_fill",     "kind": "voxel", "writes": ["p4"]},
             {"shader": "lem_fill",     "kind": "voxel", "writes": ["p4"]},
+            {"shader": "lem_iceflux",  "kind": "voxel", "writes": ["p3"]},
+            {"shader": "lem_iceupdate","kind": "voxel", "writes": ["p4"]},
             {"shader": "lem_lflux",    "kind": "voxel", "writes": ["p3"]},
             {"shader": "lem_lupdate",  "kind": "voxel", "writes": ["p4"]},
             {"shader": "lem_flux",     "kind": "voxel", "writes": ["p3"]},
