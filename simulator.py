@@ -9611,6 +9611,540 @@ void main() {
 }
 """,
 
+    "lem_fill": """
+// LEM depression-fill (Planchon-Darboux relaxation). Computes a FILLED water
+// surface F (field4.r) >= terrain (B+S): every pit is filled up to its lowest
+// spill point, so DISCHARGE can flow OVER it to a connected outlet instead of
+// being trapped. field4.g holds the standing-water depth L (preserved here,
+// evolved by lem_lupdate). A tiny eps slope lets flow still cross filled basins.
+layout(rgba32f, binding=2) uniform image3D u_src2;    // terrain: r=B, g=S
+layout(rgba32f, binding=6) uniform image3D u_src4;    // F (.r), L (.g)
+layout(rgba32f, binding=7) uniform image3D u_dst4;
+
+float Fget(int x, int z) {
+    return imageLoad(u_src4, ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1))).r;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    float Z = st.r + st.g;                              // terrain surface
+    vec4 f4 = imageLoad(u_src4, pos);
+    float L = f4.g;                                     // preserve standing water
+    float V = f4.b;                                     // preserve vegetation cover
+    float T = f4.a;                                     // preserve per-seed tectonic template
+    bool edge = (pos.x==0 || pos.x==u_size-1 || pos.z==0 || pos.z==u_size-1);
+    if (edge) { imageStore(u_dst4, pos, vec4(Z, L, V, T)); return; }  // outlet
+
+    const float eps = 0.008;
+    float m = 1e20;
+    for (int dz=-1; dz<=1; dz++) {
+        for (int dx=-1; dx<=1; dx++) {
+            if (dx==0 && dz==0) continue;
+            float dist = (dx!=0 && dz!=0) ? 1.41421356 : 1.0;
+            m = min(m, Fget(pos.x+dx, pos.z+dz) + eps*dist);
+        }
+    }
+    imageStore(u_dst4, pos, vec4(max(Z, m), L, V, T));
+}
+""",
+
+    "lem_veg": """
+// LEM vegetation — a cover fraction V (field4.b). It grows where conditions
+// favour it (moist climate or near water, gentle slope, soil to root in, on dry
+// land) and is stripped by submersion, drought, or strong flow (flash-flood
+// scour). Vegetation armours the ground in lem_hydro (lower erodibility, higher
+// failure angle), so stable green slopes stand beside raw eroding gullies.
+//   u_param1 = Rainfall   u_param3 = Evaporation
+layout(rgba32f, binding=2) uniform image3D u_src2;    // B,S,Q,C
+layout(rgba32f, binding=6) uniform image3D u_src4;    // F,L,V,T
+layout(rgba32f, binding=7) uniform image3D u_dst4;
+
+float surf_at(int x, int z) {
+    vec4 s = imageLoad(u_src2, ivec3(clamp(x,0,u_size-1),0,clamp(z,0,u_size-1)));
+    return s.r + s.g;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    vec4 f4 = imageLoad(u_src4, pos);
+    float B = st.r, S = st.g, Q = st.b;
+    float F = f4.r, L = f4.g, V = f4.b, T = f4.a;
+    float h_sea = 0.30 * float(u_size);
+
+    float sx = surf_at(pos.x+1,pos.z) - surf_at(pos.x-1,pos.z);
+    float sz = surf_at(pos.x,pos.z+1) - surf_at(pos.x,pos.z-1);
+    float slope = 0.5 * length(vec2(sx, sz));
+
+    // Moisture: rainfall supports vegetation across the whole landscape; rivers
+    // and lakes add a riparian bonus.
+    float rain = clamp(u_param1, 0.0, 0.2);
+    float evap = clamp(u_param3, 0.0, 0.1);
+    float climate = clamp((rain - 0.7 * evap) * 20.0, 0.0, 1.0);
+    float local = clamp(Q * 0.02 + L * 0.3, 0.0, 1.0);
+    float moisture = clamp(climate + 0.35 * local, 0.0, 1.0);
+
+    bool submerged = (L > 0.5) || (B + S < h_sea);
+    float slopeFac = clamp(1.0 - slope * 0.5, 0.10, 1.0);        // steep ground stays bare
+    float soilFac  = clamp(0.7 + S * 0.3, 0.7, 1.0);            // forests grow on thin soil too
+    float suit = submerged ? 0.0 : moisture * slopeFac * soilFac;
+
+    // Cover relaxes toward the equilibrium suitability; flash-flood scour and
+    // submersion strip it (the tipping point).
+    V += (suit - V) * 0.04 * u_dt;
+    V -= clamp((Q - 25.0) * 0.02, 0.0, 0.4) * u_dt;   // flood scour
+    if (submerged) V = 0.0;
+    V = clamp(V, 0.0, 1.0);
+
+    imageStore(u_dst4, pos, vec4(F, L, V, T));
+}
+""",
+
+    "lem_lflux": """
+// LEM lake flux — bounded virtual-pipe fluxes for STANDING water L, ranked by
+// the water surface H = B+S+L. The move is capped (<= half the water, <= half
+// the head drop) so it is unconditionally stable and exactly conservative: it
+// levels a lake to a flat surface and spills the excess over the lowest rim.
+//   field3 (reused as scratch) = volume sent to (+x, -x, +z, -z).
+layout(rgba32f, binding=2) uniform image3D u_src2;    // B,S,Q,C
+layout(rgba32f, binding=6) uniform image3D u_src4;    // F,L
+layout(rgba32f, binding=5) uniform image3D u_dst3;    // L flux out (scratch)
+
+float Hsurf(int x, int z) {
+    ivec3 p = ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1));
+    vec4 st = imageLoad(u_src2, p);
+    return st.r + st.g + imageLoad(u_src4, p).g;        // B + S + L
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    float L = imageLoad(u_src4, pos).g;
+    float h0 = st.r + st.g + L;
+    float ox = max(0.0, h0 - Hsurf(pos.x+1, pos.z));
+    float oy = max(0.0, h0 - Hsurf(pos.x-1, pos.z));
+    float oz = max(0.0, h0 - Hsurf(pos.x, pos.z+1));
+    float ow = max(0.0, h0 - Hsurf(pos.x, pos.z-1));
+    float sum = ox + oy + oz + ow;
+    vec4 f = vec4(0.0);
+    if (sum > 1e-6) {
+        float move = min(0.5 * L, 0.5 * sum);
+        f = vec4(ox, oy, oz, ow) * (move / sum);
+    }
+    imageStore(u_dst3, pos, f);
+}
+""",
+
+    "lem_lupdate": """
+// LEM lake update — standing-water mass balance. Rain adds water everywhere;
+// evaporation removes it from wet cells (so CLOSED basins settle where
+// evaporation balances inflow -> playas / salt lakes); the pipe fluxes move it
+// laterally (level + spill). Water that reaches the edge or exceeds the basin
+// spill level F runs off. u_param1 = Rainfall (P), u_param3 = Evaporation (E).
+layout(rgba32f, binding=2) uniform image3D u_src2;    // B,S,Q,C
+layout(rgba32f, binding=6) uniform image3D u_src4;    // F,L (src)
+layout(rgba32f, binding=7) uniform image3D u_dst4;    // F,L (dst)
+layout(rgba32f, binding=4) uniform image3D u_src3;    // L flux (scratch)
+
+vec4 fl5(int x, int z) {
+    if (x < 0 || x >= u_size || z < 0 || z >= u_size) return vec4(0.0);
+    return imageLoad(u_src3, ivec3(x, 0, z));
+}
+float terr_at(int x, int z) {
+    vec4 s = imageLoad(u_src2, ivec3(clamp(x,0,u_size-1),0,clamp(z,0,u_size-1)));
+    return s.r + s.g;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    vec4 f4 = imageLoad(u_src4, pos);
+    float F = f4.r, L = f4.g;
+    float terr = st.r + st.g;
+    bool edge = (pos.x==0 || pos.x==u_size-1 || pos.z==0 || pos.z==u_size-1);
+
+    // Lateral pipe transfer (conservative: my inflow = neighbours' flux to me).
+    vec4 fo = fl5(pos.x, pos.z);
+    float outflow = fo.x + fo.y + fo.z + fo.w;
+    float inflow = fl5(pos.x-1,pos.z).x + fl5(pos.x+1,pos.z).y
+                 + fl5(pos.x,pos.z-1).z + fl5(pos.x,pos.z+1).w;
+    L = max(0.0, L - outflow + inflow);
+
+    // Water budget: precipitation (mild wet/dry spells) in, evaporation out.
+    float speriod = float(u_frame) / 60.0;
+    float sp0 = floor(speriod);
+    float sr = mix(hash_static(ivec3(int(sp0), 13, 0), 55),
+                   hash_static(ivec3(int(sp0)+1, 13, 0), 55),
+                   smoothstep(0.0, 1.0, fract(speriod)));
+    float storm = 0.6 + 0.9 * sr;
+    L += clamp(u_param1, 0.0, 0.2) * storm * u_dt;               // rain
+    L = max(0.0, L - clamp(u_param3, 0.0, 0.1) * u_dt);          // evaporation
+
+    // Confine standing water: its surface can't exceed the basin spill (F) or,
+    // for a closed below-sea sink the fill can't see, sea level. Slopes (F=terr,
+    // terr>sea) therefore keep no standing water; below-sea sinks fill to the
+    // sea and hold a persistent lake; above-sea basins fill to their spill.
+    float h_sea = 0.30 * float(u_size);
+    // Wetlands: flat, poorly-drained, WET valley floors hold broad SHALLOW water
+    // above the normal drainage spill (water can't stay in a channel there).
+    float sx = terr_at(pos.x+1,pos.z) - terr_at(pos.x-1,pos.z);
+    float sz = terr_at(pos.x,pos.z+1) - terr_at(pos.x,pos.z-1);
+    float flatness = clamp(1.0 - 0.5 * length(vec2(sx, sz)) * 4.0, 0.0, 1.0);
+    float wetland = flatness * clamp(st.b * 0.03, 0.0, 1.8);    // shallow marsh depth
+    L = min(L, max(max(F, h_sea) - terr, wetland));
+    L = max(0.0, L);
+    if (edge) L = 0.0;                                           // ocean / outlet drains
+
+    imageStore(u_dst4, pos, vec4(F, L, f4.b, f4.a));
+}
+""",
+
+    "lem_flux": """
+// LEM flux — discharge routing over the FILLED surface F (field4). Each cell
+// sends ALL its water to the steepest-descent neighbour of the EIGHT, ranked by
+// F (not raw terrain), so flow crosses filled depressions and lakes to reach a
+// connected outlet. Jitter breaks grid ties -> dendritic; routing on the (fixed
+// within a step) filled surface is stable and accumulates W ~ drainage area.
+//   field3 = (dir.x, dir.z, volume, 0).
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=5) uniform image3D u_dst3;
+layout(rgba32f, binding=6) uniform image3D u_src4;
+
+float Fget(int x, int z) {
+    return imageLoad(u_src4, ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1))).r;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    float W = st.b;                               // route existing water (rain added in hydro)
+    float f0 = Fget(pos.x, pos.z);
+    int bx = 0, bz = 0;
+    float best = 0.0;
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dz == 0) continue;
+            float dist = (dx != 0 && dz != 0) ? 1.41421356 : 1.0;
+            float raw = (f0 - Fget(pos.x + dx, pos.z + dz)) / dist;
+            if (raw <= 0.0) continue;             // only downhill on the filled surface
+            float j = hash_static(pos, dx + 3 * dz + 17);
+            float score = raw * (1.0 + 0.8 * (j - 0.5));   // jitter breaks grid ties
+            if (score > best) { best = score; bx = dx; bz = dz; }
+        }
+    }
+    vec4 f = (bx != 0 || bz != 0) ? vec4(float(bx), float(bz), W, 0.0) : vec4(0.0);
+    imageStore(u_dst3, pos, f);
+}
+""",
+
+    "lem_hydro": """
+// LEM — hydrology + erosion pass. Uplift + hillslope diffusion of bedrock,
+// water depth from the pipe fluxes, semi-Lagrangian sediment transport, and a
+// stream-power capacity that erodes where flow is under-saturated and deposits
+// where it is over-saturated (rivers carve; sediment fills basins).
+//   u_param0 = Uplift  u_param1 = Rainfall  u_param2 = Erosion  u_param3 = Evaporation
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=3) uniform image3D u_dst2;
+layout(rgba32f, binding=4) uniform image3D u_src3;
+layout(rgba32f, binding=6) uniform image3D u_src4;
+
+vec4 st_at(int x, int z) {
+    return imageLoad(u_src2, ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1)));
+}
+float Fget(int x, int z) {
+    return imageLoad(u_src4, ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1))).r;
+}
+vec4 fl_at(int x, int z) {
+    // Out-of-bounds = no neighbour = no inflow. (Clamping to self here would
+    // let a boundary cell count its own outflow as inflow -> water created.)
+    if (x < 0 || x >= u_size || z < 0 || z >= u_size) return vec4(0.0);
+    return imageLoad(u_src3, ivec3(x, 0, z));
+}
+float sedC(vec2 p) {
+    p = clamp(p, vec2(0.0), vec2(float(u_size - 1)));
+    ivec2 i = ivec2(floor(p)); vec2 f = p - vec2(i);
+    int x1 = min(i.x + 1, u_size - 1), z1 = min(i.y + 1, u_size - 1);
+    float c00 = st_at(i.x, i.y).a, c10 = st_at(x1, i.y).a;
+    float c01 = st_at(i.x, z1).a, c11 = st_at(x1, z1).a;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+// Smooth value noise on a coarse lattice (seeded via hash_static).
+float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash_static(ivec3(int(i.x),     0, int(i.y)),     91);
+    float b = hash_static(ivec3(int(i.x) + 1, 0, int(i.y)),     91);
+    float c = hash_static(ivec3(int(i.x),     0, int(i.y) + 1), 91);
+    float d = hash_static(ivec3(int(i.x) + 1, 0, int(i.y) + 1), 91);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// Tectonic rate in [-~1.6, 1]: broad UPLIFT into ranges, with ISOLATED enclosed
+// SAG basins (low-noise cores) that subside strongly and can't drain sideways,
+// so they hold persistent lakes.
+float tect_rate(ivec3 pos) {
+    float n = vnoise(vec2(pos.xz) * 0.020);
+    float basin = smoothstep(0.30, 0.15, n);   // 1 in isolated low-noise cores
+    float up    = smoothstep(0.34, 0.72, n);   // uplift on the highs
+    return up - 1.6 * basin;
+}
+// Geologic column: a stack of alternating hard/soft beds at FIXED elevations,
+// gently dipping, so erosion exposes real strata -> ledges, cuestas, mesas.
+float rock_hardness(float x, float z, float elev) {
+    float h = elev + 0.10 * (x - z);              // gentle dip -> tilted beds
+    float layer = floor(h * 0.16);                // ~6-voxel-thick beds
+    float hv = hash_static(ivec3(int(layer), 7, 3), 77);
+    return clamp(0.12 + 0.85 * hv, 0.1, 1.0);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    vec4 st = imageLoad(u_src2, pos);
+    float B = st.r, S = st.g, W = st.b, C = st.a;
+
+    // Base level = sea level. Real LEMs pin base level at an outlet, else the
+    // interior has nothing to erode toward (it just rises or ponds). Uplift is
+    // BROAD/regional (uniform on land), NOT a point dome: a point source grows
+    // an unbounded spike because its apex has no drainage area for erosion to
+    // remove. The domain edge is a fixed coast so water/sediment leave the map.
+    float h_sea = 0.30 * float(u_size);
+    bool edge = (pos.x == 0 || pos.x == u_size-1 || pos.z == 0 || pos.z == u_size-1);
+    // Structured tectonics: some belts rise into RANGES (uplift, tapered so it
+    // can't outrun erosion), others SUBSIDE into closed basins that hold lakes
+    // (floored so they don't punch a bottomless pit). Amplitude ~ Uplift; at
+    // Uplift=0 the template does nothing and the land simply denudes.
+    float target   = 0.60 * float(u_size);
+    float floorlvl = 0.15 * float(u_size);   // basins may subside BELOW sea level (endorheic sinks)
+    float rate = clamp(u_param0, 0.0, 2.0) * 0.10 * u_dt;
+    float tect = imageLoad(u_src4, pos).a;   // per-seed tectonic template (field4.a)
+    if (!edge) {
+        if (tect >= 0.0) {
+            float taper = clamp((target - B) / max(target - h_sea, 1.0), 0.0, 1.0);
+            B += rate * tect * taper;                  // uplift into ranges
+        } else {
+            float sfloor = clamp((B - floorlvl) / max(target - floorlvl, 1.0), 0.0, 1.0);
+            B += rate * tect * sfloor;                 // subsidence into lake basins
+        }
+    }
+    if (edge) B = min(B, h_sea);                    // edges held at base level
+    float lapB = st_at(pos.x+1,pos.z).r + st_at(pos.x-1,pos.z).r
+               + st_at(pos.x,pos.z+1).r + st_at(pos.x,pos.z-1).r - 4.0 * B;
+    B += 0.05 * lapB;                                // light hillslope diffusion; fluvial incision dominates
+
+    // Water: D8 gather. I send ALL my water one way (field3.z); inflow = the
+    // neighbours whose chosen direction points back at me.
+    // Rainfall varies mildly over time (gentle wet/dry spells), smoothly
+    // interpolated so creeks don't surge abruptly.
+    float speriod = float(u_frame) / 60.0;
+    float sp0 = floor(speriod);
+    float srand = mix(hash_static(ivec3(int(sp0), 13, 0), 55),
+                      hash_static(ivec3(int(sp0)+1, 13, 0), 55),
+                      smoothstep(0.0, 1.0, fract(speriod)));
+    float storm = 0.6 + 0.9 * srand;
+    W += clamp(u_param1, 0.0, 0.2) * storm * u_dt;
+    vec4 myf = fl_at(pos.x, pos.z);
+    float outflow = myf.z;
+    float inflow = 0.0;
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dz == 0) continue;
+            vec4 nf = fl_at(pos.x + dx, pos.z + dz);
+            if (nf.x == float(-dx) && nf.y == float(-dz)) inflow += nf.z;
+        }
+    }
+    float W1 = max(0.0, W + inflow - outflow);
+    W1 = min(W1, 800.0);                          // cap so a closed pit can't blow up
+
+    // Flow velocity ~ chosen direction (1 cell/step); discharge = W1 (~ area).
+    vec2 vel = vec2(myf.x, myf.y);
+    float discharge = W1;
+
+    // Transport suspended sediment (semi-Lagrangian backtrace).
+    float Cadv = sedC(vec2(pos.xz) - vel);
+
+    // Stream-power capacity uses the WATER-SURFACE (filled) slope, so lakes
+    // (flat F) deposit while rivers (F follows the bed) incise.
+    vec2 grad = 0.5 * vec2(Fget(pos.x+1,pos.z) - Fget(pos.x-1,pos.z),
+                           Fget(pos.x,pos.z+1) - Fget(pos.x,pos.z-1));
+    float slope = length(grad);
+    float veg = imageLoad(u_src4, pos).b;                        // vegetation cover (last frame)
+    // Vegetation armours HILLSLOPES (weak flow), but strong river channels scour
+    // through it -- so rivers keep incising while vegetated slopes are protected.
+    float veg_protect = veg * clamp(1.0 - discharge * 0.03, 0.0, 1.0);
+    float Ke = clamp(u_param2, 0.0, 1.0) * (1.0 - 0.6 * veg_protect);
+    // Rock type from the fixed geologic column at the current bedrock surface:
+    // hard beds resist erosion and stand in cliffs, soft beds wear back.
+    float hardness = rock_hardness(float(pos.x), float(pos.z), B);
+    float cap = 0.30 * sqrt(discharge) * max(slope, 0.001) * mix(1.6, 0.7, hardness);
+    float delta = clamp(Ke * (cap - Cadv), -0.3, 0.3);  // + erode / - deposit, capped
+    if (B + S <= h_sea) delta = min(delta, 0.0);         // rivers grade to base level, no deeper
+    if (delta > 0.0) {
+        // Under capacity: rework SEDIMENT first, and cut BEDROCK only where the
+        // sediment cover is thin (cover effect). So sediment-buried reaches are
+        // transport-limited (flat alluvial floors) while bare rock incises canyons.
+        float fromS = min(delta, S);
+        float cover = clamp(1.0 - S / 2.0, 0.0, 1.0);    // 0 = bed buried & protected
+        float fromB = (delta - fromS) * cover;
+        S -= fromS; B -= fromB; Cadv += fromS + fromB;
+    } else {
+        // Over capacity: deposit -> alluvial fans at slope breaks, valley fill.
+        // Only deposit sediment actually in transport (conservative), else the
+        // river would create material and pile phantom sediment mountains.
+        float dep = min(-delta, Cadv);
+        S += dep; Cadv -= dep;
+    }
+
+    // --- Mass wasting: episodic landslides triggered by river undercutting ---
+    float hC = B + S;
+    float hR = st_at(pos.x+1,pos.z).r + st_at(pos.x+1,pos.z).g;
+    float hL = st_at(pos.x-1,pos.z).r + st_at(pos.x-1,pos.z).g;
+    float hU = st_at(pos.x,pos.z+1).r + st_at(pos.x,pos.z+1).g;
+    float hDn = st_at(pos.x,pos.z-1).r + st_at(pos.x,pos.z-1).g;
+    // Steepest-lower neighbour and its discharge (a strong channel there is
+    // actively cutting the toe of this slope -> undercutting).
+    float lo = hC, lowQ = 0.0;
+    if (hR  < lo) { lo = hR;  lowQ = st_at(pos.x+1,pos.z).b; }
+    if (hL  < lo) { lo = hL;  lowQ = st_at(pos.x-1,pos.z).b; }
+    if (hU  < lo) { lo = hU;  lowQ = st_at(pos.x,pos.z+1).b; }
+    if (hDn < lo) { lo = hDn; lowQ = st_at(pos.x,pos.z-1).b; }
+    float maxdrop = hC - lo;
+
+    // Talus creep down the SURFACE slope (not toward equal S): sediment slides
+    // down the TOTAL gradient, so it can't stand as a spike on a slope or on a
+    // freshly-failed peak. Limited by the sediment actually available to move;
+    // faster above the repose angle.
+    float hlap = (hR + hL + hU + hDn) - 4.0 * hC;
+    float creep = ((maxdrop > 1.0) ? 0.22 : 0.05) * hlap;
+    S = max(0.0, S + creep);
+
+    // Bedrock slope failure is EPISODIC: a cell fails when oversteepened past the
+    // rock's strength; a river cutting its toe (high lowQ) weakens it further.
+    // The trigger is stochastic, so failures fire as discrete landslide events
+    // -> scars in the rock and talus cones below, not uniform creep.
+    float Sc_rock = mix(1.5, 4.5, hardness) * (1.0 + 0.6 * veg);  // roots hold steeper
+    float undercut = clamp(lowQ * 0.02, 0.0, 1.0);
+    float Sc_eff = Sc_rock * (1.0 - 0.45 * undercut);
+    float over = maxdrop - Sc_eff;
+    if (over > 0.0) {
+        float pfail = clamp(0.25 * over + 0.02, 0.0, 1.0);      // failure chance this step
+        if (hash_temporal(pos, 41) < pfail) {
+            float fail = min(0.5 * over + 0.4, B);              // release a chunk -> scar + talus
+            B -= fail; S += fail;
+        }
+    }
+
+    W1 *= (1.0 - clamp(u_param3, 0.0, 0.1) * u_dt);   // evaporation
+    B = clamp(B, 0.0, float(u_size) - 1.0);
+
+    // Base level. The domain edge is a hard outlet: rain-fed water that reaches
+    // it LEAVES the map (W1 = 0), so the interior always has somewhere to drain.
+    // The ocean itself is drawn in the voxelize pass (visual fill to sea level) --
+    // we deliberately do NOT inject standing sea water into the physics field,
+    // else a disconnected below-sea pit would collect the whole watershed's
+    // runoff with no outlet and pile up without bound.
+    if (edge) {
+        // The map edge is the open sea: water and its suspended load LEAVE the
+        // map (exported offshore) rather than piling onto the boundary cell,
+        // which built a sediment ring-wall. Deltas form at interior coastlines.
+        Cadv = 0.0;
+        W1 = 0.0;
+    }
+    imageStore(u_dst2, pos, vec4(B, max(S, 0.0), W1, clamp(Cadv, 0.0, 100.0)));
+}
+""",
+
+    "lem_voxelize": """
+// Landscape Evolution Model — voxelisation pass. Fills the primary texture from
+// the y==0 slice: terrain (rock/sediment), LAKES (from the filled surface F in
+// field4, so pooled water is flat and merged), RIVERS (width from discharge W),
+// and OCEAN below sea level. vis_mode rgba_blend.
+layout(rgba32f, binding=2) uniform image3D u_src2;
+layout(rgba32f, binding=6) uniform image3D u_src4;
+
+// Same geologic column as the erosion pass, so hard beds read as resistant ledges.
+float rock_hardness(float x, float z, float elev) {
+    float h = elev + 0.10 * (x - z);
+    float layer = floor(h * 0.16);
+    float hv = hash_static(ivec3(int(layer), 7, 3), 77);
+    return clamp(0.12 + 0.85 * hv, 0.1, 1.0);
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    vec4 col = imageLoad(u_src2, ivec3(pos.x, 0, pos.z));
+    float B = col.r, S = col.g;
+    float veg = imageLoad(u_src4, ivec3(pos.x, 0, pos.z)).b;   // vegetation cover
+    float y = float(pos.y);
+    float h_sea = 0.30 * float(u_size);              // must match lem_hydro base level
+    float land = B + S;
+
+    // WATER SURFACE: flood this column up to the highest water surface found in
+    // a small neighbourhood -- lake (flat terr+L), river ribbon, or ocean. Taking
+    // the max over neighbours gives a lake a FLAT surface that submerges the
+    // cell-scale micro-topography (which otherwise made shallow water bead into a
+    // web of rivulets) and coalesces the gaps into one smooth body.
+    float wl = 0.0, mud = 0.0;
+    for (int dz = -3; dz <= 3; dz++) {
+        for (int dx = -3; dx <= 3; dx++) {
+            ivec3 np = ivec3(clamp(pos.x+dx,0,u_size-1), 0, clamp(pos.z+dz,0,u_size-1));
+            vec4 nc = imageLoad(u_src2, np);
+            float d = length(vec2(float(dx), float(dz)));
+            float nland = nc.r + nc.g;
+            float nL = imageLoad(u_src4, np).g;
+            if (nL > 0.4 && d <= 3.0) {                       // standing lake (flat)
+                float ls = nland + nL;
+                if (ls > land && ls > wl) { wl = ls; mud = nc.a * 0.25; }
+            }
+            if (nc.b > 2.5) {                                 // river ribbon (continuous)
+                float hw = clamp(sqrt(nc.b) * 0.16, 0.5, 3.3);   // small streams = 1 cell, trunks wide
+                if (d <= hw) {
+                    float rs = nland + clamp(0.10 * nc.b, 1.1, 3.0);  // >=1 voxel deep so it always renders (no dots)
+                    if (rs > land && rs > wl) { wl = rs; mud = nc.a; }
+                }
+            }
+        }
+    }
+    if (land < h_sea && wl < h_sea) wl = h_sea;               // edge/enclosed ocean fills to sea
+
+    bool water = wl > land + 0.05;
+    float surface = water ? wl : land;
+
+    if (y >= surface) { imageStore(u_dst, pos, vec4(0.0)); return; }
+
+    vec3 c;
+    if (y < B) {
+        float shade = 0.55 + 0.45 * (y / max(B, 1.0));   // darker with depth
+        float hd = rock_hardness(float(pos.x), float(pos.z), y);
+        c = mix(vec3(0.56, 0.47, 0.36), vec3(0.40, 0.38, 0.37), hd) * shade;  // soft tan -> hard grey beds
+    } else if (y < land) {
+        c = vec3(0.80, 0.70, 0.48);                       // sediment / talus / sand
+    } else {
+        float wdepth = surface - land;                     // total water column
+        float depth = clamp((surface - y) / 6.0, 0.0, 1.0);
+        vec3 wc = mix(vec3(0.25, 0.55, 0.85), vec3(0.05, 0.20, 0.55), depth);  // open lake / ocean
+        float marsh = clamp(1.0 - wdepth / 2.5, 0.0, 1.0);   // shallow water = wetland / marsh
+        wc = mix(wc, vec3(0.33, 0.50, 0.38), marsh * 0.55);  // marshy green-blue
+        c = mix(wc, vec3(0.55, 0.46, 0.32), clamp(mud * 1.5, 0.0, 0.6));       // muddy tint
+    }
+    // Vegetation drapes the top dry-land voxel: light grass at low cover ->
+    // dark forest green at high cover.
+    if (!water && y < land && (land - y) < 1.5 && land >= h_sea) {
+        vec3 vegcol = mix(vec3(0.45, 0.55, 0.26), vec3(0.10, 0.30, 0.09), smoothstep(0.35, 0.85, veg));
+        c = mix(c, vegcol, clamp(veg * 1.4, 0.0, 0.95));
+    }
+    imageStore(u_dst, pos, vec4(c, 1.0));
+}
+""",
+
     "rayleigh_benard_3d": """
 // 3D Rayleigh-Bénard Convection — heated floor + cooled ceiling produce
 // SPONTANEOUS convection cells.  No source: the dye field IS the
@@ -18788,6 +19322,51 @@ RULE_PRESETS = {
         "render_mode": "volumetric",
         "vis_range": (0.0, 4.0),
         "boundary": "clamped",
+    },
+
+    "lem_terrain": {
+        "label": "Landscape (LEM)",
+        "shader": "lem_hydro",
+        # 2.5-D heightfield in FIELD2 (y=0 slice: r=bedrock, g=sediment, b=water,
+        # a=suspended sediment) + FIELD3 pipe fluxes. Pass 1 updates the water
+        # fluxes; pass 2 evolves the terrain (uplift, hillslope diffusion,
+        # water routing, stream-power erosion, sediment transport/deposition);
+        # pass 3 voxelises it for the voxel renderer.
+        "passes": [
+            {"shader": "lem_fill",     "kind": "voxel", "writes": ["p4"]},
+            {"shader": "lem_fill",     "kind": "voxel", "writes": ["p4"]},
+            {"shader": "lem_fill",     "kind": "voxel", "writes": ["p4"]},
+            {"shader": "lem_lflux",    "kind": "voxel", "writes": ["p3"]},
+            {"shader": "lem_lupdate",  "kind": "voxel", "writes": ["p4"]},
+            {"shader": "lem_flux",     "kind": "voxel", "writes": ["p3"]},
+            {"shader": "lem_hydro",    "kind": "voxel", "writes": ["p2"]},
+            {"shader": "lem_veg",      "kind": "voxel", "writes": ["p4"]},
+            {"shader": "lem_voxelize", "kind": "voxel", "writes": ["p1"]},
+        ],
+        "extra_fields": 3,
+        "field2_init": "terrain_fractal",
+        "field_inits": ["terrain_fractal", "zero", "fill_high"],
+        "params": {"Uplift": 0.0, "Rainfall": 0.03,
+                   "Erosion": 0.3, "Evaporation": 0.02},
+        "param_ranges": {"Uplift": (0.0, 2.0), "Rainfall": (0.0, 0.2),
+                         "Erosion": (0.0, 1.0), "Evaporation": (0.0, 0.1)},
+        "dt": 1.0,
+        "dt_range": (0.1, 2.0),
+        "init": "blank",
+        "init_variants": ["blank"],
+        "description": ("Landscape Evolution Model: a fractal terrain sculpted by "
+                        "tectonic uplift, hillslope diffusion, and virtual-pipes "
+                        "hydraulic erosion — rainfall routes into rivers that carve "
+                        "valleys and deposit sediment. Voxelised and coloured by "
+                        "material (rock, sediment, water)."),
+        "vis_channels": ["Terrain"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgba_blend",
+        "render_mode": "voxel",
+        "voxel_threshold": 0.3,
+        "boundary": "clamped",
+        "default_size": 128,
     },
 
     "rayleigh_benard_3d": {
@@ -28528,6 +29107,70 @@ class Simulator:
                 # Keep only the upper tail -> sparse, large, rounded domains.
                 amp = np.clip((fld - 0.9) / 1.6, 0.0, 1.0)
                 arr[..., c] = (0.4 + 0.6 * amp) * (amp > 0.0)
+            return arr
+        if init_name == 'terrain_fractal':
+            # Fractal heightfield for the Landscape Evolution model. Bedrock
+            # height (in voxel units) goes into R of the y==0 slice; sediment
+            # and water start at zero. Summed octaves of smoothed noise.
+            from scipy.ndimage import gaussian_filter
+            rng = np.random.default_rng((getattr(self, 'seed', None) or 0) + 7)
+            s = self.size
+            h = np.zeros((s, s), dtype=np.float32)
+            amp = 1.0
+            for octave in range(4):
+                sigma = max(s / (4.0 * (2 ** octave)), 1.0)
+                noise = rng.standard_normal((s, s)).astype(np.float32)
+                h += amp * gaussian_filter(noise, sigma=sigma, mode='wrap')
+                amp *= 0.5
+            h -= h.min()
+            if h.max() > 1e-6:
+                h /= h.max()
+            h = (0.25 + 0.45 * h) * float(s)         # bedrock height, voxel units
+            arr[:, 0, :, 0] = h.astype(np.float32)    # y==0 slice, R = bedrock
+            return arr
+        if init_name == 'fill_high':
+            # field4: R = Planchon-Darboux fill surface, PRE-CONVERGED on the CPU
+            # for the initial terrain so it doesn't start high and morph inward as
+            # a wave (the GPU fill then just maintains it). A = a per-SEED tectonic
+            # template (horst-and-graben) that lem_hydro reads, so ranges/basins
+            # differ between seeds.
+            from scipy.ndimage import gaussian_filter, minimum_filter
+            sz = self.size
+            # Reproduce the terrain_fractal heightfield (same seed offset).
+            rz = np.random.default_rng((getattr(self, 'seed', None) or 0) + 7)
+            hh = np.zeros((sz, sz), dtype=np.float32)
+            amp = 1.0
+            for octave in range(4):
+                sigma = max(sz / (4.0 * (2 ** octave)), 1.0)
+                hh += amp * gaussian_filter(rz.standard_normal((sz, sz)).astype(np.float32),
+                                            sigma=sigma, mode='wrap')
+                amp *= 0.5
+            hh -= hh.min()
+            if hh.max() > 1e-6:
+                hh /= hh.max()
+            Z = (0.25 + 0.45 * hh) * float(sz)
+            # Planchon-Darboux: start high, relax down to the filled surface.
+            F = np.full((sz, sz), float(sz), dtype=np.float32)
+            F[0, :] = Z[0, :]; F[-1, :] = Z[-1, :]; F[:, 0] = Z[:, 0]; F[:, -1] = Z[:, -1]
+            fp = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=bool)
+            for _ in range(300):
+                Fn = np.maximum(Z, minimum_filter(F, footprint=fp, mode='nearest') + 0.008)
+                Fn[0, :] = Z[0, :]; Fn[-1, :] = Z[-1, :]; Fn[:, 0] = Z[:, 0]; Fn[:, -1] = Z[:, -1]
+                if np.max(np.abs(Fn - F)) < 1e-3:
+                    F = Fn
+                    break
+                F = Fn
+            arr[:, 0, :, 0] = F
+            # Per-seed tectonic template in the alpha channel.
+            rng = np.random.default_rng((getattr(self, 'seed', None) or 0) + 31)
+            n = gaussian_filter(rng.standard_normal((sz, sz)).astype(np.float32),
+                                sigma=max(sz / 12.0, 1.0), mode='wrap')
+            n -= n.min()
+            if n.max() > 1e-6:
+                n /= n.max()
+            basin = np.clip((0.30 - n) / 0.15, 0.0, 1.0)
+            up = np.clip((n - 0.34) / 0.38, 0.0, 1.0)
+            arr[:, 0, :, 3] = (up - 1.6 * basin).astype(np.float32)
             return arr
         if init_name in ('euler_blast_pair2',
                          'euler_shocktube_pair2',
