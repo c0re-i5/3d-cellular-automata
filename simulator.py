@@ -9629,10 +9629,10 @@ void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
     if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
     vec4 st = imageLoad(u_src2, pos);
-    float Z = st.r + st.g;                              // terrain surface
     vec4 f4 = imageLoad(u_src4, pos);
+    float Z = st.r + st.g + max(-f4.b, 0.0);           // terrain + ICE: a glacier dams water
     float L = f4.g;                                     // preserve standing water
-    float V = f4.b;                                     // preserve vegetation cover
+    float V = f4.b;                                     // preserve vegetation cover / packed ice
     float T = f4.a;                                     // preserve per-seed tectonic template
     bool edge = (pos.x==0 || pos.x==u_size-1 || pos.z==0 || pos.z==u_size-1);
     if (edge) { imageStore(u_dst4, pos, vec4(Z, L, V, T)); return; }  // outlet
@@ -9741,7 +9741,12 @@ void main() {
     float d3 = max(0.0, hs - (bed(pos.x,pos.z-1) + Hice(pos.x,pos.z-1)));
     float sum = d0 + d1 + d2 + d3;
     if (sum <= 0.0) { imageStore(u_dst3, pos, vec4(0.0)); return; }
-    float mob = clamp(H * 0.0005, 0.0, 0.2);          // thin ice frozen to bed; keeps a convex profile
+    float mob = clamp(H * 0.0005, 0.0, 0.2);          // slow creep for the bulk of the glacier
+    // Calving: oversteepened ice fronts FRACTURE and avalanche downslope far
+    // faster than the interior creeps, so tongues/chunks reach the low valleys
+    // where they dam a river; gentle accumulation zones keep their thick ice.
+    float maxd = max(max(d0, d1), max(d2, d3));
+    mob += clamp((maxd - 4.0) / 8.0, 0.0, 1.0) * 0.08;
     float move = min(mob * H, 0.5 * sum);
     float k = move / sum;
     imageStore(u_dst3, pos, vec4(k*d0, k*d1, k*d2, k*d3));
@@ -9765,6 +9770,17 @@ vec4 icef(int x, int z) {
     if (x < 0 || x >= u_size || z < 0 || z >= u_size) return vec4(0.0);
     return imageLoad(u_src3, ivec3(x, 0, z));
 }
+// Surface air temperature (arbitrary units, freezing at 0): warm at sea level,
+// cooling with elevation (lapse rate), plus a seasonal cycle and a slow ice-age
+// climate drift. The 0-isotherm is the migrating snowline that ties snow, ice,
+// melt and (later) freeze-thaw together.
+float temperature(float elev, int frame) {
+    float sizef = float(u_size);
+    float lapse = (elev - 0.30 * sizef) / sizef;        // 0 at sea level
+    return 1.0 - 5.0 * lapse
+         + 0.40 * sin(float(frame) * 0.02)              // seasons
+         + 0.25 * sin(float(frame) * 0.004);            // ice-age drift
+}
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -9785,19 +9801,18 @@ void main() {
                  + icef(pos.x,pos.z-1).z + icef(pos.x,pos.z+1).w;
     H = max(0.0, H - outflow + inflow);
 
-    // Climate mass balance about a slowly drifting snowline (ELA, measured on the
-    // GROUND surface) -> ice ages. Accumulation self-limits toward a maximum
-    // thickness Hmax, so a high plateau can't grow ice without bound; below the
-    // ELA the ice ablates hard so a glacier's terminus melts back to the snowline.
-    float ela = (0.50 - 0.02 * sin(float(u_frame) * 0.004)) * sizef;
+    // Climate mass balance driven by a real TEMPERATURE field (elevation lapse
+    // rate + seasonal cycle + slow ice-age drift). Below freezing (T<0) snow
+    // accumulates -> firn -> ice; above freezing it ablates. The 0C isotherm IS
+    // the snowline and it migrates with the seasons/climate on its own.
     float Hmax = 0.16 * sizef;
+    float Tc = temperature(elev, u_frame);
     float accum = clamp(u_param1, 0.0, 0.2) * 0.22;      // snowfall grows with precip
     float bdot;
-    if (elev > ela) {
-        bdot = accum * clamp((elev - ela) / (0.04 * sizef), 0.0, 1.0)
-                     * clamp(1.0 - H / Hmax, 0.0, 1.0);
+    if (Tc < 0.0) {
+        bdot = accum * clamp(-Tc, 0.0, 1.0) * clamp(1.0 - H / Hmax, 0.0, 1.0);
     } else {
-        bdot = -0.12 * clamp((ela - elev) / (0.10 * sizef), 0.0, 1.0);   // ablation (a few x accum)
+        bdot = -0.12 * clamp(Tc, 0.0, 1.5);              // melt faster when warmer
     }
     float Hnew = clamp(H + bdot * u_dt, 0.0, Hmax);
     if (elev < h_sea) Hnew = 0.0;                        // no ice below the sea (calves off)
@@ -9900,13 +9915,15 @@ void main() {
     // terr>sea) therefore keep no standing water; below-sea sinks fill to the
     // sea and hold a persistent lake; above-sea basins fill to their spill.
     float h_sea = 0.30 * float(u_size);
-    // Wetlands: flat, poorly-drained, WET valley floors hold broad SHALLOW water
-    // above the normal drainage spill (water can't stay in a channel there).
-    float sx = terr_at(pos.x+1,pos.z) - terr_at(pos.x-1,pos.z);
-    float sz = terr_at(pos.x,pos.z+1) - terr_at(pos.x,pos.z-1);
-    float flatness = clamp(1.0 - 0.5 * length(vec2(sx, sz)) * 4.0, 0.0, 1.0);
-    float wetland = flatness * clamp(st.b * 0.03, 0.0, 1.8);    // shallow marsh depth
-    L = min(L, max(max(F, h_sea) - terr, wetland));
+    // Lakes: confine standing water to the basin spill level F (bounded, stable);
+    // a below-sea sink fills to the sea and holds a persistent lake. A raised
+    // barrier lifts F here, so water PONDS behind it and floods upstream.
+    float spill = max(max(F, h_sea) - terr, 0.0);
+    L = min(L, spill);
+    // Rivers as FLUID: lay the routed discharge down as a water DEPTH in the
+    // channel (hydraulic geometry, depth ~ sqrt Q) so streams render as ONE
+    // continuous body that merges into the lakes, not a routed thread.
+    if (st.b > 2.5) L = max(L, clamp(0.14 * sqrt(st.b), 1.0, 3.0));
     L = max(0.0, L);
     if (edge) L = 0.0;                                           // ocean / outlet drains
 
@@ -10019,10 +10036,51 @@ float landice(int x, int z) {
     float cv = imageLoad(u_src4, p).b;
     return s.r + s.g + max(-cv, 0.0);
 }
+// Surface air temperature (see lem_iceupdate) -- must match that pass exactly.
+float temperature(float elev, int frame) {
+    float sizef = float(u_size);
+    float lapse = (elev - 0.30 * sizef) / sizef;
+    return 1.0 - 5.0 * lapse
+         + 0.40 * sin(float(frame) * 0.02)
+         + 0.25 * sin(float(frame) * 0.004);
+}
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
-    if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
+    if (pos.x >= u_size || pos.z >= u_size) return;
+    if (pos.y == 1) {
+        // GRAIN-SIZE PLANE (extra storage in the unused y=1 slice): tracked
+        // sediment COARSENESS c in [0,1]. Steep bedrock and freeze-thaw shed
+        // angular COARSE clasts; strong flow abrades/rounds them fine; the
+        // discharge advects the size downstream -> real downstream fining.
+        float c = clamp(imageLoad(u_src2, ivec3(pos.x, 1, pos.z)).r, 0.0, 1.0);
+        vec4 s0 = imageLoad(u_src2, ivec3(pos.x, 0, pos.z));
+        float sl = 0.5 * length(vec2(
+            (st_at(pos.x+1,pos.z).r + st_at(pos.x+1,pos.z).g) - (st_at(pos.x-1,pos.z).r + st_at(pos.x-1,pos.z).g),
+            (st_at(pos.x,pos.z+1).r + st_at(pos.x,pos.z+1).g) - (st_at(pos.x,pos.z-1).r + st_at(pos.x,pos.z-1).g)));
+        float Tc = temperature(s0.r + s0.g, u_frame);
+        float ftband = clamp(1.0 - abs(Tc) * 1.5, 0.0, 1.0);
+        float produce = clamp(0.6 * sl + ftband, 0.0, 1.0);       // coarse angular source
+        float fine = clamp(s0.b * 0.04, 0.0, 1.0);                // strong flow abrades -> fine
+        float ceq = clamp(produce - fine, 0.0, 1.0);
+        c += (ceq - c) * 0.06;
+        // Advect coarseness downstream: gather from the neighbours flowing into me.
+        float cin = 0.0, win = 0.0;
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dz == 0) continue;
+                vec4 nf = fl_at(pos.x + dx, pos.z + dz);
+                if (nf.x == float(-dx) && nf.y == float(-dz)) {
+                    cin += nf.z * clamp(imageLoad(u_src2, ivec3(clamp(pos.x+dx,0,u_size-1), 1, clamp(pos.z+dz,0,u_size-1))).r, 0.0, 1.0);
+                    win += nf.z;
+                }
+            }
+        }
+        if (win > 0.0) c = mix(c, cin / win, clamp(win * 0.02, 0.0, 0.4));
+        imageStore(u_dst2, ivec3(pos.x, 1, pos.z), vec4(clamp(c, 0.0, 1.0), 0.0, 0.0, 0.0));
+        return;
+    }
+    if (pos.y != 0) return;
     vec4 st = imageLoad(u_src2, pos);
     float B = st.r, S = st.g, W = st.b, C = st.a;
 
@@ -10071,8 +10129,8 @@ void main() {
     // -- a glacial outburst flood that surges down-valley for a spell.
     float iceW = max(-imageLoad(u_src4, pos).b, 0.0);
     if (iceW > 0.15) {
-        float elaW = (0.50 - 0.02 * sin(float(u_frame) * 0.004)) * float(u_size);
-        float ablation = 0.12 * clamp((elaW - (B + S)) / (0.10 * float(u_size)), 0.0, 1.0);
+        float Tw = temperature(B + S, u_frame);
+        float ablation = 0.12 * clamp(Tw, 0.0, 1.5);            // meltwater where above freezing
         float sp = floor(float(u_frame) / 50.0);
         float bk = hash_static(ivec3(pos.x / 24, int(mod(sp, 64.0)), pos.z / 24), 91);
         float surge = (bk > 0.99) ? 25.0 : 1.0;                 // rare outburst flood
@@ -10148,6 +10206,15 @@ void main() {
         B -= gero; S += gero;                                   // bedrock -> subglacial till
     }
 
+    // --- Freeze-thaw weathering: near the 0C isotherm, repeated ice-wedging
+    // shatters EXPOSED bedrock into coarse angular scree (talus), feeding the
+    // periglacial slopes with debris. Strongest at freezing, on bare steep rock. ---
+    float Tft = temperature(B + S, u_frame);
+    float ftband = clamp(1.0 - abs(Tft) * 1.5, 0.0, 1.0);
+    float exposed = clamp(1.0 - S, 0.0, 1.0);
+    float shatter = min(0.03 * ftband * exposed * clamp(slope * 4.0, 0.0, 1.0) * u_dt, B);
+    B -= shatter; S += shatter;
+
     // --- Mass wasting: episodic landslides triggered by river undercutting ---
     float hC = B + S;
     float hR = st_at(pos.x+1,pos.z).r + st_at(pos.x+1,pos.z).g;
@@ -10222,6 +10289,18 @@ float rock_hardness(float x, float z, float elev) {
     float hv = hash_static(ivec3(int(layer), 7, 3), 77);
     return clamp(0.12 + 0.85 * hv, 0.1, 1.0);
 }
+float landv(int x, int z) {
+    vec4 s = imageLoad(u_src2, ivec3(clamp(x,0,u_size-1), 0, clamp(z,0,u_size-1)));
+    return s.r + s.g;
+}
+// Surface air temperature (see lem_iceupdate) -- must match that pass exactly.
+float temperature(float elev, int frame) {
+    float sizef = float(u_size);
+    float lapse = (elev - 0.30 * sizef) / sizef;
+    return 1.0 - 5.0 * lapse
+         + 0.40 * sin(float(frame) * 0.02)
+         + 0.25 * sin(float(frame) * 0.004);
+}
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
@@ -10251,15 +10330,11 @@ void main() {
             float d = length(vec2(float(dx), float(dz)));
             float nland = nc.r + nc.g;
             float nL = imageLoad(u_src4, np).g;
-            if (nL > 0.4 && d <= 3.0) {                       // standing lake (flat)
-                float ls = nland + nL;
-                if (ls > land && ls > wl) { wl = ls; mud = nc.a * 0.25; }
-            }
-            if (nc.b > 2.5) {                                 // river ribbon (continuous)
-                float hw = clamp(sqrt(nc.b) * 0.16, 0.5, 3.3);   // small streams = 1 cell, trunks wide
-                if (d <= hw) {
-                    float rs = nland + clamp(0.10 * nc.b, 1.1, 3.0);  // >=1 voxel deep so it always renders (no dots)
-                    if (rs > land && rs > wl) { wl = rs; mud = nc.a; }
+            if (nL > 0.25) {                                  // fluid water: streams + lakes, one body
+                float rad = clamp(sqrt(nL) * 0.65, 0.7, 2.6);  // small streams stay 1 cell; only trunks widen
+                if (d <= rad) {
+                    float ls = nland + nL;
+                    if (ls > land && ls > wl) { wl = ls; mud = nc.a * 0.3; }
                 }
             }
         }
@@ -10278,7 +10353,17 @@ void main() {
         float hd = rock_hardness(float(pos.x), float(pos.z), y);
         c = mix(vec3(0.56, 0.47, 0.36), vec3(0.40, 0.38, 0.37), hd) * shade;  // soft tan -> hard grey beds
     } else if (y < land) {
-        c = vec3(0.80, 0.70, 0.48);                       // sediment / talus / sand
+        // Sediment sorted by TRACKED grain coarseness (y=1 plane): fine tan sand
+        // where flow has rounded it -> coarse angular grey scree & boulders near
+        // the periglacial/steep source, fining downstream.
+        float coarse = clamp(imageLoad(u_src2, ivec3(pos.x, 1, pos.z)).r, 0.0, 1.0);
+        vec3 sand  = vec3(0.80, 0.70, 0.48);
+        vec3 scree = vec3(0.52, 0.50, 0.47);
+        c = mix(sand, scree, coarse);
+        // Blocky clast texture: coarse debris gets per-voxel brightness jitter
+        // so it reads as loose stones/boulders rather than smooth sand.
+        float grain = hash_static(ivec3(pos.x, int(y), pos.z), 23) - 0.5;
+        c *= 1.0 + coarse * 0.35 * grain;
     } else if (glac && y < icetop && icetop >= wl) {
         // Glacier: bright snow at the surface deepening to compacted blue ice.
         float t = clamp(ice / 22.0, 0.0, 1.0);
