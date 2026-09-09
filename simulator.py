@@ -9630,7 +9630,8 @@ void main() {
     if (pos.y != 0 || pos.x >= u_size || pos.z >= u_size) return;
     vec4 st = imageLoad(u_src2, pos);
     vec4 f4 = imageLoad(u_src4, pos);
-    float Z = st.r + st.g + max(-f4.b, 0.0);           // terrain + ICE: a glacier dams water
+    float boulH = clamp(imageLoad(u_src2, ivec3(pos.x, 1, pos.z)).g * 0.22, 0.0, 3.0);
+    float Z = st.r + st.g + max(-f4.b, 0.0) + boulH;   // terrain + ICE + BOULDER piles: both dam water
     float L = f4.g;                                     // preserve standing water
     float V = f4.b;                                     // preserve vegetation cover / packed ice
     float T = f4.a;                                     // preserve per-seed tectonic template
@@ -9686,10 +9687,11 @@ void main() {
 
     // Moisture: rainfall supports vegetation across the whole landscape; rivers
     // and lakes add a riparian bonus.
-    float rain = clamp(u_param1, 0.0, 0.2);
+    float rain = clamp(u_param1, 0.0, 0.2) * max(imageLoad(u_src2, ivec3(pos.x,1,pos.z)).a, 0.15);  // orographic
     float evap = clamp(u_param3, 0.0, 0.1);
     float climate = clamp((rain - 0.7 * evap) * 20.0, 0.0, 1.0);
-    float local = clamp(Q * 0.02 + L * 0.3, 0.0, 1.0);
+    float local = clamp(Q * 0.02 + L * 0.3
+                      + imageLoad(u_src2, ivec3(pos.x,2,pos.z)).r * 0.12, 0.0, 1.0);  // + soil moisture (groundwater)
     float moisture = clamp(climate + 0.35 * local, 0.0, 1.0);
 
     bool submerged = (L > 0.5) || (B + S < h_sea);
@@ -9741,13 +9743,12 @@ void main() {
     float d3 = max(0.0, hs - (bed(pos.x,pos.z-1) + Hice(pos.x,pos.z-1)));
     float sum = d0 + d1 + d2 + d3;
     if (sum <= 0.0) { imageStore(u_dst3, pos, vec4(0.0)); return; }
-    float mob = clamp(H * 0.0005, 0.0, 0.2);          // slow creep for the bulk of the glacier
-    // Calving: oversteepened ice fronts FRACTURE and avalanche downslope far
-    // faster than the interior creeps, so tongues/chunks reach the low valleys
-    // where they dam a river; gentle accumulation zones keep their thick ice.
-    float maxd = max(max(d0, d1), max(d2, d3));
-    mob += clamp((maxd - 4.0) / 8.0, 0.0, 1.0) * 0.08;
-    float move = min(mob * H, 0.5 * sum);
+    // Shallow-ice flow: flux grows strongly with thickness AND surface slope
+    // (deformation + basal sliding ~ H^2 * slope), so thick ice on slopes SURGES
+    // downhill into the valleys as glacier tongues while thin or flat ice stays
+    // frozen as a cap. Capped at half the head drop for stability.
+    float slopeI = max(max(d0, d1), max(d2, d3));     // steepest ice-surface drop
+    float move = min(0.016 * H * H * slopeI, 0.5 * sum);
     float k = move / sum;
     imageStore(u_dst3, pos, vec4(k*d0, k*d1, k*d2, k*d3));
 }
@@ -9778,7 +9779,7 @@ float temperature(float elev, int frame) {
     float sizef = float(u_size);
     float lapse = (elev - 0.30 * sizef) / sizef;        // 0 at sea level
     return 1.0 - 5.0 * lapse
-         + 0.40 * sin(float(frame) * 0.02)              // seasons
+         + 0.12 * sin(float(frame) * 0.02)              // seasons
          + 0.25 * sin(float(frame) * 0.004);            // ice-age drift
 }
 
@@ -9807,7 +9808,8 @@ void main() {
     // the snowline and it migrates with the seasons/climate on its own.
     float Hmax = 0.16 * sizef;
     float Tc = temperature(elev, u_frame);
-    float accum = clamp(u_param1, 0.0, 0.2) * 0.22;      // snowfall grows with precip
+    float accum = clamp(u_param1, 0.0, 0.2) * 0.22
+                * max(imageLoad(u_src2, ivec3(pos.x,1,pos.z)).a, 0.15);   // snowfall grows with precip (orographic)
     float bdot;
     if (Tc < 0.0) {
         bdot = accum * clamp(-Tc, 0.0, 1.0) * clamp(1.0 - H / Hmax, 0.0, 1.0);
@@ -9906,8 +9908,9 @@ void main() {
     float sr = mix(hash_static(ivec3(int(sp0), 13, 0), 55),
                    hash_static(ivec3(int(sp0)+1, 13, 0), 55),
                    smoothstep(0.0, 1.0, fract(speriod)));
-    float storm = 0.6 + 0.9 * sr;
-    L += clamp(u_param1, 0.0, 0.2) * storm * u_dt;               // rain
+    float storm = 0.78 + 0.44 * sr;
+    L += clamp(u_param1, 0.0, 0.2) * storm
+       * max(imageLoad(u_src2, ivec3(pos.x,1,pos.z)).a, 0.15) * u_dt;   // rain (orographic)
     L = max(0.0, L - clamp(u_param3, 0.0, 0.1) * u_dt);          // evaporation
 
     // Confine standing water: its surface can't exceed the basin spill (F) or,
@@ -10041,7 +10044,7 @@ float temperature(float elev, int frame) {
     float sizef = float(u_size);
     float lapse = (elev - 0.30 * sizef) / sizef;
     return 1.0 - 5.0 * lapse
-         + 0.40 * sin(float(frame) * 0.02)
+         + 0.12 * sin(float(frame) * 0.02)
          + 0.25 * sin(float(frame) * 0.004);
 }
 
@@ -10077,7 +10080,71 @@ void main() {
             }
         }
         if (win > 0.0) c = mix(c, cin / win, clamp(win * 0.02, 0.0, 0.4));
-        imageStore(u_dst2, ivec3(pos.x, 1, pos.z), vec4(clamp(c, 0.0, 1.0), 0.0, 0.0, 0.0));
+        // Boulder blockfield (.g): rockfall from steep HARD-rock faces piles as
+        // coarse talus at the cliff foot; strong floods slowly wash/abrade it.
+        float boul = clamp(imageLoad(u_src2, ivec3(pos.x, 1, pos.z)).g, 0.0, 12.0);
+        float bsrc = boul;
+        float landc = s0.r + s0.g;
+        float hiN = max(max(st_at(pos.x+1,pos.z).r + st_at(pos.x+1,pos.z).g,
+                            st_at(pos.x-1,pos.z).r + st_at(pos.x-1,pos.z).g),
+                        max(st_at(pos.x,pos.z+1).r + st_at(pos.x,pos.z+1).g,
+                            st_at(pos.x,pos.z-1).r + st_at(pos.x,pos.z-1).g));
+        float hard = rock_hardness(float(pos.x), float(pos.z), s0.r);
+        float rockfall = clamp((hiN - landc - 1.0) * 0.3, 0.0, 1.0) * hard * (0.03 + 0.06 * ftband);
+        boul += rockfall;
+        boul -= clamp(s0.b * 0.004, 0.0, 0.2) * boul;             // floods wash/abrade the talus
+        // Boulder creep: blocks move only on slopes above their steep repose
+        // angle and lodge on gentle ground -> talus cones at the cliff foot.
+        float dboul = 0.0;
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if ((dx == 0) == (dz == 0)) continue;             // 4-neighbour only
+                float landn = st_at(pos.x+dx,pos.z+dz).r + st_at(pos.x+dx,pos.z+dz).g;
+                float dh = landc - landn;
+                if (dh > 2.0) {
+                    dboul -= min(0.15 * (dh - 2.0), 0.5) * bsrc;  // shed downslope
+                } else if (dh < -2.0) {
+                    float bn = clamp(imageLoad(u_src2, ivec3(clamp(pos.x+dx,0,u_size-1),1,clamp(pos.z+dz,0,u_size-1))).g, 0.0, 12.0);
+                    dboul += min(0.15 * (-dh - 2.0), 0.5) * bn;   // receive from above
+                }
+            }
+        }
+        boul += dboul;
+        // Orographic moisture (.b) + spatial precip multiplier (.a): moist air
+        // blows in +x, is lifted over windward slopes and rains out there,
+        // leaving a dry rain-shadow in the lee. Marches downwind to equilibrium.
+        float lup = st_at(pos.x-1,pos.z).r + st_at(pos.x-1,pos.z).g;
+        float Mup = (pos.x == 0) ? 1.0 : clamp(imageLoad(u_src2, ivec3(pos.x-1, 1, pos.z)).b, 0.0, 1.0);
+        float lift = clamp((landc - lup - 0.5) * 0.4, 0.0, 1.0);  // steep rise into the wind
+        float rainout = Mup * lift * 0.10;                        // only RISING terrain wrings moisture out
+        float Mnew = (pos.x == 0) ? 1.0 : clamp(Mup - rainout, 0.0, 1.0);
+        float precipMult = clamp(Mup * (0.9 + 1.8 * lift), 0.30, 2.5);
+        imageStore(u_dst2, ivec3(pos.x, 1, pos.z), vec4(clamp(c, 0.0, 1.0), clamp(boul, 0.0, 12.0), Mnew, precipMult));
+        return;
+    }
+    if (pos.y == 2) {
+        // GROUNDWATER plane (y=2 .r): rain infiltrates into a soil-water store G,
+        // flows slowly downhill (Darcy) toward the valleys, and returns to the
+        // surface as springs/baseflow where it collects -> perennial streams and
+        // green valley floors, drier hillslopes.
+        float Gsrc = clamp(imageLoad(u_src2, ivec3(pos.x, 2, pos.z)).r, 0.0, 20.0);
+        vec4 s0 = imageLoad(u_src2, ivec3(pos.x, 0, pos.z));
+        float landc = s0.r + s0.g;
+        float G = Gsrc;
+        float wt = landc + Gsrc;                                  // water table (use src for conservative flow)
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if ((dx == 0) == (dz == 0)) continue;             // 4-neighbour
+                float Gn = clamp(imageLoad(u_src2, ivec3(clamp(pos.x+dx,0,u_size-1), 2, clamp(pos.z+dz,0,u_size-1))).r, 0.0, 20.0);
+                float wtn = st_at(pos.x+dx,pos.z+dz).r + st_at(pos.x+dx,pos.z+dz).g + Gn;
+                G -= 0.12 * (wt - wtn);                           // Darcy flow down the water table
+            }
+        }
+        float pm = max(imageLoad(u_src2, ivec3(pos.x, 1, pos.z)).a, 0.15);
+        G += clamp(u_param1, 0.0, 0.2) * pm * 0.5 * u_dt;         // infiltration recharge (half of precip)
+        G -= (Gsrc * 0.01 + max(0.0, Gsrc - 4.0) * 0.2) * u_dt;   // springs / baseflow out (matches y=0)
+        G -= clamp(u_param3, 0.0, 0.1) * 0.15 * G * u_dt;         // slow evapotranspiration
+        imageStore(u_dst2, ivec3(pos.x, 2, pos.z), vec4(clamp(G, 0.0, 20.0), 0.0, 0.0, 0.0));
         return;
     }
     if (pos.y != 0) return;
@@ -10095,8 +10162,8 @@ void main() {
     // can't outrun erosion), others SUBSIDE into closed basins that hold lakes
     // (floored so they don't punch a bottomless pit). Amplitude ~ Uplift; at
     // Uplift=0 the template does nothing and the land simply denudes.
-    float target   = 0.60 * float(u_size);
-    float floorlvl = 0.15 * float(u_size);   // basins may subside BELOW sea level (endorheic sinks)
+    float target   = 0.54 * float(u_size);   // peaks cap just above the snowline (no all-ice runaway)
+    float floorlvl = 0.10 * float(u_size);   // ocean basins subside DEEP below sea and stay open water
     float rate = clamp(u_param0, 0.0, 2.0) * 0.10 * u_dt;
     float tect = imageLoad(u_src4, pos).a;   // per-seed tectonic template (field4.a)
     if (!edge) {
@@ -10122,8 +10189,11 @@ void main() {
     float srand = mix(hash_static(ivec3(int(sp0), 13, 0), 55),
                       hash_static(ivec3(int(sp0)+1, 13, 0), 55),
                       smoothstep(0.0, 1.0, fract(speriod)));
-    float storm = 0.6 + 0.9 * srand;
-    W += clamp(u_param1, 0.0, 0.2) * storm * u_dt;
+    float storm = 0.78 + 0.44 * srand;
+    float pm0 = max(imageLoad(u_src2, ivec3(pos.x,1,pos.z)).a, 0.15);
+    W += clamp(u_param1, 0.0, 0.2) * pm0 * 0.5 * storm * u_dt;   // surface runoff (half; the rest infiltrates)
+    float Gw = imageLoad(u_src2, ivec3(pos.x, 2, pos.z)).r;
+    W += (Gw * 0.01 + max(0.0, Gw - 4.0) * 0.2) * u_dt;         // spring / baseflow from groundwater
     // Proglacial meltwater: ablating ice (the snout, below the snowline) sheds
     // water into the channel network. Rare subglacial releases fire a JOKULHLAUP
     // -- a glacial outburst flood that surges down-valley for a spell.
@@ -10171,9 +10241,14 @@ void main() {
     // Rock type from the fixed geologic column at the current bedrock surface:
     // hard beds resist erosion and stand in cliffs, soft beds wear back.
     float hardness = rock_hardness(float(pos.x), float(pos.z), B);
-    float cap = 0.30 * sqrt(discharge) * max(slope, 0.001) * mix(1.6, 0.7, hardness);
+    // Grain size (Shields entrainment): coarse angular beds resist transport ->
+    // armoured channels and boulder-lag reaches in steep headwaters, while fine
+    // beds move freely and grade smooth. Tracked coarseness lives in the y=1 plane.
+    float coarseC = clamp(imageLoad(u_src2, ivec3(pos.x, 1, pos.z)).r, 0.0, 1.0);
+    float cap = 0.30 * sqrt(discharge) * max(slope, 0.001) * mix(1.6, 0.7, hardness) * (1.0 - 0.55 * coarseC);
     float delta = clamp(Ke * (cap - Cadv), -0.3, 0.3);  // + erode / - deposit, capped
     if (B + S <= h_sea) delta = min(delta, 0.0);         // rivers grade to base level, no deeper
+    if (B + S < h_sea - 2.0) delta = max(delta, 0.0);    // deep ocean bypasses infill -> stays open water
     if (delta > 0.0) {
         // Under capacity: rework SEDIMENT first, and cut BEDROCK only where the
         // sediment cover is thin (cover effect). So sediment-buried reaches are
@@ -10235,21 +10310,21 @@ void main() {
     // freshly-failed peak. Limited by the sediment actually available to move;
     // faster above the repose angle.
     float hlap = (hR + hL + hU + hDn) - 4.0 * hC;
-    float creep = ((maxdrop > 1.0) ? 0.22 : 0.05) * hlap;
+    float creep = ((maxdrop > 1.0) ? 0.20 : 0.05) * hlap;   // damps between discrete failures
     S = max(0.0, S + creep);
 
     // Bedrock slope failure is EPISODIC: a cell fails when oversteepened past the
     // rock's strength; a river cutting its toe (high lowQ) weakens it further.
     // The trigger is stochastic, so failures fire as discrete landslide events
     // -> scars in the rock and talus cones below, not uniform creep.
-    float Sc_rock = mix(1.5, 4.5, hardness) * (1.0 + 0.6 * veg);  // roots hold steeper
+    float Sc_rock = mix(1.4, 4.0, hardness) * (1.0 + 0.5 * veg);  // failure angle
     float undercut = clamp(lowQ * 0.02, 0.0, 1.0);
     float Sc_eff = Sc_rock * (1.0 - 0.45 * undercut);
     float over = maxdrop - Sc_eff;
     if (over > 0.0) {
-        float pfail = clamp(0.25 * over + 0.02, 0.0, 1.0);      // failure chance this step
+        float pfail = clamp(0.10 * over + 0.006, 0.0, 0.3);   // RARE -> discrete events, not a cascade
         if (hash_temporal(pos, 41) < pfail) {
-            float fail = min(0.5 * over + 0.4, B);              // release a chunk -> scar + talus
+            float fail = min(0.5 * over + 0.5, B);              // sizeable release -> visible scar + talus
             B -= fail; S += fail;
         }
     }
@@ -10298,7 +10373,7 @@ float temperature(float elev, int frame) {
     float sizef = float(u_size);
     float lapse = (elev - 0.30 * sizef) / sizef;
     return 1.0 - 5.0 * lapse
-         + 0.40 * sin(float(frame) * 0.02)
+         + 0.12 * sin(float(frame) * 0.02)
          + 0.25 * sin(float(frame) * 0.004);
 }
 
@@ -10316,6 +10391,11 @@ void main() {
     float land = B + S;
     float icetop = land + ice;
     bool glac = ice > 0.15;
+    // Boulders (y=1 plane .g): a lumpy clast cap raised on the dry surface.
+    vec4 grain = imageLoad(u_src2, ivec3(pos.x, 1, pos.z));
+    float boulH = clamp(grain.g * 0.22, 0.0, 3.0)
+                * step(0.4, hash_static(ivec3(pos.x, 0, pos.z), 61));
+    float boulTop = land + boulH;
 
     // WATER SURFACE: flood this column up to the highest water surface found in
     // a small neighbourhood -- lake (flat terr+L), river ribbon, or ocean. Taking
@@ -10344,6 +10424,7 @@ void main() {
     bool water = wl > land + 0.05;
     float surface = water ? wl : land;
     if (glac && icetop > surface) surface = icetop;   // glacier ice caps the column
+    if (!water && boulTop > surface) surface = boulTop;   // boulders raised on dry land
 
     if (y >= surface) { imageStore(u_dst, pos, vec4(0.0)); return; }
 
@@ -10369,6 +10450,10 @@ void main() {
         float t = clamp(ice / 22.0, 0.0, 1.0);
         float shade = 0.85 + 0.15 * clamp((icetop - y) / 8.0, 0.0, 1.0);
         c = mix(vec3(0.95, 0.97, 1.00), vec3(0.50, 0.70, 0.90), t) * shade;
+    } else if (!water && boulH > 0.4 && y >= land && y < boulTop) {
+        // Boulders: chunky angular grey blocks (rockfall talus / blockfields).
+        float j = hash_static(ivec3(pos.x, int(y), pos.z), 71) - 0.5;
+        c = vec3(0.50, 0.48, 0.46) * (1.0 + 0.55 * j);
     } else {
         float wdepth = surface - land;                     // total water column
         float depth = clamp((surface - y) / 6.0, 0.0, 1.0);
@@ -10379,7 +10464,7 @@ void main() {
     }
     // Vegetation drapes the top dry-land voxel: light grass at low cover ->
     // dark forest green at high cover.
-    if (!water && !glac && y < land && (land - y) < 1.5 && land >= h_sea) {
+    if (!water && !glac && boulH < 0.4 && y < land && (land - y) < 1.5 && land >= h_sea) {
         vec3 vegcol = mix(vec3(0.45, 0.55, 0.26), vec3(0.10, 0.30, 0.09), smoothstep(0.35, 0.85, veg));
         c = mix(c, vegcol, clamp(veg * 1.4, 0.0, 0.95));
     }
@@ -19590,8 +19675,9 @@ RULE_PRESETS = {
         "extra_fields": 3,
         "field2_init": "terrain_fractal",
         "field_inits": ["terrain_fractal", "zero", "fill_high"],
-        "params": {"Uplift": 0.0, "Rainfall": 0.03,
-                   "Erosion": 0.3, "Evaporation": 0.02},
+        "spin_up_steps": 1000,
+        "params": {"Uplift": 0.7, "Rainfall": 0.05,
+                   "Erosion": 0.4, "Evaporation": 0.02},
         "param_ranges": {"Uplift": (0.0, 2.0), "Rainfall": (0.0, 0.2),
                          "Erosion": (0.0, 1.0), "Evaporation": (0.0, 0.1)},
         "dt": 1.0,
@@ -29278,6 +29364,50 @@ class Simulator:
         n = int(self.preset.get('extra_fields', 0))
         return max(0, n - 1)
 
+    def _lem_terrain_and_template(self):
+        """Initial LEM bedrock ALIGNED to the tectonic template, plus the
+        template itself. Uplift belts start elevated and basins start low (near/
+        below sea), so the terrain opens at tectonic equilibrium instead of
+        collapsing into the sea and rising back out. Large-scale structure comes
+        from the template noise (seed+31); fine roughness from a fractal (seed+7).
+        Returns (bedrock, template) as (size, size) float32 arrays.
+        """
+        from scipy.ndimage import gaussian_filter
+        s = self.size
+        seed = getattr(self, 'seed', None) or 0
+        # Tectonic template: uplift belts (up) and enclosed sag basins (basin).
+        nt = gaussian_filter(np.random.default_rng(seed + 31).standard_normal((s, s)).astype(np.float32),
+                             sigma=max(s / 12.0, 1.0), mode='wrap')
+        nt -= nt.min()
+        if nt.max() > 1e-6:
+            nt /= nt.max()
+        # Continent/ocean split by PERCENTILE so EVERY seed gets ~40% ocean and
+        # ~60% land (a fixed noise threshold gave some seeds all-ocean or all-land).
+        coast = float(np.percentile(nt, 40.0))
+        lo = float(nt.min()); hi = float(nt.max())
+        ocean = np.clip((coast - nt) / (coast - lo + 1e-6), 0.0, 1.0)      # 0 at coast -> 1 deep
+        landness = np.clip((nt - coast) / (hi - coast + 1e-6), 0.0, 1.0)   # 0 at coast -> 1 peaks
+        is_land = nt >= coast
+        # Land keeps a MINIMUM uplift so even low coastal plains stay above sea
+        # instead of eroding under during startup; ocean subsides hard.
+        template = np.where(is_land, 0.15 + 0.85 * landness, -2.0 * ocean).astype(np.float32)
+        # Fine fractal roughness (normalised to ~unit std).
+        rd = np.random.default_rng(seed + 7)
+        d = np.zeros((s, s), dtype=np.float32)
+        amp = 1.0
+        for octave in range(4):
+            sigma = max(s / (4.0 * (2 ** octave)), 1.0)
+            d += amp * gaussian_filter(rd.standard_normal((s, s)).astype(np.float32), sigma=sigma, mode='wrap')
+            amp *= 0.5
+        d -= d.mean()
+        if d.std() > 1e-6:
+            d /= d.std()
+        # Land opens above sea (coast ~0.34*size -> peaks ~0.54*size); ocean floor
+        # is deep (~0.10*size) and stays open water.
+        bedrock = np.where(is_land, 0.34 + 0.20 * landness, 0.30 - 0.20 * ocean) * float(s) + d * (0.030 * float(s))
+        bedrock = np.clip(bedrock, 0.02 * float(s), 0.95 * float(s)).astype(np.float32)
+        return bedrock, template
+
     def _make_field_init(self, init_name):
         """Build a (size, size, size, 4) f32 init array for one auxiliary
         field. Recognised names (extend as needed):
@@ -29353,46 +29483,23 @@ class Simulator:
                 arr[..., c] = (0.4 + 0.6 * amp) * (amp > 0.0)
             return arr
         if init_name == 'terrain_fractal':
-            # Fractal heightfield for the Landscape Evolution model. Bedrock
-            # height (in voxel units) goes into R of the y==0 slice; sediment
-            # and water start at zero. Summed octaves of smoothed noise.
-            from scipy.ndimage import gaussian_filter
-            rng = np.random.default_rng((getattr(self, 'seed', None) or 0) + 7)
-            s = self.size
-            h = np.zeros((s, s), dtype=np.float32)
-            amp = 1.0
-            for octave in range(4):
-                sigma = max(s / (4.0 * (2 ** octave)), 1.0)
-                noise = rng.standard_normal((s, s)).astype(np.float32)
-                h += amp * gaussian_filter(noise, sigma=sigma, mode='wrap')
-                amp *= 0.5
-            h -= h.min()
-            if h.max() > 1e-6:
-                h /= h.max()
-            h = (0.25 + 0.45 * h) * float(s)         # bedrock height, voxel units
-            arr[:, 0, :, 0] = h.astype(np.float32)    # y==0 slice, R = bedrock
+            # Fractal heightfield for the Landscape Evolution model, ALIGNED to the
+            # tectonic template so it opens at equilibrium (no sink-and-rise). A
+            # thin regolith mantle buffers the first-pass bedrock incision.
+            bedrock, _ = self._lem_terrain_and_template()
+            arr[:, 0, :, 0] = bedrock                 # y==0 slice, R = bedrock
+            arr[:, 0, :, 1] = 2.0                     # G = initial soil/regolith cover
             return arr
         if init_name == 'fill_high':
             # field4: R = Planchon-Darboux fill surface, PRE-CONVERGED on the CPU
             # for the initial terrain so it doesn't start high and morph inward as
             # a wave (the GPU fill then just maintains it). A = a per-SEED tectonic
             # template (horst-and-graben) that lem_hydro reads, so ranges/basins
-            # differ between seeds.
-            from scipy.ndimage import gaussian_filter, minimum_filter
+            # differ between seeds. Terrain is ALIGNED to that template.
+            from scipy.ndimage import minimum_filter
             sz = self.size
-            # Reproduce the terrain_fractal heightfield (same seed offset).
-            rz = np.random.default_rng((getattr(self, 'seed', None) or 0) + 7)
-            hh = np.zeros((sz, sz), dtype=np.float32)
-            amp = 1.0
-            for octave in range(4):
-                sigma = max(sz / (4.0 * (2 ** octave)), 1.0)
-                hh += amp * gaussian_filter(rz.standard_normal((sz, sz)).astype(np.float32),
-                                            sigma=sigma, mode='wrap')
-                amp *= 0.5
-            hh -= hh.min()
-            if hh.max() > 1e-6:
-                hh /= hh.max()
-            Z = (0.25 + 0.45 * hh) * float(sz)
+            Z, template = self._lem_terrain_and_template()
+            Z = Z + 2.0                                # include the regolith mantle in the fill surface
             # Planchon-Darboux: start high, relax down to the filled surface.
             F = np.full((sz, sz), float(sz), dtype=np.float32)
             F[0, :] = Z[0, :]; F[-1, :] = Z[-1, :]; F[:, 0] = Z[:, 0]; F[:, -1] = Z[:, -1]
@@ -29405,16 +29512,7 @@ class Simulator:
                     break
                 F = Fn
             arr[:, 0, :, 0] = F
-            # Per-seed tectonic template in the alpha channel.
-            rng = np.random.default_rng((getattr(self, 'seed', None) or 0) + 31)
-            n = gaussian_filter(rng.standard_normal((sz, sz)).astype(np.float32),
-                                sigma=max(sz / 12.0, 1.0), mode='wrap')
-            n -= n.min()
-            if n.max() > 1e-6:
-                n /= n.max()
-            basin = np.clip((0.30 - n) / 0.15, 0.0, 1.0)
-            up = np.clip((n - 0.34) / 0.38, 0.0, 1.0)
-            arr[:, 0, :, 3] = (up - 1.6 * basin).astype(np.float32)
+            arr[:, 0, :, 3] = template                 # per-seed tectonic template
             return arr
         if init_name in ('euler_blast_pair2',
                          'euler_shocktube_pair2',
@@ -30991,6 +31089,16 @@ class Simulator:
         if not hasattr(self, 'tex_a_extras'):
             self.tex_a_extras = []
             self.tex_b_extras = []
+        # One-time spin-up: fast-forward the model internally so a fresh landscape
+        # opens already graded (no startup sink-and-rise transient). Gated on
+        # step_count==0 so it fires once per fresh start / reset, on the first step
+        # (GL context and compiled programs guaranteed ready).
+        if (self.step_count == 0 and not getattr(self, '_spinning_up', False)
+                and int(self.preset.get('spin_up_steps', 0) or 0) > 0):
+            self._spinning_up = True
+            for _ in range(int(self.preset['spin_up_steps'])):
+                self._step_sim()
+            self._spinning_up = False
         has_agents = getattr(self, 'agent_ssbo', None) is not None
         has_arena = getattr(self, 'arena', None) is not None
 
@@ -31410,6 +31518,7 @@ class Simulator:
                 init2 = self._fit_cubic_init(self._make_field2_init())
                 self.tex_a2.write(self._encode_tex_data(init2))
                 self.tex_b2.write(bytes(self.voxel_count * self._tex_bpt))
+            self.ping2 = 0   # init lives in tex_a2, so the read side must start at 0
         else:
             self._release_field2()
         # Same for the additional auxiliary fields (extras 0..N-1).
