@@ -121,6 +121,112 @@ _VIS_MODE_NAMES = {
 _VIS_MODE_LABELS = ['Density (ch0)', 'RGB channels', 'HSV phase',
                     'Bipolar (signed)', 'RGBA blend']
 
+# Default nucleus separation (voxels) for the two-centre molecule presets.
+# The schrodinger_molecule_3d shader reads this live from the "Separation"
+# param; the molecule INIT functions seed/relax the orbital at the SAME value
+# so the frame-0 state is an eigenstate of the shader potential (no snap).
+# Keep the preset default "Separation" param equal to this constant.
+QUANTUM_MOLECULE_SEP = 20.0
+
+# Per-orbital publishing metadata for the quantum_orbital browser. Every
+# orbital_* init renders under the same "Atomic Orbital" preset, so without
+# this the upload pipelines would give every orbital an identical title. The
+# recording sidecar looks the current init up here and overrides label /
+# description / short_description / shorts_hook, so each orbital Short gets its
+# own title. Keys are the orbital init names (see quantum_orbital init_variants).
+QUANTUM_ORBITAL_META = {
+    "orbital_1s": {
+        "label": "1s Orbital", "hook": "The 1s Orbital",
+        "short": "Hydrogen's 1s ground state — a single spherical, nodeless cloud of electron probability.",
+        "desc": "The 1s orbital — the spherical ground state of the hydrogen atom. A single nodeless ball of electron probability, densest at the nucleus. The phase colouring is one uniform hue because the wavefunction keeps a single sign everywhere.",
+    },
+    "orbital_2s": {
+        "label": "2s Orbital", "hook": "The 2s Orbital",
+        "short": "The 2s orbital — a sphere within a sphere, split by a radial node where the sign (colour) flips.",
+        "desc": "The 2s orbital — spherical like 1s but larger, with one radial node. An inner ball and an outer shell carry opposite sign (opposite colours), separated by a spherical surface where the electron is never found.",
+    },
+    "orbital_2p0": {
+        "label": "2p Orbital (z)", "hook": "The 2p Orbital (z-axis)",
+        "short": "The 2p orbital — two lobes along the z-axis with opposite sign, split by a nodal plane.",
+        "desc": "The 2p_z orbital — two teardrop lobes stacked along the z-axis, opposite in sign (opposite colours) and separated by a nodal plane through the nucleus where the probability vanishes.",
+    },
+    "orbital_2p1": {
+        "label": "2p Orbital (x)", "hook": "The 2p Orbital (x-axis)",
+        "short": "The 2p_x orbital — the two-lobed p dumbbell aligned along the x-axis.",
+        "desc": "The 2p_x orbital — the same two-lobed dumbbell as 2p_z but oriented along the x-axis, with a nodal plane through the nucleus separating the opposite-sign lobes.",
+    },
+    "orbital_2p-1": {
+        "label": "2p Orbital (y)", "hook": "The 2p Orbital (y-axis)",
+        "short": "The 2p_y orbital — the two-lobed p dumbbell aligned along the y-axis.",
+        "desc": "The 2p_y orbital — the two-lobed p dumbbell oriented along the y-axis, its opposite-sign lobes separated by a nodal plane through the nucleus.",
+    },
+    "orbital_3s": {
+        "label": "3s Orbital", "hook": "The 3s Orbital",
+        "short": "The 3s orbital — a large spherical cloud with two radial nodes (nested shells of alternating sign).",
+        "desc": "The 3s orbital — spherically symmetric with two radial nodes: three nested shells of alternating sign (alternating colours) wrapping the nucleus.",
+    },
+    "orbital_3p0": {
+        "label": "3p Orbital (z)", "hook": "The 3p Orbital (z)",
+        "short": "The 3p_z orbital — a z-axis dumbbell with an extra radial node inside each lobe.",
+        "desc": "The 3p_z orbital — the p dumbbell along z, now with a radial node so each lobe splits into an inner and outer piece of opposite sign.",
+    },
+    "orbital_3p1": {
+        "label": "3p Orbital (x)", "hook": "The 3p Orbital (x)",
+        "short": "The 3p_x orbital — an x-axis dumbbell with an extra radial node inside each lobe.",
+        "desc": "The 3p_x orbital — the p dumbbell along x with a radial node, each lobe split into inner and outer pieces of opposite sign.",
+    },
+    "orbital_3d0": {
+        "label": "3d Orbital (z²)", "hook": "The 3d Orbital (z²)",
+        "short": "The 3d z² orbital — a dumbbell along z wrapped by a doughnut ring in the xy-plane.",
+        "desc": "The 3d_z² orbital — two lobes along the z-axis encircled by a doughnut-shaped ring of opposite sign in the xy-plane. The ring and lobes show as different colours.",
+    },
+    "orbital_3d1": {
+        "label": "3d Orbital (xz)", "hook": "The 3d Orbital (xz)",
+        "short": "The 3d xz orbital — four lobes in the xz-plane with alternating sign.",
+        "desc": "The 3d_xz orbital — a four-lobed clover lying in the xz-plane, with adjacent lobes alternating in sign (alternating colours).",
+    },
+    "orbital_3d2": {
+        "label": "3d Orbital (x²−y²)", "hook": "The 3d Orbital (x²−y²)",
+        "short": "The 3d x²−y² orbital — a four-lobed clover along the x and y axes, lobes alternating in sign.",
+        "desc": "The 3d_x²−y² orbital — a four-lobed clover pointing along the x and y axes. Adjacent lobes have opposite sign, shown as alternating colours, with nodal planes between them.",
+    },
+    "orbital_3d-1": {
+        "label": "3d Orbital (yz)", "hook": "The 3d Orbital (yz)",
+        "short": "The 3d yz orbital — four lobes in the yz-plane with alternating sign.",
+        "desc": "The 3d_yz orbital — a four-lobed clover lying in the yz-plane, adjacent lobes alternating in sign (alternating colours).",
+    },
+    "orbital_3d-2": {
+        "label": "3d Orbital (xy)", "hook": "The 3d Orbital (xy)",
+        "short": "The 3d xy orbital — a four-lobed clover sitting between the axes (diagonal).",
+        "desc": "The 3d_xy orbital — a four-lobed clover in the xy-plane rotated 45° from 3d_x²−y², its lobes pointing between the axes and alternating in sign.",
+    },
+    "orbital_4s": {
+        "label": "4s Orbital", "hook": "The 4s Orbital",
+        "short": "The 4s orbital — a large spherical cloud with three radial nodes.",
+        "desc": "The 4s orbital — spherically symmetric with three radial nodes: four nested shells of alternating sign (alternating colours) around the nucleus.",
+    },
+    "orbital_4p0": {
+        "label": "4p Orbital (z)", "hook": "The 4p Orbital (z)",
+        "short": "The 4p_z orbital — a z-axis dumbbell with two radial nodes.",
+        "desc": "The 4p_z orbital — the p dumbbell along z with two radial nodes, so each lobe is subdivided into concentric pieces of alternating sign.",
+    },
+    "orbital_4d0": {
+        "label": "4d Orbital (z²)", "hook": "The 4d Orbital (z²)",
+        "short": "The 4d z² orbital — the z² dumbbell-and-ring, now with an added radial node.",
+        "desc": "The 4d_z² orbital — the familiar z² dumbbell wrapped by a doughnut ring, with an extra radial node adding a further shell of alternating sign.",
+    },
+    "orbital_4f0": {
+        "label": "4f Orbital (z³)", "hook": "The 4f Orbital (z³)",
+        "short": "The 4f z³ orbital — an f-shell lobe structure strung along the z-axis.",
+        "desc": "The 4f_z³ orbital — a high-angular-momentum (ℓ=3) orbital with lobes and rings arranged along the z-axis, alternating in sign (alternating colours).",
+    },
+    "orbital_4f3": {
+        "label": "4f Orbital (x(x²−3y²))", "hook": "The 4f Orbital",
+        "short": "The 4f orbital — a six-lobed flower in the xy-plane (ℓ=3, m=3).",
+        "desc": "The 4f_x(x²−3y²) orbital — a six-lobed flower lying in the xy-plane, the lobes alternating in sign (alternating colours). One of the seven ℓ=3 f orbitals.",
+    },
+}
+
 # UI / shader colormap registry. Index must match u_colormap dispatch
 # in apply_colormap (and the inline switch in VOXEL_FRAGMENT_SHADER).
 # Adding a new entry: append here, add a colormap_X(t) function to
@@ -8066,15 +8172,41 @@ void main() {
     psi_r = clamp(psi_r, -1e3, 1e3);
     psi_i = clamp(psi_i, -1e3, 1e3);
 
+    // ── Complex absorbing potential (CAP) ──
+    // u_param2 = absorption strength (0 = off). Adds -i·W(r)·ψ in a border
+    // layer so outgoing scattering packets are soaked up instead of reflecting
+    // off the clamped (Dirichlet) box and re-interfering. W ramps up
+    // quadratically from the inner edge of the layer to the wall; multiplying
+    // ψ by exp(-W·dt) each step is the leapfrog form of the -iWψ term. Bound
+    // states leave u_param2=0 (and have ψ≈0 at the walls), so they're unchanged.
+    float absorb = u_param2;
+    if (absorb > 0.0) {
+        float W = max(4.0, float(u_size) * 0.12);
+        vec3 fp = vec3(pos);
+        float dwall = min(min(min(fp.x, fp.y), fp.z),
+                          min(min(float(u_size) - 1.0 - fp.x,
+                                  float(u_size) - 1.0 - fp.y),
+                              float(u_size) - 1.0 - fp.z));
+        if (dwall < W) {
+            float tt = (W - dwall) / W;
+            float damp = exp(-absorb * tt * tt * u_dt);
+            psi_r *= damp;
+            psi_i *= damp;
+        }
+    }
+
     float prob = psi_r * psi_r + psi_i * psi_i;
     imageStore(u_dst, pos, vec4(psi_r, psi_i, V, prob));
 }
 """,
 
     "schrodinger_poisson_3d": """
-// Schrödinger + Poisson self-consistent field (Hartree mean-field)
+// Schrödinger + Poisson self-consistent field (Hartree / Schrödinger-Newton)
 // The potential V in channel B is updated each step via Jacobi relaxation
-// toward ∇²V = -α|Ψ|², creating self-interaction feedback.
+// toward ∇²V = +α|Ψ|², so the wavefunction digs its OWN attractive well and
+// self-focuses into a soliton-like bound blob (the Schrödinger-Newton effect)
+// instead of dispersing. (α with the opposite sign gives a repulsive Hartree
+// bump that disperses — that was the old behaviour.)
 //
 // Channel R = ψ_R, G = ψ_I, B = V (updated), A = |Ψ|²
 //
@@ -8109,15 +8241,13 @@ void main() {
     // REF_SIZE so that the visual character of the self-interaction
     // is consistent across grid sizes.
     //
-    // A naive physical Poisson solve V = (sum + α|ψ|²/h_sq)/6 would
+    // A naive physical Poisson solve V = (sum − α|ψ|²/h_sq)/6 would
     // make coupling 9× weaker at size 192 (h_sq=2.25) and 16× stronger
-    // at size 32 (h_sq=0.0625), inverting the desired behaviour. An
-    // earlier version had the opposite sign error (V = (sum + h_sq·
-    // α|ψ|²)/6) which made the size-192 coupling ~5× too strong and
-    // caused the wavefunction to runaway-explode within ~200 steps.
-    // The size-invariant form below matches the REF_SIZE=128 design
-    // point that α=5.0 was tuned against.
-    float V_jacobi = (sum_V + alpha * prob) / 6.0;
+    // at size 32 (h_sq=0.0625), inverting the desired behaviour. The
+    // size-invariant form below matches the REF_SIZE=128 design point
+    // that α=5.0 was tuned against. The −α|ψ|² source solves ∇²V=+α|ψ|²,
+    // i.e. an ATTRACTIVE self-well → self-focusing soliton.
+    float V_jacobi = (sum_V - alpha * prob) / 6.0;
     V = mix(V, V_jacobi, omega);
 
     // ── Schrödinger Yee leapfrog ──
@@ -10162,7 +10292,7 @@ void main() {
     // can't outrun erosion), others SUBSIDE into closed basins that hold lakes
     // (floored so they don't punch a bottomless pit). Amplitude ~ Uplift; at
     // Uplift=0 the template does nothing and the land simply denudes.
-    float target   = 0.54 * float(u_size);   // peaks cap just above the snowline (no all-ice runaway)
+    float target   = 0.68 * float(u_size);   // high peaks rise ABOVE the warm-season snowline -> persistent glaciers
     float floorlvl = 0.10 * float(u_size);   // ocean basins subside DEEP below sea and stay open water
     float rate = clamp(u_param0, 0.0, 2.0) * 0.10 * u_dt;
     float tect = imageLoad(u_src4, pos).a;   // per-seed tectonic template (field4.a)
@@ -10275,8 +10405,9 @@ void main() {
         float gsz = landice(pos.x,pos.z+1) - landice(pos.x,pos.z-1);
         float gslope = 0.5 * length(vec2(gsx, gsz));
         float slide = ice * gslope;                             // basal sliding proxy
-        float gero = clamp(clamp(u_param2,0.0,1.0) * 0.18 * slide, 0.0, 0.4)
-                     * mix(1.3, 0.6, hardness);                 // soft rock grinds faster
+        float gcover = clamp(1.0 - S / 3.0, 0.0, 1.0);          // thick till insulates bedrock from the ice
+        float gero = clamp(clamp(u_param2,0.0,1.0) * 0.35 * slide, 0.0, 0.6)
+                     * mix(1.3, 0.6, hardness) * gcover;        // soft rock grinds faster; buried rock is spared
         gero = min(gero, B);
         B -= gero; S += gero;                                   // bedrock -> subglacial till
     }
@@ -10290,44 +10421,48 @@ void main() {
     float shatter = min(0.03 * ftband * exposed * clamp(slope * 4.0, 0.0, 1.0) * u_dt, B);
     B -= shatter; S += shatter;
 
-    // --- Mass wasting: episodic landslides triggered by river undercutting ---
+    // --- Talus creep + emergent critical-slope failure ---
     float hC = B + S;
     float hR = st_at(pos.x+1,pos.z).r + st_at(pos.x+1,pos.z).g;
     float hL = st_at(pos.x-1,pos.z).r + st_at(pos.x-1,pos.z).g;
     float hU = st_at(pos.x,pos.z+1).r + st_at(pos.x,pos.z+1).g;
     float hDn = st_at(pos.x,pos.z-1).r + st_at(pos.x,pos.z-1).g;
-    // Steepest-lower neighbour and its discharge (a strong channel there is
-    // actively cutting the toe of this slope -> undercutting).
-    float lo = hC, lowQ = 0.0;
-    if (hR  < lo) { lo = hR;  lowQ = st_at(pos.x+1,pos.z).b; }
-    if (hL  < lo) { lo = hL;  lowQ = st_at(pos.x-1,pos.z).b; }
-    if (hU  < lo) { lo = hU;  lowQ = st_at(pos.x,pos.z+1).b; }
-    if (hDn < lo) { lo = hDn; lowQ = st_at(pos.x,pos.z-1).b; }
-    float maxdrop = hC - lo;
 
     // Talus creep down the SURFACE slope (not toward equal S): sediment slides
     // down the TOTAL gradient, so it can't stand as a spike on a slope or on a
     // freshly-failed peak. Limited by the sediment actually available to move;
     // faster above the repose angle.
     float hlap = (hR + hL + hU + hDn) - 4.0 * hC;
-    float creep = ((maxdrop > 1.0) ? 0.20 : 0.05) * hlap;   // damps between discrete failures
-    S = max(0.0, S + creep);
+    S = max(0.0, S + 0.06 * hlap);                          // slow soil creep (sub-repose)
 
-    // Bedrock slope failure is EPISODIC: a cell fails when oversteepened past the
-    // rock's strength; a river cutting its toe (high lowQ) weakens it further.
-    // The trigger is stochastic, so failures fire as discrete landslide events
-    // -> scars in the rock and talus cones below, not uniform creep.
-    float Sc_rock = mix(1.4, 4.0, hardness) * (1.0 + 0.5 * veg);  // failure angle
-    float undercut = clamp(lowQ * 0.02, 0.0, 1.0);
-    float Sc_eff = Sc_rock * (1.0 - 0.45 * undercut);
-    float over = maxdrop - Sc_eff;
-    if (over > 0.0) {
-        float pfail = clamp(0.10 * over + 0.006, 0.0, 0.3);   // RARE -> discrete events, not a cascade
-        if (hash_temporal(pos, 41) < pfail) {
-            float fail = min(0.5 * over + 0.5, B);              // sizeable release -> visible scar + talus
-            B -= fail; S += fail;
-        }
+    // --- Mass wasting: EMERGENT critical-slope failure + runout. A slope fails
+    // the moment erosion (undercutting/oversteepening) pushes it past the
+    // material's critical angle; debris moves to the low side and runs out over
+    // frames as a talus cone. Symmetric pairwise relaxation: for each orthogonal
+    // neighbour the donor and receiver compute the SAME transfer from src heights
+    // -> exactly conservative, stable, and self-relieving (no scripted trigger,
+    // no checkerboard). Loose debris rests near the repose angle; bare bedrock
+    // stands steeper (cohesion); roots bind the slope. ---
+    float hCs = st.r + st.g;
+    float hardC = rock_hardness(float(pos.x), float(pos.z), st.r);
+    float vegC = max(imageLoad(u_src4, pos).b, 0.0);
+    float dMW = 0.0;
+    for (int k = 0; k < 4; k++) {
+        int dx = (k == 0) ? 1 : (k == 1) ? -1 : 0;
+        int dz = (k == 2) ? 1 : (k == 3) ? -1 : 0;
+        vec4 ns = st_at(pos.x + dx, pos.z + dz);
+        float nH = ns.r + ns.g;
+        float hardN = rock_hardness(float(pos.x + dx), float(pos.z + dz), ns.r);
+        float vegN = max(imageLoad(u_src4, ivec3(clamp(pos.x+dx,0,u_size-1), 0, clamp(pos.z+dz,0,u_size-1))).b, 0.0);
+        float sedP = max(st.g, ns.g);                              // looser of the pair -> repose
+        float hardP = min(hardC, hardN);
+        float Sc = mix(mix(1.3, 4.0, hardP), 1.3, clamp(sedP * 0.4, 0.0, 0.8)) * (1.0 + 0.5 * min(vegC, vegN));
+        float diff = hCs - nH;
+        if (diff > Sc)       dMW -= 0.12 * (diff - Sc);           // too steep above N -> shed to N
+        else if (-diff > Sc) dMW += 0.12 * (-diff - Sc);          // N too steep above me -> I receive
     }
+    if (dMW < 0.0) { float need = -dMW; float fromS = min(need, S); S -= fromS; B -= (need - fromS); }
+    else           { S += dMW; }                                  // received debris settles as sediment
 
     W1 *= (1.0 - clamp(u_param3, 0.0, 0.1) * u_dt);   // evaporation
     B = clamp(B, 0.0, float(u_size) - 1.0);
@@ -11566,6 +11701,228 @@ void main() {
     float slope = lower * (1.0/6.0);
     float height01 = clamp(self / Tf, 0.0, 1.0);
     imageStore(u_dst, pos, vec4(self, supercrit, slope, height01));
+}
+""",
+
+    "granular_sandpile_3d": """
+// Granular sandpile -- a TRUE 3D grain cellular automaton. Every voxel is a cell
+// that is either empty (0) or holds one sand grain (1). Grains are injected at a
+// visible spout near the top and FALL under gravity; where a grain cannot drop
+// straight down it rolls one step down-and-sideways onto supported ground, and
+// that single local rule is what grows a conical pile at the angle of repose and
+// sheds avalanches. Nothing is a heightfield projection -- the sand IS the cells.
+//
+// Grain count is conserved EXACTLY by a MARGOLUS partition: the grid is tiled
+// into disjoint 2x2x2 blocks (the tiling shifts by 1 every step so grains cross
+// block seams), and the per-block update only REDISTRIBUTES the grains already
+// inside the block -- settle each column downward, then roll a grain from a
+// 2-high column to an empty SUPPORTED neighbour column. So the only mass changes
+// are the spout (source) and grains that roll off the open side walls (the sink
+// that keeps the pile marginally stable).
+//
+// Channel R: 0 = empty, 0.82 = grain (the baked sand colour doubles as the
+// occupancy flag; occ() thresholds R > 0.5). Moving grains are tinted brighter
+// so the falling stream and live avalanches glow.
+//
+// u_param0 = Spout rate   (injection probability per spout cell per step)
+// u_param1 = Spout width   (radius of the top-centre source, in cells)
+// u_param2 = Diagonal roll  (pile-shape knob: 0 axis-diamond .. 1 square corners)
+// u_param3 = Flow           (fraction of avalanches that run out 2 cells; the
+//                            repose-angle knob: ~0.06 = steep 38deg, 0.1 = ~33deg
+//                            real dry sand, higher = shallower spread-out pile)
+
+float occ(ivec3 w) {
+    if (w.y < 0) return 1.0;                                  // solid invisible floor
+    if (w.y >= u_size) return 0.0;                            // open top
+    if (w.x < 0 || w.x >= u_size || w.z < 0 || w.z >= u_size) return 0.0;  // open (moves are edge-guarded)
+    return imageLoad(u_src, w).r > 0.5 ? 1.0 : 0.0;
+}
+
+// Is the grain in cell w currently ROLLING (moving)? Packed into the blue
+// channel (b > 0.5). Out-of-bounds / empty cells are never rolling.
+float rollb(ivec3 w) {
+    if (w.y < 0 || w.y >= u_size ||
+        w.x < 0 || w.x >= u_size || w.z < 0 || w.z >= u_size) return 0.0;
+    return imageLoad(u_src, w).b;
+}
+
+// Surface height (y of the topmost grain + 1) of column (x,z). Full scan so it
+// is UNAMBIGUOUS -- the sliding grain and its landing cell must read the exact
+// same column heights to agree on the mutual match (conservation). Open walls
+// read as very low so grains spill off the table.
+int colH(int x, int z) {
+    if (x < 0 || x >= u_size || z < 0 || z >= u_size) return u_size;   // containing wall = tall barrier
+    for (int y = u_size - 1; y >= 0; y--)
+        if (imageLoad(u_src, ivec3(x, y, z)).r > 0.5) return y + 1;
+    return 0;
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(pos, ivec3(u_size)))) return;
+
+    // ODD FRAMES: multi-cell surface run-out avalanche. A surface grain slides R
+    // cells down the steepest-descent direction toward a lower column; a grain
+    // and its landing spot are MUTUALLY matched (each is the other's steepest
+    // partner) so exactly one grain moves per pair -> exactly conservative. This
+    // is the multi-cell transport a pairwise 1-cell roll cannot do, so it can
+    // relax the pile below 45deg toward the true ~33deg repose. Even frames run
+    // the Margolus gravity below (falling + settling); gaps left by a slide are
+    // healed by that next gravity pass.
+    if ((u_frame & 1) == 1) {
+        vec4 s = imageLoad(u_src, pos);
+        float src_rate = s.a;
+        float newr = s.r;
+        float energy = (s.r > 0.5) ? max(0.42, s.b - 0.03) : 0.0;
+        const ivec2 DIRS[4] = ivec2[4](ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1));
+        int R = 2;                                              // run-out distance
+        float pmove = clamp(u_param3, 0.0, 1.0);               // fraction of slides that run out = angle knob
+        int hc = colH(pos.x, pos.z);
+
+        if (s.r > 0.5 && pos.y == hc - 1) {
+            // SOURCE: top grain of column C. Steepest-descent dist-R column = D.
+            int lo = hc, best = -1;
+            for (int k = 0; k < 4; k++) {
+                int nh = colH(pos.x + R*DIRS[k].x, pos.z + R*DIRS[k].y);
+                if (nh < lo) { lo = nh; best = k; }
+            }
+            if (best >= 0 && hc - lo >= 2) {
+                ivec2 d = DIRS[best];
+                int dx = pos.x + R*d.x, dz = pos.z + R*d.y;
+                int hi = -1000, bk = -1;                         // D's steepest ascent
+                for (int k = 0; k < 4; k++) {
+                    int nx = dx + R*DIRS[k].x, nz = dz + R*DIRS[k].y;
+                    if (nx < 0 || nx >= u_size || nz < 0 || nz >= u_size) continue;  // wall emits nothing
+                    int nh = colH(nx, nz);
+                    if (nh > hi) { hi = nh; bk = k; }
+                }
+                if (bk >= 0 && DIRS[bk] == -d && hi == hc &&
+                    hash_temporal(ivec3(min(pos.x,dx), 0, min(pos.z,dz)), 7) < pmove)
+                    newr = 0.0;                                  // mutual + gated -> slide away
+            }
+        } else if (s.r < 0.5 && pos.y == hc) {
+            // DEST: empty cell just above column D's surface. Steepest-ascent = C.
+            int hi = hc, best = -1;
+            for (int k = 0; k < 4; k++) {
+                int nx = pos.x + R*DIRS[k].x, nz = pos.z + R*DIRS[k].y;
+                if (nx < 0 || nx >= u_size || nz < 0 || nz >= u_size) continue;   // wall emits nothing
+                int nh = colH(nx, nz);
+                if (nh > hi) { hi = nh; best = k; }
+            }
+            if (best >= 0 && hi - hc >= 2) {
+                ivec2 d = DIRS[best];
+                int sx = pos.x + R*d.x, sz = pos.z + R*d.y;
+                int lo = 100000, bk = -1;                        // C's steepest descent
+                for (int k = 0; k < 4; k++) {
+                    int nh = colH(sx + R*DIRS[k].x, sz + R*DIRS[k].y);
+                    if (nh < lo) { lo = nh; bk = k; }
+                }
+                if (bk >= 0 && DIRS[bk] == -d && lo == hc &&
+                    hash_temporal(ivec3(min(pos.x,sx), 0, min(pos.z,sz)), 7) < pmove)
+                    { newr = 0.82; energy = 0.60; }              // mutual + gated -> receive
+            }
+        }
+        float rt = clamp((energy - 0.42) / 0.18, 0.0, 1.0);
+        vec3 col = (newr > 0.5) ? vec3(mix(0.82, 0.98, rt), mix(0.70, 0.90, rt), energy)
+                                : vec3(0.0);
+        imageStore(u_dst, pos, vec4(col, src_rate));
+        return;
+    }
+
+    int off = (u_frame >> 1) & 1;                             // Margolus offset (even frames only)
+    ivec3 q     = pos - ivec3(off);
+    ivec3 block = q >> 1;                                     // arithmetic shift = floor-div by 2
+    ivec3 local = q & ivec3(1);
+    ivec3 base  = block * 2 + ivec3(off);                     // world coord of the block corner
+
+    // Read the 8 block cells as 4 columns (c = lx + 2*lz) x {bottom, top}, plus
+    // the cell below each column (support for the roll rule).
+    int g[4];
+    float support[4];
+    bool roll[4];
+    bool inb[4];
+    for (int c = 0; c < 4; c++) {
+        int lx = c & 1, lz = c >> 1;
+        float ob = occ(base + ivec3(lx, 0, lz));
+        float ot = occ(base + ivec3(lx, 1, lz));
+        g[c] = int(ob + ot);
+        support[c] = occ(base + ivec3(lx, -1, lz));
+        roll[c] = (rollb(base + ivec3(lx, 0, lz)) > 0.5) ||
+                  (rollb(base + ivec3(lx, 1, lz)) > 0.5);   // is the column's grain moving
+        int wx = base.x + lx, wz = base.z + lz;              // grains never leave the box
+        inb[c] = (wx >= 0 && wx < u_size && wz >= 0 && wz < u_size);
+    }
+
+    // Angle of repose: a grain that cannot fall straight down (its column is full
+    // and RESTING on support below) rolls one step into an empty neighbour. The
+    // neighbour need not be supported -- if it is a cliff edge the grain tumbles
+    // on down it next step (that is the avalanche). Only a gap of 2 rolls, so
+    // adjacent columns settle to differ by <= 1 -> a ~45deg pile.
+    //
+    // The 4 orthogonal AND 2 diagonal within-block column pairs are used: rolling
+    // toward the corners too (not just the axes) is what rounds the cone instead
+    // of faceting it into a 4-sided pyramid. Diagonal neighbours are sqrt(2)
+    // farther, so rolling to them at full rate over-spreads the corners; the
+    // diagonal roll fires with probability u_param2 (the pile-shape knob: 0 =
+    // axis diamond, 1 = square corners, ~0.5 = round). A per-block, per-frame
+    // rotation of the order removes the residual axis bias.
+    const ivec2 EDGES[6] = ivec2[6](ivec2(0,1), ivec2(2,3), ivec2(0,2), ivec2(1,3),
+                                    ivec2(0,3), ivec2(1,2));
+    float pdiag = clamp(u_param2, 0.0, 1.0);
+    float pflow = clamp(u_param3, 0.0, 1.0);
+    int rot = int(hash_temporal(block, 5) * 6.0);
+    for (int i = 0; i < 6; i++) {
+        int e = (i + rot) % 6;
+        if (e >= 4 && hash_temporal(block, 6 + e) >= pdiag) continue;   // throttle diagonals
+        int a = EDGES[e].x, b = EDGES[e].y;
+        // gap of 2 = far too steep: always avalanches (this alone fixes 45deg).
+        if (g[a] == 2 && g[b] == 0 && support[a] > 0.5 && inb[b])      { g[a] = 1; g[b] = 1; }
+        else if (g[b] == 2 && g[a] == 0 && support[b] > 0.5 && inb[a]) { g[b] = 1; g[a] = 1; }
+        // gap of 1 = at the 45deg step: a grain sheds here only if it is already
+        // ROLLING (momentum -> runs out down the face, prob u_param3) or, rarely,
+        // as slow static creep. Momentum run-out is what pulls the pile below
+        // 45deg to ~33deg, sweeps avalanche sheets down the slope, and gives the
+        // build-up-then-slip (the pile holds until a gap-2 nucleates a slide).
+        else if (g[a] == 1 && g[b] == 0 && support[a] > 0.5 && inb[b] &&
+                 hash_temporal(block, 12 + e) < (roll[a] ? pflow : 0.04))
+                                                             { g[a] = 0; g[b] = 1; }
+        else if (g[b] == 1 && g[a] == 0 && support[b] > 0.5 && inb[a] &&
+                 hash_temporal(block, 12 + e) < (roll[b] ? pflow : 0.04))
+                                                             { g[b] = 0; g[a] = 1; }
+    }
+
+    // Repack my column to the bottom (gravity within the block).
+    int c0 = local.x + 2 * local.z;
+    float newocc = (local.y == 0) ? (g[c0] >= 1 ? 1.0 : 0.0)
+                                  : (g[c0] >= 2 ? 1.0 : 0.0);
+
+    // --- Sources: the live central spout (params) PLUS any persistent per-cell
+    // sources painted into channel A by the init (multiple spouts of different
+    // rate/radius). Inject only into empty cells, so each self-limits into a
+    // steady stream. ---
+    float src_rate = imageLoad(u_src, pos).a;                 // painted source field (persists)
+    int rad = clamp(int(u_param1 + 0.5), 0, u_size / 3);
+    bool at_spout = (pos.y == u_size - 3 &&
+                     abs(pos.x - u_size / 2) <= rad && abs(pos.z - u_size / 2) <= rad);
+    if (newocc < 0.5) {
+        if (at_spout && hash_temporal(pos, 0) < clamp(u_param0, 0.0, 1.0)) newocc = 1.0;
+        else if (src_rate > 0.0 && hash_temporal(pos, 1) < src_rate) newocc = 1.0;
+    }
+
+    float oldocc = imageLoad(u_src, pos).r > 0.5 ? 1.0 : 0.0;
+    // Rolling "energy" lives in the blue channel: a grain that just arrived is
+    // fully moving (0.95); one that stays loses energy each frame and settles
+    // once it drops below 0.5. So momentum PERSISTS a few frames across the
+    // alternating Margolus offsets -> avalanches run out down the face instead of
+    // stalling, which is what pulls the pile below 45deg and makes slides sweep.
+    float energy;
+    if (newocc < 0.5)       energy = 0.0;                          // empty
+    else if (oldocc < 0.5)  energy = 0.60;                         // just arrived: moving
+    else                    energy = max(0.42, imageLoad(u_src, pos).b - 0.03);
+    float rt = clamp((energy - 0.42) / 0.18, 0.0, 1.0);           // 0 settled .. 1 moving
+    vec3 col = (newocc > 0.5) ? vec3(mix(0.82, 0.98, rt), mix(0.70, 0.90, rt), energy)
+                              : vec3(0.0);                          // blue = energy = roll flag
+    imageStore(u_dst, pos, vec4(col, src_rate));             // keep the source field alive in A
 }
 """,
 
@@ -13202,6 +13559,71 @@ void main() {
 }
 """
 
+# ─── SPATIAL GUIDES (bounding box + axis gnomon) ──────────────────────
+# A thin line overlay drawn into the scene FBO (so it appears in recordings
+# too) that gives a fixed sense of orientation while the camera orbits. The
+# box edges are projected with the same view-projection as the volume; far
+# edges fade so the cube reads as 3D without occluding the content.
+SPATIAL_CUBE_VERTEX_SHADER = """
+#version 430
+in vec3 a_pos;                 // unit-cube corner [0,1]
+uniform mat4 u_view_proj;
+uniform vec3 u_box_dims;       // world extent of the grid box
+uniform vec3 u_cam_pos;
+out float v_dist;
+void main() {
+    vec3 world = a_pos * u_box_dims;
+    gl_Position = u_view_proj * vec4(world, 1.0);
+    v_dist = length(world - u_cam_pos);
+}
+"""
+
+SPATIAL_CUBE_FRAGMENT_SHADER = """
+#version 430
+in float v_dist;
+out vec4 fragColor;
+uniform vec3 u_color;
+uniform float u_alpha;
+uniform float u_near_d;
+uniform float u_far_d;
+void main() {
+    float t = clamp((v_dist - u_near_d) / max(u_far_d - u_near_d, 1e-4), 0.0, 1.0);
+    float a = u_alpha * mix(1.0, 0.28, t);   // far edges fade for depth cue
+    fragColor = vec4(u_color * a, a);
+}
+"""
+
+# Fixed-corner orientation triad: axis directions rotated by the camera and
+# placed at a fixed screen anchor, so it always shows which way X/Y/Z point.
+SPATIAL_GNOMON_VERTEX_SHADER = """
+#version 430
+in vec3 a_dir;                 // axis direction (origin = 0)
+in vec3 a_color;               // per-axis RGB
+uniform mat3 u_cam_basis;      // world -> camera (transpose of camera rot)
+uniform vec2 u_anchor;         // NDC anchor of the triad origin
+uniform vec2 u_scale;          // NDC length (x pre-divided by aspect)
+out vec3 v_color;
+out float v_bright;
+void main() {
+    vec3 d = u_cam_basis * a_dir;
+    gl_Position = vec4(u_anchor.x + u_scale.x * d.x,
+                       u_anchor.y + u_scale.y * d.y, 0.0, 1.0);
+    v_color = a_color;
+    v_bright = 0.45 + 0.55 * clamp(d.z * 0.5 + 0.5, 0.0, 1.0);  // toward viewer = brighter
+}
+"""
+
+SPATIAL_GNOMON_FRAGMENT_SHADER = """
+#version 430
+in vec3 v_color;
+in float v_bright;
+out vec4 fragColor;
+uniform float u_alpha;
+void main() {
+    fragColor = vec4(v_color * v_bright * u_alpha, u_alpha);
+}
+"""
+
 # ─── MARCHING CUBES (GPU) ─────────────────────────────────────────────
 # One compute thread per cell. Each cell:
 #   1. Reads its 8 corner field values (channel selectable)
@@ -13780,6 +14202,7 @@ uniform vec3 u_camera_pos;
 uniform mat3 u_camera_rot;
 uniform float u_fov;
 uniform float u_density_scale;
+uniform float u_density_gamma;  // opacity transfer exponent (1.0 = linear)
 uniform float u_brightness;
 uniform int u_render_mode;
 uniform float u_iso_threshold;
@@ -14020,7 +14443,8 @@ void main() {
             if (density > 0.01) {
                 empty_run = 0.0;
                 vec3 col = voxel_color(s4);
-                float alpha = density * u_density_scale * base_step;
+                float dens_t = (u_density_gamma == 1.0) ? density : pow(density, u_density_gamma);
+                float alpha = dens_t * u_density_scale * base_step;
                 alpha = min(alpha, 0.95);
                 accum_color += col * alpha * (1.0 - accum_alpha) * u_brightness;
                 accum_alpha += alpha * (1.0 - accum_alpha);
@@ -14111,6 +14535,7 @@ uniform vec3 u_camera_pos;
 uniform mat3 u_camera_rot;
 uniform float u_fov;
 uniform float u_density_scale;
+uniform float u_density_gamma;  // opacity transfer exponent (1.0 = linear)
 uniform float u_brightness;
 uniform int u_render_mode;  // 0=volume, 1=iso_surface, 2=max_intensity
 uniform float u_iso_threshold;
@@ -14464,7 +14889,8 @@ void main() {
             if (density > 0.01) {
                 empty_run = 0.0;
                 vec3 col = voxel_color(s4);
-                float alpha = density * u_density_scale * base_step;
+                float dens_t = (u_density_gamma == 1.0) ? density : pow(density, u_density_gamma);
+                float alpha = dens_t * u_density_scale * base_step;
                 alpha = min(alpha, 0.95);
 
                 accum_color += col * alpha * (1.0 - accum_alpha) * u_brightness;
@@ -19095,7 +19521,7 @@ RULE_PRESETS = {
     "quantum_hydrogen": {
         "label": "Hydrogen Atom",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
@@ -19105,7 +19531,8 @@ RULE_PRESETS = {
         "init_variants": ["quantum_orbital"],
         "description": "Hydrogen atom — 1s+2p superposition in Coulomb potential. Watch the probability cloud oscillate between sphere and dumbbell.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19113,7 +19540,7 @@ RULE_PRESETS = {
     "quantum_orbital": {
         "label": "Atomic Orbital",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
@@ -19130,7 +19557,8 @@ RULE_PRESETS = {
         ],
         "description": "Hydrogen orbital browser — select any orbital from 1s through 4f. Eigenstates rotate phase; superpositions oscillate.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19138,16 +19566,17 @@ RULE_PRESETS = {
     "quantum_element": {
         "label": "Periodic Table Orbitals",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.1),
         "init": "quantum_element",
-        "description": "Real periodic-table elements rendered as TDSE-evolving valence orbital clouds. Picks an element (random or by atomic number), looks up its valence subshell from element_data.VALENCE, and superposes the m-degenerate set with random complex weights. Slater-screened Coulomb potential. Homage to the periodic-table repo.",
+        "description": "Real periodic-table elements rendered as their valence-subshell electron cloud, filled by the element's electron count (Hund's rule) over a relaxed radial profile with per-element complex phases. A stationary, phase-coloured cloud — same mechanics as the hydrogen orbitals — distinct per element. Homage to the periodic-table repo.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19155,7 +19584,7 @@ RULE_PRESETS = {
     "quantum_wavepacket": {
         "label": "Quantum Wavepacket",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
@@ -19164,7 +19593,8 @@ RULE_PRESETS = {
         "init": "quantum_wavepacket",
         "description": "Gaussian wavepacket in a box — disperses, bounces, interferes with itself.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19172,7 +19602,7 @@ RULE_PRESETS = {
     "quantum_harmonic": {
         "label": "Quantum Oscillator",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
         "params": {"ħ/2m": 2.5, "V strength": 1.0},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
@@ -19181,7 +19611,8 @@ RULE_PRESETS = {
         "init": "quantum_harmonic",
         "description": "Coherent state in harmonic trap — oscillates like a classical particle, showing quantum-classical correspondence.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19189,16 +19620,17 @@ RULE_PRESETS = {
     "quantum_tunneling": {
         "label": "Quantum Tunneling",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
-        "params": {"ħ/2m": 2.5, "V strength": 1.0},
-        "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 10.0)},
+        "params": {"ħ/2m": 2.5, "V strength": 1.0, "Absorb": 12.0},
+        "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 10.0), "Absorb": (0.0, 50.0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.1),
         "init": "quantum_tunneling",
         "description": "Wavepacket hits a potential barrier — part tunnels through, part reflects. Classically impossible.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19206,16 +19638,17 @@ RULE_PRESETS = {
     "quantum_double_slit": {
         "label": "Double Slit",
         "shader": "schrodinger_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
-        "params": {"ħ/2m": 2.5, "V strength": 1.0},
-        "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 10.0)},
+        "params": {"ħ/2m": 2.5, "V strength": 1.0, "Absorb": 12.0},
+        "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 10.0), "Absorb": (0.0, 50.0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.1),
         "init": "quantum_double_slit",
         "description": "Wavepacket through a double slit — the defining quantum experiment. Watch interference fringes form.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19223,18 +19656,19 @@ RULE_PRESETS = {
     "quantum_molecule": {
         "label": "Molecular Bond",
         "shader": "schrodinger_molecule_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
-        "params": {"ħ/2m": 2.5, "Nuclear charge": 1.0, "Separation": 8.0, "Softening": 1.5},
+        "params": {"ħ/2m": 2.5, "Nuclear charge": 1.0, "Separation": QUANTUM_MOLECULE_SEP, "Softening": 1.5},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "Nuclear charge": (0.5, 4.0),
-                         "Separation": (2.0, 20.0), "Softening": (0.5, 4.0)},
+                         "Separation": (4.0, 50.0), "Softening": (0.5, 4.0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.1),
         "init": "quantum_molecule",
         "init_variants": ["quantum_antibonding"],
         "description": "Electron in two-nucleus potential — watch bonding orbital form. Adjust separation to see bond form and break.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19242,18 +19676,43 @@ RULE_PRESETS = {
     "quantum_antibonding": {
         "label": "Antibonding Orbital",
         "shader": "schrodinger_molecule_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
-        "params": {"ħ/2m": 2.5, "Nuclear charge": 1.0, "Separation": 8.0, "Softening": 1.5},
+        "params": {"ħ/2m": 2.5, "Nuclear charge": 1.0, "Separation": QUANTUM_MOLECULE_SEP, "Softening": 1.5},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "Nuclear charge": (0.5, 4.0),
-                         "Separation": (2.0, 20.0), "Softening": (0.5, 4.0)},
+                         "Separation": (4.0, 50.0), "Softening": (0.5, 4.0)},
         "dt": 0.02,
         "dt_range": (0.005, 0.1),
         "init": "quantum_antibonding",
         "init_variants": ["quantum_molecule"],
         "description": "Antibonding molecular orbital — probability density avoids the internuclear midpoint (node).",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
+        "vis_abs": False,
+        "render_mode": "volumetric",
+        "boundary": "clamped",
+    },
+    "quantum_molecule_poly": {
+        "label": "Polyatomic Molecule",
+        "shader": "schrodinger_3d",
+        "default_size": 128,
+        "search_size": 96,
+        "params": {"ħ/2m": 2.5, "V strength": 1.0},
+        "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0)},
+        "dt": 0.02,
+        "dt_range": (0.005, 0.1),
+        "init": "molecule_ring_bond",
+        "init_variants": [
+            "molecule_h3_bond", "molecule_h3_anti",
+            "molecule_chain_bond", "molecule_chain_anti",
+            "molecule_ring_bond", "molecule_ring_anti",
+            "molecule_tetra_bond", "molecule_tetra_anti",
+        ],
+        "description": "Polyatomic molecular orbitals — an electron delocalised over several nuclei (triangle H₃⁺, linear chain, benzene-like 6-ring, tetrahedron). The bonding MO spreads one phase across all atoms; the antibonding MO splits into opposite-phase lobes with a nodal plane. Built by imaginary-time relaxation of a multi-centre Coulomb potential.",
+        "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         "boundary": "clamped",
@@ -19261,17 +19720,18 @@ RULE_PRESETS = {
     "quantum_selfinteract": {
         "label": "Self-Interacting QM",
         "shader": "schrodinger_poisson_3d",
-        "default_size": 192,
+        "default_size": 128,
         "search_size": 96,
-        "params": {"ħ/2m": 2.5, "V strength": 1.0, "Coupling α": 5.0, "Relaxation ω": 0.8},
+        "params": {"ħ/2m": 2.5, "V strength": 1.0, "Coupling α": 2.0, "Relaxation ω": 0.8},
         "param_ranges": {"ħ/2m": (0.1, 10.0), "V strength": (0.0, 5.0),
                          "Coupling α": (0.1, 50.0), "Relaxation ω": (0.1, 1.5)},
         "dt": 0.02,
         "dt_range": (0.005, 0.1),
         "init": "quantum_selfinteract",
-        "description": "Schrödinger-Poisson — wavefunction generates its own potential. Simplified Hartree mean-field model.",
+        "description": "Schrödinger-Poisson (Schrödinger-Newton) — the wavefunction digs its own attractive potential well and self-focuses into a soliton-like bound blob instead of dispersing. Simplified self-gravity / Hartree model.",
         "vis_channels": ["ψ real", "ψ imag", "Potential V", "Probability |Ψ|²"],
-        "vis_default": 3,
+        "vis_default": 0,
+        "vis_mode": "hsv_phase",
         "vis_abs": False,
         "render_mode": "volumetric",
         # |ψ|² of a self-interacting wavefunction can collapse to extremely
@@ -20105,6 +20565,37 @@ RULE_PRESETS = {
         # avalanche fronts). Volumetric mode keeps a wider colour ramp.
         "vis_range": (6.0, 12.0),
         "voxel_threshold": 8.0,
+        "boundary": "clamped",
+    },
+
+    "granular_sandpile_3d": {
+        "label": "Granular Sandpile (falling grains)",
+        "shader": "granular_sandpile_3d",
+        "params": {"Spout rate": 0.35, "Spout width": 1.0, "Diagonal roll": 0.3,
+                   "Flow": 0.09},
+        "param_ranges": {"Spout rate": (0.0, 1.0), "Spout width": (0.0, 6.0),
+                         "Diagonal roll": (0.0, 1.0), "Flow": (0.0, 1.0)},
+        "dt": 1.0,
+        "init": "granular_empty",
+        "init_variants": ["granular_empty", "granular_cone",
+                          "granular_multi_source", "granular_collapse"],
+        "description": ("A true 3D grain cellular automaton: every voxel is empty "
+                        "or a single sand grain. Grains pour from a visible spout "
+                        "and fall under gravity; a grain that cannot drop rolls "
+                        "one step down-and-over onto supported ground, and that "
+                        "one local rule grows a conical pile at the angle of "
+                        "repose and sheds avalanches -- all emergent, nothing "
+                        "scripted. A Margolus 2x2x2 block partition conserves the "
+                        "grains exactly; only the spout adds sand and the open "
+                        "walls let it spill off. The physical sandpile the "
+                        "abstract Bak-Tang-Wiesenfeld model only hints at."),
+        "vis_channels": ["Sand", "-", "Rolling", "Source rate"],
+        "vis_default": 0,
+        "vis_abs": False,
+        "vis_mode": "rgb_channels",   # R,G,B = baked sand colour; alive = R > 0.5
+        "render_mode": "voxel",
+        "colormap": 0,
+        "voxel_threshold": 0.5,
         "boundary": "clamped",
     },
 
@@ -24228,13 +24719,21 @@ def _coulomb_potential(size, Z, r_soft=1.5):
     return V
 
 
-def _harmonic_potential(size, omega=0.02):
-    """3D harmonic trap V(r) = ½ω²r²."""
+def _harmonic_potential(size, omega=0.22, v_cap=32.0):
+    """3D harmonic trap V(r) = ½ω²r², capped at v_cap.
+
+    The trap must be stiff enough that the coherent state completes a visible
+    oscillation in a few hundred steps (period ≈ 2π/(ω·√(2·ħ/2m)); at the old
+    ω=0.02 the period was ~7000 steps → looked frozen). But ½ω²r² grows without
+    bound, so at the box edges it violates the leapfrog CFL (dt·V < 2). We cap
+    V at v_cap: the oscillation region (r ≲ 0.25·size) stays purely harmonic
+    (V well below the cap there), while the far corners — where |ψ|≈0 — are
+    flattened so they can't blow up."""
     c = size / 2.0
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
     r2 = ((x - c + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2).astype(np.float64)
-    V = (0.5 * omega**2 * r2).astype(np.float32)
-    return V
+    V = np.minimum(0.5 * omega**2 * r2, v_cap)
+    return V.astype(np.float32)
 
 
 def _double_well_potential(size, depth=0.5, sep=0.25):
@@ -24382,68 +24881,46 @@ def init_quantum_orbital(size, rng):
 def init_quantum_element(size, rng, atomic_number=None):
     """Render a real periodic-table element's valence orbital cloud.
 
-    Picks an element (random if `atomic_number` is None), looks up its
-    valence subshell (n, l, occupancy) from element_data.VALENCE, builds
-    a |m|-degenerate superposition with random complex weights, and uses
-    a Slater-screened Coulomb potential V(r) = -Z_eff/r so that orbital
-    sizes stay roughly comparable across the periodic table.
+    Picks an element (random if `atomic_number` is None), looks up its valence
+    subshell (n, l, occupancy) from element_data.VALENCE, and builds the
+    Hund-filled valence m-states on the relaxed radial profile with
+    deterministic per-element complex weights — a stationary, phase-coloured
+    cloud (same mechanics as the hydrogen orbitals), distinct per element.
 
-    Homage to /home/user/development/periodic-table/ — every element's
-    actual valence shell is renderable as a TDSE-evolving wavepacket.
+    Homage to /home/user/development/periodic-table/.
     """
-    from element_data import VALENCE, slater_zeff, SYMBOLS
+    from element_data import VALENCE, SYMBOLS
     data = np.zeros((size, size, size, 4), dtype=np.float32)
 
-    # Pick element. Default focus: low-Z (period 1-4) for visibility,
-    # but allow the full table when explicitly requested.
     if atomic_number is None:
-        # Bias toward periods 1-4 (Z 1-36) so the visualization is rich
-        # — high-Z d/f orbitals get cramped at typical search sizes.
-        if rng.random() < 0.85:
-            Z = rng.randint(1, 37)
-        else:
-            Z = rng.randint(37, 119)
+        # Bias toward periods 1-4 (Z 1-36) for visibility.
+        Z = rng.randint(1, 37) if rng.random() < 0.85 else rng.randint(37, 119)
     else:
         Z = int(atomic_number)
     Z = max(1, min(118, Z))
 
+    psi_r, psi_i, V = _element_valence_cloud(size, Z)
+    data[:, :, :, 0] = psi_r
+    data[:, :, :, 1] = psi_i
+    data[:, :, :, 2] = V
+    data[:, :, :, 3] = psi_r * psi_r + psi_i * psi_i
     n, l, occ = VALENCE[Z]
-    z_eff = slater_zeff(Z, n, l, occ)
-
-    # Build a superposition of all (2l+1) m-states with random complex
-    # weights. This produces a visually-interesting cloud rather than a
-    # single oriented dumbbell/clover. Weights are normalised so peak |Ψ|=1.
-    psi_r = np.zeros((size, size, size), dtype=np.float64)
-    psi_i = np.zeros((size, size, size), dtype=np.float64)
-    for m in range(-l, l + 1):
-        # Spatial scale: hydrogen-like orbitals scale as r/Z_eff. Choose a
-        # `scale` that puts the bulk of the cloud comfortably inside the
-        # box — empirically scale ~ size / (n * 8) keeps things visible
-        # for n=1..5 at typical sizes (64..192).
-        spatial_scale = max(0.5, size / (n * 8.0 * max(1.0, z_eff ** 0.5)))
-        pr, pi = _hydrogen_orbital(size, n, l, m, Z=z_eff, scale=spatial_scale)
-        # Complex weight (cr + i*ci) — random unit complex
-        theta = rng.uniform(0.0, 2 * np.pi)
-        amp   = rng.uniform(0.5, 1.0)
-        cr, ci = amp * np.cos(theta), amp * np.sin(theta)
-        # (cr + i*ci) * (pr + i*pi) = (cr*pr - ci*pi) + i*(cr*pi + ci*pr)
-        psi_r += cr * pr - ci * pi
-        psi_i += cr * pi + ci * pr
-
-    # Normalize peak |Ψ| = 1
-    peak = float(np.sqrt(np.max(psi_r * psi_r + psi_i * psi_i)))
-    if peak > 1e-10:
-        psi_r /= peak
-        psi_i /= peak
-
-    data[:, :, :, 0] = psi_r.astype(np.float32)
-    data[:, :, :, 1] = psi_i.astype(np.float32)
-    # Slater-screened Coulomb keeps orbital scale physical across the table
-    data[:, :, :, 2] = _coulomb_potential(size, Z=z_eff, r_soft=1.5)
-    data[:, :, :, 3] = (psi_r * psi_r + psi_i * psi_i).astype(np.float32)
-    print(f"[quantum_element] Z={Z} ({SYMBOLS[Z]}) "
-          f"valence={n}{'spdf'[l]}^{occ}  Z_eff={z_eff:.2f}")
+    print(f"[quantum_element] Z={Z} ({SYMBOLS[Z]}) valence={n}{'spdf'[l]}^{occ}")
     return data
+
+
+def _make_element_init(Z):
+    """Factory: init for a specific element's valence density cloud."""
+    def init_fn(size, rng):
+        return init_quantum_element(size, rng, atomic_number=Z)
+    init_fn.__name__ = f'init_quantum_element_{Z}'
+    init_fn.__doc__ = f'{SYMBOLS[Z]} (Z={Z}) valence electron density cloud.'
+    return init_fn
+
+
+# Named per-element init variants: quantum_element_H … quantum_element_Og.
+ELEMENT_INITS = {f'quantum_element_{SYMBOLS[_Z]}': _make_element_init(_Z)
+                 for _Z in range(1, 119)}
 
 
 def init_quantum_multi_well(size, rng, n_wells=None):
@@ -24555,47 +25032,277 @@ def init_quantum_stark(size, rng):
 
 # ── Individual orbital init variants (factory) ──
 
-def _make_orbital_init(n, l, m, label):
-    """Factory for orbital init functions with specific quantum numbers."""
+_ORBITAL_RELAX_CACHE: dict = {}
+_ORBITAL_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'orbital_cache')
+
+
+def _angular_template(size, l, m):
+    """Real spherical harmonic Y_lm evaluated per voxel (direction only,
+    r-independent). Same real-orbital convention as _hydrogen_orbital."""
+    from scipy.special import sph_harm_y
+    c = size / 2.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    dx = (x - c + 0.5).astype(np.float64)
+    dy = (y - c + 0.5).astype(np.float64)
+    dz = (z - c + 0.5).astype(np.float64)
+    r = np.sqrt(dx * dx + dy * dy + dz * dz) + 1e-10
+    theta = np.arccos(np.clip(dz / r, -1, 1))
+    phi = np.arctan2(dy, dx)
+    if m == 0:
+        return sph_harm_y(l, 0, theta, phi).real
+    if m > 0:
+        return sph_harm_y(l, m, theta, phi).real * np.sqrt(2)
+    return sph_harm_y(l, abs(m), theta, phi).imag * np.sqrt(2)
+
+
+def _relaxed_orbital(size, n, l, m, scale, z_eff=1.0):
+    """Exact lattice eigenstate for (n,l,m), so |ψ|² is stationary (no drift;
+    only the phase colour rotates — the physically correct behaviour for a
+    single orbital).
+
+    Imaginary-time relaxes the analytic orbital against the SAME discrete
+    Hamiltonian the shader integrates (H = -(size/50)·(size/128)²·∇²₆ + V, with
+    V the softened Coulomb well at depth Z = 1/scale so the render size is an
+    eigenstate). The analytic angular shape Y_lm is held FIXED each step
+    (ψ ← A·c(r), projecting onto the template) so it stays a textbook orbital
+    and only the radial profile relaxes — this both preserves the familiar
+    lobes and sidesteps cubic-lattice angular mixing. Radial-node orbitals
+    (2s, 3s, 3p, …) orthogonalise against the lower same-(l,m) states so they
+    land on the correct excited state.
+
+    The relaxed state is exactly Y_lm·c(r), so only the ~size-long radial
+    profile c(r) is cached to disk (tiny); reconstruction is instant. Heavy
+    relaxation therefore runs at most once per (orbital, size) ever."""
+    key = (int(size), n, l, m, round(float(scale), 4), round(float(z_eff), 4))
+    cached = _ORBITAL_RELAX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # z_eff==1 (hydrogen) keeps the original filename for cache backward-compat.
+    suffix = '' if abs(z_eff - 1.0) < 1e-9 else f'_z{round(float(z_eff), 4):.4f}'
+    fname = os.path.join(
+        _ORBITAL_CACHE_DIR,
+        f'orb_{int(size)}_{n}_{l}_{m}_{round(float(scale), 4):.4f}{suffix}.npy')
+    if os.path.exists(fname):
+        c_radial = np.load(fname)
+    else:
+        c_radial = _relax_orbital_profile(size, n, l, m, scale, z_eff=z_eff)
+        os.makedirs(_ORBITAL_CACHE_DIR, exist_ok=True)
+        np.save(fname, c_radial.astype(np.float32))
+
+    result = _reconstruct_orbital(size, l, m, c_radial)
+    _ORBITAL_RELAX_CACHE[key] = result
+    return result
+
+
+def _reconstruct_orbital(size, l, m, c_radial):
+    """Rebuild ψ = Y_lm(angles)·c(r) from a cached radial profile. Instant."""
+    A = _angular_template(size, l, m)
+    c0 = size / 2.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    r = np.sqrt((x - c0 + 0.5)**2 + (y - c0 + 0.5)**2 + (z - c0 + 0.5)**2)
+    ir = np.clip(np.round(r).astype(np.int64), 0, len(c_radial) - 1)
+    psi = (A * c_radial[ir]).astype(np.float64)
+    peak = float(np.max(np.abs(psi)))
+    if peak > 1e-10:
+        psi = psi / peak
+    return psi.astype(np.float32)
+
+
+def _relax_orbital_profile(size, n, l, m, scale, z_eff=1.0, n_iter=150):
+    """Run the imaginary-time relaxation and return the radial coefficient
+    profile c(r) of the exact (n,l,m) lattice eigenstate (ψ = Y_lm·c(r)).
+
+    The Coulomb well depth is Z = z_eff/scale so the orbital, built at the
+    chosen render `scale`, is an eigenstate (screened charge for elements)."""
+    hbar_2m = size / 50.0
+    h_sq = (size / 128.0) ** 2
+    kin = hbar_2m * h_sq
+    V = _coulomb_potential(size, Z=z_eff / scale, r_soft=1.5).astype(np.float64)
+    dtau = 1.0 / (12.0 * kin + float(np.abs(V).max()) + 1e-6)
+
+    A = _angular_template(size, l, m)
+    c0 = size / 2.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    r = np.sqrt((x - c0 + 0.5)**2 + (y - c0 + 0.5)**2 + (z - c0 + 0.5)**2)
+    ir = np.clip(np.round(r).astype(np.int64), 0, size)
+    ir_flat = ir.ravel()
+    nbins = size + 1
+    A2_shell = np.bincount(ir_flat, weights=(A * A).ravel(), minlength=nbins)
+    A2_shell[A2_shell < 1e-12] = 1e-12
+
+    def _project_angular(psi):
+        num = np.bincount(ir_flat, weights=(psi * A).ravel(), minlength=nbins)
+        return A * (num / A2_shell)[ir]
+
+    def _norm(p):
+        s = np.sqrt((p * p).sum())
+        return p / s if s > 1e-30 else p
+
+    lower: list = []
+    for kk in range(n - l):          # k = n-l-1 radial nodes; relax 0..k
+        guess, _ = _hydrogen_orbital(size, l + 1 + kk, l, m, scale=scale)
+        psi = _norm(_project_angular(guess.astype(np.float64)))
+        for _ in range(n_iter):
+            lap = (-6.0 * psi
+                   + np.roll(psi, 1, 0) + np.roll(psi, -1, 0)
+                   + np.roll(psi, 1, 1) + np.roll(psi, -1, 1)
+                   + np.roll(psi, 1, 2) + np.roll(psi, -1, 2))
+            psi = psi - dtau * (-kin * lap + V * psi)
+            psi = _project_angular(psi)
+            for s in lower:
+                psi -= (psi * s).sum() * s
+            psi = _norm(psi)
+        lower.append(psi)
+
+    # Extract the radial profile c(r) of the final (target) state.
+    num = np.bincount(ir_flat, weights=(lower[-1] * A).ravel(), minlength=nbins)
+    return (num / A2_shell).astype(np.float32)
+
+
+# ── Periodic-table element valence clouds ─────────────────────────────
+# Each element shows its valence subshell electron DENSITY, filled per the real
+# electron count (Hund's rule): ρ = c(r)²·Σ(occupied) occ·Y_lm². This is the
+# physically faithful cloud — partial shells are lobed, half/full shells are
+# spherical — and distinct per element. Rendered as a static colour-mapped
+# cloud (a multi-electron density has no single phase to animate). Uses the
+# same relaxed radial profile as the hydrogen orbitals for the shell shape.
+_ELEMENT_CLOUD_CACHE: dict = {}
+
+
+def _real_m_order(l):
+    """Real-orbital m ordering for a subshell: 0, +1, -1, +2, -2, … (length 2l+1)."""
+    order = [0]
+    for mm in range(1, l + 1):
+        order += [mm, -mm]
+    return order
+
+
+def _orbital_radial_profile_cached(size, n, l, scale, z_eff=1.0):
+    """Disk-cached radial profile c(r) of the relaxed (n,l) eigenstate (the
+    radial is m-independent, computed via the m=0 relaxation — shares the
+    orbital cache file)."""
+    suffix = '' if abs(z_eff - 1.0) < 1e-9 else f'_z{round(float(z_eff), 4):.4f}'
+    fname = os.path.join(
+        _ORBITAL_CACHE_DIR,
+        f'orb_{int(size)}_{n}_{l}_0_{round(float(scale), 4):.4f}{suffix}.npy')
+    if os.path.exists(fname):
+        return np.load(fname)
+    c = _relax_orbital_profile(size, n, l, 0, scale, z_eff=z_eff)
+    os.makedirs(_ORBITAL_CACHE_DIR, exist_ok=True)
+    np.save(fname, c.astype(np.float32))
+    return c
+
+
+def _element_valence_cloud(size, Z):
+    """Return (ψ_real, ψ_imag, V) for element Z's valence subshell: the Hund-
+    filled valence m-states on the relaxed radial profile, combined with
+    DETERMINISTIC per-element complex weights. Because every m-state shares the
+    same energy E_nl this is a STATIONARY eigenstate (|ψ|² doesn't drift — like
+    a single hydrogen orbital), and the complex weights give each element its
+    own spatial phase/colour pattern. Cached per (size, Z)."""
+    from element_data import VALENCE, slater_zeff
+    key = (int(size), int(Z))
+    cached = _ELEMENT_CLOUD_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    n, l, occ = VALENCE[Z]
+    z_eff = slater_zeff(Z, n, l, occ)
+    # Size so a₀ ≈ size/(16n²) (clouds compact → bright per voxel, not a diffuse
+    # cube-filling fog) but clamp a₀ ≳ 0.8 voxel so high-n shells stay
+    # resolvable, capped at the box-fitting a₀ (⟨r⟩≈1.5n²a₀).
+    a0 = min(max(size / (16.0 * n * n), 0.8), 0.16 * size / (n * n))
+    scale = min(10.0, max(0.05, a0 * 25.0 * z_eff / size))
+    c_radial = _orbital_radial_profile_cached(size, n, l, scale, z_eff)
+
+    c0 = size / 2.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    r = np.sqrt((x - c0 + 0.5)**2 + (y - c0 + 0.5)**2 + (z - c0 + 0.5)**2)
+    ir = np.clip(np.round(r).astype(np.int64), 0, len(c_radial) - 1)
+    radial = c_radial[ir].astype(np.float64)
+
+    # Hund's rule: one electron per real orbital, then pair up.
+    n_up = min(occ, 2 * l + 1)
+    n_down = max(0, occ - (2 * l + 1))
+    # Deterministic per-element complex phases → distinct, phase-colourable.
+    wrng = np.random.RandomState((Z * 2654435761) % (2**32))
+    psi_r = np.zeros((size, size, size), dtype=np.float64)
+    psi_i = np.zeros((size, size, size), dtype=np.float64)
+    for i, mm in enumerate(_real_m_order(l)):
+        occ_i = (1.0 if i < n_up else 0.0) + (1.0 if i < n_down else 0.0)
+        if occ_i > 0.0:
+            orb = _angular_template(size, l, mm) * radial
+            theta = wrng.uniform(0.0, 2.0 * np.pi)
+            w = np.sqrt(occ_i)
+            psi_r += w * np.cos(theta) * orb
+            psi_i += w * np.sin(theta) * orb
+
+    peak = float(np.sqrt(np.max(psi_r * psi_r + psi_i * psi_i)))
+    if peak > 1e-10:
+        psi_r /= peak
+        psi_i /= peak
+    V = _coulomb_potential(size, Z=z_eff / scale, r_soft=1.5)
+    result = (psi_r.astype(np.float32), psi_i.astype(np.float32),
+              V.astype(np.float32))
+    _ELEMENT_CLOUD_CACHE[key] = result
+    return result
+
+
+def _make_orbital_init(n, l, m, label, scale=1.0):
+    """Factory for orbital init functions with specific quantum numbers.
+
+    `scale` sizes the orbital (see _ORBITAL_DEFS): _hydrogen_orbital sets
+    a₀ = size·scale/(25·Z), chosen per orbital so all enclose 99% of their
+    probability within ≈0.40·size — consistent apparent size, always fits.
+    """
     def init_fn(size, rng):
         data = np.zeros((size, size, size, 4), dtype=np.float32)
-        psi_r, psi_i = _hydrogen_orbital(size, n, l, m)
+        psi_r = _relaxed_orbital(size, n, l, m, scale)
         data[:, :, :, 0] = psi_r
-        data[:, :, :, 1] = psi_i
-        data[:, :, :, 2] = _coulomb_potential(size, Z=1.0, r_soft=1.5)
-        data[:, :, :, 3] = psi_r**2 + psi_i**2
+        data[:, :, :, 1] = 0.0
+        # Potential depth matches the orbital's render scale (Z = 1/scale) so
+        # the relaxed state is a true eigenstate at this size.
+        data[:, :, :, 2] = _coulomb_potential(size, Z=1.0 / scale, r_soft=1.5)
+        data[:, :, :, 3] = psi_r**2
         return data
     init_fn.__name__ = f'init_orbital_{label}'
     init_fn.__doc__ = f'Hydrogen {label} orbital (n={n}, l={l}, m={m}).'
     return init_fn
 
-# Standard orbital labels: spectroscopic notation + m subscript
+# Standard orbital labels: spectroscopic notation + m subscript.
+# The 5th field is a per-orbital render scale chosen so every orbital encloses
+# 99% of its probability within ≈0.40·size (measured empirically) — i.e. they
+# all fill a comparable fraction of the frame and fit the grid. A single fixed
+# a₀ fails here: s-orbitals have long faint tails while high-ℓ orbitals are
+# compact, and n=4 at the old a₀=size/25 overflowed the box as a clipped cube.
 _ORBITAL_DEFS = [
-    # (n, l, m, label)
-    (1, 0, 0, '1s'),
-    (2, 0, 0, '2s'),
-    (2, 1, 0, '2p0'),
-    (2, 1, 1, '2p1'),
-    (2, 1, -1, '2p-1'),
-    (3, 0, 0, '3s'),
-    (3, 1, 0, '3p0'),
-    (3, 1, 1, '3p1'),
-    (3, 2, 0, '3d0'),
-    (3, 2, 1, '3d1'),
-    (3, 2, 2, '3d2'),
-    (3, 2, -1, '3d-1'),
-    (3, 2, -2, '3d-2'),
-    (4, 0, 0, '4s'),
-    (4, 1, 0, '4p0'),
-    (4, 2, 0, '4d0'),
-    (4, 3, 0, '4f0'),
-    (4, 3, 3, '4f3'),
+    # (n, l, m, label, scale)
+    (1, 0, 0, '1s', 2.60),
+    (2, 0, 0, '2s', 0.79),
+    (2, 1, 0, '2p0', 0.86),
+    (2, 1, 1, '2p1', 0.86),
+    (2, 1, -1, '2p-1', 0.86),
+    (3, 0, 0, '3s', 0.39),
+    (3, 1, 0, '3p0', 0.41),
+    (3, 1, 1, '3p1', 0.41),
+    (3, 2, 0, '3d0', 0.46),
+    (3, 2, 1, '3d1', 0.46),
+    (3, 2, 2, '3d2', 0.46),
+    (3, 2, -1, '3d-1', 0.46),
+    (3, 2, -2, '3d-2', 0.46),
+    (4, 0, 0, '4s', 0.24),
+    (4, 1, 0, '4p0', 0.24),
+    (4, 2, 0, '4d0', 0.26),
+    (4, 3, 0, '4f0', 0.29),
+    (4, 3, 3, '4f3', 0.29),
 ]
 
 ORBITAL_INITS = {}
-for _n, _l, _m, _label in _ORBITAL_DEFS:
+for _n, _l, _m, _label, _scale in _ORBITAL_DEFS:
     _fname = f'orbital_{_label}'
-    ORBITAL_INITS[_fname] = _make_orbital_init(_n, _l, _m, _label)
+    ORBITAL_INITS[_fname] = _make_orbital_init(_n, _l, _m, _label, _scale)
 
 
 def init_quantum_wavepacket(size, rng):
@@ -24634,8 +25341,9 @@ def init_quantum_harmonic(size, rng):
     c = size / 2.0
     sigma = size * 0.08
 
-    # Displace from center (the restoring force will pull it back)
-    displacement = rng.uniform(0.1, 0.25) * size
+    # Displace from center (the restoring force will pull it back). Kept modest
+    # so the turning points stay inside the harmonic (un-capped) region.
+    displacement = rng.uniform(0.12, 0.18) * size
     angle = rng.uniform(0, 2 * np.pi)
     cx = c + displacement * np.cos(angle)
     cy = c + displacement * np.sin(angle)
@@ -24644,7 +25352,7 @@ def init_quantum_harmonic(size, rng):
     psi_r, psi_i = _gaussian_wavepacket(size, cx, cy, cz, sigma)
     data[:, :, :, 0] = psi_r
     data[:, :, :, 1] = psi_i
-    data[:, :, :, 2] = _harmonic_potential(size, omega=0.02)
+    data[:, :, :, 2] = _harmonic_potential(size)
     data[:, :, :, 3] = psi_r**2 + psi_i**2
     return data
 
@@ -24731,59 +25439,214 @@ def init_quantum_double_slit(size, rng):
     return data
 
 
-def init_quantum_molecule(size, rng):
-    """Two-center molecular orbital — electron in potential of two nuclei.
-    Seeds with a 1s-like wavefunction centered between nuclei (bonding orbital)."""
-    data = np.zeros((size, size, size, 4), dtype=np.float32)
+def _molecule_potential(size, Z, sep, r_soft):
+    """Two-centre softened Coulomb V(r), nuclei on the x-axis at ±sep/2.
+    Matches schrodinger_molecule_3d exactly: mid = size/2, r = pos + 0.5."""
     c = size / 2.0
-    sigma = size * 0.1
-
-    # Wavepacket centered between the two nuclei
-    psi_r, psi_i = _gaussian_wavepacket(size, c, c, c, sigma)
-    data[:, :, :, 0] = psi_r
-    data[:, :, :, 1] = psi_i
-
-    # Two-center potential is computed dynamically in the shader,
-    # but we pre-compute it here for the initial |Ψ|² rendering
-    sep = size * 0.25  # default separation
-    r_soft = 1.5
     z, y, x = np.mgrid[0:size, 0:size, 0:size]
-    d1 = np.sqrt((x - c + sep/2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
-    d2 = np.sqrt((x - c - sep/2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
-    V = -1.0 / np.sqrt(d1**2 + r_soft**2) - 1.0 / np.sqrt(d2**2 + r_soft**2)
+    d1 = np.sqrt((x - c + sep / 2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
+    d2 = np.sqrt((x - c - sep / 2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
+    V = -Z / np.sqrt(d1**2 + r_soft**2) - Z / np.sqrt(d2**2 + r_soft**2)
+    return V.astype(np.float64)
+
+
+def _relax_imaginary_time(psi, V, size, n_iter=220, project_out=None):
+    """Imaginary-time projection to the lowest eigenstate of the SAME discrete
+    Hamiltonian the schrodinger shaders integrate:
+
+        H ψ = -(ħ/2m)·h_sq·∇²₆ ψ + V ψ ,   ħ/2m = size/50,  h_sq = (size/128)²
+
+    ∂ψ/∂τ = -Hψ relaxes any guess (with nonzero ground-state overlap) to the
+    ground state; renormalising each step keeps the amplitude alive. Passing
+    `project_out` (a list of already-relaxed states) Gram-Schmidts them out
+    every step, so the result is the lowest eigenstate ORTHOGONAL to them —
+    i.e. the next molecular orbital (bonding → antibonding → …).
+
+    Returns a float64 real wavefunction normalised to ∫|ψ|² = 1.
+    """
+    hbar_2m = size / 50.0
+    h_sq = (size / 128.0) ** 2
+    kin = hbar_2m * h_sq
+    # Explicit-diffusion stability: dτ·(12·kin + |V|max) < 2.
+    dtau = 1.2 / (12.0 * kin + float(np.abs(V).max()) + 1e-6)
+    psi = psi.astype(np.float64).copy()
+    V = V.astype(np.float64)
+    ortho = [p / np.sqrt((p * p).sum()) for p in (project_out or [])]
+
+    def _normalise(p):
+        n = np.sqrt((p * p).sum())
+        return p / n if n > 1e-30 else p
+
+    psi = _normalise(psi)
+    for _ in range(n_iter):
+        lap = (-6.0 * psi
+               + np.roll(psi, 1, 0) + np.roll(psi, -1, 0)
+               + np.roll(psi, 1, 1) + np.roll(psi, -1, 1)
+               + np.roll(psi, 1, 2) + np.roll(psi, -1, 2))
+        psi = psi - dtau * (-kin * lap + V * psi)
+        for p in ortho:
+            psi -= (psi * p).sum() * p
+        psi = _normalise(psi)
+    return psi
+
+
+# Relaxed two-centre orbitals are a pure function of (size, Z, sep, r_soft);
+# cache so repeated loads/resets (and the shared bonding solve the antibonding
+# init needs) don't re-run the ~0.2 Mcell × 220-iter relaxation every time.
+_MOLECULE_ORBITAL_CACHE: dict = {}
+
+
+def _molecule_orbitals(size, Z=1.0, sep=QUANTUM_MOLECULE_SEP, r_soft=1.5):
+    """Return (bonding, antibonding, V) for the two-centre H₂⁺ potential.
+    bonding = σ ground state; antibonding = σ* first excited (ground projected
+    out). Both are real eigenstates of the shader's discrete Hamiltonian, so
+    they render as stable MOs. Cached per parameter set."""
+    key = (int(size), round(Z, 3), round(sep, 2), round(r_soft, 2))
+    cached = _MOLECULE_ORBITAL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    c = size / 2.0
+    a0 = size / 25.0
+    V = _molecule_potential(size, Z, sep, r_soft)
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    dA = np.sqrt((x - c + sep / 2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
+    dB = np.sqrt((x - c - sep / 2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
+    bonding = _relax_imaginary_time(np.exp(-dA / a0) + np.exp(-dB / a0), V, size)
+    antibonding = _relax_imaginary_time(np.exp(-dA / a0) - np.exp(-dB / a0), V, size,
+                                        project_out=[bonding])
+    result = (bonding, antibonding, V)
+    _MOLECULE_ORBITAL_CACHE[key] = result
+    return result
+
+
+def init_quantum_molecule(size, rng):
+    """H₂⁺ bonding molecular orbital — the true σ ground state of the electron
+    in the two-nucleus Coulomb potential, found by imaginary-time relaxation of
+    an LCAO (1s_A + 1s_B) guess. Because it is an eigenstate of the SAME
+    potential the shader uses, it renders as a stable bonding cloud (single
+    phase/colour, charge piled up between the nuclei) instead of snapping."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    bonding, _anti, V = _molecule_orbitals(size)
+    psi_r = (bonding / np.max(np.abs(bonding))).astype(np.float32)
+    data[:, :, :, 0] = psi_r
+    data[:, :, :, 1] = 0.0
     data[:, :, :, 2] = V.astype(np.float32)
-    data[:, :, :, 3] = psi_r**2 + psi_i**2
+    data[:, :, :, 3] = psi_r**2
     return data
 
 
 def init_quantum_antibonding(size, rng):
-    """Antibonding molecular orbital — electron probability avoids the midpoint.
-    Seeds with two out-of-phase Gaussians centered on each nucleus."""
+    """H₂⁺ antibonding orbital (σ*) — the first excited state, found by
+    imaginary-time relaxation of an LCAO (1s_A − 1s_B) guess while projecting
+    out the bonding ground state each step. The result has a true nodal plane
+    at the internuclear midpoint (sign flip across it → colour flip in the
+    phase render)."""
     data = np.zeros((size, size, size, 4), dtype=np.float32)
-    c = size / 2.0
-    sep = size * 0.25
-    sigma = size * 0.07
-
-    # Two Gaussians with opposite phase (antibonding = ψ_A - ψ_B)
-    psi_r1, psi_i1 = _gaussian_wavepacket(size, c - sep/2, c, c, sigma)
-    psi_r2, psi_i2 = _gaussian_wavepacket(size, c + sep/2, c, c, sigma)
-    psi_r = psi_r1 - psi_r2  # destructive at midpoint
-    psi_i = psi_i1 - psi_i2
-    norm = np.sqrt(np.max(psi_r**2 + psi_i**2))
-    if norm > 1e-10:
-        psi_r /= norm
-        psi_i /= norm
-
+    _bonding, antibonding, V = _molecule_orbitals(size)
+    psi_r = (antibonding / np.max(np.abs(antibonding))).astype(np.float32)
     data[:, :, :, 0] = psi_r
-    data[:, :, :, 1] = psi_i
-
-    z, y, x = np.mgrid[0:size, 0:size, 0:size]
-    d1 = np.sqrt((x - c + sep/2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
-    d2 = np.sqrt((x - c - sep/2 + 0.5)**2 + (y - c + 0.5)**2 + (z - c + 0.5)**2)
-    V = -1.0 / np.sqrt(d1**2 + 1.5**2) - 1.0 / np.sqrt(d2**2 + 1.5**2)
+    data[:, :, :, 1] = 0.0
     data[:, :, :, 2] = V.astype(np.float32)
-    data[:, :, :, 3] = psi_r**2 + psi_i**2
+    data[:, :, :, 3] = psi_r**2
     return data
+
+
+# ── Polyatomic molecular orbitals (arbitrary nuclei) ──────────────────────
+# Molecule L2: build an N-centre Coulomb potential for any geometry and relax
+# the electron into its molecular orbitals. Uses the static-V schrodinger_3d
+# shader (V baked into channel B) — no shader changes needed. The ground MO is
+# the bonding combination (electron delocalised over all nuclei, one phase);
+# the first excited MO develops a nodal plane (phase/colour flip across it).
+
+_MOLECULE_MO_CACHE: dict = {}
+
+
+def _molecule_centers(geometry, size):
+    """Nucleus positions (voxel coords) for a named geometry, centred in grid.
+    Bond length ≈ 0.16·size so the molecule fills the frame and the 1s clouds
+    (a₀ = size/25) overlap enough to bond."""
+    c = size / 2.0
+    b = size * 0.16
+    if geometry == 'h3':                      # equilateral triangle (xy-plane)
+        R = b / (2.0 * np.sin(np.pi / 3))
+        return [(c + R * np.cos(a), c + R * np.sin(a), c)
+                for a in (np.pi / 2, np.pi / 2 + 2 * np.pi / 3,
+                          np.pi / 2 + 4 * np.pi / 3)]
+    if geometry == 'chain':                   # 4 collinear nuclei (x-axis)
+        return [(c + (i - 1.5) * b, c, c) for i in range(4)]
+    if geometry == 'ring':                    # 6-membered ring (benzene-like)
+        R = b / (2.0 * np.sin(np.pi / 6))
+        return [(c + R * np.cos(2 * np.pi * i / 6),
+                 c + R * np.sin(2 * np.pi * i / 6), c) for i in range(6)]
+    if geometry == 'tetra':                   # tetrahedron (methane-like)
+        verts = np.array([(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)],
+                         dtype=np.float64) * (b / (2.0 * np.sqrt(2)))
+        return [(c + vx, c + vy, c + vz) for vx, vy, vz in verts]
+    raise ValueError(f'unknown molecule geometry {geometry!r}')
+
+
+def _multi_nucleus_potential(size, centers, Z=1.0, r_soft=1.5):
+    """Softened Coulomb well summed over all nuclei: V = -Σ Z/√(|r-Rₖ|²+r_soft²)."""
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    V = np.zeros((size, size, size), dtype=np.float64)
+    for (cx, cy, cz) in centers:
+        d2 = (x + 0.5 - cx)**2 + (y + 0.5 - cy)**2 + (z + 0.5 - cz)**2
+        V -= Z / np.sqrt(d2 + r_soft**2)
+    return V
+
+
+def _molecule_mos(size, geometry, Z=1.0, r_soft=1.5):
+    """Return (bonding, antibonding, V) for a polyatomic geometry. bonding =
+    ground MO (all-in-phase LCAO relaxed); antibonding = first excited (seed an
+    x-split sign pattern, relax with the ground projected out). Cached."""
+    key = (int(size), geometry, round(Z, 3), round(r_soft, 3))
+    cached = _MOLECULE_MO_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    centers = _molecule_centers(geometry, size)
+    V = _multi_nucleus_potential(size, centers, Z, r_soft)
+    a0 = size / 25.0
+    cx0 = size / 2.0
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+
+    bond_guess = np.zeros((size, size, size), dtype=np.float64)
+    anti_guess = np.zeros((size, size, size), dtype=np.float64)
+    for (cx, cy, cz) in centers:
+        lobe = np.exp(-np.sqrt((x + 0.5 - cx)**2 + (y + 0.5 - cy)**2
+                               + (z + 0.5 - cz)**2) / a0)
+        bond_guess += lobe
+        anti_guess += (1.0 if cx >= cx0 else -1.0) * lobe
+
+    bonding = _relax_imaginary_time(bond_guess, V, size)
+    antibonding = _relax_imaginary_time(anti_guess, V, size, project_out=[bonding])
+    result = (bonding, antibonding, V)
+    _MOLECULE_MO_CACHE[key] = result
+    return result
+
+
+def _make_molecule_init(geometry, kind):
+    """Factory: init for a polyatomic geometry's bonding or antibonding MO."""
+    def init_fn(size, rng):
+        data = np.zeros((size, size, size, 4), dtype=np.float32)
+        bonding, antibonding, V = _molecule_mos(size, geometry)
+        mo = bonding if kind == 'bond' else antibonding
+        psi_r = (mo / np.max(np.abs(mo))).astype(np.float32)
+        data[:, :, :, 0] = psi_r
+        data[:, :, :, 1] = 0.0
+        data[:, :, :, 2] = V.astype(np.float32)
+        data[:, :, :, 3] = psi_r**2
+        return data
+    init_fn.__name__ = f'init_molecule_{geometry}_{kind}'
+    init_fn.__doc__ = f'Polyatomic {geometry} {kind}ing molecular orbital.'
+    return init_fn
+
+
+MOLECULE_POLY_INITS = {}
+for _geo in ('h3', 'chain', 'ring', 'tetra'):
+    for _kind in ('bond', 'anti'):
+        MOLECULE_POLY_INITS[f'molecule_{_geo}_{_kind}'] = \
+            _make_molecule_init(_geo, _kind)
 
 
 def init_quantum_selfinteract(size, rng):
@@ -25280,6 +26143,63 @@ def init_sandpile_critical(size, rng):
     coords = rng.randint(size // 4, 3 * size // 4, size=(n_pokes, 3))
     for x, y, z in coords:
         data[int(x), int(y), int(z), 0] = 9.0
+    return data
+
+
+def init_granular_cone(size, rng):
+    """A pre-built cone of ACTUAL grains (occupied voxels) at ~45deg repose, so
+    the sandpile opens as a pile and the spout keeps feeding it. Grains are real
+    cells (R=0.82 sand colour, which also reads as the occupancy flag)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    # tex.read()/reshape maps axis0->z, axis1->y, axis2->x.
+    zz, yy, xx = np.meshgrid(np.arange(size), np.arange(size), np.arange(size),
+                             indexing='ij')
+    c = size / 2.0
+    dist = np.sqrt((xx - c) ** 2 + (zz - c) ** 2)
+    H = np.maximum(0.0, size * 0.34 - dist)          # 45deg cone (slope 1)
+    grain = (yy < H)
+    for k, v in enumerate((0.82, 0.70, 0.42)):
+        data[..., k] = grain * v
+    return data
+
+
+def init_granular_empty(size, rng):
+    """Start with an empty box so the pile visibly self-organises from the
+    falling grains alone -- the clearest proof it is a real CA."""
+    return np.zeros((size, size, size, 4), dtype=np.float32)
+
+
+def init_granular_multi_source(size, rng):
+    """Several spouts of different rate and radius painted into the source
+    channel (A). Distinct piles grow side by side at different speeds and widths;
+    where their skirts meet they merge into a shared range."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    zz, yy, xx = np.meshgrid(np.arange(size), np.arange(size), np.arange(size),
+                             indexing='ij')
+    sy = size - 3
+    # (frac_x, frac_z, injection rate, radius in cells)
+    sources = [(0.26, 0.28, 0.65, 1), (0.74, 0.30, 0.20, 3),
+               (0.30, 0.74, 0.35, 2), (0.72, 0.72, 0.50, 1)]
+    for fx, fz, rate, r in sources:
+        cx, cz = fx * size, fz * size
+        disk = ((xx - cx) ** 2 + (zz - cz) ** 2 <= r * r) & (yy == sy)
+        data[..., 3][disk] = rate
+    return data
+
+
+def init_granular_collapse(size, rng):
+    """A tall column of grains far steeper than the angle of repose. With the
+    rule running it slumps outward into a cone -- the classic granular
+    column-collapse experiment, showing the repose angle emerge from a vertical
+    start. No painted source (set the spout rate to 0 to watch a pure collapse)."""
+    data = np.zeros((size, size, size, 4), dtype=np.float32)
+    zz, yy, xx = np.meshgrid(np.arange(size), np.arange(size), np.arange(size),
+                             indexing='ij')
+    c = size / 2.0
+    r = size * 0.12
+    tower = ((xx - c) ** 2 + (zz - c) ** 2 <= r * r) & (yy < size * 0.72)
+    for k, v in enumerate((0.82, 0.70, 0.42)):
+        data[..., k] = tower * v
     return data
 
 
@@ -26220,6 +27140,10 @@ INIT_FUNCS = {
     # 2026-05 additions
     'sandpile_uniform': init_sandpile_uniform,
     'sandpile_critical': init_sandpile_critical,
+    'granular_cone': init_granular_cone,
+    'granular_empty': init_granular_empty,
+    'granular_multi_source': init_granular_multi_source,
+    'granular_collapse': init_granular_collapse,
     'excitable_seed': init_excitable_seed,
     'excitable_random': init_excitable_random,
     'wireworld_torus': init_wireworld_torus,
@@ -27159,6 +28083,10 @@ INIT_FUNCS['nematic_defect_pair']   = init_nematic_defect_pair
 
 # Register individual orbital init variants
 INIT_FUNCS.update(ORBITAL_INITS)
+# Register polyatomic molecular-orbital init variants
+INIT_FUNCS.update(MOLECULE_POLY_INITS)
+# Register per-element valence-cloud init variants (quantum_element_<symbol>)
+INIT_FUNCS.update(ELEMENT_INITS)
 
 
 def init_sandbox_empty(size, rng):
@@ -27779,8 +28707,19 @@ class Simulator:
 
         # Rendering
         self.density_scale = 15.0
+        # Opacity transfer exponent: alpha ∝ density^gamma. 1.0 = linear.
+        # <1 (e.g. 0.5) compresses the dynamic range so faint outer orbital
+        # shells/lobes stay visible instead of being swamped by the central
+        # peak. Per-preset via 'density_gamma'; schrodinger presets default <1.
+        self.density_gamma = 1.0
         self.brightness = 1.5
         self.render_mode = 0      # 0=volume, 1=iso, 2=MIP
+        # Spatial-orientation guides drawn into the scene (so they're in
+        # recordings too): a faint bounding cube + a corner axis gnomon.
+        self.show_bounding_box = True
+        self.show_axis_gnomon = True
+        # Currently-selected element for the Periodic Table picker (Z 1-118).
+        self._element_picker_z = 6
         self.iso_threshold = 0.5
         self.colormap = self.preset.get('colormap', 0)
         # Remember the preset's declared default colormap so we can detect
@@ -27848,6 +28787,16 @@ class Simulator:
         # Parameters (copy from preset)
         self.params = dict(self.preset['params'])
         self.dt = self.preset['dt']
+        # Steps run per rendered frame (live view). Quantum bound-state phase
+        # rotates at E·dt per step (~0.002 rad) — imperceptible at 1 step/frame;
+        # schrodinger presets default to 8 so the phase/beat is visible. Any
+        # preset can override via 'steps_per_frame'; the UI slider still rules.
+        self.sim_speed = int(self.preset.get(
+            'steps_per_frame',
+            12 if self.preset.get('shader', '').startswith('schrodinger') else 1))
+        self.density_gamma = float(self.preset.get(
+            'density_gamma',
+            0.5 if self.preset.get('shader', '').startswith('schrodinger') else 1.0))
 
         # Mouse state for orbit
         self.mouse_pressed = False
@@ -28164,6 +29113,7 @@ class Simulator:
         self._rp_u_fov = rp['u_fov']
         self._rp_u_aspect = rp['u_aspect']
         self._rp_u_density_scale = rp['u_density_scale']
+        self._rp_u_density_gamma = rp.get('u_density_gamma', None)
         self._rp_u_brightness = rp['u_brightness']
         self._rp_u_render_mode = rp['u_render_mode']
         self._rp_u_iso_threshold = rp['u_iso_threshold']
@@ -28617,6 +29567,7 @@ class Simulator:
         self._cr_u_camera_rot = cr.get('u_camera_rot', None)
         self._cr_u_fov = cr.get('u_fov', None)
         self._cr_u_density_scale = cr.get('u_density_scale', None)
+        self._cr_u_density_gamma = cr.get('u_density_gamma', None)
         self._cr_u_brightness = cr.get('u_brightness', None)
         self._cr_u_render_mode = cr.get('u_render_mode', None)
         self._cr_u_iso_threshold = cr.get('u_iso_threshold', None)
@@ -29404,7 +30355,7 @@ class Simulator:
             d /= d.std()
         # Land opens above sea (coast ~0.34*size -> peaks ~0.54*size); ocean floor
         # is deep (~0.10*size) and stays open water.
-        bedrock = np.where(is_land, 0.34 + 0.20 * landness, 0.30 - 0.20 * ocean) * float(s) + d * (0.030 * float(s))
+        bedrock = np.where(is_land, 0.34 + 0.34 * landness, 0.30 - 0.20 * ocean) * float(s) + d * (0.030 * float(s))
         bedrock = np.clip(bedrock, 0.02 * float(s), 0.95 * float(s)).astype(np.float32)
         return bedrock, template
 
@@ -30334,6 +31285,127 @@ class Simulator:
         self.ctx.disable(moderngl.BLEND)
         self.ctx.disable(moderngl.DEPTH_TEST)
 
+    # ── Spatial guides (bounding box + axis gnomon) ───────────────────
+    _CUBE_EDGE_VERTS = np.array([
+        [0, 0, 0], [1, 0, 0], [1, 0, 0], [1, 1, 0], [1, 1, 0], [0, 1, 0],
+        [0, 1, 0], [0, 0, 0],                                   # bottom z=0
+        [0, 0, 1], [1, 0, 1], [1, 0, 1], [1, 1, 1], [1, 1, 1], [0, 1, 1],
+        [0, 1, 1], [0, 0, 1],                                   # top z=1
+        [0, 0, 0], [0, 0, 1], [1, 0, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1],
+        [0, 1, 0], [0, 1, 1],                                   # verticals
+    ], dtype='f4')
+    # Axis triad: origin→+X (red), origin→+Y (green), origin→+Z (blue).
+    _GNOMON_VERTS = np.array([
+        [0, 0, 0, 1.0, 0.33, 0.33], [1, 0, 0, 1.0, 0.33, 0.33],
+        [0, 0, 0, 0.40, 1.0, 0.40], [0, 1, 0, 0.40, 1.0, 0.40],
+        [0, 0, 0, 0.45, 0.6, 1.0], [0, 0, 1, 0.45, 0.6, 1.0],
+    ], dtype='f4')
+
+    def _compile_spatial_progs(self):
+        self._spatial_cube_prog = self.ctx.program(
+            vertex_shader=SPATIAL_CUBE_VERTEX_SHADER,
+            fragment_shader=SPATIAL_CUBE_FRAGMENT_SHADER)
+        self._spatial_cube_vbo = self.ctx.buffer(self._CUBE_EDGE_VERTS.tobytes())
+        self._spatial_cube_vao = self.ctx.vertex_array(
+            self._spatial_cube_prog, [(self._spatial_cube_vbo, '3f', 'a_pos')])
+        self._spatial_gnomon_prog = self.ctx.program(
+            vertex_shader=SPATIAL_GNOMON_VERTEX_SHADER,
+            fragment_shader=SPATIAL_GNOMON_FRAGMENT_SHADER)
+        self._spatial_gnomon_vbo = self.ctx.buffer(self._GNOMON_VERTS.tobytes())
+        self._spatial_gnomon_vao = self.ctx.vertex_array(
+            self._spatial_gnomon_prog,
+            [(self._spatial_gnomon_vbo, '3f 3f', 'a_dir', 'a_color')])
+
+    def _render_spatial_guides(self):
+        """Draw the bounding cube + corner axis gnomon into the scene FBO."""
+        if not (self.show_bounding_box or self.show_axis_gnomon):
+            return
+        if self._is_viewport_kind():   # fractals have no grid box
+            return
+        if not hasattr(self, '_spatial_cube_prog'):
+            self._compile_spatial_progs()
+
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+
+        if self.show_bounding_box:
+            vp_flat, _ = self._get_view_proj()
+            cam_pos = self._get_camera_pos()
+            bd = np.array([float(d) for d in self.box_dims])
+            corners = np.array([[x, y, z] for x in (0.0, bd[0])
+                                for y in (0.0, bd[1]) for z in (0.0, bd[2])])
+            dists = np.linalg.norm(corners - cam_pos, axis=1)
+            p = self._spatial_cube_prog
+            p['u_view_proj'].value = tuple(vp_flat)
+            p['u_box_dims'].value = tuple(bd)
+            p['u_cam_pos'].value = tuple(float(c) for c in cam_pos)
+            p['u_color'].value = (0.55, 0.66, 0.90)
+            p['u_alpha'].value = 0.45
+            p['u_near_d'].value = float(dists.min())
+            p['u_far_d'].value = float(dists.max())
+            self._spatial_cube_vao.render(moderngl.LINES, vertices=24)
+
+        if self.show_axis_gnomon:
+            cam_rot = self._get_camera_rot()
+            aspect = self.width / max(self.height, 1)
+            g = self._spatial_gnomon_prog
+            g['u_cam_basis'].value = tuple(cam_rot.flatten())  # world→camera
+            g['u_anchor'].value = (-0.80, -0.68)
+            g['u_scale'].value = (0.12 / aspect, 0.12)
+            g['u_alpha'].value = 0.95
+            self._spatial_gnomon_vao.render(moderngl.LINES, vertices=6)
+
+        self.ctx.disable(moderngl.BLEND)
+
+    def _center_view(self):
+        """Snap the orbit pivot back to the grid's geometric centre."""
+        self.cam_target = np.array([self.box_dims[0] * 0.5,
+                                    self.box_dims[1] * 0.5,
+                                    self.box_dims[2] * 0.5], dtype=np.float64)
+
+    def _set_element(self, z):
+        """Select a specific element for the Periodic Table picker and reload."""
+        import element_data as _ed
+        z = int(max(1, min(118, z)))
+        self._element_picker_z = z
+        self._current_init = f'quantum_element_{_ed.SYMBOLS[z]}'
+        self._reset()
+
+    def _draw_element_picker(self):
+        """Compact ◀ Fe — Iron ▶ element stepper for the quantum_element preset."""
+        import element_data as _ed
+        # Keep the picker in sync if the init was changed elsewhere.
+        cur = getattr(self, '_current_init', '')
+        if isinstance(cur, str) and cur.startswith('quantum_element_'):
+            sym = cur[len('quantum_element_'):]
+            for zz in range(1, 119):
+                if _ed.SYMBOLS[zz] == sym:
+                    self._element_picker_z = zz
+                    break
+        z = getattr(self, '_element_picker_z', 6)
+        n, l, occ = _ed.VALENCE[z]
+        imgui.text("Element:")
+        if imgui.button("<##elprev"):
+            self._set_element(z - 1)
+            return
+        imgui.same_line()
+        imgui.text(f"{_ed.SYMBOLS[z]} - {_ed.NAMES[z]}")
+        imgui.same_line()
+        if imgui.button(">##elnext"):
+            self._set_element(z + 1)
+            return
+        imgui.set_next_item_width(90)
+        changed, newz = imgui.input_int("Z##elz", z)
+        if changed:
+            self._set_element(newz)
+            return
+        imgui.same_line()
+        if imgui.button("Random##elrand"):
+            self._set_element(random.randint(1, 118))
+            return
+        imgui.text_disabled(f"  valence {n}{'spdf'[l]}^{occ}")
+
     def _release_mc(self):
         for attr in ('_mc_vert_ssbo', '_mc_counter_ssbo', '_mc_tri_ssbo',
                      '_mc_render_vao'):
@@ -31213,7 +32285,18 @@ class Simulator:
             if cu['size'] is not None:
                 cu['size'].value = self.size
             if cu['dt'] is not None:
-                cu['dt'].value = self.dt
+                dt_val = self.dt
+                # Schrodinger leapfrog goes unstable once dt*(12*(h/2m)*h_sq + V) >= 2,
+                # and (h/2m)*h_sq grows ~size^2, so a fixed dt blows up on large grids
+                # (catastrophic by 256). Cap dt from the GLOBAL kinetic bound (uniform
+                # -> exact norm conservation) at CFL 1.4, leaving headroom for V and
+                # matching the poisson V-cap's 1.6 target. Makes any grid size stable.
+                if spec.get('shader', '').startswith('schrodinger'):
+                    h_sq = (self.size / 128.0) ** 2
+                    kinetic = 12.0 * float(self.params.get('ħ/2m', 1.0)) * h_sq
+                    if kinetic > 1e-6:
+                        dt_val = min(dt_val, 1.4 / kinetic)
+                cu['dt'].value = dt_val
             if cu['boundary'] is not None:
                 cu['boundary'].value = self.boundary_mode
             if cu['frame'] is not None:
@@ -31786,6 +32869,12 @@ class Simulator:
         self.preset = _resolve_composed_preset(rule_name)
         self.params = dict(self.preset['params'])
         self.dt = self.preset['dt']
+        self.sim_speed = int(self.preset.get(
+            'steps_per_frame',
+            12 if self.preset.get('shader', '').startswith('schrodinger') else 1))
+        self.density_gamma = float(self.preset.get(
+            'density_gamma',
+            0.5 if self.preset.get('shader', '').startswith('schrodinger') else 1.0))
         self._current_init = self.preset['init']
         self.vis_channels = self.preset.get('vis_channels', ['Value'])
         self.vis_channel = self.preset.get('vis_default', 0)
@@ -32564,6 +33653,7 @@ void main() {
             _SCHEMA_V = 1
         entry = {
             'schema_version': _SCHEMA_V,
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'rule': self.rule_name,
             'rule_code_hash': rule_code_hash(self.rule_name),
             'params': dict(self.params),
@@ -33658,6 +34748,8 @@ void main() {
         self._rp_u_fov.value = fov
         self._rp_u_aspect.value = aspect
         self._rp_u_density_scale.value = self.density_scale
+        if self._rp_u_density_gamma is not None:
+            self._rp_u_density_gamma.value = self.density_gamma
         self._rp_u_brightness.value = self.brightness
         self._rp_u_render_mode.value = self.render_mode
         self._rp_u_iso_threshold.value = self.iso_threshold
@@ -34415,6 +35507,8 @@ void main() {
         self._render_glyphs()
         # Optional marching-cubes iso-surface overlay.
         self._render_iso_surface()
+        # Spatial-orientation guides (bounding cube + axis gnomon).
+        self._render_spatial_guides()
 
     def _hq_enabled(self):
         """True when the HQ post-processing path should wrap the scene render."""
@@ -34760,6 +35854,7 @@ void main() {
         _su(self._cr_u_fov, 1.0)
         _su(self._cr_u_aspect, w / max(h, 1))
         _su(self._cr_u_density_scale, self.density_scale)
+        _su(self._cr_u_density_gamma, self.density_gamma)
         _su(self._cr_u_brightness, self.brightness)
         _su(self._cr_u_render_mode, self.render_mode)
         _su(self._cr_u_iso_threshold, self.iso_threshold)
@@ -35571,6 +36666,10 @@ void main() {
                         imgui.set_item_default_focus()
                 imgui.end_combo()
 
+        # Periodic Table element picker (quantum_element preset only).
+        if self.rule_name == 'quantum_element':
+            self._draw_element_picker()
+
         # ── Video recording ───────────────────────────────────────────
         # Auto-rotate camera (rate-locked to output time when recording,
         # wall-clock when not). Lives above the recording controls so
@@ -35847,7 +36946,7 @@ void main() {
                         if self._disc_sort_mode == 0:
                             indices.extend(sorted(ri, key=lambda i: get_field(self.discoveries[i], 'score', 0), reverse=True))
                         else:
-                            indices.extend(sorted(ri, reverse=True))
+                            indices.extend(sorted(ri, key=lambda i: (self.discoveries[i].get('created_at') or '', i), reverse=True))
                     return indices
                 else:
                     ri = [i for i, d in enumerate(self.discoveries) if get_field(d, 'rule') == self.rule_name]
@@ -35856,7 +36955,7 @@ void main() {
                     if self._disc_sort_mode == 0:
                         return sorted(ri, key=lambda i: get_field(self.discoveries[i], 'score', 0), reverse=True)
                     else:
-                        return sorted(ri, reverse=True)
+                        return sorted(ri, key=lambda i: (self.discoveries[i].get('created_at') or '', i), reverse=True)
 
             if imgui.button("<##disc_prev"):
                 all_idx = _sorted_disc_indices()
@@ -36296,6 +37395,21 @@ void main() {
                         imgui.set_item_default_focus()
                 imgui.end_combo()
             self._draw_colormap_legend()
+
+            # Spatial orientation guides (bounding box + axis gnomon + recenter)
+            imgui.separator()
+            imgui.text("Orientation:")
+            changed, val = imgui.checkbox("Bounding box", self.show_bounding_box)
+            if changed:
+                self.show_bounding_box = val
+            imgui.same_line()
+            changed, val = imgui.checkbox("Axis gnomon", self.show_axis_gnomon)
+            if changed:
+                self.show_axis_gnomon = val
+            if imgui.button("Center view"):
+                self._center_view()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Snap the view pivot back to the grid centre (undo pan)")
 
             # Performance options
             imgui.separator()
@@ -37330,6 +38444,50 @@ void main() {
             'resolution': [self._rec_width, self._rec_height],
             'duration_sec': round(time.time() - self._rec_start_time, 2),
         }
+        # Per-orbital publishing override: give each orbital_* variant of the
+        # quantum_orbital browser its own title/description instead of the
+        # shared "Atomic Orbital" preset copy (see QUANTUM_ORBITAL_META).
+        init_name = getattr(self, '_current_init', None)
+        meta['init_variant'] = init_name
+        orb = QUANTUM_ORBITAL_META.get(init_name)
+        if orb:
+            meta['label'] = orb['label']
+            meta['description'] = orb['desc']
+            meta['short_description'] = orb['short']
+            meta['shorts_hook'] = orb['hook']
+            # Per-orbital search tags (e.g. "2p orbital", "p orbital").
+            subshell = orb['label'].split()[0].lower()      # '1s', '2p', '3d'
+            l_letter = subshell[-1] if subshell[-1:] in ('s', 'p', 'd', 'f') else ''
+            meta['extra_tags'] = [t for t in (
+                f'{subshell} orbital', f'{l_letter} orbital' if l_letter else '',
+                'atomic orbital', 'hydrogen orbital', 'electron orbital',
+                'electron cloud', 'quantum chemistry', 'wavefunction',
+                'schrodinger equation', 'quantum physics') if t]
+        # Per-element publishing override for the Periodic Table series.
+        elif isinstance(init_name, str) and init_name.startswith('quantum_element_'):
+            import element_data as _ed
+            sym = init_name[len('quantum_element_'):]
+            z = next((zz for zz in range(1, 119) if _ed.SYMBOLS[zz] == sym), None)
+            if z is not None:
+                name = _ed.NAMES[z]
+                n, l, occ = _ed.VALENCE[z]
+                shell = f"{n}{'spdf'[l]}"
+                meta['label'] = f'{name} — Electron Cloud'
+                meta['shorts_hook'] = f'The {name} Atom'
+                meta['short_description'] = (
+                    f'{name} ({sym}, Z={z}) — its {shell} valence electron cloud, '
+                    f'the real quantum-mechanical shape of the atom.')
+                meta['description'] = (
+                    f'The electron density of {name} ({sym}), atomic number {z}. '
+                    f'This is the {shell} valence subshell filled with {occ} '
+                    f'electron(s) by Hund\'s rule and rendered as its true 3D '
+                    f'probability cloud — partial shells are lobed, full shells '
+                    f'spherical. Part of a periodic-table series.')
+                meta['extra_tags'] = [
+                    name.lower(), sym.lower(), f'{name.lower()} atom',
+                    f'{shell} orbital', 'periodic table', 'atomic orbital',
+                    'electron cloud', 'electron configuration', 'valence electrons',
+                    'quantum chemistry', 'chemistry', 'quantum physics']
         if self.discovery_index >= 0 and self.discovery_index < len(self.discoveries):
             disc = self.discoveries[self.discovery_index]
             meta['discovery_score'] = get_field(disc, 'score', 0)

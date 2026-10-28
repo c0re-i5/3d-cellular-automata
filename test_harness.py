@@ -3615,6 +3615,7 @@ def _make_discovery(r):
         _code_hash = None
     d = {
         'schema_version': DISCOVERY_SCHEMA_VERSION,
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'rule': r['rule'],
         'rule_code_hash': _code_hash,
         'params': r['params'],

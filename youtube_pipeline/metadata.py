@@ -316,6 +316,14 @@ def _shorten_for_shorts(desc: str) -> str:
     return truncated + '…'
 
 
+def _renderer_tags(renderer_mode: str) -> list[str]:
+    """Search tags describing how the clip was rendered, from the recorded
+    renderer mode (so a voxel capture isn't mislabelled 'volumetric')."""
+    if (renderer_mode or '').lower() == 'voxel':
+        return ['voxel rendering', 'voxels', '3d voxels']
+    return ['volumetric rendering', 'ray marching', 'volume rendering']
+
+
 def build_metadata(sidecar_path: Path) -> dict:
     """Return a dict with ``title``, ``description``, ``tags``, ``shorts``.
 
@@ -362,7 +370,12 @@ def build_metadata(sidecar_path: Path) -> dict:
         # a hand-written hook; presets whose label is already human and
         # high-search (Game of Life, SmoothLife, 4/4/5, Crystal) fall
         # back to their cleaned label.
-        hook_seg = _hook_for(rule) or _humanize_label(title_label)
+        #
+        # A sidecar may also supply an explicit ``shorts_hook`` (e.g. the
+        # per-orbital quantum_orbital variants), which wins over the generic
+        # per-rule hook so each variant gets its own title.
+        hook_seg = (meta.get('shorts_hook') or _hook_for(rule)
+                    or _humanize_label(title_label))
         # If the hook already names the science proper noun (i.e. the
         # category phrase appears within it, e.g. "The 3D Wave Equation"
         # vs category "Wave Equation"), the "— 3D {category}" anchor is a
@@ -495,12 +508,16 @@ def build_metadata(sidecar_path: Path) -> dict:
 
     # ── Tags ──────────────────────────────────────────────────────────
     raw_tags = [
-        'cellular automata', '3d cellular automata', 'generative art',
-        'simulation', 'emergent behavior', 'gpu compute',
-        'volumetric rendering', 'compute shader', 'complex systems',
-        'procedural generation', 'opengl',
+        # Video-specific keywords first (e.g. per-orbital) so they survive
+        # the character-budget trim ahead of the generic brand tags.
+        *meta.get('extra_tags', []),
         category.lower(),
         title_label.lower(),
+        'cellular automata', '3d cellular automata', 'generative art',
+        'simulation', 'emergent behavior', 'gpu compute',
+        'compute shader', 'complex systems',
+        'procedural generation', 'opengl',
+        *_renderer_tags(renderer_mode),
         rule.replace('_', ' ') if rule else '',
     ]
     if is_time_axis:

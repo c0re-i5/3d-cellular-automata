@@ -1,0 +1,160 @@
+{
+  "rule": "granular_sandpile_3d",
+  "size": 48,
+  "seed": 1001,
+  "dt": 1.0,
+  "init": "granular_empty",
+  "params": {
+    "Spout rate": 0.35,
+    "Spout width": 1.0,
+    "Diagonal roll": 0.3,
+    "Flow": 0.09
+  },
+  "checkpoints": [
+    25,
+    100,
+    250
+  ],
+  "snapshots": [
+    {
+      "step": 25,
+      "hash": "4b96510e95fe078428d197b868662037869d462205dcd25960784a8b07739ce6",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0002394386538071558,
+            "std": 0.015076715499162674,
+            "min": 0.0,
+            "max": 0.9800000190734863,
+            "alive": 28,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0002170139050576836,
+            "std": 0.013689729385077953,
+            "min": 0.0,
+            "max": 0.8999999761581421,
+            "alive": 28,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.00014214411203283817,
+            "std": 0.00899739470332861,
+            "min": 0.0,
+            "max": 0.6000000238418579,
+            "alive": 28,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 100,
+      "hash": "841a1b1b29423410aec100e92caea3cfebefe0ae06fb071493555b9ea08a7573",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.001015323679894209,
+            "std": 0.030261686071753502,
+            "min": 0.0,
+            "max": 0.9800000190734863,
+            "alive": 125,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0009018133278004825,
+            "std": 0.026946671307086945,
+            "min": 0.0,
+            "max": 0.8999999761581421,
+            "alive": 125,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0005742729990743101,
+            "std": 0.01724669709801674,
+            "min": 0.0,
+            "max": 0.6000000238418579,
+            "alive": 125,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    },
+    {
+      "step": 250,
+      "hash": "a487d110723190113b0cb68f735b8d2a831a3b6f154a0e8ddbf1c845e6bad415",
+      "stats": {
+        "shape": [
+          48,
+          48,
+          48,
+          4
+        ],
+        "channels": [
+          {
+            "mean": 0.0024743201211094856,
+            "std": 0.045884162187576294,
+            "min": 0.0,
+            "max": 0.9800000190734863,
+            "alive": 322,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0021466289181262255,
+            "std": 0.039896491914987564,
+            "min": 0.0,
+            "max": 0.8999999761581421,
+            "alive": 322,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.001320529612712562,
+            "std": 0.024663051590323448,
+            "min": 0.0,
+            "max": 0.6000000238418579,
+            "alive": 322,
+            "nonfinite": 0
+          },
+          {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "alive": 0,
+            "nonfinite": 0
+          }
+        ]
+      }
+    }
+  ],
+  "blessed_at": "2026-09-20T20:25:06+00:00",
+  "note": "containing walls: pile keeps gaining height (conservative, no edge spill)"
+}

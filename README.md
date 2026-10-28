@@ -106,6 +106,8 @@ An optional, toggleable **cinematic post-processing path** applied to the *final
 - **NaN/Inf detection** — GPU metrics shader catches numerical instabilities
 - **Sandbox mode** — paint elements, set temperature, erase with adjustable brush size
 - **Element palette** — 16 common elements (H, C, N, O, Na, Fe, Cu, Au, etc.) for the Element Chemistry rule
+- **Periodic-table picker** — `<` / `>` stepper, atomic-number input, and Random button for the Quantum Element rule (Z = 1–118)
+- **Spatial guides** — bounding cube with depth-faded far edges plus an R/G/B axis gnomon that track the camera (also baked into recordings), and a **Center view** button
 - **Sandbox state save/load** — serialize full grid state to NPZ
 - **FPS counter** in window title with rolling 60-frame average
 
@@ -116,7 +118,7 @@ An optional, toggleable **cinematic post-processing path** applied to the *final
 | **Classic** | Game of Life, SmoothLife | Discrete and continuous life-like automata |
 | **Reaction-Diffusion** | Gray-Scott, BZ, Barkley, Morphogen, BZ Turbulence, Flow Turing (differential-flow) | Chemical pattern formation — spots, spirals, scroll waves, drifting wave trains |
 | **Continuous** | Lenia, Multi-channel Lenia | Kernel-based continuous CAs with lifelike organisms |
-| **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×6), Schrödinger–Poisson, 3+1D Dirac (4-spinor leapfrog) | Wave equations, full-vector electromagnetics, single-particle and self-interacting QM, relativistic spin-½ evolution |
+| **Physics** | Wave, EM Wave (Yee FDTD), Schrödinger (×10: hydrogen, orbitals, periodic-table elements, wavepacket, harmonic, tunneling, double-slit, diatomic bonding/antibonding, polyatomic MOs), Schrödinger–Poisson, 3+1D Dirac (4-spinor leapfrog) | Wave equations, full-vector electromagnetics, single-particle and self-interacting QM, relativistic spin-½ evolution |
 | **Materials** | Crystal Growth (×5: Compact, Octahedral, Cubic, Dendritic, Snowflake), Crystal Coring/Zoning, Directional Solidification (Bridgman), Cahn-Hilliard, Fracture (peridynamic), Erosion (hydraulic), Active Nematic (Q-tensor) | Phase separation, anisotropic and directional solidification, solute zoning, brittle fracture, channelised erosion, defect-driven liquid-crystal flow |
 | **Active Matter** | Active Ising (flocking bands), Active Phase Separation (non-reciprocal Cahn-Hilliard) | Self-propelled and non-reciprocal systems where static order is replaced by perpetual travelling structure |
 | **Biology** | Predator-Prey, Wolf-Sheep-Grass, Flocking (Reynolds + predator), Physarum (adaptive flux), Mycelium (anastomosing), Lichen, Termites (3-aux-field stigmergy), Ant Colony (stigmergic foraging), Ant Colony Rivalry (3 teams sharing one food field), Ant Colony Lifecycle (queens + GPU spawn + worker aging), Wandering Voxels (entity_arena demo) | Population dynamics, swarm behaviour, biological transport networks, stigmergic self-organisation, multi-team rivalry over a shared resource, validation harness for the entity-arena GPU substrate |
@@ -164,6 +166,8 @@ Use the imgui panel to switch presets, adjust parameters, and control the simula
 | **1 / 2 / 3** | Brush tool: element / temperature / eraser |
 | **F5** | Start / stop recording |
 | **F9** | Toggle high-quality render mode |
+| **F11** | Toggle debug panel (stats, histograms, spatial decomposition, snapshots) |
+| **F12** | Toggle performance overlay |
 | **Escape** | Quit |
 
 #### Mouse Controls
@@ -607,13 +611,25 @@ A Hertzian dipole sources $E_z = \sin(2\pi f t)$ at the box centre. CFL: $c\,dt 
 
 $$i\hbar\,\partial_t \Psi = -\frac{\hbar^2}{2m}\nabla^2\Psi + V(\mathbf{r})\Psi$$
 
-Split into real/imaginary parts with staggered updates. 6 presets: hydrogen atom, orbital, wavepacket, harmonic oscillator, tunneling, double-slit.
+Split into real/imaginary parts with staggered updates. Presets: hydrogen atom, orbital, periodic-table element, wavepacket, harmonic oscillator, tunneling, double-slit, diatomic bonding/antibonding, and polyatomic molecules. All render in HSV-phase mode (hue $=\arg\Psi$, brightness $=|\Psi|$).
 
-**Schrödinger-Poisson** — Adds self-consistent Hartree mean-field: $\nabla^2 V = -\alpha|\Psi|^2$, solved via SOR Jacobi relaxation each frame.
+- **Stability** — `dt` is clamped to the leapfrog CFL limit for the current grid and potential, so norm stays bounded at any slider setting.
+- **Absorbing boundary** — tunneling and double-slit use a complex absorbing potential near the walls so outgoing waves leave instead of reflecting back.
+- **Stationary orbitals** — the 18 hydrogen orbitals (`orbital_1s` … `orbital_4f3`) are relaxed in imaginary time to eigenstates of the *discrete* lattice Hamiltonian. The angular part $Y_{lm}$ stays fixed and only the radial profile $c(r)$ relaxes, so shapes stay textbook and $|\Psi|^2$ remains stationary under evolution. Radial profiles are cached in `orbital_cache/`.
+- **Periodic-table elements** — `quantum_element_<Symbol>` for Z = 1–118 builds the valence subshell from the element's configuration with a Slater-screened $Z_\text{eff}$, fills it by Hund's rule, and combines the occupied real orbitals with fixed per-element complex weights:
 
-**Molecular Schrödinger** — Two-center softened Coulomb potential for bonding/antibonding orbitals:
+$$\Psi = c_{nl}(r)\sum_{m} \sqrt{n_m}\,e^{i\theta_m(Z)}\,Y_{lm}$$
 
-$$V(\mathbf{r}) = -\frac{Z}{\sqrt{|\mathbf{r}-\mathbf{R}_1|^2 + r_s^2}} - \frac{Z}{\sqrt{|\mathbf{r}-\mathbf{R}_2|^2 + r_s^2}}$$
+  Every term shares the energy $E_{nl}$, so this is a stationary state: stable and phase-coloured, and distinct per element. Periods 6–7 render compactly at 128³ because of grid resolution.
+- **Harmonic oscillator** — coherent state in a capped quadratic trap that oscillates like a classical particle.
+
+**Schrödinger-Poisson** — Adds self-consistent Hartree mean-field: $\nabla^2 V = -\alpha|\Psi|^2$, solved via SOR Jacobi relaxation each frame. The sign is attractive, so the default packet forms a self-bound soliton.
+
+**Molecular Schrödinger** — Multi-center softened Coulomb potential:
+
+$$V(\mathbf{r}) = -\sum_k \frac{Z}{\sqrt{|\mathbf{r}-\mathbf{R}_k|^2 + r_s^2}}$$
+
+Diatomic presets show the bonding (in-phase, density between nuclei) and antibonding (nodal plane) MOs. The polyatomic preset adds an H₃⁺ triangle, a linear chain, a benzene-like 6-ring, and a tetrahedron (`molecule_<shape>_bond` / `_anti`), each relaxed to the lowest / highest delocalised MO.
 
 ---
 
@@ -733,6 +749,16 @@ The potential $\Phi$ is warm-started across timesteps in pair 2, so only a handf
 | ![3D Game of Life at 64³](screenshots/3d-ca-sim-voxel-3dgol-01.png) | ![3D Game of Life at 512³](screenshots/3d-ca-sim-voxel-3dgol-02.png) |
 
 *3D Game of Life (B6-7/S5-7) — voxel renderer with surface neighbor count coloring. 11.5M visible voxels at 512³.*
+
+### Control & debug panels
+
+![Full control panel](screenshots/Screenshot%20From%202026-10-28%2019-28-35-full-panel-features.png)
+
+*Full ImGui control panel: rule, grid size, parameters, playback, seed, init pattern, recording, and the discovery browser with its refinement report (seed stability, period / translation / growth / symmetry analysis, parameter elasticity, nearest neighbours, neighbourhood explorer).*
+
+![Control panel with debug panel](screenshots/Screenshot%20From%202026-10-28%2019-29-28-full-panel-features-and-debug-panel.png)
+
+*The same session with the `F11` debug panel open: health status, per-channel scalars, active-fraction history, log-count channel histograms, spatial decomposition (AABB, centre of mass, gyration radius over time), and JSON / voxel snapshot export to `debug_runs/`.*
 
 ## License
 
